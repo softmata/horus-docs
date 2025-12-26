@@ -1,0 +1,838 @@
+---
+title: Core Concepts - Shared Memory
+description: Understanding HORUS shared memory IPC architecture
+order: 23
+---
+
+# Shared Memory IPC
+
+HORUS achieves **248ns-2.8µs latency** through a zero-copy shared memory IPC architecture. This page explains how HORUS uses platform-specific shared memory for ultra-low latency inter-process communication.
+
+**Cross-Platform Support:**
+| Platform | Shared Memory Path | Notes |
+|----------|-------------------|-------|
+| Linux | `/dev/shm/horus/` | Native POSIX shm, fastest |
+| macOS | `/tmp/horus/` | tmpfs-backed |
+| Windows | `%TEMP%\horus\` | Temp directory |
+
+## What is Shared Memory IPC?
+
+Shared memory is a region of RAM that multiple processes can access simultaneously. Unlike network-based communication (TCP/UDP) or message queues, shared memory:
+
+**Eliminates serialization**: No conversion to/from bytes
+
+**Eliminates copying**: Data written once, read directly
+
+**Enables zero-copy semantics**: Loan pattern for minimal allocations
+
+**Provides deterministic latency**: No network stack overhead
+
+**Scales linearly**: Latency proportional to message size
+
+## Architecture Overview
+
+### Storage Location
+
+HORUS stores shared memory segments in platform-specific directories using a **flat namespace** (like ROS):
+
+**Linux:**
+```
+/dev/shm/horus/topics/
+```
+
+**macOS:**
+```
+/tmp/horus/topics/
+```
+
+**Windows:**
+```
+%TEMP%\horus\topics\
+```
+
+All processes on the same machine share the same topic namespace. This is simple and familiar to ROS developers.
+
+**Why platform-specific paths?**
+
+**RAM-backed**: Stored in RAM (or tmpfs on macOS), not disk
+
+**Fast access**: Direct memory operations
+
+**Kernel-managed**: Operating system handles memory mapping
+
+**Cross-platform**: Auto-detected at compile time
+
+**Simple cleanup**: Use `horus clean --shm` or delete the directory
+
+### Flat Namespace Design (ROS-like)
+
+HORUS uses a **flat topic namespace** like ROS. All processes on the same machine share the same topics:
+
+```
+# Terminal 1: Robot controller
+Hub::new("cmd_vel")  → /dev/shm/horus/topics/horus_cmd_vel
+
+# Terminal 2: GUI monitor (same topic!)
+Hub::new("cmd_vel")  → /dev/shm/horus/topics/horus_cmd_vel
+```
+
+**Result**: Both processes automatically communicate. No configuration needed!
+
+### Why Flat Namespace?
+
+| Benefit | Description |
+|---------|-------------|
+| **Simplicity** | No session IDs to configure |
+| **ROS familiarity** | Same mental model as ROS developers expect |
+| **Easy debugging** | `ls /dev/shm/horus/topics/` shows all topics |
+| **Multi-process by default** | Nodes in different terminals automatically share topics |
+
+### Topic Isolation (When Needed)
+
+If you need topic isolation between projects, use **topic prefixes** (like ROS namespaces):
+
+```rust
+// Project A
+Hub::new("robot_arm/cmd_vel")?;
+
+// Project B
+Hub::new("mobile_robot/cmd_vel")?;
+```
+
+This creates separate topics:
+- `/dev/shm/horus/topics/horus_robot_arm_cmd_vel`
+- `/dev/shm/horus/topics/horus_mobile_robot_cmd_vel`
+
+### File Naming Convention
+
+Shared memory topics follow this naming:
+
+```
+/dev/shm/horus/topics/horus_{topic_name}
+```
+
+Examples:
+```bash
+/dev/shm/horus/topics/horus_cmd_vel
+/dev/shm/horus/topics/horus_laser_scan
+/dev/shm/horus/topics/horus_system_monitor
+```
+
+**Topic name sanitization**:
+- `/` characters become `_`
+- `:` characters become `_`
+- Creates safe filesystem names
+
+## ShmRegion: Memory-Mapped Files
+
+### What is ShmRegion?
+
+`ShmRegion` is the low-level abstraction for creating and managing memory-mapped files in `/dev/shm`.
+
+### Structure
+
+```rust
+pub struct ShmRegion {
+    mmap: MmapMut,      // Memory-mapped region
+    size: usize,        // Size in bytes
+    path: PathBuf,      // Path to /dev/shm file
+    _file: File,        // Underlying file handle
+    name: String,       // Topic name
+    owner: bool,        // Created this region?
+}
+```
+
+### Creating a Region
+
+```rust
+// Create or open shared memory region
+let region = ShmRegion::new("my_topic", 4096)?;
+```
+
+**Behavior**:
+- Creates `/dev/shm/horus/topics/horus_my_topic`
+- Allocates 4096 bytes
+- Zero-initializes memory if new
+- Reuses existing memory if already created
+
+### Opening Existing Region
+
+```rust
+// Open existing shared memory (no creation)
+let region = ShmRegion::open("my_topic")?;
+```
+
+**Behavior**:
+- Returns error if topic doesn't exist
+- Maps existing memory
+- Detects size automatically
+
+### Ownership
+
+The first process to create a region is the **owner**:
+
+```rust
+if region.is_owner() {
+    println!("I created this shared memory");
+} else {
+    println!("I'm using existing shared memory");
+}
+```
+
+**Owner responsibilities**:
+- Initializes memory to zero
+- Optionally cleans up on exit (currently disabled for debugging)
+
+## ShmTopic: Lock-Free Ring Buffer (Internal)
+
+`ShmTopic<T>` is the internal implementation used by Hub for lock-free ring buffer communication in shared memory.
+
+**Key Features**:
+- Multi-producer/multi-consumer support
+- 64-byte cache-line alignment for optimal performance
+- Zero-copy loan pattern for direct memory access
+- Atomic operations without locks
+
+## Zero-Copy Loan Pattern (Internal)
+
+HORUS uses a loan pattern to achieve zero-copy communication:
+
+**Traditional approach**: Message is copied multiple times (serialize, send, deserialize)
+
+**HORUS approach**: Message written once to shared memory, read directly by all subscribers
+
+**How it works**:
+1. Publisher "loans" a slot in shared memory
+2. Writes data directly to that slot
+3. When done, message automatically becomes visible to subscribers
+4. Subscribers read directly from shared memory (no copy)
+
+This eliminates all serialization and network overhead.
+
+## Lock-Free Operations (Internal)
+
+HORUS uses lock-free atomic operations for thread-safe communication without mutexes:
+
+**Publishing**:
+- Uses atomic compare-and-swap to claim a memory slot
+- 75% fill limit prevents overwriting unread messages
+- Multiple publishers can write concurrently without blocking
+
+**Subscribing**:
+- Each subscriber independently tracks its read position
+- Non-destructive reads allow multiple subscribers
+- Lock-free atomic operations ensure thread safety
+
+This design eliminates mutex contention and provides deterministic latency.
+
+## Multi-Consumer Architecture
+
+### How Multiple Subscribers Work
+
+Each subscriber maintains its own `consumer_tail` position:
+
+```
+Publisher writes:    HEAD  [0] [1] [2] [3] [4]
+
+Subscriber A:        TAIL_A  [0]  (just joined)
+Subscriber B:        TAIL_B  [2]  (caught up partially)
+Subscriber C:        TAIL_C  [4]  (fully caught up)
+```
+
+**Each subscriber**:
+- Tracks its own position independently
+- Can join at any time (starts from current HEAD)
+- Reads at its own pace
+- Doesn't affect other subscribers
+
+### Buffer Fill Management
+
+To prevent overwriting unread messages:
+
+```rust
+let max_unread = (self.capacity * 3) / 4;  // 75% fill limit
+```
+
+**Why 75% limit?**
+- Allows slower subscribers to catch up
+- Prevents buffer wraparound issues
+- Trades capacity for safety
+- Ensures deterministic behavior
+
+**What happens when full?**
+- `push()` returns `Err(msg)` with original message
+- `loan()` returns `Err("Buffer full")`
+- Publishers can retry or drop message
+- Subscribers continue reading
+
+## Safety Features
+
+### Comprehensive Bounds Checking
+
+Every memory access is validated:
+
+```rust
+// Validate index is in bounds
+if head >= self.capacity {
+    panic!("Critical safety violation: head index >= capacity");
+}
+
+// Validate byte offset is in bounds
+let byte_offset = head * mem::size_of::<T>();
+let data_region_size = self.capacity * mem::size_of::<T>();
+if byte_offset + mem::size_of::<T>() > data_region_size {
+    panic!("Critical safety violation: write would exceed bounds");
+}
+```
+
+### Capacity Limits
+
+Safety constants prevent dangerous configurations:
+
+```rust
+const MAX_CAPACITY: usize = 1_000_000;        // Max elements
+const MIN_CAPACITY: usize = 1;                // Min elements
+const MAX_ELEMENT_SIZE: usize = 1_000_000;    // Max size per element
+const MAX_TOTAL_SIZE: usize = 100_000_000;    // Max total (100MB)
+```
+
+**Validation**:
+```rust
+if capacity > MAX_CAPACITY {
+    return Err("Capacity too large");
+}
+if element_size > MAX_ELEMENT_SIZE {
+    return Err("Element size too large");
+}
+```
+
+### Type Safety
+
+Element size is validated when opening existing topics:
+
+```rust
+let stored_element_size = header.element_size.load(Ordering::Relaxed);
+let expected_element_size = mem::size_of::<T>();
+if stored_element_size != expected_element_size {
+    return Err("Element size mismatch");
+}
+```
+
+**Prevents**:
+- Opening topic with wrong type
+- Mismatched publisher/subscriber types
+- Memory corruption from type confusion
+
+## Performance Optimizations
+
+### Cache-Line Alignment
+
+```rust
+#[repr(align(64))]
+```
+
+**Benefits**:
+- Prevents false sharing between cores
+- Optimizes atomic operations
+- Reduces cache invalidations
+- Each field gets its own cache line
+
+### Atomic Operations
+
+Using appropriate memory ordering:
+
+```rust
+// Relaxed for non-critical reads
+let head = header.head.load(Ordering::Relaxed);
+
+// Acquire for critical synchronization
+let current_head = header.head.load(Ordering::Acquire);
+
+// Release when publishing
+header.head.compare_exchange_weak(..., Ordering::Release, ...);
+```
+
+**Why different orderings?**
+- Relaxed: Fastest, no synchronization guarantees
+- Acquire: Synchronizes with Release operations
+- Release: Makes all previous writes visible
+- Balanced for performance and correctness
+
+### Zero-Copy Semantics
+
+No allocations in the hot path:
+
+```rust
+// No allocations - just pointer arithmetic
+let sample = topic.loan()?;  // Returns stack-allocated sample
+sample.write(data);          // Writes directly to shared memory
+// Drop publishes (no allocation)
+```
+
+## Hub Integration
+
+`Hub<T>` uses ShmTopic internally to provide the user-facing pub/sub API. When you call `hub.send()`, it internally uses the loan pattern to write directly to shared memory and automatically publishes the message to all subscribers.
+
+## Managing Shared Memory
+
+### Viewing Active Topics
+
+```bash
+# Linux
+ls -lh /dev/shm/horus/topics/
+
+# macOS
+ls -lh /tmp/horus/topics/
+
+# Example output:
+# -rw-r--r-- 1 user user 4.0K Oct 5 12:34 horus_cmd_vel
+# -rw-r--r-- 1 user user 8.0K Oct 5 12:34 horus_laser_scan
+```
+
+### Checking Available Space
+
+```bash
+# Linux
+df -h /dev/shm
+
+# macOS (check temp space)
+df -h /tmp
+
+# Example output (Linux):
+# Filesystem      Size  Used Avail Use% Mounted on
+# tmpfs           7.8G  128M  7.7G   2% /dev/shm
+```
+
+### Manual Cleanup
+
+HORUS uses a flat namespace, so shared memory persists across runs. Clean up when needed:
+
+```bash
+# Using HORUS CLI (recommended)
+horus clean --shm
+
+# Or manually remove the directory
+rm -rf /dev/shm/horus/      # Linux
+rm -rf /tmp/horus/          # macOS
+```
+
+**When to clean:**
+- After crashes
+- When testing different configurations
+- Before starting a new development session
+
+### Monitoring Memory Usage
+
+```bash
+# Watch memory usage in real-time
+watch -n 1 'du -sh /dev/shm/horus/'
+
+# Show per-topic sizes
+du -h /dev/shm/horus/topics/*
+```
+
+## Platform Considerations
+
+HORUS has **native cross-platform support** - the same code works on Linux, macOS, and Windows.
+
+### Linux
+
+Fastest performance with native POSIX shared memory:
+
+**Native /dev/shm support**: Tmpfs filesystem in RAM
+
+**Excellent performance**: Direct kernel support
+
+**No configuration needed**: Works out of the box
+
+**Typical limits**: 50% of RAM or configurable
+
+**Increasing /dev/shm Size (Linux only):**
+
+```bash
+# Check current size
+df -h /dev/shm
+
+# Increase to 4GB (requires sudo)
+sudo mount -o remount,size=4G /dev/shm
+
+# Make permanent (add to /etc/fstab):
+# tmpfs /dev/shm tmpfs defaults,size=4G 0 0
+```
+
+### macOS
+
+HORUS has **native macOS support** using `/tmp/horus/`:
+
+**tmpfs-backed**: Fast memory-mapped files
+
+**No Docker/VM needed**: Works directly on macOS
+
+**Same API**: Code works unchanged from Linux
+
+```bash
+# Check shared memory
+ls -lh /tmp/horus/
+
+# Check available space
+df -h /tmp
+```
+
+### Windows
+
+HORUS has **native Windows support** using `%TEMP%\horus\`:
+
+**Native support**: Uses Windows temp directory
+
+**No WSL required**: Works directly on Windows
+
+**Same API**: Code works unchanged from Linux
+
+```powershell
+# Check shared memory
+dir $env:TEMP\horus
+
+# View temp directory location
+echo $env:TEMP
+```
+
+**Alternative: WSL 2** (if you prefer Linux environment):
+```powershell
+wsl --install
+# Inside WSL, HORUS uses Linux's /dev/shm/
+```
+
+## Best Practices
+
+### Understanding Capacity vs Memory Size
+
+HORUS provides two ways to configure shared memory allocation:
+
+#### High-Level API: Message Capacity
+
+The recommended approach using Hub:
+
+```rust
+// Specify number of messages to buffer
+Hub::new_with_capacity("topic", 1000)?;  // 1000 messages
+```
+
+**Actual memory usage** = `capacity × sizeof(T) + overhead`
+
+**Note:** Link uses a single-slot design (no capacity parameter) - it always stores exactly one message (the latest value) for minimal latency.
+
+#### Low-Level API: Direct Memory Size
+
+For advanced users needing precise memory control:
+
+```rust
+use horus_core::memory::ShmRegion;
+
+// Allocate exactly 100 MB of shared memory
+let size_bytes = 100 * 1024 * 1024;  // 100 MB
+let region = ShmRegion::new("large_topic", size_bytes)?;
+```
+
+### Calculating Memory Requirements
+
+#### From Messages to Bytes
+
+```rust
+use std::mem::size_of;
+
+// Example: Hub with 1000 messages of type LaserScan
+let capacity = 1000;
+let message_size = size_of::<LaserScan>();  // ~1536 bytes
+let total_memory = capacity * message_size;  // ~1.5 MB
+
+Hub::<LaserScan>::new_with_capacity("scan", capacity)?;
+```
+
+#### From MB to Message Capacity
+
+```rust
+// Example: Want to use 50 MB for PointCloud messages
+let target_memory_mb = 50;
+let target_bytes = target_memory_mb * 1024 * 1024;
+let message_size = size_of::<PointCloud>();  // ~120 KB
+
+let capacity = target_bytes / message_size;  // ~426 messages
+
+Hub::<PointCloud>::new_with_capacity("points", capacity)?;
+```
+
+### Memory Size Examples
+
+| Message Type | Size | Capacity | Total Memory |
+|--------------|------|----------|--------------|
+| `f32` | 4 bytes | 10,000 | 40 KB |
+| `CmdVel` | 16 bytes | 1,000 | 16 KB |
+| `Imu` | 304 bytes | 1,000 | 304 KB |
+| `LaserScan` | 1.5 KB | 100 | 150 KB |
+| `PointCloud` | 120 KB | 10 | 1.2 MB |
+| Custom large | 10 MB | 5 | 50 MB |
+
+### System Limits
+
+HORUS enforces safety limits to prevent misconfiguration:
+
+```rust
+// Maximum constraints (defined in horus_core)
+const MAX_CAPACITY: usize = 1_000_000;        // Max messages
+const MAX_ELEMENT_SIZE: usize = 1_000_000;    // Max 1 MB per message
+const MAX_TOTAL_SIZE: usize = 100_000_000;    // Max 100 MB per topic
+```
+
+**Attempting to exceed these limits returns an error.**
+
+### Choosing Memory Configuration
+
+#### By Message Count (Recommended)
+
+Best for most use cases:
+
+```rust
+// Small messages, high frequency
+Hub::<CmdVel>::new_with_capacity("cmd_vel", 1000)?;  // 16 KB
+
+// Medium messages, moderate frequency
+Hub::<Imu>::new_with_capacity("imu", 500)?;  // 152 KB
+
+// Large messages, lower frequency
+Hub::<LaserScan>::new_with_capacity("scan", 100)?;  // 150 KB
+```
+
+#### By Memory Budget
+
+When you have specific memory constraints:
+
+```rust
+// Budget: 10 MB for point cloud buffer
+let budget_mb = 10;
+let budget_bytes = budget_mb * 1024 * 1024;
+let msg_size = size_of::<PointCloud>();  // 120 KB
+
+let capacity = budget_bytes / msg_size;  // ~85 messages
+Hub::<PointCloud>::new_with_capacity("points", capacity)?;
+```
+
+#### Rule of Thumb Calculations
+
+```rust
+// High-frequency control (1 kHz) - buffer 1 second
+let capacity_1khz = 1000;  // 1 second @ 1000 Hz
+
+// Video frames (30 Hz) - buffer 5 seconds
+let capacity_30hz = 150;   // 5 seconds @ 30 Hz
+
+// Sensor data (100 Hz) - buffer 10 seconds
+let capacity_100hz = 1000; // 10 seconds @ 100 Hz
+
+// Match to your loop rate and desired buffer time
+let capacity = loop_rate_hz * buffer_seconds;
+```
+
+### Choose Appropriate Capacity
+
+```rust
+// Small messages, high frequency
+ShmTopic::<CmdVel>::new("cmd_vel", 100)?;  // 100 slots
+
+// Large messages, lower frequency
+ShmTopic::<PointCloud>::new("points", 10)?;  // 10 slots
+
+// Balance between latency and memory usage
+```
+
+### Monitor Buffer Utilization
+
+```rust
+let metrics = hub.get_metrics();
+if metrics.messages_sent > capacity * 100 {
+    println!("Consider increasing buffer capacity");
+}
+```
+
+### Handle Buffer Full Errors
+
+```rust
+match hub.send(data, &mut ctx) {
+    Ok(()) => {},
+    Err(original_data) => {
+        // Buffer full - decide what to do
+        // Option 1: Log and drop
+        ctx.log_warning("Buffer full, dropping message");
+
+        // Option 2: Retry with backoff
+        // Option 3: Use larger buffer
+    }
+}
+```
+
+### Clean Up Regularly
+
+```rust
+// In development, clean shared memory between runs
+#[cfg(debug_assertions)]
+fn cleanup_shm() {
+    // Cross-platform cleanup using HORUS platform module
+    use horus::memory::platform::shm_base_dir;
+    let _ = std::fs::remove_dir_all(shm_base_dir());
+}
+```
+
+## Troubleshooting
+
+### "No space left on device"
+
+**Cause**: Shared memory directory is full
+
+**Solution (Linux)**:
+```bash
+# Check usage
+df -h /dev/shm
+
+# Clean up (HORUS auto-cleans sessions, but manual cleanup helps if full)
+rm -rf /dev/shm/horus/
+
+# Or increase size
+sudo mount -o remount,size=2G /dev/shm
+```
+
+**Solution (macOS)**:
+```bash
+# Check usage
+df -h /tmp
+
+# Clean up
+rm -rf /tmp/horus/
+```
+
+**Solution (Windows)**:
+```powershell
+# Clean up
+Remove-Item -Recurse -Force "$env:TEMP\horus"
+```
+
+### "Permission denied"
+
+**Cause**: Insufficient permissions
+
+**Solution (Linux/macOS)**:
+```bash
+# Check permissions (Linux)
+ls -la /dev/shm/horus/
+
+# Check permissions (macOS)
+ls -la /tmp/horus/
+
+# Fix permissions (if needed)
+chmod 755 /dev/shm/horus/  # Linux
+chmod 755 /tmp/horus/      # macOS
+```
+
+### Stale Shared Memory
+
+**Cause**: Node crashed leaving shared memory files
+
+**Solution**:
+```bash
+# Using HORUS CLI
+horus clean --shm
+
+# Or manually:
+# Linux
+rm -rf /dev/shm/horus/
+
+# macOS
+rm -rf /tmp/horus/
+```
+
+```powershell
+# Windows
+Remove-Item -Recurse -Force "$env:TEMP\horus"
+```
+
+### "Element size mismatch"
+
+**Cause**: Publisher and subscriber using different types
+
+**Solution**: Ensure both use the same type:
+```rust
+// Publisher
+let pub_hub: Hub<f32> = Hub::new("data");
+
+// Subscriber
+let sub_hub: Hub<f32> = Hub::new("data");  // Same type!
+```
+
+## Multi-Process Communication
+
+HORUS uses a **flat namespace** (like ROS), so multi-process communication works automatically:
+
+### Automatic Topic Sharing
+
+When processes use the same topic name, they automatically communicate:
+
+```rust
+// Backend (Terminal 1) - inside Node::tick()
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    let data = self.read_sensor();
+    self.publisher.send(data, &mut ctx).ok();  // Hub::new("sensors")
+}
+
+// GUI (Terminal 2) - inside Node::tick()
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    if let Some(data) = self.subscriber.recv(&mut ctx) {  // Hub::new("sensors")
+        // Receives data from backend automatically!
+    }
+}
+```
+
+Both processes use `/dev/shm/horus/topics/horus_sensors` - no configuration needed!
+
+### Running Multi-Process Applications
+
+```bash
+# Terminal 1 - Backend
+horus run backend.rs
+
+# Terminal 2 - GUI (same topic names = automatic communication)
+horus run gui.rs
+```
+
+### Topic Isolation (When Needed)
+
+If you need to isolate topics between projects, use prefixes:
+
+```rust
+// Project A
+Hub::new("project_a/sensors")?;
+
+// Project B
+Hub::new("project_b/sensors")?;
+```
+
+
+### Real-World Example: Snake Game
+
+The snakesim example demonstrates multi-process communication:
+
+```bash
+# Terminal 1 - Backend
+cd ~/my_snakesim
+horus run main.rs
+
+# Terminal 2 - GUI (same topics = automatic communication)
+cd ~/my_snakesim
+horus run snakesim_gui/main.rs
+```
+
+Both use the same topic names, so communication works automatically.
+
+## Next Steps
+
+- Learn about [Message Types](/concepts/message-types) for standard robotics data
+- Read the [Performance Guide](/performance/performance) for optimization tips
+- Explore [Examples](/rust/examples/basic-examples) showing shared memory usage
+- Check the [API Reference](/rust/api) for detailed documentation

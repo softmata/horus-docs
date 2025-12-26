@@ -1,0 +1,352 @@
+---
+title: Common Mistakes
+description: Avoid these common beginner pitfalls when using HORUS
+order: 6
+---
+
+# Common Mistakes
+
+New to HORUS? Here are the most common mistakes beginners make and how to fix them.
+
+---
+
+## 1. Using Slashes in Topic Names
+
+**The Problem:**
+```rust
+// WRONG - This will fail!
+let hub: Hub<f32> = Hub::new("sensors/lidar")?;
+```
+
+**Error:** `No such file or directory`
+
+**Why:** HORUS uses shared memory files in `/dev/shm/`. Slashes in topic names are interpreted as directory paths.
+
+**The Fix:**
+```rust
+// CORRECT - Use dots instead
+let hub: Hub<f32> = Hub::new("sensors.lidar")?;
+```
+
+---
+
+## 2. Forgetting to Call recv() Every Tick
+
+**The Problem:**
+```rust
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // Only check for messages sometimes
+    if self.counter % 10 == 0 {
+        if let Some(data) = self.sensor_sub.recv(&mut ctx) {
+            self.process(data);
+        }
+    }
+    self.counter += 1;
+}
+```
+
+**Why:** Messages can be missed if you don't check every tick. Hub only stores the latest message.
+
+**The Fix:**
+```rust
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // ALWAYS check for new messages
+    if let Some(data) = self.sensor_sub.recv(&mut ctx) {
+        self.last_data = Some(data);
+    }
+
+    // Use cached data for processing
+    if self.counter % 10 == 0 {
+        if let Some(ref data) = self.last_data {
+            self.process(data);
+        }
+    }
+    self.counter += 1;
+}
+```
+
+---
+
+## 3. Blocking in tick()
+
+**The Problem:**
+```rust
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // WRONG - This blocks the entire scheduler!
+    let data = std::fs::read_to_string("large_file.txt").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+}
+```
+
+**Why:** All nodes run in a single tick cycle. Blocking one node blocks them all.
+
+**The Fix:**
+```rust
+fn init(&mut self, ctx: &mut NodeInfo) -> Result<()> {
+    // Do slow initialization in init(), not tick()
+    self.data = std::fs::read_to_string("large_file.txt")?;
+    Ok(())
+}
+
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // Keep tick() fast - ideally under 1ms
+    self.process(&self.data);
+}
+```
+
+---
+
+## 4. Wrong Priority Order
+
+**The Problem:**
+```rust
+// WRONG - Logger runs before sensor!
+scheduler.add(Box::new(logger), 0, Some(true));      // Priority 0 (highest)
+scheduler.add(Box::new(sensor), 10, Some(true));     // Priority 10
+scheduler.add(Box::new(controller), 5, Some(true));  // Priority 5
+```
+
+**Why:** Lower priority number = runs first. Safety-critical code should be priority 0.
+
+**The Fix:**
+```rust
+// CORRECT - Proper priority ordering
+scheduler.add(Box::new(safety_monitor), 0, Some(true));  // Safety first!
+scheduler.add(Box::new(sensor), 5, Some(true));          // Then sensors
+scheduler.add(Box::new(controller), 10, Some(true));     // Then control
+scheduler.add(Box::new(logger), 100, Some(true));        // Logging last
+```
+
+---
+
+## 5. Not Implementing shutdown() for Motors
+
+**The Problem:**
+```rust
+impl Node for MotorController {
+    fn name(&self) -> &'static str { "motor" }
+
+    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+        self.motor.set_velocity(self.velocity);
+    }
+
+    // No shutdown() implemented!
+}
+```
+
+**Why:** When you press Ctrl+C, the motor keeps running at its last velocity!
+
+**The Fix:**
+```rust
+impl Node for MotorController {
+    fn name(&self) -> &'static str { "motor" }
+
+    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+        self.motor.set_velocity(self.velocity);
+    }
+
+    fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> {
+        // CRITICAL: Stop motor on shutdown!
+        ctx.log_info("Stopping motor for safe shutdown");
+        self.motor.set_velocity(0.0);
+        Ok(())
+    }
+}
+```
+
+---
+
+## 6. Using String Instead of Fixed Arrays
+
+**The Problem:**
+```rust
+#[derive(Clone, Debug)]
+struct MyMessage {
+    name: String,        // WRONG - heap allocated
+    data: Vec<f32>,      // WRONG - heap allocated
+}
+```
+
+**Why:** Strings and Vecs use heap memory, which doesn't work well with shared memory IPC.
+
+**The Fix:**
+```rust
+#[derive(Clone, Copy, Debug)]
+struct MyMessage {
+    name: [u8; 32],      // CORRECT - fixed size
+    data: [f32; 10],     // CORRECT - fixed size
+}
+```
+
+Or use the standard message types which are already optimized:
+```rust
+use horus::prelude::*;
+
+// These are already designed for shared memory
+let hub: Hub<CmdVel> = Hub::new("cmd_vel")?;
+let hub: Hub<Odometry> = Hub::new("odom")?;
+```
+
+---
+
+## 7. Ignoring send() Errors
+
+**The Problem:**
+```rust
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // WRONG - Ignoring the Result
+    self.pub.send(data, &mut ctx);
+}
+```
+
+**Why:** If send fails, you won't know about it.
+
+**The Fix:**
+```rust
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // Log if send fails
+    if let Err(data) = self.pub.send(data, &mut ctx) {
+        if let Some(ref mut c) = ctx {
+            c.log_warning("Failed to publish data");
+        }
+    }
+}
+
+// Or simply use .ok() if you intentionally want to ignore errors
+self.pub.send(data, &mut ctx).ok();
+```
+
+---
+
+## 8. Creating Hub Inside tick()
+
+**The Problem:**
+```rust
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    // WRONG - Creates new Hub every tick!
+    let hub: Hub<f32> = Hub::new("data").unwrap();
+    hub.send(42.0, &mut ctx).ok();
+}
+```
+
+**Why:** Creating a Hub is expensive (opens shared memory). Doing it every tick wastes resources.
+
+**The Fix:**
+```rust
+struct MyNode {
+    hub: Hub<f32>,  // Store Hub in struct
+}
+
+impl MyNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            hub: Hub::new("data")?,  // Create once
+        })
+    }
+}
+
+fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    self.hub.send(42.0, &mut ctx).ok();  // Reuse existing Hub
+}
+```
+
+---
+
+## 9. Mismatched Topic Types
+
+**The Problem:**
+```rust
+// Publisher sends f32
+let pub_hub: Hub<f32> = Hub::new("data")?;
+pub_hub.send(42.0, &mut ctx).ok();
+
+// Subscriber expects i32
+let sub_hub: Hub<i32> = Hub::new("data")?;  // WRONG TYPE!
+let value = sub_hub.recv(&mut ctx);  // Will get garbage data
+```
+
+**Why:** HORUS doesn't check types at runtime. Mismatched types cause data corruption.
+
+**The Fix:**
+```rust
+// Use the SAME type for publisher and subscriber
+let pub_hub: Hub<f32> = Hub::new("data")?;
+let sub_hub: Hub<f32> = Hub::new("data")?;  // Same type!
+```
+
+**Pro tip:** Use named message types to avoid confusion:
+```rust
+type SensorReading = f32;
+let pub_hub: Hub<SensorReading> = Hub::new("sensor")?;
+let sub_hub: Hub<SensorReading> = Hub::new("sensor")?;
+```
+
+---
+
+## 10. Using Raw Node Trait When node! Macro Would Be Simpler
+
+**The Problem:**
+```rust
+// Manual implementation - lots of boilerplate
+struct MySensor {
+    pub_hub: Hub<f32>,
+}
+
+impl MySensor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            pub_hub: Hub::new("sensor.data")?,
+        })
+    }
+}
+
+impl Node for MySensor {
+    fn name(&self) -> &'static str { "MySensor" }
+
+    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+        let data = self.read_sensor();
+        self.pub_hub.send(data, &mut ctx).ok();
+    }
+}
+```
+
+**The Fix:**
+```rust
+// Use node! macro - 75% less code!
+node! {
+    name: MySensor,
+    publishers: [sensor_data: f32 -> "sensor.data"],
+
+    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+        let data = self.read_sensor();
+        self.sensor_data.send(data, &mut ctx).ok();
+    }
+}
+```
+
+See [node! Macro](/concepts/node-macro) for more examples.
+
+---
+
+## Quick Reference
+
+| Mistake | Fix |
+|---------|-----|
+| Slashes in topic names | Use dots: `sensors.lidar` |
+| Not checking recv() every tick | Always call recv(), cache last value |
+| Blocking in tick() | Keep tick() under 1ms, do I/O in init() |
+| Wrong priority order | Lower number = higher priority |
+| No shutdown() for motors | Always stop actuators in shutdown() |
+| String/Vec in messages | Use fixed-size arrays |
+| Ignoring send() errors | Handle or explicitly ignore with `.ok()` |
+| Creating Hub in tick() | Create Hub once in new() |
+| Mismatched topic types | Use same type for pub and sub |
+| Too much boilerplate | Use the `node!` macro |
+
+---
+
+## Still Having Issues?
+
+- Check [Troubleshooting](/troubleshooting) for error messages
+- See [Examples](/rust/examples/basic-examples) for working code
+- Run `horus monitor` to see what your nodes are doing
