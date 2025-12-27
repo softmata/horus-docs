@@ -24,6 +24,9 @@ import {
   ThroughputChart,
   RealTimeChart,
   PythonComparisonChart,
+  PythonThroughputChart,
+  PythonStressChart,
+  PythonRustComparisonChart,
 } from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
 
@@ -97,6 +100,9 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
         ThroughputChart,
         RealTimeChart,
         PythonComparisonChart,
+        PythonThroughputChart,
+        PythonStressChart,
+        PythonRustComparisonChart,
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {
