@@ -1,0 +1,553 @@
+---
+title: "Redundancy & Fault Tolerance"
+description: "Checkpointing, Triple Modular Redundancy (TMR), voting systems, and recovery for safety-critical robotics"
+weight: 40
+---
+
+# Redundancy & Fault Tolerance
+
+HORUS provides comprehensive fault tolerance mechanisms for safety-critical robotic systems, including state checkpointing for recovery and Triple Modular Redundancy (TMR) with voting for detecting and correcting errors.
+
+## Overview
+
+The fault tolerance stack includes:
+
+- **CheckpointManager**: Periodic state snapshots for crash recovery
+- **RedundancyManager**: TMR and voting for safety-critical operations
+- **VotingStrategy**: Multiple voting algorithms (majority, unanimous, median)
+- **FaultStats**: Tracking and reporting of fault tolerance statistics
+
+## Checkpoint System
+
+The checkpoint system enables periodic state persistence for crash recovery and rollback to known-good states.
+
+### CheckpointManager
+
+```rust
+use horus::prelude::*;
+
+// Create checkpoint manager with 5-second interval
+let mut checkpoint_mgr = CheckpointManager::new(
+    PathBuf::from("/var/lib/horus/checkpoints"),
+    5000  // 5000ms interval
+);
+
+// Configure retention
+checkpoint_mgr.set_max_checkpoints(10);
+
+// In scheduler loop
+if checkpoint_mgr.should_checkpoint() {
+    let metadata = CheckpointMetadata {
+        scheduler_name: "robot_controller".to_string(),
+        total_ticks: 100000,
+        learning_complete: true,
+        node_count: 12,
+        uptime_secs: 3600.0,
+    };
+
+    if let Some(checkpoint) = checkpoint_mgr.create_checkpoint(metadata) {
+        // Add node states to checkpoint
+        let mut checkpoint = checkpoint;
+        for (name, state) in &node_states {
+            checkpoint.node_states.insert(
+                name.clone(),
+                NodeCheckpoint {
+                    name: name.clone(),
+                    tick_count: state.ticks,
+                    last_tick_us: state.last_duration_us,
+                    error_count: state.errors,
+                    custom_state: state.serialize(),
+                },
+            );
+        }
+
+        // Save to disk
+        match checkpoint_mgr.save_checkpoint(&checkpoint) {
+            Ok(path) => log::info!("Checkpoint saved: {:?}", path),
+            Err(e) => log::error!("Checkpoint failed: {}", e),
+        }
+    }
+}
+```
+
+### Checkpoint Recovery
+
+```rust
+use horus::prelude::*;
+
+// Recover from latest checkpoint on startup
+let checkpoint_mgr = CheckpointManager::new(
+    PathBuf::from("/var/lib/horus/checkpoints"),
+    5000
+);
+
+if let Ok(Some(checkpoint)) = checkpoint_mgr.load_latest_checkpoint() {
+    log::info!("Recovering from checkpoint {}", checkpoint.id);
+    log::info!("  Timestamp: {}", checkpoint.timestamp);
+    log::info!("  Ticks: {}", checkpoint.metadata.total_ticks);
+    log::info!("  Nodes: {}", checkpoint.metadata.node_count);
+
+    // Restore node states
+    for (name, node_state) in &checkpoint.node_states {
+        log::info!("  Restoring node: {} (ticks: {})",
+            node_state.name, node_state.tick_count);
+
+        if let Some(state_data) = &node_state.custom_state {
+            // Deserialize and apply custom state
+            restore_node_state(name, state_data);
+        }
+    }
+}
+```
+
+### Listing Checkpoints
+
+```rust
+use horus::prelude::*;
+
+let checkpoint_mgr = CheckpointManager::default();
+
+// List all available checkpoints
+for (id, path) in checkpoint_mgr.list_checkpoints() {
+    println!("Checkpoint {}: {:?}", id, path);
+
+    // Load specific checkpoint
+    if let Ok(Some(cp)) = checkpoint_mgr.load_checkpoint(&path) {
+        println!("  Created: {} seconds ago",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() - cp.timestamp);
+    }
+}
+```
+
+### Checkpoint Data Structures
+
+**Checkpoint:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `u64` | Unique checkpoint identifier |
+| `timestamp` | `u64` | Unix timestamp (seconds) |
+| `node_states` | `HashMap<String, NodeCheckpoint>` | Per-node state data |
+| `metadata` | `CheckpointMetadata` | Scheduler metadata |
+
+**NodeCheckpoint:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Node name |
+| `tick_count` | `u64` | Total ticks executed |
+| `last_tick_us` | `u64` | Last tick duration (microseconds) |
+| `error_count` | `u64` | Error count |
+| `custom_state` | `Option<Vec<u8>>` | Serialized custom state |
+
+**CheckpointMetadata:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scheduler_name` | `String` | Scheduler identifier |
+| `total_ticks` | `u64` | Total scheduler ticks |
+| `learning_complete` | `bool` | Learning phase complete |
+| `node_count` | `usize` | Number of nodes |
+| `uptime_secs` | `f64` | Uptime in seconds |
+
+## Triple Modular Redundancy (TMR)
+
+TMR executes critical operations on multiple replicas and uses voting to detect and correct errors.
+
+### RedundancyManager
+
+```rust
+use horus::prelude::*;
+
+// Create TMR manager (3 replicas, majority voting)
+let mut rm = RedundancyManager::tmr();
+
+// Or dual redundancy (2 replicas, unanimous)
+let rm_dual = RedundancyManager::dual();
+
+// Or custom configuration
+let rm_custom = RedundancyManager::new(5, VotingStrategy::Majority);
+```
+
+### Executing with Redundancy
+
+```rust
+use horus::prelude::*;
+
+let mut rm = RedundancyManager::tmr();
+
+// Execute a safety-critical computation redundantly
+let result = rm.execute_redundant(|replica_id| {
+    // Each replica computes the same result
+    // Slight differences indicate hardware faults
+    let sensor_reading = read_sensor_with_replica(replica_id);
+
+    Some(sensor_reading.round() as i32)
+});
+
+match result {
+    VoteResult::Consensus(value) => {
+        // All replicas agreed (or majority voted)
+        log::info!("Consensus reached: {}", value);
+        apply_value(value);
+    }
+    VoteResult::Disagreement { values, reason } => {
+        // Replicas produced different results
+        log::error!("Voting disagreement: {} - values: {:?}", reason, values);
+        enter_safe_mode();
+    }
+    VoteResult::PartialFailure { successful, failed_count } => {
+        // Some replicas failed but consensus possible
+        log::warn!("{} replicas failed, using survivors: {:?}",
+            failed_count, successful);
+    }
+    VoteResult::TotalFailure => {
+        // All replicas failed
+        log::error!("Total failure - all replicas failed!");
+        emergency_stop();
+    }
+}
+```
+
+### Voting Strategies
+
+```rust
+use horus::prelude::*;
+
+// Majority voting (2 of 3 must agree) - for TMR
+let rm_majority = RedundancyManager::new(3, VotingStrategy::Majority);
+
+// Unanimous voting (all must agree) - strictest
+let rm_unanimous = RedundancyManager::new(3, VotingStrategy::Unanimous);
+
+// Any (first successful result) - for availability, not correctness
+let rm_any = RedundancyManager::new(3, VotingStrategy::Any);
+
+// First success (use first result that doesn't fail)
+let rm_first = RedundancyManager::new(3, VotingStrategy::FirstSuccess);
+
+// Median (for numeric values) - tolerates outliers
+let rm_median = RedundancyManager::new(5, VotingStrategy::Median);
+```
+
+**VotingStrategy Values:**
+
+| Strategy | Description | Use Case |
+|----------|-------------|----------|
+| `Majority` | 2 of 3 (or n/2+1) must agree | TMR, standard fault tolerance |
+| `Unanimous` | All replicas must agree | High-criticality systems |
+| `Any` | Use any successful result | Availability over correctness |
+| `FirstSuccess` | Use first non-failing result | Fast path with fallback |
+| `Median` | Use median value | Numeric outputs with outliers |
+
+### Custom Voting
+
+```rust
+use horus::prelude::*;
+
+// Create custom voter
+let voter: Voter<i32> = Voter::majority(2);  // Need at least 2 successful
+
+let mut redundant = RedundantValue::new(3);
+
+// Record results from replicas
+redundant.record(0, 42, Duration::from_micros(100));
+redundant.record(1, 42, Duration::from_micros(110));
+redundant.record(2, 99, Duration::from_micros(105));  // Faulty replica!
+
+// Vote on results
+let result = voter.vote(&redundant);
+match result {
+    VoteResult::Consensus(v) => {
+        assert_eq!(v, 42);  // Majority wins
+    }
+    _ => panic!("Expected consensus"),
+}
+```
+
+### Numeric Median Voting
+
+For numeric values, median voting provides better tolerance to outliers:
+
+```rust
+use horus::prelude::*;
+
+let voter: Voter<f64> = Voter::majority(3);
+let mut redundant = RedundantValue::new(5);
+
+// Record sensor readings with potential outliers
+redundant.record(0, 25.0, Duration::from_micros(100));
+redundant.record(1, 25.1, Duration::from_micros(110));
+redundant.record(2, 99999.0, Duration::from_micros(105));  // Outlier!
+redundant.record(3, 25.2, Duration::from_micros(108));
+redundant.record(4, 24.9, Duration::from_micros(112));
+
+// Median vote ignores outliers
+match voter.median_vote(&redundant) {
+    VoteResult::Consensus(v) => {
+        println!("Median value: {}", v);  // 25.1 (ignores outlier)
+    }
+    _ => {}
+}
+```
+
+### Fault Statistics
+
+```rust
+use horus::prelude::*;
+
+let mut rm = RedundancyManager::tmr();
+
+// Execute many redundant operations...
+for _ in 0..1000 {
+    rm.execute_redundant(|_| Some(compute_value()));
+}
+
+// Check fault statistics
+let stats = rm.stats();
+println!("Redundancy Statistics:");
+println!("  Total votes: {}", stats.total_votes);
+println!("  Consensus: {} ({:.1}%)",
+    stats.consensus_count,
+    100.0 * stats.consensus_count as f64 / stats.total_votes as f64);
+println!("  Disagreements: {}", stats.disagreement_count);
+println!("  Partial failures: {}", stats.partial_failure_count);
+println!("  Total failures: {}", stats.total_failure_count);
+
+// Reset statistics
+rm.reset_stats();
+```
+
+**FaultStats Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_votes` | `u64` | Total voting operations |
+| `consensus_count` | `u64` | Successful consensus |
+| `disagreement_count` | `u64` | Disagreements detected |
+| `partial_failure_count` | `u64` | Partial failures |
+| `total_failure_count` | `u64` | Total failures |
+
+## Fault Tolerance Configuration
+
+Configure fault tolerance in `SchedulerConfig`:
+
+```rust
+use horus::prelude::*;
+
+let config = SchedulerConfig {
+    fault: FaultConfig {
+        circuit_breaker_enabled: true,
+        max_failures: 5,
+        recovery_threshold: 3,
+        circuit_timeout_ms: 30000,
+        auto_restart: true,
+        redundancy_factor: 3,  // TMR
+        checkpoint_interval_ms: 5000,  // Every 5 seconds
+    },
+    ..Default::default()
+};
+```
+
+**FaultConfig Fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `circuit_breaker_enabled` | `bool` | `true` | Enable circuit breaker |
+| `max_failures` | `u32` | 5 | Failures before circuit opens |
+| `recovery_threshold` | `u32` | 3 | Successes to close circuit |
+| `circuit_timeout_ms` | `u64` | 30000 | Circuit timeout (ms) |
+| `auto_restart` | `bool` | `false` | Auto-restart failed nodes |
+| `redundancy_factor` | `u32` | 1 | Number of replicas |
+| `checkpoint_interval_ms` | `u64` | 0 | Checkpoint interval (0 = disabled) |
+
+## Real-Time Node Fallback
+
+For RT nodes, HORUS supports N-version programming with fallback nodes:
+
+```rust
+use horus::prelude::*;
+
+impl RTNode for SafetyController {
+    fn name(&self) -> &'static str { "SafetyController" }
+
+    fn tick(&mut self, ctx: Option<&mut NodeInfo>) {
+        // Primary implementation
+    }
+
+    fn fallback_node(&self) -> Option<Box<dyn RTNode>> {
+        // Provide fallback implementation for redundancy
+        Some(Box::new(SafetyControllerBackup::new()))
+    }
+}
+```
+
+## Complete Example: Fault-Tolerant Motor Controller
+
+```rust
+use horus::prelude::*;
+use std::path::PathBuf;
+
+struct FaultTolerantController {
+    checkpoint_mgr: CheckpointManager,
+    redundancy_mgr: RedundancyManager,
+    sensor_sub: Hub<f64>,
+    motor_pub: Hub<MotorCommand>,
+    tick_count: u64,
+    last_safe_command: MotorCommand,
+}
+
+impl Node for FaultTolerantController {
+    fn name(&self) -> &'static str { "FaultTolerantController" }
+
+    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+        self.tick_count += 1;
+
+        // Read sensor with TMR
+        let sensor_result = self.redundancy_mgr.execute_redundant(|replica| {
+            if let Some(val) = self.sensor_sub.try_recv(&mut ctx) {
+                Some((val * 1000.0).round() as i64)  // Convert to int for voting
+            } else {
+                None
+            }
+        });
+
+        let command = match sensor_result {
+            VoteResult::Consensus(value) => {
+                // Compute motor command from consensus sensor value
+                let sensor_value = value as f64 / 1000.0;
+                let cmd = self.compute_command(sensor_value);
+                self.last_safe_command = cmd.clone();
+                cmd
+            }
+            VoteResult::Disagreement { .. } => {
+                log::warn!("Sensor disagreement, using last safe command");
+                self.last_safe_command.clone()
+            }
+            VoteResult::PartialFailure { .. } |
+            VoteResult::TotalFailure => {
+                log::error!("Sensor failure, emergency safe state");
+                MotorCommand::safe_stop()
+            }
+        };
+
+        self.motor_pub.send(command, &mut ctx).ok();
+
+        // Periodic checkpointing
+        if self.checkpoint_mgr.should_checkpoint() {
+            self.save_checkpoint();
+        }
+    }
+
+    fn init(&mut self, ctx: Option<&mut NodeInfo>) {
+        // Attempt recovery from checkpoint
+        if let Ok(Some(checkpoint)) = self.checkpoint_mgr.load_latest_checkpoint() {
+            log::info!("Recovering from checkpoint {}", checkpoint.id);
+            self.tick_count = checkpoint.metadata.total_ticks;
+
+            if let Some(state) = checkpoint.node_states.get("FaultTolerantController") {
+                if let Some(data) = &state.custom_state {
+                    self.restore_state(data);
+                }
+            }
+        }
+    }
+}
+
+impl FaultTolerantController {
+    fn new() -> Self {
+        Self {
+            checkpoint_mgr: CheckpointManager::new(
+                PathBuf::from("/var/lib/horus/motor_checkpoints"),
+                5000,  // 5 second interval
+            ),
+            redundancy_mgr: RedundancyManager::tmr(),
+            sensor_sub: Hub::new(),
+            motor_pub: Hub::new(),
+            tick_count: 0,
+            last_safe_command: MotorCommand::safe_stop(),
+        }
+    }
+
+    fn compute_command(&self, sensor_value: f64) -> MotorCommand {
+        // PID control logic...
+        MotorCommand { velocity: sensor_value * 0.5, torque: 0.0 }
+    }
+
+    fn save_checkpoint(&mut self) {
+        let metadata = CheckpointMetadata {
+            scheduler_name: "motor_controller".to_string(),
+            total_ticks: self.tick_count,
+            learning_complete: true,
+            node_count: 1,
+            uptime_secs: self.tick_count as f64 * 0.01,
+        };
+
+        if let Some(mut checkpoint) = self.checkpoint_mgr.create_checkpoint(metadata) {
+            checkpoint.node_states.insert(
+                "FaultTolerantController".to_string(),
+                NodeCheckpoint {
+                    name: "FaultTolerantController".to_string(),
+                    tick_count: self.tick_count,
+                    last_tick_us: 0,
+                    error_count: self.redundancy_mgr.stats().total_failure_count,
+                    custom_state: Some(self.serialize_state()),
+                },
+            );
+
+            self.checkpoint_mgr.save_checkpoint(&checkpoint).ok();
+        }
+    }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        // Serialize internal state...
+        vec![]
+    }
+
+    fn restore_state(&mut self, _data: &[u8]) {
+        // Restore internal state...
+    }
+}
+```
+
+## CLI Commands
+
+Manage checkpoints from the command line:
+
+```bash
+# Enable checkpointing (5 second interval)
+horus run robot.yaml --checkpoint-interval 5000
+
+# List available checkpoints
+horus checkpoint --list
+
+# Restore from specific checkpoint
+horus run robot.yaml --restore-checkpoint /path/to/checkpoint.bin
+
+# Clean old checkpoints
+horus checkpoint --clean --older-than 7d
+```
+
+## Best Practices
+
+1. **Checkpoint Interval**: Set based on acceptable data loss. 5-10 seconds for most applications.
+
+2. **TMR for Safety-Critical**: Use TMR (3 replicas, majority voting) for safety-critical computations.
+
+3. **Median for Sensors**: Use median voting for noisy sensor readings to reject outliers.
+
+4. **Checkpoint Size**: Keep custom state small for fast checkpointing. Large states slow down checkpoint creation.
+
+5. **Recovery Testing**: Regularly test checkpoint recovery to ensure it works correctly.
+
+6. **Monitor Fault Stats**: Track `FaultStats` to detect degrading hardware or software issues.
+
+## See Also
+
+- [Circuit Breaker](/advanced/circuit-breaker) - Fault isolation patterns
+- [Safety Monitor](/advanced/safety-monitor) - Safety system monitoring
+- [Telemetry](/advanced/telemetry) - Monitoring and observability
+- [Record & Replay](/advanced/record-replay) - Debug recording

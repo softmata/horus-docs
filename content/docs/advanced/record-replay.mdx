@@ -1,0 +1,526 @@
+---
+title: "Record & Replay"
+description: "Node-level granular recording and tick-perfect replay for debugging, testing, and analysis"
+weight: 30
+---
+
+# Record & Replay
+
+HORUS provides a comprehensive record/replay system for capturing node execution and replaying it with tick-perfect determinism. This enables powerful debugging workflows including time travel, breakpoints, and comparing behavior between runs.
+
+## Overview
+
+The record/replay system supports:
+
+- **Node-level recording**: Record individual nodes or entire systems
+- **Tick-perfect replay**: Reproduce exact behavior deterministically
+- **Time travel**: Jump to any recorded tick
+- **Mixed replay**: Combine recorded nodes with live execution
+- **Debug features**: Breakpoints, stepping, and watch expressions
+- **Auto-recording**: Automatically capture data on errors or conditions
+
+## Recording Configuration
+
+Configure recording sessions with `RecordingConfig`:
+
+```rust
+use horus::prelude::*;
+
+// Default configuration
+let config = RecordingConfig::default();
+// Stores in: ~/.horus/recordings/<session_name>/
+
+// Custom configuration
+let config = RecordingConfig {
+    session_name: "sensor_test_001".to_string(),
+    base_dir: PathBuf::from("/data/recordings"),
+    max_size: 50 * 1024 * 1024,  // 50MB per node
+    compress: true,               // Use gzip compression
+    interval: 1,                  // Record every tick
+    include_nodes: vec![],        // Empty = all nodes
+    exclude_nodes: vec!["DebugNode".to_string()],
+};
+
+// Named session (shorthand)
+let config = RecordingConfig::with_name("lidar_calibration");
+```
+
+**Configuration Options:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `session_name` | `String` | Generated | Session identifier |
+| `base_dir` | `PathBuf` | `~/.horus/recordings` | Recording directory |
+| `max_size` | `usize` | 100MB | Maximum size per node |
+| `compress` | `bool` | `true` | Enable gzip compression |
+| `interval` | `u64` | 1 | Record every N ticks |
+| `include_nodes` | `Vec<String>` | Empty (all) | Nodes to include |
+| `exclude_nodes` | `Vec<String>` | Empty | Nodes to exclude |
+
+## Recording Nodes
+
+### Using NodeRecorder
+
+```rust
+use horus::prelude::*;
+
+// Create a recorder for a specific node
+let config = RecordingConfig::with_name("motor_debug");
+let mut recorder = NodeRecorder::new("MotorController", "motor_001", config);
+
+// In node's tick function:
+fn tick(&mut self, ctx: Option<&mut NodeInfo>) {
+    // Start recording this tick
+    self.recorder.begin_tick(self.tick_count);
+
+    // Record inputs as they arrive
+    if let Some(cmd) = self.velocity_sub.try_recv(&mut ctx) {
+        self.recorder.record_input("velocity_cmd", serialize(&cmd));
+        self.process_command(cmd);
+    }
+
+    // Record outputs as they're sent
+    let motor_state = self.get_motor_state();
+    self.recorder.record_output("motor_state", serialize(&motor_state));
+    self.state_pub.send(motor_state, &mut ctx).ok();
+
+    // Optionally record internal state
+    self.recorder.record_state(serialize(&self.internal_state));
+
+    // Finish recording with execution duration
+    self.recorder.end_tick(duration_ns);
+}
+
+// Save recording when done
+let path = recorder.finish()?;
+println!("Recording saved to: {:?}", path);
+```
+
+### Tick Snapshots
+
+Each tick is captured as a `NodeTickSnapshot`:
+
+```rust
+let snapshot = NodeTickSnapshot::new(tick)
+    .with_input("sensor", sensor_data.to_bytes())
+    .with_output("motor", motor_cmd.to_bytes())
+    .with_state(node_state.to_bytes())
+    .with_duration(1500); // nanoseconds
+```
+
+**Snapshot Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tick` | `u64` | Tick number |
+| `timestamp_us` | `u64` | Microseconds since epoch |
+| `inputs` | `HashMap<String, Vec<u8>>` | Input data by topic |
+| `outputs` | `HashMap<String, Vec<u8>>` | Output data by topic |
+| `state` | `Option<Vec<u8>>` | Internal state snapshot |
+| `duration_ns` | `u64` | Execution duration |
+
+## Replaying Recordings
+
+### Basic Replay
+
+```rust
+use horus::prelude::*;
+
+// Load and replay a recording
+let mut replayer = NodeReplayer::load(&PathBuf::from(
+    "~/.horus/recordings/sensor_test/MotorController@motor_001.horus"
+))?;
+
+// Iterate through recorded ticks
+while !replayer.is_finished() {
+    if let Some(snapshot) = replayer.current_snapshot() {
+        println!("Tick {}: {} inputs, {} outputs",
+            snapshot.tick,
+            snapshot.inputs.len(),
+            snapshot.outputs.len());
+
+        // Get specific output
+        if let Some(motor_data) = replayer.get_output("motor_state") {
+            let state: MotorState = deserialize(motor_data)?;
+            println!("  Motor position: {}", state.position);
+        }
+    }
+
+    replayer.advance();
+}
+```
+
+### Replay Modes
+
+```rust
+use horus::prelude::*;
+
+// Full replay - replay entire system from a scheduler recording
+let mode = ReplayMode::Full {
+    scheduler_path: PathBuf::from("~/.horus/recordings/mission/scheduler.horus"),
+};
+
+// Mixed replay - some nodes from recording, others live
+let mode = ReplayMode::Mixed {
+    replay_nodes: HashMap::from([
+        ("Lidar".to_string(), PathBuf::from("recordings/Lidar@001.horus")),
+        ("Camera".to_string(), PathBuf::from("recordings/Camera@002.horus")),
+    ]),
+};
+
+// Time travel - replay a specific tick range
+let mode = ReplayMode::TimeTravel {
+    scheduler_path: PathBuf::from("recordings/scheduler.horus"),
+    start_tick: 1000,
+    end_tick: Some(2000),  // None = replay to end
+};
+```
+
+### Seeking and Navigation
+
+```rust
+// Jump to specific tick
+replayer.seek(1500);
+
+// Reset to beginning
+replayer.reset();
+
+// Get position information
+println!("Current tick: {}", replayer.current_tick());
+println!("Total ticks: {}", replayer.total_ticks());
+println!("Finished: {}", replayer.is_finished());
+```
+
+## Advanced Debugging
+
+The `ReplayDebugger` provides IDE-like debugging features:
+
+```rust
+use horus::prelude::*;
+
+// Load a recording with debugger
+let mut debugger = ReplayDebugger::load(&recording_path)?;
+
+// Add breakpoints
+let bp1 = debugger.add_breakpoint_at_tick(500);
+let bp2 = debugger.add_breakpoint(BreakpointCondition::TopicHasData("error".to_string()));
+let bp3 = debugger.add_named_breakpoint("slow_tick",
+    BreakpointCondition::OnSlowExecution { threshold_ns: 10_000_000 });
+
+// Add watch expressions
+debugger.add_watch(WatchExpression::output("motor_pos", "Motor Position", "motor_state"));
+debugger.add_watch(WatchExpression::input("cmd_vel", "Command Velocity", "velocity_cmd")
+    .with_range(0, 8));  // Watch specific byte range
+
+// Run until breakpoint
+debugger.continue_execution();
+
+// Check state at breakpoint
+if debugger.state() == DebuggerState::Paused {
+    let values = debugger.evaluate_watches();
+    for val in values {
+        println!("{}: {}", val.expression_id, val.display_value);
+    }
+}
+
+// Step controls
+debugger.step_forward();
+debugger.step_backward();  // Time travel!
+debugger.seek(1234);
+debugger.reset();
+debugger.stop();
+```
+
+### Breakpoint Conditions
+
+```rust
+// Break at specific tick
+BreakpointCondition::AtTick(500)
+
+// Break when topic has data
+BreakpointCondition::TopicHasData("error_report".to_string())
+
+// Break when output matches pattern
+BreakpointCondition::OutputMatches {
+    topic: "status".to_string(),
+    pattern: vec![0xFF, 0x00],  // Error code
+}
+
+// Break on any error
+BreakpointCondition::OnError
+
+// Break after N ticks from current position
+BreakpointCondition::AfterTicks(100)
+
+// Break on custom expression
+BreakpointCondition::Expression(WatchExpression::output("id", "name", "topic"))
+```
+
+### Watch Expressions
+
+```rust
+// Watch output topic
+let watch = WatchExpression::output("motor_pos", "Motor Position", "motor_state");
+
+// Watch input topic
+let watch = WatchExpression::input("cmd", "Command", "velocity_cmd");
+
+// Watch specific bytes (e.g., first 4 bytes as f32)
+let watch = WatchExpression::output("temp", "Temperature", "sensors")
+    .with_range(8, 4);  // Offset 8, length 4
+
+// Evaluate watch
+if let Some(value) = watch.evaluate(&snapshot) {
+    println!("Value: {}", value.display_value);
+    println!("Raw bytes: {:02x?}", value.raw_bytes);
+}
+```
+
+### Debug Events
+
+The debugger emits events you can monitor:
+
+```rust
+for event in debugger.recent_events(10) {
+    match event {
+        DebugEvent::BreakpointHit { breakpoint_id, tick } => {
+            println!("Hit breakpoint {} at tick {}", breakpoint_id, tick);
+        }
+        DebugEvent::WatchValueChanged { watch_id, old_value, new_value } => {
+            println!("Watch {} changed: {} -> {}",
+                watch_id,
+                old_value.map(|v| v.display_value).unwrap_or_default(),
+                new_value.display_value);
+        }
+        DebugEvent::PositionChanged { tick, .. } => {
+            println!("Now at tick {}", tick);
+        }
+        DebugEvent::Finished { total_ticks } => {
+            println!("Replay finished after {} ticks", total_ticks);
+        }
+        _ => {}
+    }
+}
+```
+
+## Auto-Recording
+
+Automatically capture recordings when specific conditions occur:
+
+```rust
+use horus::prelude::*;
+
+// Auto-record on errors
+let config = AutoRecordConfig::on_error();
+
+// Auto-record on slow execution (>10ms)
+let config = AutoRecordConfig::on_slow_execution(10);
+
+// Auto-record when specific topic is active
+let config = AutoRecordConfig::on_topic("collision_alert")
+    .with_pre_trigger(100)   // Keep 100 ticks before trigger
+    .with_post_trigger(50);  // Record 50 ticks after
+
+// Create auto-recorder
+let mut auto_recorder = AutoRecorder::new("MotorController", "motor_001", config);
+
+// In tick function
+fn tick(&mut self, ctx: Option<&mut NodeInfo>) {
+    // ... normal processing ...
+
+    // Create snapshot
+    let snapshot = NodeTickSnapshot::new(self.tick_count)
+        .with_output("motor_state", serialize(&state));
+
+    // Process tick (may trigger recording)
+    if let Some(path) = self.auto_recorder.process_tick(snapshot) {
+        log::info!("Auto-recording saved: {:?}", path);
+    }
+}
+```
+
+### Auto-Record Triggers
+
+```rust
+// Trigger on error patterns in topic names
+AutoRecordTrigger::OnError {
+    patterns: vec!["error".to_string(), "fault".to_string()],
+}
+
+// Trigger on specific condition
+AutoRecordTrigger::OnCondition {
+    topic: "sensor_status".to_string(),
+    condition: TriggerCondition::DataEquals(vec![0xFF]),  // Error code
+}
+
+// Trigger on topic activity
+AutoRecordTrigger::OnTopicActivity {
+    topic: "emergency_stop".to_string(),
+}
+
+// Trigger on slow execution
+AutoRecordTrigger::OnSlowExecution {
+    threshold_ns: 10_000_000,  // 10ms
+}
+```
+
+## Recording Management
+
+The `RecordingManager` helps discover and manage recording sessions:
+
+```rust
+use horus::prelude::*;
+
+let manager = RecordingManager::new();
+
+// List all sessions
+for session in manager.list_sessions()? {
+    println!("Session: {}", session);
+
+    // List recordings in session
+    for path in manager.get_session_recordings(&session)? {
+        println!("  Recording: {:?}", path);
+    }
+}
+
+// Get total storage used
+let total_bytes = manager.total_size()?;
+println!("Total recording storage: {} MB", total_bytes / 1024 / 1024);
+
+// Delete old session
+manager.delete_session("old_session_name")?;
+```
+
+## Comparing Recordings
+
+Compare two recordings to find differences:
+
+```rust
+use horus::prelude::*;
+
+let recording1 = NodeRecording::load(&path1)?;
+let recording2 = NodeRecording::load(&path2)?;
+
+let diffs = diff_recordings(&recording1, &recording2);
+
+for diff in diffs {
+    match diff {
+        RecordingDiff::OutputDifference { tick, topic, .. } => {
+            println!("Tick {}: Output '{}' differs", tick, topic);
+        }
+        RecordingDiff::MissingOutput { tick, topic, in_recording } => {
+            println!("Tick {}: Output '{}' missing in recording {}",
+                tick, topic, in_recording);
+        }
+        RecordingDiff::MissingTick { tick, in_recording } => {
+            println!("Tick {} missing in recording {}", tick, in_recording);
+        }
+    }
+}
+```
+
+## Compression
+
+Recordings can be compressed with gzip:
+
+```rust
+use horus::prelude::*;
+
+// Save with compression
+save_recording_compressed(&recording, &path, true)?;
+
+// Load (auto-detects compression)
+let recording = load_recording_compressed(&path)?;
+
+// Manual compression utilities
+let compressed = compress_data(&data, 6)?;  // Level 0-9
+let decompressed = decompress_data(&compressed)?;
+```
+
+## Session Persistence
+
+Save and restore debug sessions:
+
+```rust
+use horus::prelude::*;
+
+// Save session state
+let mut session = DebugSessionState::new(recording_path, "debug_session_1");
+session.update_from_debugger(&debugger);
+session.save(&PathBuf::from("~/.horus/sessions/my_debug.json"))?;
+
+// Later, restore session
+let session = DebugSessionState::load(&path)?;
+let mut debugger = session.create_debugger()?;
+// Breakpoints, watches, and position are restored
+```
+
+## Example: Regression Testing
+
+```rust
+use horus::prelude::*;
+
+/// Test that motor controller produces same outputs as recorded baseline
+fn test_motor_regression() {
+    // Load baseline recording
+    let baseline = NodeRecording::load(&PathBuf::from(
+        "testdata/motor_baseline.horus"
+    )).unwrap();
+
+    // Run the same inputs through current implementation
+    let mut motor = MotorController::new();
+    let mut current = NodeRecording::new("MotorController", "test", "regression_test");
+
+    for snapshot in baseline.snapshots.iter() {
+        // Feed recorded inputs
+        for (topic, data) in &snapshot.inputs {
+            motor.inject_input(topic, data.clone());
+        }
+
+        // Run tick
+        motor.tick(None);
+
+        // Capture outputs
+        let mut new_snapshot = NodeTickSnapshot::new(snapshot.tick);
+        for (topic, data) in motor.get_outputs() {
+            new_snapshot.outputs.insert(topic.clone(), data.clone());
+        }
+        current.add_snapshot(new_snapshot);
+    }
+
+    // Compare
+    let diffs = diff_recordings(&baseline, &current);
+    assert!(diffs.is_empty(), "Found {} differences from baseline", diffs.len());
+}
+```
+
+## CLI Commands
+
+Record and replay from the command line:
+
+```bash
+# Start recording
+horus record --session motor_test --nodes MotorController,Lidar
+
+# List recordings
+horus record --list
+
+# Replay a recording
+horus replay ~/.horus/recordings/motor_test/
+
+# Replay with time travel to specific tick
+horus replay --seek 1000 ~/.horus/recordings/motor_test/
+
+# Compare two recordings
+horus diff recording1.horus recording2.horus
+
+# Clean old recordings
+horus record --clean --older-than 30d
+```
+
+## See Also
+
+- [Deterministic Execution](/advanced/deterministic-execution) - Reproducible node execution
+- [Testing](/development/testing) - Testing HORUS applications
+- [Blackbox Recording](/advanced/blackbox) - Flight recorder for debugging
+- [Scheduler Configuration](/advanced/scheduler-configuration) - Execution order control

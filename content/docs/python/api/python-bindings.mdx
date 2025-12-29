@@ -521,6 +521,181 @@ router_hub = Hub(CmdVel, endpoint="cmdvel@router")
 - `"topic@router"` - Router broker (auto-discovery on localhost:7777)
 - `"topic@192.168.1.100:7777"` - Router broker at specific address
 
+### Hub Methods
+
+**Core Operations:**
+
+| Method | Description |
+|--------|-------------|
+| `hub.send(msg)` | Send a single message |
+| `hub.recv()` | Receive one message (returns None if empty) |
+| `hub.topic()` | Get the topic name |
+| `hub.transport_type()` | Get transport type ("shm", "udp", "router") |
+
+**Batch Operations (High-Performance):**
+
+| Method | Description |
+|--------|-------------|
+| `hub.send_many(msgs)` | Send multiple messages at once, returns count sent |
+| `hub.recv_many(n)` | Receive up to n messages in batch |
+| `hub.drain()` | Receive all available messages (up to 1000) |
+| `hub.view()` | Zero-copy raw bytes (GenericMessage only) |
+
+**Batch Example:**
+
+```python
+from horus import Hub, CmdVel
+
+# === Send multiple messages at once ===
+hub = Hub(CmdVel)
+commands = [
+    CmdVel(linear=1.0, angular=0.0),
+    CmdVel(linear=1.5, angular=0.2),
+    CmdVel(linear=0.0, angular=0.5),
+]
+sent = hub.send_many(commands)
+print(f"Sent {sent}/{len(commands)} messages")
+
+# === Receive up to N messages ===
+messages = hub.recv_many(10)  # Get up to 10 messages
+for msg in messages:
+    print(f"linear={msg.linear}, angular={msg.angular}")
+
+# === Drain all available messages ===
+all_msgs = hub.drain()  # Get everything pending
+print(f"Drained {len(all_msgs)} messages")
+```
+
+**Zero-Copy Raw Access (Generic Hubs Only):**
+
+```python
+from horus import Hub
+import msgpack  # pip install msgpack
+
+# For custom/large data where you control serialization
+hub = Hub("sensor_data")  # Generic (untyped) topic
+
+# view() returns raw MessagePack bytes without JSON overhead
+if raw := hub.view():
+    # Parse with your own logic (msgpack, struct, numpy, etc.)
+    data = msgpack.unpackb(raw)
+    print(f"Raw data: {data}")
+
+# Note: view() raises TypeError for typed hubs (CmdVel, etc.)
+# because they're already optimized for direct field access
+```
+
+**Performance Tips:**
+- Use `send_many()` when you have multiple messages queued (1 GIL release vs N)
+- Use `drain()` when processing bursts of data
+- Use `view()` for custom serialization of large blobs (avoids JSON round-trip)
+- Batch operations release the GIL once for all messages, not per-message
+
+### Generic Hub Methods
+
+When you create a Hub with a **string topic** (instead of a typed class), you get a generic hub that accepts any serializable data:
+
+```python
+from horus import Hub
+
+# Generic hub (string topic = dynamic typing)
+hub = Hub("my.topic")
+
+# Typed hub (class = static typing, better performance)
+typed_hub = Hub(CmdVel)
+```
+
+**Generic Hub Methods:**
+
+| Method | Description |
+|--------|-------------|
+| `send(obj)` | Send any JSON-serializable object (dict, list, str, int, float) |
+| `recv()` | Receive and deserialize to Python object |
+| `send_bytes(data)` | Send raw bytes (up to 4KB) |
+| `view()` | Receive raw bytes without deserialization |
+| `send_numpy(arr)` | Send NumPy array as bytes |
+| `send_with_metadata(data, meta)` | Send bytes with string metadata |
+| `recv_with_metadata()` | Receive bytes and metadata tuple |
+| `is_generic` | Property: True if this is a generic hub |
+
+**Example: JSON-Serializable Objects**
+
+```python
+from horus import Hub
+
+pub = Hub("sensor.data")
+sub = Hub("sensor.data")
+
+# Send dict, list, or any JSON-serializable data
+pub.send({"temperature": 25.5, "humidity": 60.0})
+pub.send([1.0, 2.0, 3.0, 4.0])
+pub.send("status: OK")
+
+# Receive (returns Python object)
+msg = sub.recv()  # {"temperature": 25.5, "humidity": 60.0}
+```
+
+**Example: Raw Bytes**
+
+```python
+from horus import Hub
+
+pub = Hub("binary.data")
+sub = Hub("binary.data")
+
+# Send raw bytes (custom binary protocol)
+pub.send_bytes(b'\x01\x02\x03\x04')
+
+# Receive raw bytes (no deserialization)
+raw = sub.view()  # b'\x01\x02\x03\x04'
+```
+
+**Example: NumPy Arrays**
+
+```python
+from horus import Hub
+import numpy as np
+
+pub = Hub("numpy.data")
+sub = Hub("numpy.data")
+
+# Send NumPy array
+arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+pub.send_numpy(arr)
+
+# Receive and reconstruct
+raw = sub.view()
+received = np.frombuffer(raw, dtype=np.float32)
+```
+
+**Example: Bytes with Metadata**
+
+```python
+from horus import Hub
+import json
+
+pub = Hub("tagged.data")
+sub = Hub("tagged.data")
+
+# Send with type hint metadata
+data = json.dumps({"x": 1.0, "y": 2.0}).encode()
+pub.send_with_metadata(data, "json")
+
+# Receive with metadata
+payload, metadata = sub.recv_with_metadata()
+if metadata == "json":
+    obj = json.loads(payload)
+```
+
+**Performance Comparison:**
+
+| Method | Latency | Use Case |
+|--------|---------|----------|
+| Typed (`Hub(CmdVel)`) | ~3μs | Production, high-frequency |
+| `send()` / `recv()` | ~50μs | Dynamic schemas, prototyping |
+| `send_bytes()` / `view()` | ~10μs | Custom binary protocols |
+| `send_numpy()` | ~15μs | Array data |
+
 ### Link Class (Point-to-Point)
 
 Link provides high-performance point-to-point (SPSC) communication - ~30% faster than Hub for single producer/consumer patterns.
@@ -875,6 +1050,7 @@ if node.get_message_age("cmd_vel") > 0.1:
 ### 4. Batch Processing
 
 ```python
+# === Node API (for tick functions) ===
 def batch_processor(node):
     # Process all available messages at once
     messages = node.get_all("input")
@@ -882,6 +1058,19 @@ def batch_processor(node):
         results = [process(msg) for msg in messages]
         for result in results:
             node.send("output", result)
+
+# === Hub API (direct usage) ===
+from horus import Hub, CmdVel
+
+hub = Hub(CmdVel)
+
+# Receive in batches (1 GIL release for N messages)
+messages = hub.recv_many(100)  # Up to 100 messages
+all_msgs = hub.drain()          # All available messages
+
+# Send in batches (1 GIL release for N messages)
+commands = [CmdVel(linear=v, angular=0) for v in range(10)]
+sent = hub.send_many(commands)  # Returns count sent
 ```
 
 ### 5. Keep tick() Fast

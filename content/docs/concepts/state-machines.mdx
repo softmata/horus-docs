@@ -1,0 +1,580 @@
+---
+title: State Machines
+description: Event-driven finite state machines for robot behavior and mode management
+order: 10
+---
+
+# State Machines
+
+## Key Takeaways
+
+After reading this guide, you will understand:
+- How to create finite state machines (FSMs) for robot mode management
+- Event-driven transitions with guard conditions for safe state changes
+- Entry/exit/tick callbacks for state lifecycle management
+- The fluent StateMachineBuilder API for clean FSM construction
+- Factory functions for common patterns (toggle, sequential, mode selector)
+- Thread-safe SharedStateMachine for concurrent access
+
+State machines provide a structured way to manage robot modes, behaviors, and control states. They ensure predictable transitions and make complex robot behavior easier to reason about.
+
+## What are State Machines?
+
+State machines model discrete system modes with well-defined transitions between them:
+
+**States**: Discrete modes the robot can be in (e.g., "idle", "moving", "charging")
+
+**Transitions**: Rules for moving between states, triggered by events
+
+**Guards**: Conditions that must be true for a transition to occur
+
+**Actions**: Code executed on entry, exit, or during a state
+
+## Basic Usage
+
+### Creating a Simple FSM
+
+```rust
+use horus::prelude::*; // Provides {StateMachine, State, Transition, StateId, Event, StateMachineError}
+
+// Define your context - data the FSM operates on
+struct RobotContext {
+    battery_level: f32,
+    motors_enabled: bool,
+}
+
+fn main() -> Result<(), StateMachineError> {
+    // Create a state machine
+    let mut fsm = StateMachine::<RobotContext>::new("robot_modes")
+        .add_state(State::new("idle").initial())
+        .add_state(State::new("moving"))
+        .add_state(State::new("stopped"))
+        .add_transition(
+            Transition::new("idle", "moving")
+                .on_event("start")
+        )
+        .add_transition(
+            Transition::new("moving", "stopped")
+                .on_event("stop")
+        )
+        .add_transition(
+            Transition::new("stopped", "idle")
+                .on_event("reset")
+        )
+        .build()?;
+
+    let mut ctx = RobotContext {
+        battery_level: 1.0,
+        motors_enabled: false,
+    };
+
+    // Start the FSM
+    fsm.start(&mut ctx)?;
+    assert_eq!(fsm.current_state(), Some(&StateId::named("idle")));
+
+    // Process events to trigger transitions
+    fsm.process_event(&Event::new("start"), &mut ctx)?;
+    assert_eq!(fsm.current_state(), Some(&StateId::named("moving")));
+
+    Ok(())
+}
+```
+
+### States with Callbacks
+
+States can execute code at different lifecycle points:
+
+```rust
+use horus::prelude::*; // Provides State
+
+struct RobotContext {
+    motors_enabled: bool,
+    position: f32,
+}
+
+let moving_state = State::<RobotContext>::new("moving")
+    .on_entry(|ctx| {
+        println!("Entering moving state");
+        ctx.motors_enabled = true;
+    })
+    .on_tick(|ctx| {
+        // Called each update cycle while in this state
+        ctx.position += 0.1;
+    })
+    .on_exit(|ctx| {
+        println!("Exiting moving state");
+        ctx.motors_enabled = false;
+    });
+```
+
+### Guard Conditions
+
+Guards prevent transitions unless conditions are met:
+
+```rust
+use horus::prelude::*; // Provides Transition
+
+struct RobotContext {
+    battery_level: f32,
+    sensors_ok: bool,
+}
+
+let transition = Transition::<RobotContext>::new("idle", "moving")
+    .on_event("start")
+    .with_guard(|ctx| {
+        // Only allow transition if battery is sufficient and sensors work
+        ctx.battery_level > 0.2 && ctx.sensors_ok
+    });
+```
+
+## StateMachineBuilder API
+
+The builder provides a fluent API for cleaner FSM construction:
+
+```rust
+use horus::prelude::*; // Provides StateMachineBuilder
+use std::time::Duration;
+
+struct RobotContext {
+    ready: bool,
+    task_complete: bool,
+}
+
+let fsm = StateMachineBuilder::<RobotContext>::new("task_executor")
+    // Initial state
+    .initial_state("waiting")
+        .on_entry(|ctx| {
+            ctx.ready = false;
+            ctx.task_complete = false;
+        })
+        .done()
+
+    // Working state with timeout
+    .state("working")
+        .on_entry(|ctx| println!("Starting work"))
+        .on_tick(|ctx| {
+            // Do work each tick
+        })
+        .with_timeout(Duration::from_secs(30), "timeout")
+        .done()
+
+    // Completed state
+    .state("completed")
+        .on_entry(|ctx| ctx.task_complete = true)
+        .done()
+
+    // Error state
+    .state("error")
+        .on_entry(|_| eprintln!("Task failed!"))
+        .done()
+
+    // Transitions
+    .transition("waiting", "working")
+        .on_event("start")
+        .with_guard(|ctx| ctx.ready)
+        .done()
+
+    .transition("working", "completed")
+        .on_event("done")
+        .done()
+
+    .transition("working", "error")
+        .on_event("error")
+        .done()
+
+    .transition("working", "error")
+        .on_event("timeout")  // From timeout
+        .done()
+
+    .build()?;
+```
+
+## Event Processing
+
+### Immediate Processing
+
+```rust
+// Process event immediately
+fsm.process_event(&Event::new("start"), &mut ctx)?;
+```
+
+### Event Queue
+
+Events can be queued for batch processing:
+
+```rust
+use horus::prelude::*; // Provides {Event, EventPriority}
+
+// Queue events with different priorities
+fsm.queue_event(Event::new("low_priority_event"))?;
+fsm.queue_event(Event::high_priority("emergency_stop"))?;
+
+// Process all queued events (high priority first)
+fsm.process_queue(&mut ctx)?;
+```
+
+### Event Priorities
+
+```rust
+use horus::prelude::*; // Provides {Event, EventPriority}
+
+// Normal priority (default)
+let normal = Event::new("update");
+
+// High priority - processed first
+let urgent = Event::high_priority("emergency");
+
+// Custom priority
+let custom = Event::with_priority("command", EventPriority::Critical);
+```
+
+## Factory Functions
+
+Common FSM patterns are available as factory functions:
+
+### Toggle Machine
+
+Switches between two states:
+
+```rust
+use horus::prelude::*; // Provides toggle_machine
+
+// Creates FSM that toggles between "off" and "on" on "toggle" event
+let mut fsm = toggle_machine::<RobotContext>("power", "off", "on", "toggle")?;
+
+let mut ctx = RobotContext::default();
+fsm.start(&mut ctx)?;
+assert_eq!(fsm.current_state(), Some(&StateId::named("off")));
+
+fsm.process_event(&Event::new("toggle"), &mut ctx)?;
+assert_eq!(fsm.current_state(), Some(&StateId::named("on")));
+
+fsm.process_event(&Event::new("toggle"), &mut ctx)?;
+assert_eq!(fsm.current_state(), Some(&StateId::named("off")));
+```
+
+### Sequential Machine
+
+Progresses through states in order:
+
+```rust
+use horus::prelude::*; // Provides sequential_machine
+
+// Progress through calibration steps
+let mut fsm = sequential_machine::<RobotContext>(
+    "calibration",
+    &["start", "zero_sensors", "test_motors", "verify", "complete"],
+    "next"  // Event that advances to next state
+)?;
+
+let mut ctx = RobotContext::default();
+fsm.start(&mut ctx)?;
+
+// Advance through states
+fsm.process_event(&Event::new("next"), &mut ctx)?;  // -> zero_sensors
+fsm.process_event(&Event::new("next"), &mut ctx)?;  // -> test_motors
+fsm.process_event(&Event::new("next"), &mut ctx)?;  // -> verify
+fsm.process_event(&Event::new("next"), &mut ctx)?;  // -> complete
+```
+
+### Mode Selector Machine
+
+Hub-and-spoke pattern for mode selection:
+
+```rust
+use horus::prelude::*; // Provides mode_selector_machine
+
+// Robot operation modes
+let mut fsm = mode_selector_machine::<RobotContext>(
+    "operation_mode",
+    &["manual", "autonomous", "calibration", "maintenance"],
+    "select",  // Event to select mode (with mode name as data)
+    "back"     // Event to return to hub
+)?;
+```
+
+## Thread-Safe FSM
+
+For concurrent access, use `SharedStateMachine`:
+
+```rust
+use horus::prelude::*; // Provides {SharedStateMachine, StateMachine, State, Transition}
+use std::sync::Arc;
+use std::thread;
+
+// Create a shared FSM
+let fsm = StateMachine::<RobotContext>::new("shared")
+    .add_state(State::new("idle").initial())
+    .add_state(State::new("active"))
+    .add_transition(Transition::new("idle", "active").on_event("activate"))
+    .build()?;
+
+let shared = SharedStateMachine::new(fsm);
+let mut ctx = RobotContext::default();
+
+// Start the FSM
+shared.start(&mut ctx)?;
+
+// Clone for use in threads
+let shared_clone = shared.clone();
+
+thread::spawn(move || {
+    // Safe to query state from another thread
+    if shared_clone.is_running() {
+        println!("FSM is running");
+    }
+});
+
+// Query current state (thread-safe)
+assert_eq!(shared.current_state(), Some(StateId::named("idle")));
+```
+
+## Metrics and Monitoring
+
+State machines track execution metrics:
+
+```rust
+let metrics = fsm.metrics();
+
+println!("Successful transitions: {}", metrics.successful_transitions);
+println!("Failed transitions: {}", metrics.failed_transitions);
+println!("Events processed: {}", metrics.events_processed);
+println!("Current state duration: {:?}", metrics.current_state_duration);
+```
+
+## Real-World Examples
+
+### Robot Operating Modes
+
+```rust
+use horus::prelude::*; // Provides StateMachineBuilder
+
+struct RobotContext {
+    battery_level: f32,
+    emergency_stop: bool,
+    localized: bool,
+}
+
+let robot_modes = StateMachineBuilder::<RobotContext>::new("robot_modes")
+    // Boot state
+    .initial_state("booting")
+        .on_entry(|_| println!("Robot booting..."))
+        .done()
+
+    // Idle - ready but not moving
+    .state("idle")
+        .on_entry(|_| println!("Robot ready"))
+        .done()
+
+    // Autonomous navigation
+    .state("autonomous")
+        .on_tick(|ctx| {
+            // Run navigation logic
+        })
+        .done()
+
+    // Manual teleoperation
+    .state("manual")
+        .on_entry(|_| println!("Manual control active"))
+        .done()
+
+    // Emergency stopped
+    .state("emergency")
+        .on_entry(|ctx| {
+            ctx.emergency_stop = true;
+            eprintln!("EMERGENCY STOP ACTIVATED");
+        })
+        .done()
+
+    // Charging
+    .state("charging")
+        .on_tick(|ctx| {
+            ctx.battery_level += 0.01;  // Simulate charging
+        })
+        .done()
+
+    // Transitions
+    .transition("booting", "idle")
+        .on_event("boot_complete")
+        .done()
+
+    .transition("idle", "autonomous")
+        .on_event("start_autonomous")
+        .with_guard(|ctx| ctx.localized && ctx.battery_level > 0.2)
+        .done()
+
+    .transition("idle", "manual")
+        .on_event("enable_manual")
+        .done()
+
+    .transition("autonomous", "idle")
+        .on_event("stop")
+        .done()
+
+    .transition("manual", "idle")
+        .on_event("disable_manual")
+        .done()
+
+    // Emergency stop from any active state
+    .transition("autonomous", "emergency")
+        .on_event("emergency_stop")
+        .done()
+
+    .transition("manual", "emergency")
+        .on_event("emergency_stop")
+        .done()
+
+    // Recovery from emergency
+    .transition("emergency", "idle")
+        .on_event("reset")
+        .with_guard(|ctx| !ctx.emergency_stop)
+        .done()
+
+    // Charging transitions
+    .transition("idle", "charging")
+        .on_event("dock_connected")
+        .done()
+
+    .transition("charging", "idle")
+        .on_event("undock")
+        .with_guard(|ctx| ctx.battery_level > 0.3)
+        .done()
+
+    .build()?;
+```
+
+### Navigation State Machine
+
+```rust
+use horus::prelude::*; // Provides StateMachineBuilder
+
+struct NavContext {
+    goal_reached: bool,
+    obstacle_detected: bool,
+    path_valid: bool,
+}
+
+let navigation_fsm = StateMachineBuilder::<NavContext>::new("navigation")
+    .initial_state("idle")
+        .done()
+
+    .state("planning")
+        .on_entry(|ctx| ctx.path_valid = false)
+        .done()
+
+    .state("following_path")
+        .on_tick(|ctx| {
+            // Execute path following
+        })
+        .done()
+
+    .state("avoiding_obstacle")
+        .on_entry(|_| println!("Obstacle avoidance active"))
+        .done()
+
+    .state("goal_reached")
+        .on_entry(|ctx| ctx.goal_reached = true)
+        .done()
+
+    // Start navigation
+    .transition("idle", "planning")
+        .on_event("navigate_to")
+        .done()
+
+    // Path ready
+    .transition("planning", "following_path")
+        .on_event("path_found")
+        .with_guard(|ctx| ctx.path_valid)
+        .done()
+
+    // Obstacle detected
+    .transition("following_path", "avoiding_obstacle")
+        .on_event("obstacle")
+        .done()
+
+    // Obstacle cleared
+    .transition("avoiding_obstacle", "following_path")
+        .on_event("clear")
+        .done()
+
+    // Goal reached
+    .transition("following_path", "goal_reached")
+        .on_event("arrived")
+        .done()
+
+    // Reset
+    .transition("goal_reached", "idle")
+        .on_event("reset")
+        .done()
+
+    .build()?;
+```
+
+## Integration with HORUS Nodes
+
+State machines integrate naturally with HORUS nodes:
+
+```rust
+use horus::prelude::*; // Provides {Node, Hub, Subscriber, StateMachine, StateMachineBuilder, Event}
+
+struct RobotModeContext {
+    current_velocity: f32,
+}
+
+#[horus::node]
+struct ModeController {
+    fsm: StateMachine<RobotModeContext>,
+    ctx: RobotModeContext,
+    cmd_sub: Subscriber<String>,
+}
+
+impl ModeController {
+    pub fn new(hub: &Hub) -> Result<Self> {
+        let fsm = StateMachineBuilder::<RobotModeContext>::new("mode_ctrl")
+            .initial_state("idle").done()
+            .state("active").done()
+            .transition("idle", "active").on_event("start").done()
+            .transition("active", "idle").on_event("stop").done()
+            .build()?;
+
+        Ok(Self {
+            fsm,
+            ctx: RobotModeContext { current_velocity: 0.0 },
+            cmd_sub: hub.subscribe("mode_commands")?,
+        })
+    }
+}
+
+impl Node for ModeController {
+    fn init(&mut self) -> Result<()> {
+        self.fsm.start(&mut self.ctx)?;
+        Ok(())
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        // Check for mode commands
+        if let Some(cmd) = self.cmd_sub.try_recv() {
+            self.fsm.process_event(&Event::new(&cmd), &mut self.ctx)?;
+        }
+
+        // Tick the FSM (runs on_tick callbacks)
+        self.fsm.tick(&mut self.ctx)?;
+
+        Ok(())
+    }
+}
+```
+
+## Best Practices
+
+1. **Keep states focused**: Each state should represent a single, clear mode
+2. **Use guards for safety**: Prevent invalid transitions with guard conditions
+3. **Log state changes**: Use entry callbacks for logging/debugging
+4. **Handle timeouts**: Use timeouts to prevent stuck states
+5. **Test transitions**: Verify all transitions work as expected
+
+## Next Steps
+
+- Learn about [Mission Planner](/concepts/mission-planner) for task orchestration
+- See [Orchestration](/concepts/orchestration) for combining FSMs with missions
+- Explore [Real-time Nodes](/concepts/realtime-nodes) for time-critical behavior

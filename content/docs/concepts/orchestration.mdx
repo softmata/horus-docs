@@ -1,0 +1,498 @@
+---
+title: Orchestration Overview
+description: High-level behavior orchestration with state machines and mission planning
+order: 9
+---
+
+# Orchestration Overview
+
+## Key Takeaways
+
+After reading this guide, you will understand:
+- How HORUS provides two complementary orchestration approaches
+- When to use State Machines vs Mission Planner
+- How they integrate together for complex robot behavior
+- Choosing the right approach for your use case
+
+## What is Orchestration?
+
+Orchestration is the coordination of high-level robot behaviors beyond individual node execution. While the HORUS scheduler handles node execution timing, orchestration manages **what** the robot should be doing and **when** to switch between different behaviors.
+
+HORUS provides two complementary orchestration modules:
+
+| Module | Best For | Structure |
+|--------|----------|-----------|
+| [State Machines](/concepts/state-machines) | Mode management, reactive behavior | Event-driven FSM |
+| [Mission Planner](/concepts/mission-planner) | Task sequences, multi-step goals | DAG-based hierarchy |
+
+## State Machines vs Mission Planner
+
+### State Machines
+
+State machines excel at **reactive, mode-based behavior**:
+
+```rust
+use horus::prelude::*; // Provides StateMachineBuilder
+
+// Robot operating modes - switch based on events
+let modes = StateMachineBuilder::<RobotContext>::new("robot_modes")
+    .initial_state("idle").done()
+    .state("autonomous").done()
+    .state("manual").done()
+    .state("emergency").done()
+
+    .transition("idle", "autonomous").on_event("start_auto").done()
+    .transition("idle", "manual").on_event("enable_teleop").done()
+    .transition("autonomous", "emergency").on_event("e_stop").done()
+    .transition("manual", "emergency").on_event("e_stop").done()
+
+    .build()?;
+```
+
+**Use State Machines when:**
+- Managing discrete operating modes (idle, active, charging)
+- Handling reactive events (emergency stop, mode switches)
+- Implementing behavioral states (patrolling, following, waiting)
+- Building UI/interaction flows
+
+### Mission Planner
+
+Mission Planner excels at **goal-oriented, multi-step tasks**:
+
+```rust
+use horus::prelude::*; // Provides {MissionPlannerBuilder, GoalSpec, TaskSpec}
+
+// Pick and place mission - structured task hierarchy
+let mission = MissionPlannerBuilder::new()
+    .mission("warehouse_pickup")
+        .add_goal(GoalSpec::new("pick_item")
+            .add_task(TaskSpec::action("navigate_to_shelf")
+                .action(|_ctx| async { /* nav code */ Ok(()) })
+            )
+            .add_task(TaskSpec::action("grab_item")
+                .action(|_ctx| async { /* gripper code */ Ok(()) })
+                .depends_on("navigate_to_shelf")
+            )
+        )
+        .add_goal(GoalSpec::new("place_item")
+            .depends_on("pick_item")
+            .add_task(TaskSpec::action("navigate_to_bin")
+                .action(|_ctx| async { /* nav code */ Ok(()) })
+            )
+            .add_task(TaskSpec::action("release_item")
+                .action(|_ctx| async { /* release code */ Ok(()) })
+                .depends_on("navigate_to_bin")
+            )
+        )
+        .done()
+    .build()?;
+```
+
+**Use Mission Planner when:**
+- Executing multi-step procedures (assembly, inspection)
+- Managing parallel task execution
+- Handling task dependencies and ordering
+- Implementing retry logic and failure recovery
+- Coordinating multi-robot operations
+
+## Decision Guide
+
+```
+Is your behavior...?
+
+├── Reactive to external events?
+│   └── STATE MACHINE
+│       Examples: E-stop handling, mode switching, UI flows
+│
+├── A sequence of steps to achieve a goal?
+│   └── MISSION PLANNER
+│       Examples: Pick-and-place, navigation sequences, calibration
+│
+├── Both event-driven AND goal-oriented?
+│   └── COMBINE THEM (see Integration below)
+│       Examples: Autonomous robot with mode management
+│
+└── Simple node coordination?
+    └── Use Scheduler directly
+        Examples: Sensor fusion, control loops
+```
+
+## Integration Patterns
+
+### Pattern 1: State Machine Controls Mission Planner
+
+Use a state machine to manage high-level modes, with the Mission Planner handling tasks within each mode:
+
+```rust
+use horus::prelude::*; // Provides {StateMachineBuilder, MissionPlanner, MissionSpec, GoalSpec, TaskSpec, MissionId}
+
+struct RobotContext {
+    mission_planner: MissionPlanner,
+    current_mission: Option<MissionId>,
+}
+
+let robot_fsm = StateMachineBuilder::<RobotContext>::new("robot")
+    .initial_state("idle")
+        .on_entry(|ctx| {
+            // Cancel any running mission when entering idle
+            if let Some(id) = ctx.current_mission.take() {
+                let _ = ctx.mission_planner.cancel_mission(&id);
+            }
+        })
+        .done()
+
+    .state("executing_mission")
+        .on_entry(|ctx| {
+            // Start a new mission
+            let mission = MissionSpec::new("current_task")
+                .add_goal(GoalSpec::new("main_goal")
+                    .add_task(TaskSpec::noop("do_work"))
+                );
+            ctx.current_mission = Some(ctx.mission_planner.submit_mission(mission).unwrap());
+        })
+        .on_tick(|ctx| {
+            // Check mission progress
+            ctx.mission_planner.tick().unwrap();
+        })
+        .done()
+
+    .state("paused")
+        .on_entry(|ctx| {
+            if let Some(ref id) = ctx.current_mission {
+                let _ = ctx.mission_planner.pause_mission(id);
+            }
+        })
+        .done()
+
+    .transition("idle", "executing_mission")
+        .on_event("start_mission")
+        .done()
+
+    .transition("executing_mission", "idle")
+        .on_event("mission_complete")
+        .done()
+
+    .transition("executing_mission", "paused")
+        .on_event("pause")
+        .done()
+
+    .transition("paused", "executing_mission")
+        .on_event("resume")
+        .done()
+
+    .build()?;
+```
+
+### Pattern 2: Mission Tasks Use State Machines
+
+Individual tasks within a mission can use state machines for complex behavior:
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, StateMachineBuilder}
+
+// A task that uses a state machine internally
+let docking_task = TaskSpec::state_machine(
+    "dock_to_charger",
+    StateMachineBuilder::<DockingContext>::new("docking")
+        .initial_state("approaching")
+            .on_tick(|ctx| {
+                // Drive toward dock
+                ctx.distance_to_dock -= 0.1;
+            })
+            .done()
+        .state("aligning")
+            .on_tick(|ctx| {
+                // Fine alignment
+            })
+            .done()
+        .state("connecting")
+            .on_entry(|ctx| {
+                // Activate charging connection
+            })
+            .done()
+        .state("docked")
+            .done()
+
+        .transition("approaching", "aligning")
+            .on_event("close_enough")
+            .with_guard(|ctx| ctx.distance_to_dock < 0.5)
+            .done()
+        .transition("aligning", "connecting")
+            .on_event("aligned")
+            .done()
+        .transition("connecting", "docked")
+            .on_event("connected")
+            .done()
+
+        .build()?,
+);
+
+let mission = MissionSpec::new("go_charge")
+    .add_goal(GoalSpec::new("charge")
+        .add_task(TaskSpec::action("navigate_to_dock_area")
+            .action(|_| async { Ok(()) })
+        )
+        .add_task(docking_task.depends_on("navigate_to_dock_area"))
+    );
+```
+
+### Pattern 3: Event Bridge
+
+Bridge events between state machine and mission planner:
+
+```rust
+use horus::prelude::*; // Provides {StateMachine, MissionPlanner, Event, MissionEvent}
+
+struct OrchestratorContext {
+    fsm: StateMachine<FsmContext>,
+    fsm_ctx: FsmContext,
+    planner: MissionPlanner,
+}
+
+impl OrchestratorContext {
+    fn tick(&mut self) -> Result<()> {
+        // Tick mission planner
+        self.planner.tick()?;
+
+        // Check for mission events and forward to FSM
+        while let Some(event) = self.planner.poll_event() {
+            match event {
+                MissionEvent::MissionCompleted { .. } => {
+                    self.fsm.process_event(
+                        &Event::new("mission_complete"),
+                        &mut self.fsm_ctx
+                    )?;
+                }
+                MissionEvent::MissionFailed { .. } => {
+                    self.fsm.process_event(
+                        &Event::new("mission_failed"),
+                        &mut self.fsm_ctx
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        // Tick FSM
+        self.fsm.tick(&mut self.fsm_ctx)?;
+
+        Ok(())
+    }
+}
+```
+
+## Real-World Example: Autonomous Mobile Robot
+
+Here's a complete example combining both orchestration approaches:
+
+```rust
+use horus::prelude::*; // Provides {StateMachineBuilder, StateMachine, MissionSpec, GoalSpec, TaskSpec, MissionPlanner, Event, StateId, MissionEvent, Node, Subscriber}
+
+// Robot context shared between FSM and Mission Planner
+struct AMRContext {
+    battery_level: f32,
+    localized: bool,
+    has_payload: bool,
+    emergency_stop: bool,
+}
+
+// High-level robot modes (State Machine)
+fn create_mode_fsm() -> Result<StateMachine<AMRContext>> {
+    StateMachineBuilder::<AMRContext>::new("amr_modes")
+        // Startup state
+        .initial_state("booting")
+            .on_entry(|_| println!("AMR initializing..."))
+            .done()
+
+        // Ready to receive commands
+        .state("idle")
+            .on_entry(|_| println!("AMR ready"))
+            .done()
+
+        // Executing a mission
+        .state("on_mission")
+            .on_tick(|ctx| {
+                // Monitor battery during mission
+                if ctx.battery_level < 0.15 {
+                    println!("Low battery warning!");
+                }
+            })
+            .done()
+
+        // Autonomous charging
+        .state("charging")
+            .on_tick(|ctx| {
+                ctx.battery_level = (ctx.battery_level + 0.01).min(1.0);
+            })
+            .done()
+
+        // Emergency stopped
+        .state("emergency")
+            .on_entry(|ctx| {
+                ctx.emergency_stop = true;
+                eprintln!("EMERGENCY STOP!");
+            })
+            .done()
+
+        // Boot complete
+        .transition("booting", "idle")
+            .on_event("boot_complete")
+            .with_guard(|ctx| ctx.localized)
+            .done()
+
+        // Start mission
+        .transition("idle", "on_mission")
+            .on_event("mission_start")
+            .with_guard(|ctx| ctx.battery_level > 0.2)
+            .done()
+
+        // Mission complete
+        .transition("on_mission", "idle")
+            .on_event("mission_complete")
+            .done()
+
+        // Go charge
+        .transition("idle", "charging")
+            .on_event("charge")
+            .done()
+
+        .transition("on_mission", "charging")
+            .on_event("low_battery")
+            .done()
+
+        // Charging complete
+        .transition("charging", "idle")
+            .on_event("charged")
+            .with_guard(|ctx| ctx.battery_level > 0.9)
+            .done()
+
+        // Emergency from any active state
+        .transition("idle", "emergency").on_event("e_stop").done()
+        .transition("on_mission", "emergency").on_event("e_stop").done()
+        .transition("charging", "emergency").on_event("e_stop").done()
+
+        // Recovery from emergency
+        .transition("emergency", "idle")
+            .on_event("reset")
+            .with_guard(|ctx| !ctx.emergency_stop)
+            .done()
+
+        .build()
+}
+
+// Delivery mission (Mission Planner)
+fn create_delivery_mission(pickup: &str, dropoff: &str) -> MissionSpec {
+    MissionSpec::new("delivery")
+        .add_goal(GoalSpec::new("pickup")
+            .add_task(TaskSpec::action("navigate_to_pickup")
+                .action(move |_ctx| async move {
+                    println!("Navigating to pickup: {}", pickup);
+                    Ok(())
+                })
+            )
+            .add_task(TaskSpec::action("load_payload")
+                .action(|_ctx| async {
+                    println!("Loading payload...");
+                    Ok(())
+                })
+                .depends_on("navigate_to_pickup")
+            )
+        )
+        .add_goal(GoalSpec::new("delivery")
+            .depends_on("pickup")
+            .add_task(TaskSpec::action("navigate_to_dropoff")
+                .action(move |_ctx| async move {
+                    println!("Navigating to dropoff: {}", dropoff);
+                    Ok(())
+                })
+            )
+            .add_task(TaskSpec::action("unload_payload")
+                .action(|_ctx| async {
+                    println!("Unloading payload...");
+                    Ok(())
+                })
+                .depends_on("navigate_to_dropoff")
+            )
+        )
+}
+
+// Main orchestrator node
+#[horus::node]
+struct AMROrchestrator {
+    mode_fsm: StateMachine<AMRContext>,
+    mission_planner: MissionPlanner,
+    ctx: AMRContext,
+    command_sub: Subscriber<String>,
+}
+
+impl Node for AMROrchestrator {
+    fn tick(&mut self) -> Result<()> {
+        // Handle incoming commands
+        if let Some(cmd) = self.command_sub.try_recv() {
+            match cmd.as_str() {
+                "deliver:A:B" => {
+                    let mission = create_delivery_mission("A", "B");
+                    self.mission_planner.submit_mission(mission)?;
+                    self.mode_fsm.process_event(
+                        &Event::new("mission_start"),
+                        &mut self.ctx
+                    )?;
+                }
+                "emergency" => {
+                    self.mode_fsm.process_event(
+                        &Event::new("e_stop"),
+                        &mut self.ctx
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        // Tick mission planner if on mission
+        if self.mode_fsm.current_state() == Some(&StateId::named("on_mission")) {
+            self.mission_planner.tick()?;
+
+            // Check for mission completion
+            while let Some(event) = self.mission_planner.poll_event() {
+                if matches!(event, MissionEvent::MissionCompleted { .. }) {
+                    self.mode_fsm.process_event(
+                        &Event::new("mission_complete"),
+                        &mut self.ctx
+                    )?;
+                }
+            }
+        }
+
+        // Tick FSM
+        self.mode_fsm.tick(&mut self.ctx)?;
+
+        Ok(())
+    }
+}
+```
+
+## Performance Considerations
+
+Both orchestration modules are designed for efficiency:
+
+| Aspect | State Machines | Mission Planner |
+|--------|----------------|-----------------|
+| Memory | Minimal - just state + metrics | Moderate - DAGs + task state |
+| Tick overhead | O(1) - just callbacks | O(n) - tracks all tasks |
+| Thread safety | `SharedStateMachine` | `SharedMissionPlanner` |
+| Event handling | Immediate or queued | Event polling |
+
+## Best Practices
+
+1. **Start simple**: Use state machines for basic mode management before adding Mission Planner
+2. **Single source of truth**: Don't duplicate state between FSM and Mission Planner
+3. **Clear boundaries**: State machines for modes, Mission Planner for tasks
+4. **Event-driven communication**: Bridge events between modules cleanly
+5. **Test transitions**: Verify all state transitions and task dependencies
+
+## Next Steps
+
+- Learn [State Machines](/concepts/state-machines) in detail
+- Explore [Mission Planner](/concepts/mission-planner) for complex tasks
+- See [Real-time Nodes](/concepts/realtime-nodes) for time-critical behavior
+- Check [Scheduler](/concepts/core-concepts-scheduler) for node execution

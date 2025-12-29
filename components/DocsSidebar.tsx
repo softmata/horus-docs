@@ -67,6 +67,16 @@ const sections: SidebarSection[] = [
       { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
       { title: "Robot Architectures", href: "/concepts/robot-architectures", order: 11 },
       { title: "Multi-Language", href: "/concepts/multi-language", order: 12 },
+      {
+        title: "Orchestration",
+        href: "/concepts/orchestration",
+        order: 13,
+        children: [
+          { title: "Overview", href: "/concepts/orchestration", order: 0 },
+          { title: "State Machines", href: "/concepts/state-machines", order: 1 },
+          { title: "Mission Planner", href: "/concepts/mission-planner", order: 2 },
+        ]
+      },
     ],
   },
   {
@@ -205,6 +215,7 @@ const sections: SidebarSection[] = [
       { title: "Library Reference", href: "/development/library-reference", order: 8 },
       { title: "Error Handling", href: "/development/error-handling", order: 9 },
       { title: "AI Integration", href: "/development/ai-integration", order: 10 },
+      { title: "ROS2 Bridge", href: "/development/ros2-bridge", order: 11 },
     ],
   },
   {

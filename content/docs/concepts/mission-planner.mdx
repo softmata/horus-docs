@@ -1,0 +1,682 @@
+---
+title: Mission Planner
+description: Hierarchical mission planning and task orchestration for complex robot operations
+order: 11
+---
+
+# Mission Planner
+
+## Key Takeaways
+
+After reading this guide, you will understand:
+- The three-level hierarchy: Mission -> Goal -> Task
+- DAG-based dependency management for parallel and sequential execution
+- Task executors for different action types (Action, StateMachine, Custom, Noop)
+- Retry policies and failure handling strategies
+- Condition-based task execution and optional tasks
+- Progress tracking, metrics, and event callbacks
+
+The Mission Planner orchestrates complex robot operations by breaking them into manageable goals and tasks with automatic dependency resolution, parallel execution, and failure recovery.
+
+## What is the Mission Planner?
+
+The Mission Planner provides:
+
+**Hierarchical Organization**: Missions contain goals, goals contain tasks
+
+**Dependency Management**: DAG-based scheduling ensures correct execution order
+
+**Parallel Execution**: Independent tasks run concurrently for efficiency
+
+**Failure Recovery**: Retry policies and failure modes for robustness
+
+**Progress Tracking**: Real-time progress, metrics, and event callbacks
+
+## Mission Hierarchy
+
+```
+Mission: "Deliver Package to Room 101"
+├── Goal: "Pick up package"
+│   ├── Task: "Navigate to pickup location"
+│   ├── Task: "Detect package"
+│   └── Task: "Grasp package"
+├── Goal: "Navigate to destination"
+│   ├── Task: "Plan path"
+│   └── Task: "Execute trajectory"
+└── Goal: "Deliver package"
+    ├── Task: "Navigate to drop zone"
+    └── Task: "Release package"
+```
+
+## Basic Usage
+
+### Creating a Simple Mission
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, TaskExecutor, GoalSpec, MissionSpec, MissionPlanner, MissionPlannerError}
+
+fn main() -> Result<(), MissionPlannerError> {
+    // Create tasks
+    let navigate = TaskSpec::new(
+        "navigate",
+        "Navigate to Target",
+        TaskExecutor::Noop,  // Placeholder for demo
+    );
+
+    let pickup = TaskSpec::new(
+        "pickup",
+        "Pick Up Object",
+        TaskExecutor::Noop,
+    );
+
+    // Task IDs for dependencies
+    let navigate_id = navigate.id.clone();
+
+    // Create goal with sequential tasks
+    let goal = GoalSpec::new("fetch", "Fetch Object")
+        .add_task(navigate)
+        .add_task_after(pickup, &navigate_id);  // pickup depends on navigate
+
+    // Create mission
+    let mission = MissionSpec::new("delivery")
+        .with_description("Deliver a package")
+        .add_goal(goal);
+
+    // Create planner and run
+    let mut planner = MissionPlanner::new();
+    let mission_id = planner.submit(mission)?;
+    planner.start(&mission_id)?;
+
+    // Tick until complete
+    loop {
+        planner.tick()?;
+        let status = planner.get_mission_status(&mission_id)?;
+        if status.status.is_terminal() {
+            println!("Mission completed: {:?}", status.status);
+            break;
+        }
+    }
+
+    Ok(())
+}
+```
+
+### Parallel Tasks
+
+Tasks without dependencies run in parallel:
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, GoalSpec}
+
+// Three independent sensor checks
+let check_lidar = TaskSpec::noop("check_lidar", "Check LiDAR");
+let check_camera = TaskSpec::noop("check_camera", "Check Camera");
+let check_imu = TaskSpec::noop("check_imu", "Check IMU");
+
+// Final task waits for all checks
+let start_nav = TaskSpec::noop("start_nav", "Start Navigation");
+
+let lidar_id = check_lidar.id.clone();
+let camera_id = check_camera.id.clone();
+let imu_id = check_imu.id.clone();
+
+let goal = GoalSpec::new("startup", "Startup Checks")
+    .add_task(check_lidar)    // These three run
+    .add_task(check_camera)   // in parallel
+    .add_task(check_imu)      // automatically
+    .add_task_after_all(start_nav, &[lidar_id, camera_id, imu_id]);
+```
+
+### Goal Dependencies
+
+Goals can also have dependencies on other goals:
+
+```rust
+use horus::prelude::*; // Provides {GoalSpec, TaskSpec, MissionSpec}
+
+let pickup_goal = GoalSpec::new("pickup", "Pick Up Package")
+    .add_task(TaskSpec::noop("approach", "Approach Object"))
+    .add_task(TaskSpec::noop("grasp", "Grasp Object"));
+
+let navigate_goal = GoalSpec::new("navigate", "Navigate to Destination")
+    .add_task(TaskSpec::noop("plan", "Plan Path"))
+    .add_task(TaskSpec::noop("execute", "Execute Path"));
+
+let deliver_goal = GoalSpec::new("deliver", "Deliver Package")
+    .add_task(TaskSpec::noop("release", "Release Object"));
+
+let pickup_id = pickup_goal.id.clone();
+let navigate_id = navigate_goal.id.clone();
+
+let mission = MissionSpec::new("full_delivery")
+    .add_goal(pickup_goal)
+    .add_goal_after(navigate_goal, &pickup_id)      // After pickup
+    .add_goal_after(deliver_goal, &navigate_id);    // After navigate
+```
+
+## Task Executors
+
+Tasks can use different executors depending on the action type:
+
+### Noop (No Operation)
+
+Synchronization points that complete immediately:
+
+```rust
+let sync_task = TaskSpec::noop("sync", "Synchronization Point");
+```
+
+### Custom Handler
+
+Register custom execution functions:
+
+```rust
+use horus::prelude::*; // Provides {MissionPlanner, TaskSpec, TaskExecutor, ExecutionContext}
+use std::sync::Arc;
+use std::collections::HashMap;
+
+let task = TaskSpec::new(
+    "custom_work",
+    "Custom Work Task",
+    TaskExecutor::Custom {
+        handler: "my_handler".to_string(),
+        parameters: {
+            let mut params = HashMap::new();
+            params.insert("key".to_string(), serde_json::json!("value"));
+            params
+        },
+    },
+);
+
+let mut planner = MissionPlanner::new();
+
+// Register the handler
+planner.register_executor(
+    "my_handler",
+    Arc::new(|task: &TaskSpec, ctx: &ExecutionContext| {
+        println!("Executing task: {}", task.id);
+        // Do work here...
+        Ok(Some(serde_json::json!({"result": "success"})))
+    }),
+);
+```
+
+### Action Executor
+
+For long-running actions with feedback:
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, TaskExecutor}
+use std::collections::HashMap;
+
+let navigate_task = TaskSpec::new(
+    "navigate",
+    "Navigate to Pose",
+    TaskExecutor::Action {
+        action_type: "navigate_to_pose".to_string(),
+        parameters: {
+            let mut params = HashMap::new();
+            params.insert("x".to_string(), serde_json::json!(1.0));
+            params.insert("y".to_string(), serde_json::json!(2.0));
+            params.insert("theta".to_string(), serde_json::json!(0.0));
+            params
+        },
+    },
+);
+```
+
+### State Machine Transition
+
+Trigger state machine transitions:
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, TaskExecutor}
+
+let transition_task = TaskSpec::new(
+    "enter_autonomous",
+    "Enter Autonomous Mode",
+    TaskExecutor::StateMachine {
+        machine_id: "robot_modes".to_string(),
+        event: "start_autonomous".to_string(),
+    },
+);
+```
+
+## Retry Policies
+
+Configure automatic retry on failure:
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, TaskExecutor, RetryPolicy}
+use std::time::Duration;
+
+let flaky_task = TaskSpec::new(
+    "network_call",
+    "Network API Call",
+    TaskExecutor::Custom {
+        handler: "api_call".to_string(),
+        parameters: Default::default(),
+    },
+)
+.with_retry(RetryPolicy {
+    max_attempts: 3,                              // Try up to 3 times
+    delay: Duration::from_secs(1),                // Wait 1s between retries
+    exponential_backoff: true,                    // Double delay each retry
+    max_delay: Duration::from_secs(30),           // Cap at 30s
+    retry_on: vec!["NetworkError".to_string()],   // Only retry these errors
+});
+```
+
+## Conditional Execution
+
+Tasks can have conditions that control execution:
+
+```rust
+use horus::prelude::*; // Provides {TaskSpec, TaskExecutor, TaskCondition, MissionPlanner}
+use std::sync::Arc;
+
+// Task only runs if condition is met
+let conditional_task = TaskSpec::new(
+    "backup",
+    "Backup Navigation",
+    TaskExecutor::Noop,
+)
+.with_condition(TaskCondition::Custom {
+    name: "battery_check".to_string(),
+    args: vec!["high".to_string()],
+});
+
+let mut planner = MissionPlanner::new();
+
+// Register condition evaluator
+planner.register_condition_evaluator(
+    "battery_check",
+    Arc::new(|condition, ctx| {
+        if let TaskCondition::Custom { args, .. } = condition {
+            // Check if battery level matches requirement
+            args.contains(&"high".to_string())
+        } else {
+            false
+        }
+    }),
+);
+```
+
+### Built-in Conditions
+
+```rust
+use horus::prelude::*; // Provides TaskCondition
+
+// Always execute
+let always = TaskCondition::Always;
+
+// Never execute (skip)
+let never = TaskCondition::Never;
+
+// Execute only if another task succeeded
+let depends = TaskCondition::TaskSucceeded("other_task".to_string());
+
+// Custom condition with evaluator
+let custom = TaskCondition::Custom {
+    name: "my_check".to_string(),
+    args: vec!["arg1".to_string()],
+};
+```
+
+### Optional Tasks
+
+Mark tasks as optional so unmet conditions skip rather than fail:
+
+```rust
+let optional_task = TaskSpec::noop("optional", "Optional Optimization")
+    .with_condition(TaskCondition::Custom {
+        name: "resources_available".to_string(),
+        args: vec![],
+    })
+    .optional();  // Won't fail mission if condition not met
+```
+
+## Failure Handling
+
+### Goal Failure Policies
+
+```rust
+use horus::prelude::*; // Provides {GoalSpec, GoalFailurePolicy, TaskSpec}
+
+// Critical goal - abort entire mission on failure
+let critical = GoalSpec::new("safety_check", "Safety Check")
+    .with_failure_policy(GoalFailurePolicy::AbortMission)
+    .add_task(TaskSpec::noop("check", "Check Safety"));
+
+// Optional goal - continue mission if this fails
+let optional = GoalSpec::new("optimization", "Optimize Path")
+    .with_failure_policy(GoalFailurePolicy::Continue)
+    .optional()
+    .add_task(TaskSpec::noop("optimize", "Optimize"));
+
+// Retry the goal on failure
+let retryable = GoalSpec::new("connect", "Connect to Server")
+    .with_failure_policy(GoalFailurePolicy::RetryGoal { max_attempts: 3 })
+    .add_task(TaskSpec::noop("connect", "Establish Connection"));
+```
+
+## Event Handling
+
+Subscribe to mission events for monitoring:
+
+```rust
+use horus::prelude::*; // Provides {MissionPlanner, MissionEvent}
+use std::sync::Arc;
+
+let mut planner = MissionPlanner::new();
+
+planner.on_event(Arc::new(|event| {
+    match event {
+        MissionEvent::MissionStarted { mission_id } => {
+            println!("Mission {} started", mission_id);
+        }
+        MissionEvent::GoalStarted { mission_id, goal_id } => {
+            println!("Goal {} started", goal_id);
+        }
+        MissionEvent::TaskStarted { task_id, .. } => {
+            println!("Task {} started", task_id);
+        }
+        MissionEvent::TaskCompleted { task_id, success, .. } => {
+            println!("Task {} completed: success={}", task_id, success);
+        }
+        MissionEvent::Progress { mission_id, progress } => {
+            println!("Mission {}: {:.1}% complete", mission_id, progress * 100.0);
+        }
+        MissionEvent::MissionCompleted { mission_id, success } => {
+            println!("Mission {} completed: success={}", mission_id, success);
+        }
+        _ => {}
+    }
+}));
+```
+
+## Builder Pattern
+
+Use the builder for complex configurations:
+
+```rust
+use horus::prelude::*; // Provides MissionPlannerBuilder
+use std::time::Duration;
+use std::sync::Arc;
+
+let planner = MissionPlannerBuilder::new()
+    .max_concurrent_missions(4)        // Run up to 4 missions at once
+    .max_concurrent_tasks(8)           // Run up to 8 tasks per mission
+    .default_task_timeout(Duration::from_secs(60))
+    .collect_metrics(true)
+    .register_executor("custom", Arc::new(|task, ctx| {
+        // Custom executor implementation
+        Ok(None)
+    }))
+    .on_event(Arc::new(|event| {
+        // Event handler
+    }))
+    .build();
+```
+
+## Thread-Safe Access
+
+Use `SharedMissionPlanner` for multi-threaded access:
+
+```rust
+use horus::prelude::*; // Provides {MissionPlanner, SharedMissionPlanner, MissionSpec, GoalSpec, TaskSpec}
+use std::thread;
+
+let planner = MissionPlanner::new();
+let shared = SharedMissionPlanner::new(planner);
+
+// Submit mission
+let goal = GoalSpec::new("g1", "Goal").add_task(TaskSpec::noop("t1", "Task"));
+let mission = MissionSpec::new("m1").add_goal(goal);
+let id = shared.submit(mission).unwrap();
+shared.start(&id).unwrap();
+
+// Tick from multiple threads
+let shared_clone = shared.clone_arc();
+let handle = thread::spawn(move || {
+    for _ in 0..10 {
+        shared_clone.tick().unwrap();
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+});
+
+// Main thread also ticks
+for _ in 0..10 {
+    shared.tick().unwrap();
+    thread::sleep(std::time::Duration::from_millis(10));
+}
+
+handle.join().unwrap();
+```
+
+## Metrics and Progress
+
+Track mission execution metrics:
+
+```rust
+use horus::prelude::*; // Provides MissionPlanner
+
+let mut planner = MissionPlanner::new();
+
+// After running missions...
+let metrics = planner.metrics();
+
+println!("Total missions: {}", metrics.total_missions);
+println!("Successful: {}", metrics.successful_missions);
+println!("Failed: {}", metrics.failed_missions);
+println!("Total tasks: {}", metrics.total_tasks);
+println!("Successful tasks: {}", metrics.successful_tasks);
+```
+
+## Real-World Examples
+
+### Pick and Place Operation
+
+```rust
+use horus::prelude::*; // Provides {MissionSpec, GoalSpec, TaskSpec, TaskExecutor, RetryPolicy, GoalFailurePolicy}
+use std::time::Duration;
+
+fn create_pick_and_place_mission(
+    pickup_location: (f64, f64),
+    place_location: (f64, f64),
+) -> MissionSpec {
+    // Pickup goal
+    let navigate_to_pickup = TaskSpec::new(
+        "nav_pickup",
+        "Navigate to Pickup",
+        TaskExecutor::Action {
+            action_type: "navigate".to_string(),
+            parameters: [
+                ("x".to_string(), serde_json::json!(pickup_location.0)),
+                ("y".to_string(), serde_json::json!(pickup_location.1)),
+            ].into_iter().collect(),
+        },
+    ).with_timeout(Duration::from_secs(60));
+
+    let detect_object = TaskSpec::new(
+        "detect",
+        "Detect Object",
+        TaskExecutor::Action {
+            action_type: "detect_object".to_string(),
+            parameters: Default::default(),
+        },
+    );
+
+    let grasp = TaskSpec::new(
+        "grasp",
+        "Grasp Object",
+        TaskExecutor::Action {
+            action_type: "grasp".to_string(),
+            parameters: Default::default(),
+        },
+    ).with_retry(RetryPolicy {
+        max_attempts: 3,
+        delay: Duration::from_millis(500),
+        exponential_backoff: false,
+        max_delay: Duration::from_secs(5),
+        retry_on: vec!["GraspFailed".to_string()],
+    });
+
+    let nav_id = navigate_to_pickup.id.clone();
+    let detect_id = detect_object.id.clone();
+
+    let pickup_goal = GoalSpec::new("pickup", "Pick Up Object")
+        .with_failure_policy(GoalFailurePolicy::AbortMission)
+        .add_task(navigate_to_pickup)
+        .add_task_after(detect_object, &nav_id)
+        .add_task_after(grasp, &detect_id);
+
+    // Place goal
+    let navigate_to_place = TaskSpec::new(
+        "nav_place",
+        "Navigate to Place Location",
+        TaskExecutor::Action {
+            action_type: "navigate".to_string(),
+            parameters: [
+                ("x".to_string(), serde_json::json!(place_location.0)),
+                ("y".to_string(), serde_json::json!(place_location.1)),
+            ].into_iter().collect(),
+        },
+    );
+
+    let release = TaskSpec::new(
+        "release",
+        "Release Object",
+        TaskExecutor::Action {
+            action_type: "release".to_string(),
+            parameters: Default::default(),
+        },
+    );
+
+    let nav_place_id = navigate_to_place.id.clone();
+
+    let place_goal = GoalSpec::new("place", "Place Object")
+        .add_task(navigate_to_place)
+        .add_task_after(release, &nav_place_id);
+
+    let pickup_goal_id = pickup_goal.id.clone();
+
+    MissionSpec::new("pick_and_place")
+        .with_description("Pick up object and place at destination")
+        .with_timeout(Duration::from_secs(300))
+        .add_goal(pickup_goal)
+        .add_goal_after(place_goal, &pickup_goal_id)
+}
+```
+
+### Multi-Robot Coordination
+
+```rust
+use horus::prelude::*; // Provides {MissionSpec, GoalSpec, TaskSpec, TaskExecutor}
+
+fn create_multi_robot_survey_mission() -> MissionSpec {
+    // Robot 1 surveys zone A
+    let survey_a = TaskSpec::new("survey_a", "Survey Zone A",
+        TaskExecutor::Custom {
+            handler: "robot1_survey".to_string(),
+            parameters: Default::default(),
+        });
+
+    // Robot 2 surveys zone B (parallel)
+    let survey_b = TaskSpec::new("survey_b", "Survey Zone B",
+        TaskExecutor::Custom {
+            handler: "robot2_survey".to_string(),
+            parameters: Default::default(),
+        });
+
+    // Robot 3 surveys zone C (parallel)
+    let survey_c = TaskSpec::new("survey_c", "Survey Zone C",
+        TaskExecutor::Custom {
+            handler: "robot3_survey".to_string(),
+            parameters: Default::default(),
+        });
+
+    // Merge results (after all surveys complete)
+    let merge = TaskSpec::new("merge", "Merge Survey Data",
+        TaskExecutor::Custom {
+            handler: "merge_surveys".to_string(),
+            parameters: Default::default(),
+        });
+
+    let a_id = survey_a.id.clone();
+    let b_id = survey_b.id.clone();
+    let c_id = survey_c.id.clone();
+
+    let survey_goal = GoalSpec::new("survey", "Complete Survey")
+        .add_task(survey_a)  // All three run
+        .add_task(survey_b)  // in parallel
+        .add_task(survey_c)
+        .add_task_after_all(merge, &[a_id, b_id, c_id]);
+
+    MissionSpec::new("multi_robot_survey")
+        .add_goal(survey_goal)
+}
+```
+
+## Integration with HORUS Nodes
+
+```rust
+use horus::prelude::*; // Provides {Node, Hub, Subscriber, Publisher, SharedMissionPlanner, MissionPlannerBuilder, MissionSpec, MissionStatus}
+use std::sync::Arc;
+
+#[horus::node]
+struct MissionExecutor {
+    planner: SharedMissionPlanner,
+    mission_sub: Subscriber<MissionSpec>,
+    status_pub: Publisher<MissionStatus>,
+}
+
+impl MissionExecutor {
+    pub fn new(hub: &Hub) -> Result<Self> {
+        let planner = MissionPlannerBuilder::new()
+            .max_concurrent_missions(2)
+            .build();
+
+        Ok(Self {
+            planner: SharedMissionPlanner::new(planner),
+            mission_sub: hub.subscribe("missions")?,
+            status_pub: hub.advertise("mission_status")?,
+        })
+    }
+}
+
+impl Node for MissionExecutor {
+    fn tick(&mut self) -> Result<()> {
+        // Accept new missions
+        if let Some(mission) = self.mission_sub.try_recv() {
+            let id = self.planner.submit(mission)?;
+            self.planner.start(&id)?;
+        }
+
+        // Tick the planner
+        self.planner.tick()?;
+
+        // Publish status updates
+        for status in self.planner.all_mission_statuses()? {
+            self.status_pub.publish(&status)?;
+        }
+
+        Ok(())
+    }
+}
+```
+
+## Best Practices
+
+1. **Break down complex operations**: Use the hierarchy (Mission -> Goal -> Task) effectively
+2. **Use dependencies wisely**: Let independent tasks run in parallel
+3. **Configure retry policies**: Network and hardware operations often need retries
+4. **Set timeouts**: Prevent stuck missions with appropriate timeouts
+5. **Monitor with events**: Use callbacks for logging and visualization
+6. **Test failure scenarios**: Verify retry and recovery logic works correctly
+
+## Next Steps
+
+- Learn about [State Machines](/concepts/state-machines) for mode management
+- See [Orchestration](/concepts/orchestration) for combining planners with FSMs
+- Explore [Actions](/rust/api/actions) for long-running task execution

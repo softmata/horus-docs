@@ -1,0 +1,369 @@
+---
+title: ROS2 Bridge
+description: Runtime interoperability between HORUS and ROS2 using Zenoh
+order: 50
+---
+
+# ROS2 Bridge
+
+The HORUS ROS2 Bridge enables **runtime interoperability** between HORUS and ROS2 systems using Zenoh as the transport layer. Unlike the `from-ros` command which converts ROS2 code to HORUS, the bridge allows existing ROS2 nodes to coexist and communicate with HORUS nodes at runtime.
+
+## Architecture
+
+```
+┌─────────────┐     Zenoh      ┌─────────────┐
+│   ROS2      │◄──────────────►│   HORUS     │
+│   Nodes     │   (CDR msgs)   │   Bridge    │
+└─────────────┘                └──────┬──────┘
+                                      │
+                                      ▼ Shared Memory
+                               ┌─────────────┐
+                               │   HORUS     │
+                               │   Nodes     │
+                               └─────────────┘
+```
+
+The bridge works by:
+1. Connecting to the ROS2 network via Zenoh (using the zenoh-ros2-dds-bridge protocol)
+2. Discovering ROS2 topics, services, actions, and parameter nodes
+3. Translating messages between CDR (ROS2) and HORUS formats
+4. Publishing/subscribing on HORUS shared memory topics
+
+## Quick Start
+
+### Bridge Specific Topics
+
+```bash
+# Bridge selected topics bidirectionally
+horus bridge ros2 --topics /scan,/odom,/cmd_vel
+
+# Bridge with a specific ROS2 domain ID
+horus bridge ros2 --domain 42 --topics /scan
+```
+
+### Bridge All Topics
+
+```bash
+# Discover and bridge all available topics
+horus bridge ros2 --all
+
+# Bridge all topics in a specific namespace
+horus bridge ros2 --namespace /robot1 --all
+```
+
+### One-Way Bridging
+
+```bash
+# ROS2 → HORUS only (subscribe from ROS2)
+horus bridge ros2 --direction in --topics /scan,/odom
+
+# HORUS → ROS2 only (publish to ROS2)
+horus bridge ros2 --direction out --topics /cmd_vel
+```
+
+## Topic Naming Convention
+
+ROS2 and HORUS use different topic naming conventions. The bridge automatically translates between them:
+
+| ROS2 Topic | HORUS Topic |
+|------------|-------------|
+| `/scan` | `scan` |
+| `/robot/odom` | `robot.odom` |
+| `/robot/sensor/lidar` | `robot.sensor.lidar` |
+| `/cmd_vel` | `cmd_vel` |
+
+**Key differences:**
+- ROS2 uses `/` (forward slash) as separator
+- HORUS uses `.` (dot) as separator
+- Leading `/` is stripped
+
+When bridging `/robot/odom`:
+- ROS2 side: publishes/subscribes to `/robot/odom`
+- HORUS side: publishes/subscribes to `robot.odom`
+
+```rust
+// In your HORUS node, access the bridged topic:
+let odom = Link::consumer("robot.odom")?;  // Receives from ROS2 /robot/odom
+let cmd = Hub::new("cmd_vel")?;            // Publishes to ROS2 /cmd_vel
+```
+
+## Configuration
+
+### Bridge Direction
+
+| Direction | Description | Use Case |
+|-----------|-------------|----------|
+| `in` | ROS2 → HORUS | Consume ROS2 sensor data in HORUS |
+| `out` | HORUS → ROS2 | Send HORUS commands to ROS2 |
+| `both` | Bidirectional (default) | Full interoperability |
+
+### QoS Profiles
+
+The bridge supports multiple QoS (Quality of Service) profiles for different use cases:
+
+```bash
+# Use sensor-optimized QoS (best effort, small queue)
+horus bridge ros2 --qos sensor --topics /scan
+
+# Use reliable QoS for commands
+horus bridge ros2 --qos reliable --topics /cmd_vel
+
+# Keep all messages (for logging/recording)
+horus bridge ros2 --qos keep-all --topics /diagnostics
+```
+
+| Profile | Reliability | Durability | History | Use Case |
+|---------|-------------|------------|---------|----------|
+| `sensor` | Best Effort | Volatile | Keep Last (5) | High-frequency sensor data |
+| `default` | Reliable | Volatile | Keep Last (10) | General purpose |
+| `reliable` | Reliable | Volatile | Keep Last (10) | Commands, state |
+| `services` | Reliable | Volatile | Keep Last (10) | Service calls |
+| `keep-all` | Reliable | Transient Local | Keep All | Logging, late joiners |
+
+### Domain Configuration
+
+```bash
+# Connect to ROS2 domain 0 (default)
+horus bridge ros2 --domain 0
+
+# Connect to a different domain
+horus bridge ros2 --domain 42 --topics /scan
+```
+
+### Namespace Filtering
+
+```bash
+# Only bridge topics under /robot1
+horus bridge ros2 --namespace /robot1 --all
+
+# Bridge specific robot's topics
+horus bridge ros2 --namespace /arm_left --topics /joint_states
+```
+
+## Bridging Services
+
+ROS2 services can be bridged to allow HORUS nodes to call ROS2 services and vice versa:
+
+```bash
+# Bridge specific services
+horus bridge ros2 --services /get_map,/set_parameters
+
+# Bridge all discovered services
+horus bridge ros2 --all-services
+```
+
+### Service Call from HORUS
+
+```rust
+use horus::prelude::*; // Provides Hub
+
+// Call a bridged ROS2 service
+let client = Hub::service_client("get_map")?;
+let response = client.call(GetMapRequest::default())?;
+```
+
+## Bridging Actions
+
+ROS2 actions (long-running tasks with feedback) are also supported:
+
+```bash
+# Bridge navigation action
+horus bridge ros2 --actions /navigate_to_pose
+
+# Bridge all discovered actions
+horus bridge ros2 --all-actions
+```
+
+## TF2 Transform Bridging
+
+The bridge automatically handles TF2 transform data:
+
+```bash
+# Bridge transforms (enabled by default with --all)
+horus bridge ros2 --topics /tf,/tf_static
+```
+
+Transform messages (`TFMessage`) are automatically converted and made available on HORUS topics.
+
+## Parameter Bridging
+
+ROS2 node parameters can be exposed to HORUS:
+
+```bash
+# Bridge parameters from specific nodes
+horus bridge ros2 --param-nodes /controller_manager,/robot_state_publisher
+```
+
+## Recovery and Reliability
+
+### Auto-Recovery
+
+The bridge includes automatic recovery mechanisms:
+
+```bash
+# Enable recovery with custom settings
+horus bridge ros2 --recovery \
+  --max-retries 5 \
+  --retry-delay 1000 \
+  --backoff-multiplier 2.0 \
+  --max-delay 30000
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--max-retries` | 3 | Maximum reconnection attempts |
+| `--retry-delay` | 1000ms | Initial delay between retries |
+| `--backoff-multiplier` | 1.5 | Exponential backoff multiplier |
+| `--max-delay` | 10000ms | Maximum delay cap |
+
+### Rate Limiting
+
+Prevent overwhelming slow subscribers:
+
+```bash
+# Limit message rate per topic
+horus bridge ros2 --rate-limit 100 --topics /scan
+```
+
+## Monitoring
+
+### Bridge Statistics
+
+View real-time bridge statistics:
+
+```bash
+# Show bridge status
+horus bridge ros2 status
+
+# Show detailed per-topic stats
+horus bridge ros2 status --detailed
+```
+
+Statistics include:
+- Messages bridged per topic
+- Latency (min/avg/max)
+- Byte throughput
+- Error counts
+- Health status
+
+### Health Monitoring
+
+The bridge reports health status:
+
+| Status | Description |
+|--------|-------------|
+| `Healthy` | All connections active, no errors |
+| `Degraded` | Some topics have errors or high latency |
+| `Unhealthy` | Critical failures, bridge may be non-functional |
+
+## Supported Message Types
+
+The bridge includes built-in support for common ROS2 message types:
+
+### Geometry Messages
+- `geometry_msgs/Twist`, `TwistStamped`
+- `geometry_msgs/Pose`, `PoseStamped`, `PoseWithCovariance`
+- `geometry_msgs/Point`, `Vector3`, `Quaternion`
+- `geometry_msgs/Transform`, `TransformStamped`
+
+### Sensor Messages
+- `sensor_msgs/LaserScan`
+- `sensor_msgs/Imu`
+- `sensor_msgs/Image`, `CompressedImage`
+- `sensor_msgs/PointCloud2`
+- `sensor_msgs/JointState`
+
+### Navigation Messages
+- `nav_msgs/Odometry`
+- `nav_msgs/Path`
+- `nav_msgs/OccupancyGrid`
+
+### Standard Messages
+- `std_msgs/Header`
+- `std_msgs/String`, `Bool`, `Int32`, `Float64`
+- `builtin_interfaces/Time`, `Duration`
+
+### TF2 Messages
+- `tf2_msgs/TFMessage`
+
+### Custom Messages
+
+For custom message types, the bridge uses dynamic deserialization based on message definitions:
+
+```bash
+# Register custom message definition
+horus bridge ros2 --msg-path /path/to/my_msgs
+```
+
+## Example: Hybrid Robot System
+
+A common use case is integrating HORUS with an existing ROS2 navigation stack:
+
+```bash
+# Terminal 1: Start the bridge
+horus bridge ros2 \
+  --topics /scan,/odom,/map \
+  --direction in \
+  --topics /cmd_vel \
+  --direction out \
+  --services /get_plan \
+  --actions /navigate_to_pose
+```
+
+```rust
+// HORUS node consuming ROS2 data
+use horus::prelude::*; // Provides {Hub, Node, NodeInfo}
+
+struct NavigationNode {
+    scan: Hub<LaserScan>,
+    odom: Hub<Odometry>,
+    cmd_vel: Hub<Twist>,
+}
+
+impl Node for NavigationNode {
+    fn name(&self) -> &'static str { "navigation" }
+
+    fn tick(&mut self, ctx: Option<&mut NodeInfo>) {
+        // Read ROS2 sensor data (bridged automatically)
+        if let Some(scan) = self.scan.try_recv() {
+            // Process laser scan from ROS2
+        }
+
+        // Send velocity command (bridged to ROS2)
+        let cmd = Twist { linear: Vector3 { x: 0.5, ..Default::default() }, ..Default::default() };
+        self.cmd_vel.send(cmd, &mut ctx);
+    }
+}
+```
+
+## Troubleshooting
+
+### Bridge Not Discovering Topics
+
+1. Verify ROS2 DDS discovery is working: `ros2 topic list`
+2. Check Zenoh connectivity: `horus bridge ros2 --verbose`
+3. Ensure domain IDs match: `--domain` flag
+
+### High Latency
+
+1. Use appropriate QoS profile: `--qos sensor` for high-frequency data
+2. Enable rate limiting if subscriber is slow
+3. Check network configuration between ROS2 and HORUS hosts
+
+### Message Type Errors
+
+1. Ensure message types are registered
+2. Use `--msg-path` for custom messages
+3. Check CDR serialization compatibility
+
+## Requirements
+
+- HORUS with `zenoh-transport` feature enabled
+- ROS2 Humble, Iron, or Rolling
+- Zenoh ROS2 DDS bridge (zenoh-plugin-ros2dds)
+
+## See Also
+
+- [From ROS2 Migration](/development/from-ros) - Convert ROS2 code to native HORUS
+- [Network Communication](/concepts/network-communication) - HORUS distributed communication
+- [Communication Transport](/concepts/communication-transport) - Local vs network transport

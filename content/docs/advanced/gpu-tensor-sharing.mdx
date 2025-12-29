@@ -14,6 +14,9 @@ After reading this guide, you will understand:
 - How CUDA IPC enables zero-copy GPU memory sharing
 - When to use GPU tensor sharing vs CPU tensors
 - How to implement cross-process GPU pipelines
+- **Tensor views and slices** for zero-copy reshaping and cropping
+- **Multi-GPU P2P** for direct GPU-to-GPU transfers
+- **CUDA streams** for async operations and overlapping transfers
 - Performance characteristics and limitations
 
 ## Why GPU Tensor Sharing?
@@ -92,7 +95,7 @@ horus_core = { version = "0.1", features = ["cuda"] }
 Check availability at runtime:
 
 ```rust
-use horus::memory::{cuda_available, cuda_device_count};
+use horus::prelude::*;
 
 if cuda_available() {
     println!("CUDA available with {} devices", cuda_device_count());
@@ -104,7 +107,7 @@ if cuda_available() {
 ### Rust API
 
 ```rust
-use horus::memory::{CudaTensorPool, CudaTensorPoolConfig, TensorDtype};
+use horus::prelude::*;
 
 // Process A: Create pool and allocate tensor
 let pool = CudaTensorPool::new(1, 0, CudaTensorPoolConfig::default())?;
@@ -188,7 +191,6 @@ GPU tensors integrate with HORUS Hub and Link communication:
 
 ```rust
 use horus::prelude::*;
-use horus::memory::{TensorHandle, TensorDevice};
 
 // Allocate GPU tensor
 let handle = TensorHandle::alloc(pool, &[640, 480, 3], TensorDtype::F32, TensorDevice::Cuda0)?;
@@ -292,7 +294,6 @@ Complete example of zero-copy GPU sharing between perception and planning:
 ```rust
 // perception_node.rs
 use horus::prelude::*;
-use horus::memory::{CudaTensorPool, TensorDtype};
 
 struct PerceptionNode {
     pool: CudaTensorPool,
@@ -336,6 +337,241 @@ impl Node for PlanningNode {
     }
 }
 ```
+
+## Tensor Views and Slices
+
+CUDA tensors support zero-copy view and slice operations for efficient memory manipulation without data movement.
+
+### Creating Views
+
+Reshape a tensor without copying data:
+
+```rust
+use horus::prelude::*;
+
+let pool = CudaTensorPool::new(1, 0, Default::default())?;
+let tensor = pool.alloc(&[12, 8], TensorDtype::F32)?;  // 96 elements
+
+// Reshape to different dimensions (same total elements)
+let view_3d = tensor.view(&[4, 3, 8]).unwrap();  // 96 elements
+let view_1d = tensor.view(&[96]).unwrap();       // Flatten
+
+// Views share the same GPU memory - no copy!
+assert_eq!(tensor.numel, view_3d.numel);
+```
+
+### Slicing Tensors
+
+Extract a portion of a tensor along any dimension:
+
+```rust
+// Slice along first dimension
+let tensor = pool.alloc(&[100, 64, 64], TensorDtype::F32)?;  // Batch of 100
+
+// Get items 10-20 (zero-copy slice)
+let batch_slice = tensor.slice_first_dim(10, 20).unwrap();
+assert_eq!(batch_slice.shape[0], 10);  // 10 items
+
+// Slice along any dimension
+let spatial_crop = tensor.slice_dim(1, 16, 48).unwrap();  // Crop dim 1
+assert_eq!(spatial_crop.shape[1], 32);  // 48 - 16 = 32
+```
+
+### Dimension Manipulation
+
+```rust
+// Transpose dimensions (swaps strides, no copy)
+let tensor = pool.alloc(&[3, 224, 224], TensorDtype::F32)?;  // CHW
+let transposed = tensor.transpose(0, 2).unwrap();  // WHC
+assert_eq!(transposed.shape, [224, 224, 3]);
+
+// Squeeze: remove size-1 dimensions
+let batched = pool.alloc(&[1, 64, 64], TensorDtype::F32)?;
+let squeezed = batched.squeeze(0).unwrap();
+assert_eq!(squeezed.shape[0], 64);  // Now [64, 64]
+
+// Unsqueeze: add size-1 dimension
+let unbatched = pool.alloc(&[64, 64], TensorDtype::F32)?;
+let batched = unbatched.unsqueeze(0).unwrap();
+assert_eq!(batched.shape[0], 1);  // Now [1, 64, 64]
+```
+
+### Checking Contiguity
+
+Views and slices may become non-contiguous. Check before operations that require contiguous memory:
+
+```rust
+let tensor = pool.alloc(&[10, 20, 30], TensorDtype::F32)?;
+
+// Original is always contiguous
+assert!(tensor.is_contiguous());
+
+// Slices along first dim are contiguous
+let slice = tensor.slice_first_dim(0, 5).unwrap();
+assert!(slice.is_contiguous());
+
+// Transpose makes it non-contiguous
+let transposed = tensor.transpose(0, 1).unwrap();
+assert!(!transposed.is_contiguous());
+
+// Views require contiguous input
+assert!(transposed.view(&[6000]).is_none());  // Fails
+```
+
+## Multi-GPU Peer-to-Peer (P2P)
+
+For systems with multiple GPUs, HORUS supports direct GPU-to-GPU memory transfers without CPU involvement.
+
+### Checking P2P Capability
+
+```rust
+use horus::prelude::*;
+
+// Check if GPU 0 can access GPU 1 directly
+if P2PManager::can_access_peer(0, 1)? {
+    println!("P2P supported between GPU 0 and GPU 1");
+}
+
+// Get full P2P topology
+let topology = P2PManager::get_p2p_topology()?;
+for info in topology {
+    println!("GPU {} → GPU {}: {}",
+        info.device, info.peer_device,
+        if info.can_access { "P2P" } else { "via CPU" }
+    );
+}
+```
+
+### Enabling P2P Access
+
+```rust
+let p2p = P2PManager::new();
+
+// Enable bidirectional P2P access between two GPUs
+p2p.enable_bidirectional(0, 1)?;
+
+// Or enable one-way access
+p2p.enable_peer_access(0, 1)?;  // GPU 0 can access GPU 1
+```
+
+### P2P Memory Copies
+
+```rust
+use horus::prelude::*;
+
+let p2p = P2PManager::new();
+p2p.enable_bidirectional(0, 1)?;
+
+// Create pools on different GPUs
+let pool_gpu0 = CudaTensorPool::new(1, 0, Default::default())?;
+let pool_gpu1 = CudaTensorPool::new(2, 1, Default::default())?;
+
+// Allocate tensor on GPU 0
+let src_tensor = pool_gpu0.alloc(&[1024, 1024], TensorDtype::F32)?;
+
+// Direct P2P copy to GPU 1 (synchronous)
+let dst_tensor = p2p.copy_p2p(&pool_gpu0, &src_tensor, &pool_gpu1)?;
+
+// Async P2P copy with CUDA stream
+let stream = cuda_ffi::stream_create()?;
+let dst_tensor = pool_gpu1.alloc(&[1024, 1024], TensorDtype::F32)?;
+p2p.copy_p2p_async(&pool_gpu0, &src_tensor, &pool_gpu1, &dst_tensor, stream)?;
+cuda_ffi::stream_synchronize(stream)?;
+```
+
+### P2P Performance
+
+| Interconnect | Bandwidth | Use Case |
+|--------------|-----------|----------|
+| PCIe 3.0 x16 | ~12 GB/s | Budget multi-GPU |
+| PCIe 4.0 x16 | ~25 GB/s | Standard workstations |
+| NVLink 3.0 | ~300 GB/s | High-end compute |
+
+## CUDA Streams and Async Operations
+
+HORUS supports asynchronous GPU operations for overlapping computation and data transfer.
+
+### Creating Streams
+
+```rust
+use horus::prelude::*;
+
+// Create a non-blocking stream
+let stream = cuda_ffi::stream_create_with_flags(
+    cuda_ffi::CudaStreamFlags::NonBlocking
+)?;
+
+// Use default stream
+let default_stream = std::ptr::null_mut();
+```
+
+### Async Memory Operations
+
+```rust
+// Async device-to-host copy
+let host_buffer: Vec<f32> = vec![0.0; tensor.numel as usize];
+cuda_ffi::memcpy_async(
+    host_buffer.as_ptr() as *mut _,
+    pool.device_ptr(&tensor),
+    tensor.size as usize,
+    cuda_ffi::CudaMemcpyKind::DeviceToHost,
+    stream,
+)?;
+
+// Continue other work while copy happens...
+
+// Wait for completion when needed
+cuda_ffi::stream_synchronize(stream)?;
+```
+
+### Events for Synchronization
+
+```rust
+// Create event
+let event = cuda_ffi::event_create()?;
+
+// Record event on stream
+cuda_ffi::event_record(event, stream)?;
+
+// Wait for event from another stream
+cuda_ffi::stream_wait_event(other_stream, event)?;
+
+// Query if event completed (non-blocking)
+if cuda_ffi::event_query(event).is_ok() {
+    println!("Event completed");
+}
+```
+
+## Pinned (Page-Locked) Memory
+
+For faster CPU↔GPU transfers, use pinned host memory:
+
+```rust
+use horus::prelude::*;
+
+// Allocate pinned host memory
+let size = 1024 * 1024 * 4;  // 4MB
+let pinned_ptr = cuda_ffi::host_malloc(size)?;
+
+// Register existing memory as pinned
+let buffer: Vec<f32> = vec![0.0; 1_000_000];
+cuda_ffi::host_register(
+    buffer.as_ptr() as *mut _,
+    buffer.len() * 4,
+    cuda_ffi::CudaHostRegisterFlags::Portable,
+)?;
+
+// Unregister when done
+cuda_ffi::host_unregister(buffer.as_ptr() as *mut _)?;
+```
+
+### Pinned Memory Benefits
+
+| Transfer Type | Regular Memory | Pinned Memory | Speedup |
+|--------------|----------------|---------------|---------|
+| H→D (1GB) | ~800 MB/s | ~12 GB/s | 15x |
+| D→H (1GB) | ~800 MB/s | ~12 GB/s | 15x |
+| Async capable | No | Yes | ∞ |
 
 ## See Also
 
