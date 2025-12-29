@@ -32,17 +32,19 @@ const sections: SidebarSection[] = [
       { title: "Common Mistakes", href: "/getting-started/common-mistakes", order: 8 },
       { title: "Troubleshooting", href: "/troubleshooting", order: 9 },
       { title: "Runtime Errors", href: "/troubleshooting-runtime", order: 10 },
+      { title: "Advanced Examples", href: "/advanced-examples", order: 11 },
     ],
   },
   {
     title: "Core Concepts",
     links: [
       { title: "Overview", href: "/concepts", order: 0 },
-      { title: "Nodes", href: "/concepts/core-concepts-nodes", order: 1 },
+      { title: "Core Architecture", href: "/concepts/core", order: 1 },
+      { title: "Nodes", href: "/concepts/core-concepts-nodes", order: 2 },
       {
         title: "Communication Patterns",
         href: "/concepts/communication-overview",
-        order: 2,
+        order: 3,
         children: [
           { title: "Hub (MPMC)", href: "/concepts/core-concepts-hub", order: 1 },
           { title: "Link (SPSC)", href: "/concepts/core-concepts-link", order: 2 },
@@ -51,26 +53,26 @@ const sections: SidebarSection[] = [
       {
         title: "Communication Transport",
         href: "/concepts/communication-transport",
-        order: 3,
+        order: 4,
         children: [
           { title: "Local (Shared Memory)", href: "/concepts/core-concepts-shared-memory", order: 1 },
           { title: "Network", href: "/concepts/network-communication", order: 2 },
           { title: "Configuration", href: "/concepts/communication-configuration", order: 3 },
         ]
       },
-      { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 4 },
-      { title: "node! Macro", href: "/concepts/node-macro", order: 5 },
-      { title: "message! Macro", href: "/concepts/message-macro", order: 6 },
-      { title: "Message Types", href: "/concepts/message-types", order: 7 },
-      { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 8 },
-      { title: "Hybrid Nodes", href: "/concepts/hybrid-nodes", order: 9 },
-      { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
-      { title: "Robot Architectures", href: "/concepts/robot-architectures", order: 11 },
-      { title: "Multi-Language", href: "/concepts/multi-language", order: 12 },
+      { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 5 },
+      { title: "node! Macro", href: "/concepts/node-macro", order: 6 },
+      { title: "message! Macro", href: "/concepts/message-macro", order: 7 },
+      { title: "Message Types", href: "/concepts/message-types", order: 8 },
+      { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 9 },
+      { title: "Hybrid Nodes", href: "/concepts/hybrid-nodes", order: 10 },
+      { title: "HFrame Transforms", href: "/concepts/hframe", order: 11 },
+      { title: "Robot Architectures", href: "/concepts/robot-architectures", order: 12 },
+      { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
       {
         title: "Orchestration",
         href: "/concepts/orchestration",
-        order: 13,
+        order: 14,
         children: [
           { title: "Overview", href: "/concepts/orchestration", order: 0 },
           { title: "State Machines", href: "/concepts/state-machines", order: 1 },
@@ -83,30 +85,36 @@ const sections: SidebarSection[] = [
     title: "Rust",
     links: [
       { title: "Overview", href: "/rust", order: 0 },
+      { title: "Library Overview", href: "/rust/library", order: 1 },
       {
         title: "API Reference",
         href: "/rust/api",
-        order: 1,
+        order: 2,
         children: [
           { title: "Overview", href: "/rust/api", order: 0 },
           { title: "horus_core", href: "/rust/api/core", order: 1 },
           { title: "horus_macros", href: "/rust/api/macros", order: 2 },
           { title: "TensorPool", href: "/rust/api/tensor-pool", order: 3 },
+          { title: "Tensor Messages", href: "/rust/api/tensor-messages", order: 4 },
+          { title: "Hardware Discovery", href: "/rust/api/hardware", order: 5 },
           {
             title: "Messages",
             href: "/rust/api/messages",
-            order: 4,
+            order: 6,
             children: [
               { title: "Overview", href: "/rust/api/messages", order: 0 },
               { title: "Control", href: "/rust/api/control-messages", order: 1 },
               { title: "Coordination", href: "/rust/api/coordination-messages", order: 2 },
               { title: "Diagnostics", href: "/rust/api/diagnostics-messages", order: 3 },
               { title: "Force", href: "/rust/api/force-messages", order: 4 },
-              { title: "I/O", href: "/rust/api/io-messages", order: 5 },
-              { title: "ML", href: "/rust/api/ml-messages", order: 6 },
-              { title: "Navigation", href: "/rust/api/navigation-messages", order: 7 },
-              { title: "Perception", href: "/rust/api/perception-messages", order: 8 },
-              { title: "Vision", href: "/rust/api/vision-messages", order: 9 },
+              { title: "Geometry", href: "/rust/api/geometry-messages", order: 5 },
+              { title: "I/O", href: "/rust/api/io-messages", order: 6 },
+              { title: "ML", href: "/rust/api/ml-messages", order: 7 },
+              { title: "Navigation", href: "/rust/api/navigation-messages", order: 8 },
+              { title: "Perception", href: "/rust/api/perception-messages", order: 9 },
+              { title: "Sensor", href: "/rust/api/sensor-messages", order: 10 },
+              { title: "Timing", href: "/rust/api/timing-messages", order: 11 },
+              { title: "Vision", href: "/rust/api/vision-messages", order: 12 },
             ]
           },
         ]
@@ -114,25 +122,65 @@ const sections: SidebarSection[] = [
       {
         title: "Built-in Nodes",
         href: "/rust/library/built-in-nodes",
-        order: 2,
+        order: 3,
         children: [
           { title: "Overview", href: "/rust/library/built-in-nodes", order: 0 },
+          // Communication Buses
           { title: "I2C Bus", href: "/rust/library/built-in-nodes/i2c-bus", order: 1 },
           { title: "SPI Bus", href: "/rust/library/built-in-nodes/spi-bus", order: 2 },
           { title: "CAN Bus", href: "/rust/library/built-in-nodes/can-bus", order: 3 },
           { title: "Serial", href: "/rust/library/built-in-nodes/serial", order: 4 },
-          { title: "DC Motor", href: "/rust/library/built-in-nodes/dc-motor", order: 5 },
-          { title: "Servo Controller", href: "/rust/library/built-in-nodes/servo-controller", order: 6 },
-          { title: "Camera", href: "/rust/library/built-in-nodes/camera", order: 7 },
-          { title: "IMU", href: "/rust/library/built-in-nodes/imu", order: 8 },
-          { title: "GPS", href: "/rust/library/built-in-nodes/gps", order: 9 },
-          { title: "LiDAR", href: "/rust/library/built-in-nodes/lidar", order: 10 },
+          { title: "Modbus", href: "/rust/library/built-in-nodes/modbus", order: 5 },
+          // Motors
+          { title: "DC Motor", href: "/rust/library/built-in-nodes/dc-motor", order: 10 },
+          { title: "BLDC Motor", href: "/rust/library/built-in-nodes/bldc-motor", order: 11 },
+          { title: "Servo Controller", href: "/rust/library/built-in-nodes/servo-controller", order: 12 },
+          { title: "Stepper Motor", href: "/rust/library/built-in-nodes/stepper-motor", order: 13 },
+          { title: "Dynamixel", href: "/rust/library/built-in-nodes/dynamixel", order: 14 },
+          { title: "Roboclaw Motor", href: "/rust/library/built-in-nodes/roboclaw-motor", order: 15 },
+          { title: "Differential Drive", href: "/rust/library/built-in-nodes/differential-drive", order: 16 },
+          // Sensors
+          { title: "Camera", href: "/rust/library/built-in-nodes/camera", order: 20 },
+          { title: "Depth Camera", href: "/rust/library/built-in-nodes/depth-camera", order: 21 },
+          { title: "IMU", href: "/rust/library/built-in-nodes/imu", order: 22 },
+          { title: "GPS", href: "/rust/library/built-in-nodes/gps", order: 23 },
+          { title: "LiDAR", href: "/rust/library/built-in-nodes/lidar", order: 24 },
+          { title: "Ultrasonic", href: "/rust/library/built-in-nodes/ultrasonic", order: 25 },
+          { title: "Encoder", href: "/rust/library/built-in-nodes/encoder", order: 26 },
+          { title: "Force Torque", href: "/rust/library/built-in-nodes/force-torque", order: 27 },
+          // Input Devices
+          { title: "Joystick", href: "/rust/library/built-in-nodes/joystick", order: 30 },
+          { title: "Keyboard Input", href: "/rust/library/built-in-nodes/keyboard-input", order: 31 },
+          { title: "Digital I/O", href: "/rust/library/built-in-nodes/digital-io", order: 32 },
+          // Perception & Vision
+          { title: "Image Processor", href: "/rust/library/built-in-nodes/image-processor", order: 40 },
+          { title: "Depth Estimation", href: "/rust/library/built-in-nodes/depth-estimation", order: 41 },
+          { title: "Visual Odometry", href: "/rust/library/built-in-nodes/visual-odometry", order: 42 },
+          { title: "Pose Estimation", href: "/rust/library/built-in-nodes/pose-estimation", order: 43 },
+          { title: "Semantic Segmentation", href: "/rust/library/built-in-nodes/semantic-segmentation", order: 44 },
+          { title: "YOLO Detector", href: "/rust/library/built-in-nodes/yolo-detector", order: 45 },
+          { title: "Collision Detector", href: "/rust/library/built-in-nodes/collision-detector", order: 46 },
+          // ML & Inference
+          { title: "Cloud LLM", href: "/rust/library/built-in-nodes/cloud-llm", order: 50 },
+          { title: "Embedding", href: "/rust/library/built-in-nodes/embedding", order: 51 },
+          { title: "ONNX Inference", href: "/rust/library/built-in-nodes/onnx-inference", order: 52 },
+          { title: "TensorRT Inference", href: "/rust/library/built-in-nodes/tensorrt-inference", order: 53 },
+          { title: "TFLite Inference", href: "/rust/library/built-in-nodes/tflite-inference", order: 54 },
+          // Navigation & Control
+          { title: "Odometry", href: "/rust/library/built-in-nodes/odometry", order: 60 },
+          { title: "Localization", href: "/rust/library/built-in-nodes/localization", order: 61 },
+          { title: "Path Planner", href: "/rust/library/built-in-nodes/path-planner", order: 62 },
+          { title: "PID Controller", href: "/rust/library/built-in-nodes/pid-controller", order: 63 },
+          // Safety & Monitoring
+          { title: "Battery Monitor", href: "/rust/library/built-in-nodes/battery-monitor", order: 70 },
+          { title: "Safety Monitor", href: "/rust/library/built-in-nodes/safety-monitor", order: 71 },
+          { title: "Emergency Stop", href: "/rust/library/built-in-nodes/emergency-stop", order: 72 },
         ]
       },
       {
         title: "Algorithms",
         href: "/rust/library/algorithms",
-        order: 3,
+        order: 4,
         children: [
           { title: "Overview", href: "/rust/library/algorithms", order: 0 },
           { title: "PID Controller", href: "/rust/library/algorithms/pid", order: 1 },
@@ -144,12 +192,19 @@ const sections: SidebarSection[] = [
           { title: "Differential Drive", href: "/rust/library/algorithms/differential-drive", order: 7 },
           { title: "Occupancy Grid", href: "/rust/library/algorithms/occupancy-grid", order: 8 },
           { title: "Sensor Fusion", href: "/rust/library/algorithms/sensor-fusion", order: 9 },
+          { title: "AABB Collision", href: "/rust/library/algorithms/aabb", order: 10 },
+          { title: "Safety Layer", href: "/rust/library/algorithms/safety-layer", order: 11 },
         ]
+      },
+      {
+        title: "Drivers",
+        href: "/rust/library/drivers",
+        order: 5,
       },
       {
         title: "Examples",
         href: "/rust/examples",
-        order: 4,
+        order: 6,
         children: [
           { title: "Basic Examples", href: "/rust/examples/basic-examples", order: 1 },
           { title: "Advanced Examples", href: "/rust/examples/advanced-examples", order: 2 },
@@ -161,12 +216,29 @@ const sections: SidebarSection[] = [
     title: "Python",
     links: [
       { title: "Overview", href: "/python", order: 0 },
-      { title: "Python Bindings", href: "/python/api/python-bindings", order: 1 },
-      { title: "Async Nodes", href: "/python/api/async-nodes", order: 2 },
-      { title: "Message Library", href: "/python/library/python-message-library", order: 3 },
-      { title: "Hardware Nodes", href: "/python/library/python-hardware-nodes", order: 4 },
-      { title: "ML Utilities", href: "/python/library/ml-utilities", order: 5 },
-      { title: "Examples", href: "/python/examples", order: 6 },
+      {
+        title: "API Reference",
+        href: "/python/api",
+        order: 1,
+        children: [
+          { title: "Overview", href: "/python/api", order: 0 },
+          { title: "Python Bindings", href: "/python/api/python-bindings", order: 1 },
+          { title: "Async Nodes", href: "/python/api/async-nodes", order: 2 },
+          { title: "Custom Messages", href: "/python/api/custom-messages", order: 3 },
+        ]
+      },
+      {
+        title: "Library",
+        href: "/python/library",
+        order: 2,
+        children: [
+          { title: "Overview", href: "/python/library", order: 0 },
+          { title: "Message Library", href: "/python/library/python-message-library", order: 1 },
+          { title: "Hardware Nodes", href: "/python/library/python-hardware-nodes", order: 2 },
+          { title: "ML Utilities", href: "/python/library/ml-utilities", order: 3 },
+        ]
+      },
+      { title: "Examples", href: "/python/examples", order: 3 },
     ],
   },
   {
@@ -216,6 +288,11 @@ const sections: SidebarSection[] = [
       { title: "Error Handling", href: "/development/error-handling", order: 9 },
       { title: "AI Integration", href: "/development/ai-integration", order: 10 },
       { title: "ROS2 Bridge", href: "/development/ros2-bridge", order: 11 },
+      { title: "Migrate from ROS", href: "/development/from-ros", order: 12 },
+      { title: "Hardware Discovery", href: "/development/hardware-discovery", order: 13 },
+      { title: "Sim3D Editor", href: "/development/sim3d-editor", order: 14 },
+      { title: "Sim3D Multi-Robot", href: "/development/sim3d-multi-robot", order: 15 },
+      { title: "Sim3D Recording", href: "/development/sim3d-recording", order: 16 },
     ],
   },
   {
@@ -233,6 +310,9 @@ const sections: SidebarSection[] = [
       { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },
       { title: "Checkpoint System", href: "/advanced/checkpoint", order: 11 },
       { title: "Model Registry", href: "/advanced/model-registry", order: 12 },
+      { title: "Record & Replay", href: "/advanced/record-replay", order: 13 },
+      { title: "Redundancy", href: "/advanced/redundancy", order: 14 },
+      { title: "Telemetry", href: "/advanced/telemetry", order: 15 },
     ],
   },
   {
