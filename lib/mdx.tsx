@@ -27,6 +27,10 @@ import {
   PythonThroughputChart,
   PythonStressChart,
   PythonRustComparisonChart,
+  HFrameLatencyChart,
+  HFrameSpeedupChart,
+  HFrameMemoryChart,
+  HFrameConcurrentChart,
 } from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
 
@@ -103,6 +107,11 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
         PythonThroughputChart,
         PythonStressChart,
         PythonRustComparisonChart,
+        // HFrame charts
+        HFrameLatencyChart,
+        HFrameSpeedupChart,
+        HFrameMemoryChart,
+        HFrameConcurrentChart,
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {

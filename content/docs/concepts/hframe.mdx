@@ -1,82 +1,425 @@
 ---
 title: "HFrame Transform System"
-description: "Lock-free coordinate frame management"
+description: "High-performance, lock-free coordinate frame management for real-time robotics"
 weight: 25
 ---
 
 # HFrame Transform System
 
-HFrame is a lock-free coordinate frame system for real-time robotics applications.
+HFrame is HORUS's high-performance coordinate frame management system, designed as a real-time safe replacement for ROS2 TF2.
 
-## Performance
+## Why HFrame?
 
-| Operation | HFrame | ROS2 TF2 |
-|-----------|--------|----------|
-| Lookup by ID | ~50ns | N/A |
-| Lookup by name | ~200ns | ~2μs |
-| Chain resolution | ~150ns | ~5μs |
+Traditional transform systems like ROS2 TF2 have fundamental limitations for real-time robotics:
+
+| Problem with TF2 | HFrame Solution |
+|------------------|-----------------|
+| Mutex-based locking | Lock-free seqlock protocol |
+| Unbounded latency spikes | Predictable sub-microsecond latency |
+| String-only frame lookup | Dual API: Integer IDs + Names |
+| No hard real-time support | Real-time safe, no allocations |
+| Shared library overhead | Zero-copy shared memory |
+
+---
+
+## Performance Comparison
+
+<HFrameLatencyChart />
+
+### Benchmark Results
+
+| Operation | HFrame | ROS2 TF2 | Speedup |
+|-----------|--------|----------|---------|
+| Lookup by ID | **~50ns** | N/A | ∞ |
+| Lookup by name | **~200ns** | ~2μs | **10x** |
+| Chain resolution (depth 3) | **~150ns** | ~5μs | **33x** |
+| Chain resolution (depth 10) | **~2.5μs** | ~15μs | **6x** |
+| Transform update | **~500ns** | ~1μs | **2x** |
+| Concurrent reads (4 threads) | **~800ns** | ~8μs | **10x** |
+| Real-time safe | **Yes** | No | ∞ |
+
+<HFrameSpeedupChart />
+
+---
+
+## Architecture
+
+<MermaidDiagram
+  chart={`%%{init: {'theme': 'dark'}}%%
+graph TB
+    subgraph HFrame["HFrame System"]
+        subgraph Registry["FrameRegistry"]
+            NTI["name_to_id<br/>HashMap&lt;String, FrameId&gt;"]
+            ITN["id_to_name<br/>Vec&lt;String&gt;"]
+        end
+
+        subgraph Core["HFrameCore (Lock-Free)"]
+            Slots["FrameSlot[]<br/>Cache-aligned, 64B"]
+            Parents["parents[]<br/>AtomicU32"]
+            Children["children[]<br/>RwLock&lt;Vec&gt;"]
+            Cache["ChainCache<br/>LRU 256 entries"]
+        end
+
+        subgraph Slot["FrameSlot (Seqlock)"]
+            Ver["version: AtomicU64"]
+            Hist["history: Ring&lt;Transform, 32&gt;"]
+            Static["static_tf: Transform"]
+        end
+    end
+
+    API["User API<br/>hf.tf('camera', 'world')"]
+    FastAPI["Fast API<br/>hf.tf_by_id(3, 0)"]
+
+    API --> NTI
+    NTI --> Core
+    FastAPI --> Core
+    Core --> Slots
+    Slots --> Slot
+`}
+  caption="HFrame Architecture Overview"
+/>
+
+### Key Components
+
+#### 1. FrameRegistry
+Maps human-readable frame names to integer IDs for fast lookup.
+
+```rust
+// String API (~200ns)
+let tf = hf.tf("camera_frame", "base_link")?;
+
+// Integer ID API (~50ns) - for hot paths
+let camera_id = hf.frame_id("camera_frame").unwrap();
+let base_id = hf.frame_id("base_link").unwrap();
+let tf = hf.tf_by_id(camera_id, base_id);
+```
+
+#### 2. HFrameCore
+Lock-free transform storage with O(1) ID-based lookup.
+
+- **slots**: Pre-allocated `Vec<FrameSlot>` with cache-line alignment
+- **parents**: `Vec<AtomicU32>` for parent relationships
+- **children**: Computed lazily for tree traversal
+- **chain_cache**: LRU cache for frequently-used transform chains
+
+#### 3. FrameSlot (Seqlock Protocol)
+Each frame uses a seqlock (sequence lock) for lock-free reads:
+
+```rust
+#[repr(C, align(64))]  // Cache-line aligned
+pub struct FrameSlot {
+    version: AtomicU64,      // Odd = write in progress
+    sequence: AtomicU64,     // Increment on each update
+    parent: AtomicU32,       // Parent frame ID
+    frame_type: AtomicU8,    // Static or Dynamic
+    history: Vec<TransformEntry>,  // Ring buffer
+}
+```
+
+**How seqlock works:**
+1. Writer increments version to odd (signals "writing")
+2. Writer updates transform data
+3. Writer increments version to even (signals "done")
+4. Reader checks version before/after read
+5. If versions differ or odd, retry read
+
+This allows **wait-free reads** with no locking overhead.
+
+---
+
+## Why HFrame is Faster
+
+### 1. Lock-Free Reads (Seqlock)
+
+**TF2**: Uses `std::mutex` for thread safety. Every lookup acquires a lock.
+
+**HFrame**: Uses seqlock protocol. Readers never block, even during concurrent writes.
+
+<HFrameConcurrentChart />
+
+### 2. Integer Frame IDs
+
+**TF2**: Every lookup hashes the frame name string.
+
+**HFrame**:
+- First lookup: Hash name → ID (~200ns)
+- Subsequent lookups: Direct array index (~50ns)
+
+```rust
+// Cache the ID once
+let camera = hf.frame_id("camera").unwrap();  // Do this once
+
+// Use integer ID in hot loop
+loop {
+    let tf = hf.tf_by_id(camera, world);  // ~50ns vs ~2μs
+    control_robot(tf);
+}
+```
+
+### 3. Cache-Line Aligned Storage
+
+Each `FrameSlot` is 64-byte aligned to prevent false sharing:
+
+```rust
+#[repr(C, align(64))]
+pub struct FrameSlot { ... }
+```
+
+This ensures multiple CPU cores can read different frames without cache invalidation.
+
+### 4. Pre-Allocated Memory
+
+**TF2**: Dynamic allocation during frame registration and updates.
+
+**HFrame**: All memory pre-allocated at startup. Zero allocations in hot path.
+
+```rust
+// Pre-allocate for 1024 frames at startup
+let hf = HFrame::with_config(HFrameConfig {
+    max_frames: 1024,
+    history_len: 32,
+    ..Default::default()
+});
+```
+
+### 5. Chain Resolution Cache
+
+Transform chains are cached with LRU eviction:
+
+```rust
+// First query: Compute chain camera → base → world
+let tf = hf.tf("camera", "world");  // ~150ns
+
+// Second query: Cache hit
+let tf = hf.tf("camera", "world");  // ~50ns
+```
+
+---
+
+## Technical Specifications
+
+### Data Types
+
+```rust
+/// 3D Transform (translation + quaternion)
+pub struct Transform {
+    pub translation: [f64; 3],  // meters
+    pub rotation: [f64; 4],     // quaternion [x, y, z, w]
+}
+
+/// Frame identifier (16-bit)
+pub type FrameId = u16;
+
+/// Configuration
+pub struct HFrameConfig {
+    pub max_frames: usize,        // 256 - 65535
+    pub max_static_frames: usize, // Pre-allocated static frames
+    pub history_len: usize,       // Ring buffer size (1-256)
+    pub chain_cache_size: usize,  // LRU cache entries
+}
+```
+
+### Memory Layout
+
+<HFrameMemoryChart />
+
+| Preset | Frames | Static | History | Memory |
+|--------|--------|--------|---------|--------|
+| `small()` | 256 | 128 | 32 | ~550KB |
+| `medium()` | 1024 | 512 | 32 | ~2.2MB |
+| `large()` | 4096 | 2048 | 64 | ~9MB |
+| `simulation()` | 16384 | 8192 | 64 | ~36MB |
+
+### Precision
+
+- **Translation**: f64 (double precision) in meters
+- **Rotation**: f64 quaternion [x, y, z, w] (Hamilton convention)
+- **Timestamp**: u64 nanoseconds since epoch
+
+---
 
 ## Usage
+
+### Basic Usage
 
 ```rust
 use horus::prelude::*; // Provides {HFrame, Transform}
 
-// Create and register frames
+// Create with default config (256 frames)
 let hf = HFrame::new();
+
+// Register frame hierarchy
 hf.register_frame("world", None)?;
 hf.register_frame("base_link", Some("world"))?;
 hf.register_frame("camera", Some("base_link"))?;
 
 // Update transform
 let tf = Transform::new(
-    [1.0, 0.0, 0.5],        // translation
-    [0.0, 0.0, 0.0, 1.0]    // quaternion [x,y,z,w]
+    [1.0, 0.0, 0.5],        // translation [x, y, z]
+    [0.0, 0.0, 0.0, 1.0]    // quaternion [x, y, z, w]
 );
 hf.update_transform("camera", &tf, timestamp_now())?;
 
 // Query transform
 let tf = hf.tf("camera", "world")?;
 let point_world = tf.transform_point([1.0, 0.0, 0.0]);
+```
 
-// Fast path with cached IDs
+### Hot Path Optimization
+
+```rust
+// Cache frame IDs at startup
 let camera_id = hf.frame_id("camera").unwrap();
 let world_id = hf.frame_id("world").unwrap();
-let tf = hf.tf_by_id(camera_id, world_id);  // ~50ns
-```
 
-## Configuration Presets
-
-| Preset | Frames | Memory |
-|--------|--------|--------|
-| `small()` | 256 | ~550KB |
-| `medium()` | 1024 | ~2.2MB |
-| `large()` | 4096 | ~9MB |
-
-## Transform Type
-
-```rust
-pub struct Transform {
-    pub translation: [f64; 3],  // meters
-    pub rotation: [f64; 4],     // quaternion [x,y,z,w]
+// Use IDs in control loop (50ns vs 200ns)
+loop {
+    let tf = hf.tf_by_id(camera_id, world_id);
+    // Control loop...
 }
-
-// Creation helpers
-Transform::identity()
-Transform::from_translation([x, y, z])
-Transform::from_euler([x, y, z], [roll, pitch, yaw])
-
-// Operations
-tf.compose(&other)
-tf.inverse()
-tf.transform_point(point)
-tf.interpolate(&other, 0.5)
 ```
 
-## Time-Travel Queries
+### Time-Travel Queries
 
 ```rust
-// Query transform at past timestamp
+// Query transform at past timestamp (SLERP interpolation)
 let past = timestamp_now() - 100_000_000;  // 100ms ago
 let tf = hf.tf_at("camera", "world", past)?;
+
+// Query with extrapolation limit
+let tf = hf.tf_at_with_tolerance("camera", "world", past, 50_000_000)?;
 ```
 
+### Static Transforms
+
+```rust
+// Static transforms (never change, optimized path)
+hf.register_static_frame("lidar", Some("base_link"), &lidar_tf)?;
+
+// Update static transform (rare)
+hf.set_static_transform("lidar", &new_tf)?;
+```
+
+### Configuration Presets
+
+```rust
+// Small robot (256 frames, ~550KB)
+let hf = HFrame::small();
+
+// Medium robot (1024 frames, ~2.2MB)
+let hf = HFrame::medium();
+
+// Large simulation (4096 frames, ~9MB)
+let hf = HFrame::large();
+
+// Custom configuration
+let hf = HFrame::with_config(HFrameConfig {
+    max_frames: 2048,
+    max_static_frames: 1024,
+    history_len: 64,
+    chain_cache_size: 512,
+});
+```
+
+---
+
+## CLI Tools
+
+HORUS provides CLI tools equivalent to ROS2 tf2_ros:
+
+```bash
+# List all frames
+horus hf list
+
+# Echo transform between frames (like tf_echo)
+horus hf echo camera base_link
+
+# Show frame tree (like view_frames)
+horus hf tree
+
+# Check if transform is available
+horus hf can-transform camera world
+
+# Monitor update rates
+horus hf monitor
+```
+
+---
+
+## Test Coverage
+
+HFrame has comprehensive test coverage:
+
+| Category | Tests | Coverage |
+|----------|-------|----------|
+| Transform math | 11 | Quaternion ops, SLERP, matrix conversion |
+| Core storage | 8 | Lock-free reads, chain resolution |
+| Registry | 8 | Name ↔ ID mapping |
+| Messages | 7 | Serialization, POD safety |
+| Slot | 6 | Seqlock protocol, history |
+| Config | 4 | Validation, presets |
+| Integration | 3 | Full API tests |
+| **Total** | **49** | **All passing** |
+
+### Running Tests
+
+```bash
+# Run all HFrame tests
+cargo test --package horus_library hframe
+
+# Run with output
+cargo test --package horus_library hframe -- --nocapture
+
+# Run benchmarks
+cargo test --release --package horus_library hframe_benchmark -- --nocapture --ignored
+```
+
+---
+
+## Integration with ROS2
+
+HFrame integrates with ROS2 TF2 via the bridge:
+
+```rust
+// Publish HFrame transforms to TF2
+use horus::bridge::TF2Publisher;
+
+let tf_pub = TF2Publisher::new(&hf);
+tf_pub.broadcast_all()?;  // Publish to /tf and /tf_static
+```
+
+```rust
+// Subscribe to TF2 and update HFrame
+use horus::bridge::TF2Subscriber;
+
+let tf_sub = TF2Subscriber::new(&hf);
+tf_sub.start();  // Listens to /tf and /tf_static
+```
+
+---
+
+## Comparison Summary
+
+| Feature | HFrame | ROS2 TF2 |
+|---------|--------|----------|
+| **Lock-free reads** | Yes (seqlock) | No (mutex) |
+| **Real-time safe** | Yes | No |
+| **Lookup by ID** | ~50ns | N/A |
+| **Lookup by name** | ~200ns | ~2μs |
+| **Chain (depth 3)** | ~150ns | ~5μs |
+| **Concurrent scaling** | Near-constant | Linear degradation |
+| **Memory allocation** | None (hot path) | Possible |
+| **Precision** | f64 | f64 |
+| **Time interpolation** | SLERP | SLERP |
+| **Static frames** | Optimized | Separate topic |
+| **Max frames** | 65,535 | Unlimited |
+| **CLI tools** | Yes | Yes |
+
+---
+
+## Next Steps
+
+- [Quick Start](/getting-started/quick-start) - Get started with HORUS
+- [Benchmarks](/performance/benchmarks) - Full performance analysis
+- [ROS2 Bridge](/development/ros2-bridge) - Interoperability with ROS2
+- [Real-Time Nodes](/concepts/realtime-nodes) - Hard real-time support

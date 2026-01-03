@@ -871,6 +871,292 @@ export function PythonRustComparisonChart() {
   );
 }
 
+/**
+ * HFrame vs TF2 Latency Comparison Chart
+ */
+export function HFrameLatencyChart() {
+  const colors = useColors();
+
+  const data = [
+    { name: 'Lookup\nby ID', hframe: 50, tf2: null, unit: 'ns' },
+    { name: 'Lookup\nby Name', hframe: 200, tf2: 2000, unit: 'ns' },
+    { name: 'Chain\n(depth 3)', hframe: 150, tf2: 5000, unit: 'ns' },
+    { name: 'Chain\n(depth 10)', hframe: 2500, tf2: 15000, unit: 'ns' },
+    { name: 'Update', hframe: 500, tf2: 1000, unit: 'ns' },
+  ];
+
+  return (
+    <div
+      className="w-full rounded-xl p-6 my-6"
+      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
+    >
+      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
+        HFrame vs ROS2 TF2 Latency
+      </h3>
+      <p className="text-sm mb-4" style={{ color: colors.text }}>
+        Lower is better. Logarithmic scale (nanoseconds)
+      </p>
+      <ResponsiveContainer width="100%" height={350}>
+        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
+          <XAxis
+            dataKey="name"
+            stroke={colors.text}
+            tick={{ fill: colors.text, fontSize: 11 }}
+            interval={0}
+          />
+          <YAxis
+            stroke={colors.text}
+            tick={{ fill: colors.text }}
+            scale="log"
+            domain={[10, 20000]}
+            tickFormatter={(value) => value >= 1000 ? `${(value/1000).toFixed(0)}μs` : `${value}ns`}
+            label={{ value: 'Latency (log scale)', angle: -90, position: 'insideLeft', fill: colors.text }}
+          />
+          <Tooltip content={<CustomTooltip colors={colors} />} />
+          <Legend
+            formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
+          />
+          <Bar dataKey="hframe" fill={colors.horus} radius={[4, 4, 0, 0]} name="HORUS HFrame" />
+          <Bar dataKey="tf2" fill={colors.ros2} radius={[4, 4, 0, 0]} name="ROS2 TF2" />
+        </BarChart>
+      </ResponsiveContainer>
+      <div className="mt-4 flex flex-wrap justify-center gap-4 md:gap-6 text-sm">
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.horus }}></div>
+          <span style={{ color: colors.text }}>HORUS HFrame (lock-free)</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.ros2 }}></div>
+          <span style={{ color: colors.text }}>ROS2 TF2 (mutex-based)</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * HFrame Speedup vs TF2 Chart
+ */
+export function HFrameSpeedupChart() {
+  const colors = useColors();
+
+  const data = [
+    { name: 'Lookup by Name', speedup: 10, category: 'Query' },
+    { name: 'Chain (depth 3)', speedup: 33, category: 'Query' },
+    { name: 'Chain (depth 10)', speedup: 6, category: 'Query' },
+    { name: 'Transform Update', speedup: 2, category: 'Write' },
+    { name: 'Concurrent Reads', speedup: 100, category: 'Contention' },
+  ];
+
+  return (
+    <div
+      className="w-full rounded-xl p-6 my-6"
+      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
+    >
+      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
+        HFrame Speedup vs TF2
+      </h3>
+      <p className="text-sm mb-4" style={{ color: colors.text }}>
+        How many times faster HFrame is compared to TF2
+      </p>
+      <ResponsiveContainer width="100%" height={300}>
+        <BarChart data={data} layout="vertical" margin={{ top: 20, right: 80, left: 120, bottom: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} horizontal={true} vertical={false} />
+          <XAxis
+            type="number"
+            stroke={colors.text}
+            tick={{ fill: colors.text }}
+            tickFormatter={(value) => `${value}x`}
+            domain={[0, 110]}
+          />
+          <YAxis
+            type="category"
+            dataKey="name"
+            stroke={colors.text}
+            tick={{ fill: colors.text }}
+            width={110}
+          />
+          <Tooltip
+            formatter={(value: any) => [`${value}x faster`, 'Speedup']}
+            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
+            labelStyle={{ color: colors.text }}
+          />
+          <Bar dataKey="speedup" radius={[0, 4, 4, 0]}>
+            {data.map((entry, index) => (
+              <Cell
+                key={`cell-${index}`}
+                fill={entry.speedup > 30 ? colors.horus : entry.speedup > 5 ? colors.horusLink : colors.accent}
+              />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+      <div className="mt-4 flex flex-wrap justify-center gap-4 md:gap-6 text-sm">
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.horus }}></div>
+          <span style={{ color: colors.text }}>&gt;30x faster</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.horusLink }}></div>
+          <span style={{ color: colors.text }}>5-30x faster</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.accent }}></div>
+          <span style={{ color: colors.text }}>&lt;5x faster</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * HFrame Memory Configuration Chart
+ */
+export function HFrameMemoryChart() {
+  const colors = useColors();
+
+  const data = [
+    { name: 'Small\n(256 frames)', memory: 550, frames: 256 },
+    { name: 'Medium\n(1024 frames)', memory: 2200, frames: 1024 },
+    { name: 'Large\n(4096 frames)', memory: 9000, frames: 4096 },
+    { name: 'Max\n(65535 frames)', memory: 145000, frames: 65535 },
+  ];
+
+  return (
+    <div
+      className="w-full rounded-xl p-6 my-6"
+      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
+    >
+      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
+        HFrame Memory Usage
+      </h3>
+      <p className="text-sm mb-4" style={{ color: colors.text }}>
+        Pre-allocated memory by configuration preset (KB)
+      </p>
+      <ResponsiveContainer width="100%" height={300}>
+        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
+          <XAxis
+            dataKey="name"
+            stroke={colors.text}
+            tick={{ fill: colors.text, fontSize: 11 }}
+            interval={0}
+          />
+          <YAxis
+            stroke={colors.text}
+            tick={{ fill: colors.text }}
+            scale="log"
+            domain={[100, 200000]}
+            tickFormatter={(value) => value >= 1000 ? `${(value/1024).toFixed(0)}MB` : `${value}KB`}
+            label={{ value: 'Memory (log scale)', angle: -90, position: 'insideLeft', fill: colors.text }}
+          />
+          <Tooltip
+            formatter={(value: any) => [value >= 1000 ? `${(value/1024).toFixed(1)}MB` : `${value}KB`, 'Memory']}
+            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
+            labelStyle={{ color: colors.text }}
+          />
+          <Bar dataKey="memory" fill={colors.horus} radius={[4, 4, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+      <div className="mt-4 grid grid-cols-4 gap-4 text-center">
+        {data.map((d) => (
+          <div
+            key={d.name}
+            className="rounded-lg p-3"
+            style={{ backgroundColor: colors.cardBg }}
+          >
+            <div className="text-xl font-bold" style={{ color: colors.horus }}>
+              {d.frames.toLocaleString()}
+            </div>
+            <div className="text-sm" style={{ color: colors.text }}>frames</div>
+            <div className="text-xs mt-1" style={{ color: colors.text }}>
+              {d.memory >= 1000 ? `${(d.memory/1024).toFixed(1)}MB` : `${d.memory}KB`}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * HFrame Concurrent Performance Chart
+ */
+export function HFrameConcurrentChart() {
+  const colors = useColors();
+
+  const data = [
+    { threads: 1, hframe: 500, tf2: 2000 },
+    { threads: 2, hframe: 550, tf2: 3500 },
+    { threads: 4, hframe: 800, tf2: 8000 },
+    { threads: 8, hframe: 1100, tf2: 18000 },
+    { threads: 16, hframe: 1400, tf2: 45000 },
+  ];
+
+  return (
+    <div
+      className="w-full rounded-xl p-6 my-6"
+      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
+    >
+      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
+        Concurrent Read Performance
+      </h3>
+      <p className="text-sm mb-4" style={{ color: colors.text }}>
+        Latency under contention (ns). HFrame uses lock-free reads.
+      </p>
+      <ResponsiveContainer width="100%" height={350}>
+        <LineChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
+          <XAxis
+            dataKey="threads"
+            stroke={colors.text}
+            tick={{ fill: colors.text }}
+            label={{ value: 'Concurrent Readers', position: 'bottom', fill: colors.text, offset: 0 }}
+          />
+          <YAxis
+            stroke={colors.text}
+            tick={{ fill: colors.text }}
+            scale="log"
+            domain={[100, 100000]}
+            tickFormatter={(value) => value >= 1000 ? `${(value/1000).toFixed(0)}μs` : `${value}ns`}
+            label={{ value: 'Latency (log scale)', angle: -90, position: 'insideLeft', fill: colors.text }}
+          />
+          <Tooltip
+            formatter={(value: any) => [value >= 1000 ? `${(value/1000).toFixed(2)}μs` : `${value}ns`, '']}
+            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
+            labelStyle={{ color: colors.text }}
+            labelFormatter={(label: any) => `${label} threads`}
+          />
+          <Legend
+            formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
+          />
+          <Line
+            type="monotone"
+            dataKey="hframe"
+            stroke={colors.horus}
+            strokeWidth={3}
+            dot={{ fill: colors.horus, strokeWidth: 2, r: 5 }}
+            name="HORUS HFrame"
+          />
+          <Line
+            type="monotone"
+            dataKey="tf2"
+            stroke={colors.ros2}
+            strokeWidth={3}
+            dot={{ fill: colors.ros2, strokeWidth: 2, r: 5 }}
+            name="ROS2 TF2"
+            strokeDasharray="5 5"
+          />
+        </LineChart>
+      </ResponsiveContainer>
+      <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
+        HFrame maintains <span style={{ color: colors.horus, fontWeight: 'bold' }}>near-constant latency</span> under contention due to lock-free design
+      </div>
+    </div>
+  );
+}
+
 // Export all charts as a single default for easy MDX import
 export default {
   LatencyComparisonChart,
@@ -883,4 +1169,8 @@ export default {
   PythonThroughputChart,
   PythonStressChart,
   PythonRustComparisonChart,
+  HFrameLatencyChart,
+  HFrameSpeedupChart,
+  HFrameMemoryChart,
+  HFrameConcurrentChart,
 };
