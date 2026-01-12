@@ -1,0 +1,532 @@
+---
+title: "DriverLoader Configuration"
+description: "Configure driver loading modes: static, dynamic, and hybrid. Plugin discovery, auto-detection, and runtime management."
+weight: 27
+---
+
+# DriverLoader Configuration
+
+The `DriverLoader` is the central interface for managing HORUS drivers. It supports three loading modes and provides unified access to both static (compiled) and dynamic (runtime-loaded) drivers.
+
+---
+
+## Driver Loading Modes
+
+HORUS supports three driver loading modes:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Static** | Drivers compiled into binary | Production, embedded systems |
+| **Dynamic** | Drivers loaded at runtime | Development, plugin ecosystem |
+| **Hybrid** | Core static, specialized dynamic | Production with extensibility |
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Driver Loading Modes                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  STATIC MODE                    DYNAMIC MODE                     │
+│  ┌─────────────┐               ┌─────────────┐                  │
+│  │  Compiled   │               │  .so/.dylib │                  │
+│  │   Drivers   │               │   Plugins   │                  │
+│  └──────┬──────┘               └──────┬──────┘                  │
+│         │                              │                         │
+│         ▼                              ▼                         │
+│  ┌─────────────┐               ┌─────────────┐                  │
+│  │    Zero     │               │   dlopen()  │                  │
+│  │   Overhead  │               │    Load     │                  │
+│  └──────┬──────┘               └──────┬──────┘                  │
+│         │                              │                         │
+│         └──────────────┬───────────────┘                        │
+│                        ▼                                         │
+│               ┌─────────────────┐                                │
+│               │  DriverLoader   │                                │
+│               │   Unified API   │                                │
+│               └─────────────────┘                                │
+│                                                                  │
+│  HYBRID MODE: Static + Dynamic combined                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Configuration File
+
+Configure driver loading in `horus.yaml`:
+
+```yaml
+# horus.yaml
+
+# Driver loading mode: static, dynamic, or hybrid
+driver_mode: hybrid
+
+# Plugin configuration
+plugins:
+  # Search paths for dynamic plugins
+  search_paths:
+    - ~/.horus/drivers
+    - /usr/local/lib/horus/drivers
+    - ./plugins
+
+  # Auto-discover plugins in search paths (default: true)
+  auto_discover: true
+
+  # For hybrid mode: drivers to load statically
+  static:
+    - horus-imu          # IMU drivers (compiled in)
+    - horus-motor        # Motor drivers (compiled in)
+
+  # For hybrid mode: drivers to load dynamically
+  dynamic:
+    - horus-camera-fancy  # Specialized camera (loaded at runtime)
+    - horus-lidar-velodyne # Third-party LiDAR plugin
+```
+
+---
+
+## Static Mode
+
+In static mode, drivers are compiled into the binary via Cargo feature flags.
+
+### Cargo.toml Configuration
+
+```toml
+[dependencies]
+horus = { version = "0.5", features = ["static-drivers"] }
+
+[features]
+default = []
+
+# Enable specific hardware drivers
+mpu6050-imu = ["horus/mpu6050-imu"]
+bno055-imu = ["horus/bno055-imu"]
+rplidar = ["horus/rplidar"]
+v4l2-camera = ["horus/v4l2-camera"]
+
+# All drivers
+full-hardware = ["mpu6050-imu", "bno055-imu", "rplidar", "v4l2-camera"]
+```
+
+### Static Registration
+
+```rust
+use horus::prelude::*;
+use horus::plugin::{DriverLoader, DriverLoaderConfig, DriverMode};
+
+fn main() -> HorusResult<()> {
+    // Create static mode loader
+    let config = DriverLoaderConfig {
+        mode: DriverMode::Static,
+        ..Default::default()
+    };
+
+    let mut loader = DriverLoader::new(config);
+
+    // Register compiled-in drivers
+    #[cfg(feature = "mpu6050-imu")]
+    loader.register_static(Box::new(Mpu6050Plugin));
+
+    #[cfg(feature = "bno055-imu")]
+    loader.register_static(Box::new(Bno055Plugin));
+
+    #[cfg(feature = "rplidar")]
+    loader.register_static(Box::new(RplidarPlugin));
+
+    // Initialize (validates registration)
+    loader.initialize()?;
+
+    // List available drivers
+    println!("Available drivers: {:?}", loader.available_drivers());
+
+    Ok(())
+}
+```
+
+### Advantages of Static Mode
+
+- **Zero runtime overhead** - No dlopen, no dynamic dispatch
+- **Single binary deployment** - Everything in one executable
+- **Smaller binary** - Only compile what you need
+- **Startup time** - Drivers ready immediately
+
+---
+
+## Dynamic Mode
+
+In dynamic mode, drivers are loaded at runtime from shared libraries (`.so` on Linux, `.dylib` on macOS).
+
+### Enable Dynamic Plugins
+
+```toml
+[dependencies]
+horus = { version = "0.5", features = ["dynamic-plugins"] }
+```
+
+### Configuration
+
+```yaml
+# horus.yaml
+driver_mode: dynamic
+
+plugins:
+  search_paths:
+    - ~/.horus/drivers
+    - /usr/local/lib/horus/drivers
+  auto_discover: true
+```
+
+### Usage
+
+```rust
+use horus::prelude::*;
+use horus::plugin::{DriverLoader, DriverLoaderConfig, DriverMode};
+
+fn main() -> HorusResult<()> {
+    // Create dynamic mode loader
+    let config = DriverLoaderConfig {
+        mode: DriverMode::Dynamic,
+        search_paths: vec![
+            "~/.horus/drivers".into(),
+            "/usr/local/lib/horus/drivers".into(),
+        ],
+        auto_discover: true,
+        ..Default::default()
+    };
+
+    let mut loader = DriverLoader::new(config);
+
+    // Initialize discovers plugins in search paths
+    loader.initialize()?;
+
+    // List discovered drivers
+    for driver_id in loader.available_drivers() {
+        println!("Discovered: {}", driver_id);
+    }
+
+    // Load and use a driver
+    let config = SingleDriverConfig::default();
+    let imu = loader.create_driver("horus-imu", "mpu6050", &config)?;
+
+    Ok(())
+}
+```
+
+### Search Path Resolution
+
+The loader searches paths in order:
+
+1. **Configured paths** - From `search_paths` in config
+2. **Default paths** (if `auto_discover: true`):
+   - `~/.horus/drivers/`
+   - `~/.local/lib/horus/drivers/`
+   - `/usr/local/lib/horus/drivers/`
+   - `/usr/lib/horus/drivers/`
+3. **Environment variable** - `HORUS_DRIVER_PATH` (colon-separated)
+
+### Plugin File Naming
+
+Dynamic plugins must follow the naming convention:
+
+```
+libhorus_<name>.so      # Linux
+libhorus_<name>.dylib   # macOS
+horus_<name>.dll        # Windows
+```
+
+Examples:
+- `libhorus_imu_mpu6050.so`
+- `libhorus_camera_v4l2.so`
+- `libhorus_lidar_rplidar.so`
+
+---
+
+## Hybrid Mode
+
+Hybrid mode combines static and dynamic loading for optimal flexibility.
+
+### Configuration
+
+```yaml
+# horus.yaml
+driver_mode: hybrid
+
+plugins:
+  search_paths:
+    - ~/.horus/drivers
+
+  # Core drivers compiled in (fast)
+  static:
+    - horus-imu
+    - horus-motor
+    - horus-encoder
+
+  # Specialized drivers loaded at runtime (flexible)
+  dynamic:
+    - horus-camera-realsense
+    - horus-lidar-velodyne
+```
+
+### Usage
+
+```rust
+use horus::prelude::*;
+use horus::plugin::{DriverLoader, DriverLoaderConfig, DriverMode};
+
+fn main() -> HorusResult<()> {
+    let config = DriverLoaderConfig {
+        mode: DriverMode::Hybrid,
+        static_drivers: vec![
+            "horus-imu".to_string(),
+            "horus-motor".to_string(),
+        ],
+        dynamic_drivers: vec![
+            "horus-camera-realsense".to_string(),
+        ],
+        search_paths: vec!["~/.horus/drivers".into()],
+        auto_discover: true,
+    };
+
+    let mut loader = DriverLoader::new(config);
+
+    // Register static drivers
+    #[cfg(feature = "mpu6050-imu")]
+    loader.register_static(Box::new(Mpu6050Plugin));
+
+    #[cfg(feature = "gpio-motor")]
+    loader.register_static(Box::new(GpioMotorPlugin));
+
+    // Initialize (registers static + discovers dynamic)
+    loader.initialize()?;
+
+    // Both static and dynamic are now available
+    for driver in loader.available_drivers() {
+        println!("Available: {}", driver);
+    }
+
+    Ok(())
+}
+```
+
+### Hybrid Resolution Order
+
+When requesting a driver:
+1. Check static registry first (prefer compiled drivers)
+2. Fall back to dynamic plugins if not static
+3. Return error if not found in either
+
+---
+
+## API Reference
+
+### Creating Drivers
+
+```rust
+// Create driver with explicit backend
+let imu = loader.create_driver(
+    "horus-imu",    // Plugin ID
+    "mpu6050",      // Backend ID
+    &config,        // SingleDriverConfig
+)?;
+
+// Auto-detect and create best match
+let imu = loader.auto_create_driver(
+    "horus-imu",    // Plugin ID
+    &config,        // SingleDriverConfig
+)?;
+
+// Downcast to concrete type
+let imu: Box<dyn ImuDriver> = imu
+    .downcast()
+    .map_err(|_| HorusError::driver("Type mismatch"))?;
+```
+
+### Hardware Probing
+
+```rust
+// Probe for hardware using a specific plugin
+let results = loader.probe("horus-imu")?;
+
+for result in results {
+    if result.detected {
+        println!(
+            "Found {} at {} (confidence: {:.0}%)",
+            result.backend_id,
+            result.device_path.unwrap_or_default(),
+            result.confidence * 100.0
+        );
+    }
+}
+```
+
+### Health Monitoring
+
+```rust
+// Get health of all plugins
+let health = loader.health();
+
+for (plugin_id, status) in &health {
+    if status.healthy {
+        println!("{}: Healthy", plugin_id);
+    } else {
+        println!("{}: {}", plugin_id, status.message);
+    }
+}
+```
+
+### Plugin Discovery
+
+```rust
+// Get list of available drivers
+let drivers = loader.available_drivers();
+
+// Get specific plugin
+let plugin = loader.get_plugin("horus-imu")?;
+
+// Check plugin metadata
+let manifest = plugin.manifest();
+println!("Plugin: {} v{}", manifest.name, manifest.version);
+println!("Backends: {:?}", manifest.backend_ids());
+```
+
+---
+
+## Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `HORUS_DRIVER_PATH` | Additional search paths | `/opt/drivers:/custom/path` |
+| `HORUS_DRIVER_MODE` | Override mode | `static`, `dynamic`, `hybrid` |
+| `HORUS_PLUGIN_DEBUG` | Enable debug logging | `1` |
+
+```bash
+# Example usage
+export HORUS_DRIVER_PATH="/opt/custom-drivers"
+export HORUS_DRIVER_MODE="hybrid"
+./my_robot
+```
+
+---
+
+## Best Practices
+
+### 1. Use Static for Production
+
+```toml
+# Cargo.toml for production
+[profile.release]
+lto = true
+codegen-units = 1
+
+[features]
+production = ["static-drivers", "mpu6050-imu", "gpio-motor"]
+```
+
+### 2. Use Dynamic for Development
+
+```yaml
+# horus-dev.yaml
+driver_mode: dynamic
+plugins:
+  search_paths:
+    - ./target/debug  # Load from build directory
+  auto_discover: true
+```
+
+### 3. Feature Detection
+
+```rust
+fn setup_loader() -> HorusResult<DriverLoader> {
+    let config = if cfg!(feature = "dynamic-plugins") {
+        DriverLoaderConfig {
+            mode: DriverMode::Hybrid,
+            ..Default::default()
+        }
+    } else {
+        DriverLoaderConfig {
+            mode: DriverMode::Static,
+            ..Default::default()
+        }
+    };
+
+    let mut loader = DriverLoader::new(config);
+    register_static_drivers(&mut loader);
+    loader.initialize()?;
+    Ok(loader)
+}
+```
+
+### 4. Graceful Fallback
+
+```rust
+fn create_imu(loader: &DriverLoader) -> HorusResult<Box<dyn ImuDriver>> {
+    // Try hardware first
+    let config = SingleDriverConfig::i2c("mpu6050", 1, 0x68);
+
+    match loader.create_driver("horus-imu", "mpu6050", &config) {
+        Ok(driver) => driver.downcast().map_err(|_| HorusError::driver("Type mismatch")),
+        Err(e) => {
+            warn!("Hardware IMU unavailable: {}. Using simulation.", e);
+            let sim_config = SingleDriverConfig::simulation();
+            loader.create_driver("horus-imu", "simulation", &sim_config)?
+                .downcast()
+                .map_err(|_| HorusError::driver("Type mismatch"))
+        }
+    }
+}
+```
+
+---
+
+## Troubleshooting
+
+### "Plugin not found"
+
+```rust
+// Check if plugin is discovered
+if loader.available_drivers().contains(&"horus-imu".to_string()) {
+    println!("Plugin is available");
+} else {
+    // Check search paths
+    println!("Search paths: {:?}", config.search_paths);
+
+    // List what's in each path
+    for path in &config.search_paths {
+        if path.exists() {
+            for entry in std::fs::read_dir(path)? {
+                println!("  Found: {:?}", entry?.path());
+            }
+        }
+    }
+}
+```
+
+### "Dynamic mode requires feature"
+
+Enable the feature in `Cargo.toml`:
+
+```toml
+[dependencies]
+horus = { version = "0.5", features = ["dynamic-plugins"] }
+```
+
+### Plugin ABI Mismatch
+
+Plugins must be compiled with the same HORUS version:
+
+```bash
+# Check plugin version
+nm -D libhorus_mydriver.so | grep horus_version
+
+# Rebuild plugins after HORUS upgrade
+cargo build --release -p my-driver-plugin
+```
+
+---
+
+## See Also
+
+- [Driver Plugin Development](/rust/library/drivers/plugin-development) - Creating plugins
+- [Hardware Drivers](/rust/library/drivers) - Driver overview
+- [Multi-Driver Scenarios](/rust/library/drivers/multi-driver) - Coordinating multiple drivers
+- [Driver Error Handling](/rust/library/drivers/error-handling) - Error patterns

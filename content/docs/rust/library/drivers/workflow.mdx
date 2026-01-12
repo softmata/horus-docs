@@ -1,0 +1,564 @@
+---
+title: "Simulation to Hardware Workflow"
+description: "Complete guide to developing with simulation drivers and deploying to hardware"
+weight: 23
+---
+
+# Simulation to Hardware Workflow
+
+HORUS is designed for **simulation-first development**. This guide covers the complete workflow from initial development through production deployment.
+
+---
+
+## The HORUS Development Philosophy
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    Development Lifecycle                        │
+├────────────────────────────────────────────────────────────────┤
+│  1. DEVELOP      2. TEST         3. VALIDATE     4. DEPLOY     │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐   ┌──────────┐   │
+│  │Simulation│ -> │Simulation│ -> │ Hardware │ ->│Production│   │
+│  │  Driver  │    │  Tests   │    │   Tests  │   │  Deploy  │   │
+│  └──────────┘    └──────────┘    └──────────┘   └──────────┘   │
+│      ↑                                               │          │
+│      └──────────── Iterate & Fix ────────────────────┘          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Why simulation-first?**
+
+1. **Faster iteration** - No hardware setup, instant feedback
+2. **Reproducible bugs** - Same inputs, same outputs
+3. **CI/CD friendly** - Tests run anywhere
+4. **Safe experimentation** - Won't damage hardware
+5. **Team collaboration** - Everyone can develop without hardware access
+
+---
+
+## Phase 1: Develop with Simulation
+
+### Starting a New Project
+
+Every driver type in HORUS has a simulation implementation:
+
+```rust
+use horus::prelude::*;
+
+fn main() -> HorusResult<()> {
+    // Simulation is the default - no config needed!
+    let mut imu = SimulationImuDriver::new();
+    imu.init()?;
+
+    let data = imu.read()?;
+    println!("IMU reading: {:?}", data);
+
+    Ok(())
+}
+```
+
+### Configuration Files
+
+Use separate config files for different environments:
+
+```
+my_robot/
+├── config/
+│   ├── drivers.yaml           # Default (simulation)
+│   ├── drivers.hardware.yaml  # Hardware config
+│   └── drivers.dev.yaml       # Development overrides
+├── src/
+│   └── main.rs
+└── Cargo.toml
+```
+
+**config/drivers.yaml** (Simulation - default):
+```yaml
+drivers:
+  imu:
+    backend: simulation
+    fps: 100
+    add_noise: true
+    accel_noise_std: 0.02
+
+  lidar:
+    backend: simulation
+    scan_frequency: 10
+    num_points: 360
+
+  motor_left:
+    backend: simulation
+
+  motor_right:
+    backend: simulation
+```
+
+**config/drivers.hardware.yaml** (Production):
+```yaml
+drivers:
+  imu:
+    backend: mpu6050
+    i2c_bus: 1
+    i2c_address: 0x68
+    fps: 100
+
+  lidar:
+    backend: rplidar
+    port: /dev/ttyUSB0
+    baud_rate: 115200
+
+  motor_left:
+    backend: gpio_pwm
+    pin: 18
+    frequency: 1000
+
+  motor_right:
+    backend: gpio_pwm
+    pin: 19
+    frequency: 1000
+```
+
+### Loading Environment-Specific Configs
+
+```rust
+use horus::prelude::*;
+use std::env;
+
+fn load_config() -> HorusResult<DriversConfig> {
+    // Check for environment-specific config
+    let config_path = match env::var("HORUS_ENV") {
+        Ok(env) if env == "hardware" => "config/drivers.hardware.yaml",
+        Ok(env) if env == "dev" => "config/drivers.dev.yaml",
+        _ => "config/drivers.yaml", // Default to simulation
+    };
+
+    DriversConfig::from_file(config_path)
+}
+
+fn main() -> HorusResult<()> {
+    let config = load_config()?;
+
+    // Driver selection is now transparent!
+    let imu_config = config.get_driver_or_default("imu");
+    println!("Using IMU backend: {}", imu_config.backend);
+
+    Ok(())
+}
+```
+
+### Developing Algorithms
+
+Develop your algorithms against simulation drivers:
+
+```rust
+pub struct RobotController {
+    state: RobotState,
+}
+
+impl RobotController {
+    pub fn new() -> Self {
+        Self { state: RobotState::default() }
+    }
+
+    /// Update robot state from IMU data
+    /// Works identically with simulation or hardware
+    pub fn update_from_imu(&mut self, imu: &Imu) {
+        // Algorithm doesn't know/care if data is simulated
+        self.state.orientation = Quaternion::from_angular_velocity(
+            imu.angular_velocity,
+            self.state.dt,
+        );
+
+        self.state.linear_velocity += Vector3::new(
+            imu.linear_acceleration[0],
+            imu.linear_acceleration[1],
+            imu.linear_acceleration[2],
+        ) * self.state.dt;
+    }
+
+    /// Compute motor commands
+    pub fn compute_motor_command(&self, target: &Pose) -> MotorCommand {
+        // PID control, path planning, etc.
+        // All developed and tested with simulation
+        todo!()
+    }
+}
+```
+
+---
+
+## Phase 2: Test Thoroughly with Simulation
+
+### Unit Tests
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_controller_integrates_imu() {
+        let mut controller = RobotController::new();
+
+        // Use simulation driver in tests
+        let mut imu = SimulationImuDriver::new();
+        imu.init().unwrap();
+
+        // Simulate movement
+        for _ in 0..100 {
+            let data = imu.read().unwrap();
+            controller.update_from_imu(&data);
+        }
+
+        // Verify expected behavior
+        assert!(controller.state.orientation.norm() > 0.99);
+    }
+}
+```
+
+### Integration Tests with Scheduler
+
+```rust
+#[test]
+fn test_full_robot_pipeline() {
+    let mut scheduler = Scheduler::new();
+
+    // All nodes use simulation by default
+    let imu_node = ImuNode::new().unwrap();
+    let controller_node = ControllerNode::new();
+    let motor_node = MotorNode::new().unwrap();
+
+    scheduler.add(Box::new(imu_node), 100, Some(true));
+    scheduler.add(Box::new(controller_node), 100, None);
+    scheduler.add(Box::new(motor_node), 100, None);
+
+    // Run for a simulated duration
+    scheduler.run_for(Duration::from_secs(5)).unwrap();
+
+    // Verify behavior
+    // ...
+}
+```
+
+### Configurable Simulation Realism
+
+Test with different noise levels:
+
+```rust
+#[test]
+fn test_controller_handles_noisy_data() {
+    let config = SimulationImuConfig {
+        add_noise: true,
+        accel_noise_std: 0.1,  // Higher noise
+        gyro_noise_std: 0.05,
+        ..Default::default()
+    };
+
+    let mut imu = SimulationImuDriver::with_config(config);
+    imu.init().unwrap();
+
+    let mut controller = RobotController::new();
+
+    // Run with noisy data
+    for _ in 0..1000 {
+        let data = imu.read().unwrap();
+        controller.update_from_imu(&data);
+    }
+
+    // Controller should still be stable
+    assert!(controller.is_stable());
+}
+```
+
+---
+
+## Phase 3: Validate with Hardware
+
+### Feature Flags for Hardware Drivers
+
+In `Cargo.toml`:
+
+```toml
+[features]
+default = []  # Simulation only by default
+
+# Individual hardware backends
+mpu6050-imu = ["horus/mpu6050-imu"]
+rplidar = ["horus/rplidar"]
+gpio = ["horus/gpio"]
+
+# All hardware
+full-hardware = ["mpu6050-imu", "rplidar", "gpio"]
+```
+
+### Conditional Hardware Tests
+
+```rust
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires hardware"]
+    #[cfg(feature = "mpu6050-imu")]
+    fn test_mpu6050_initialization() {
+        let mut driver = Mpu6050Driver::new("/dev/i2c-1", 0x68)
+            .expect("Failed to create driver - is MPU6050 connected?");
+
+        driver.init().expect("Failed to initialize");
+
+        let data = driver.read().expect("Failed to read");
+
+        // Hardware-specific assertions
+        assert!((data.linear_acceleration[2] - 9.81).abs() < 0.5);
+    }
+
+    #[test]
+    #[ignore = "requires hardware"]
+    #[cfg(feature = "rplidar")]
+    fn test_rplidar_scan() {
+        let mut driver = RplidarDriver::new("/dev/ttyUSB0", 115200)
+            .expect("Failed to create driver - is RPLidar connected?");
+
+        driver.init().expect("Failed to initialize");
+
+        let scan = driver.read().expect("Failed to read scan");
+
+        // Should have many scan points
+        assert!(scan.ranges.len() > 100);
+    }
+}
+```
+
+### Running Hardware Validation
+
+```bash
+# On development machine (simulation only)
+cargo test
+
+# On robot with hardware connected
+HORUS_ENV=hardware cargo test --features full-hardware -- --include-ignored
+
+# Run specific hardware test
+cargo test --features mpu6050-imu test_mpu6050_initialization -- --include-ignored
+```
+
+### Hardware Validation Checklist
+
+Before moving to production:
+
+- [ ] All simulation tests pass
+- [ ] Hardware detected and initialized correctly
+- [ ] Sensor data is within expected ranges
+- [ ] Actuators respond correctly to commands
+- [ ] Error recovery works (disconnect/reconnect)
+- [ ] Performance meets timing requirements
+- [ ] Edge cases handled (sensor saturation, etc.)
+
+---
+
+## Phase 4: Deploy to Production
+
+### Production Configuration
+
+**config/drivers.production.yaml**:
+```yaml
+drivers:
+  imu:
+    backend: mpu6050
+    i2c_bus: 1
+    i2c_address: 0x68
+    fps: 100
+    # Production-specific settings
+    calibration_file: /etc/horus/imu_calibration.yaml
+
+  lidar:
+    backend: rplidar
+    port: /dev/rplidar  # Use udev symlink
+    baud_rate: 115200
+    scan_mode: express
+
+  motor_left:
+    backend: gpio_pwm
+    pin: 18
+    frequency: 1000
+    max_duty: 0.8  # Safety limit
+
+  motor_right:
+    backend: gpio_pwm
+    pin: 19
+    frequency: 1000
+    max_duty: 0.8
+```
+
+### Deployment Script
+
+```bash
+#!/bin/bash
+# deploy.sh
+
+set -e
+
+ROBOT_HOST="${ROBOT_HOST:-robot.local}"
+DEPLOY_DIR="/opt/horus/my_robot"
+
+echo "Building for ARM..."
+cross build --release --target aarch64-unknown-linux-gnu --features full-hardware
+
+echo "Deploying to $ROBOT_HOST..."
+ssh $ROBOT_HOST "mkdir -p $DEPLOY_DIR/config"
+scp target/aarch64-unknown-linux-gnu/release/my_robot $ROBOT_HOST:$DEPLOY_DIR/
+scp config/drivers.production.yaml $ROBOT_HOST:$DEPLOY_DIR/config/drivers.yaml
+
+echo "Restarting service..."
+ssh $ROBOT_HOST "sudo systemctl restart my-robot"
+
+echo "Deployment complete!"
+```
+
+### Production systemd Service
+
+```ini
+# /etc/systemd/system/my-robot.service
+[Unit]
+Description=My Robot Controller
+After=network.target
+
+[Service]
+Type=simple
+User=robot
+WorkingDirectory=/opt/horus/my_robot
+Environment="HORUS_ENV=production"
+Environment="RUST_LOG=info"
+ExecStart=/opt/horus/my_robot/my_robot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Runtime Backend Selection
+
+For maximum flexibility, support runtime backend selection:
+
+```rust
+use horus::prelude::*;
+
+fn create_imu_driver(config: &SingleDriverConfig) -> HorusResult<Box<dyn ImuDriver>> {
+    match config.backend.as_str() {
+        "simulation" => Ok(Box::new(SimulationImuDriver::new())),
+
+        #[cfg(feature = "mpu6050-imu")]
+        "mpu6050" => {
+            let bus = config.i2c_bus.unwrap_or(1);
+            let addr = config.i2c_address.unwrap_or(0x68);
+            Ok(Box::new(Mpu6050Driver::new(
+                format!("/dev/i2c-{}", bus),
+                addr,
+            )?))
+        }
+
+        #[cfg(feature = "bno055-imu")]
+        "bno055" => {
+            let bus = config.i2c_bus.unwrap_or(1);
+            let addr = config.i2c_address.unwrap_or(0x28);
+            Ok(Box::new(Bno055Driver::new(
+                format!("/dev/i2c-{}", bus),
+                addr,
+            )?))
+        }
+
+        backend => Err(HorusError::driver(
+            format!("Unknown IMU backend: {}", backend)
+        )),
+    }
+}
+```
+
+---
+
+## Environment Variables
+
+HORUS respects these environment variables:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `HORUS_ENV` | Environment name | `simulation`, `hardware`, `production` |
+| `HORUS_CONFIG_DIR` | Config search directory | `/etc/horus` |
+| `HORUS_LOG_LEVEL` | Logging level | `debug`, `info`, `warn` |
+| `HORUS_DRIVER_TIMEOUT` | Driver timeout (ms) | `5000` |
+
+---
+
+## Best Practices
+
+### 1. Never Hardcode Backends
+
+```rust
+// BAD: Hardcoded backend
+let imu = Mpu6050Driver::new("/dev/i2c-1", 0x68)?;
+
+// GOOD: Config-driven
+let config = DriversConfig::find_and_load()?;
+let imu = create_driver_from_config(&config.get_driver("imu")?)?;
+```
+
+### 2. Use udev Rules for Device Names
+
+```bash
+# /etc/udev/rules.d/99-horus.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="rplidar"
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1234", SYMLINK+="robot_camera"
+```
+
+Then in config:
+```yaml
+lidar:
+  port: /dev/rplidar  # Stable name!
+```
+
+### 3. Graceful Degradation
+
+```rust
+// Try hardware, fall back to simulation
+fn create_imu_with_fallback(config: &SingleDriverConfig) -> Box<dyn ImuDriver> {
+    match create_hardware_imu(config) {
+        Ok(driver) => {
+            info!("Using hardware IMU: {}", config.backend);
+            driver
+        }
+        Err(e) => {
+            warn!("Hardware IMU unavailable: {}. Using simulation.", e);
+            Box::new(SimulationImuDriver::new())
+        }
+    }
+}
+```
+
+### 4. Log Backend Selection
+
+```rust
+fn main() -> HorusResult<()> {
+    let config = DriversConfig::find_and_load()?;
+
+    for (name, driver_config) in &config.drivers {
+        info!(
+            "Driver '{}': backend={}, enabled={}",
+            name, driver_config.backend, driver_config.enabled
+        );
+    }
+
+    // Continue with initialization...
+    Ok(())
+}
+```
+
+---
+
+## See Also
+
+- [Driver Testing Guide](/rust/library/drivers/testing) - Testing strategies
+- [Hardware Drivers](/rust/library/drivers) - Driver overview
+- [Driver Error Handling](/rust/library/drivers/error-handling) - Error patterns
+- [Driver Troubleshooting](/rust/library/drivers/troubleshooting) - Debug issues

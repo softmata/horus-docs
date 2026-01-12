@@ -1,0 +1,537 @@
+---
+title: "Driver Troubleshooting Guide"
+description: "Diagnose and fix common driver issues: hardware detection, communication problems, and performance debugging"
+weight: 25
+---
+
+# Driver Troubleshooting Guide
+
+This guide helps you diagnose and fix common driver issues in HORUS.
+
+---
+
+## Quick Diagnostic Checklist
+
+When a driver isn't working, check these items in order:
+
+```
+□ 1. Is the device physically connected?
+□ 2. Does the device appear in the OS? (lsusb, ls /dev, i2cdetect)
+□ 3. Do you have permissions to access the device?
+□ 4. Is the correct backend specified in config?
+□ 5. Are hardware-specific features enabled in Cargo.toml?
+□ 6. Is the driver initialized before use?
+□ 7. Are there resource conflicts? (another process using the device)
+```
+
+---
+
+## Hardware Detection Issues
+
+### Device Not Found
+
+**Symptom**: `Device /dev/ttyUSB0 not found` or similar
+
+**Diagnostic steps**:
+
+```bash
+# Check if device is connected (USB)
+lsusb
+
+# Check for serial devices
+ls -la /dev/ttyUSB* /dev/ttyACM*
+
+# Check for I2C devices
+ls -la /dev/i2c-*
+
+# Check kernel messages for device detection
+dmesg | tail -20
+```
+
+**Common fixes**:
+
+1. **Reconnect the device** - Try a different USB port
+2. **Check cable** - Use a data cable, not charge-only
+3. **Enable interface** - For I2C/SPI on Raspberry Pi:
+   ```bash
+   sudo raspi-config
+   # Navigate to: Interface Options > I2C > Enable
+   ```
+4. **Load kernel module**:
+   ```bash
+   # For I2C
+   sudo modprobe i2c-dev
+
+   # Check if loaded
+   lsmod | grep i2c
+   ```
+
+### I2C Device Not Detected
+
+**Symptom**: Device should be at address 0x68 but `i2cdetect` shows nothing
+
+**Diagnostic steps**:
+
+```bash
+# List I2C buses
+ls /dev/i2c-*
+
+# Scan I2C bus 1 (common on Raspberry Pi)
+sudo i2cdetect -y 1
+
+# Expected output for MPU6050 at 0x68:
+#      0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+# 60: -- -- -- -- -- -- -- -- 68 -- -- -- -- -- -- --
+```
+
+**Common fixes**:
+
+1. **Check wiring**:
+   - SDA → SDA (data line)
+   - SCL → SCL (clock line)
+   - VCC → 3.3V or 5V (check device specs!)
+   - GND → GND
+
+2. **Check address** - Some devices have address selection pins:
+   ```
+   MPU6050: AD0=LOW → 0x68, AD0=HIGH → 0x69
+   BNO055:  ADR=LOW → 0x28, ADR=HIGH → 0x29
+   ```
+
+3. **Pull-up resistors** - I2C requires pull-ups (usually 4.7kΩ)
+
+4. **Bus speed** - Try reducing I2C speed:
+   ```bash
+   # In /boot/config.txt (Raspberry Pi)
+   dtparam=i2c_baudrate=50000  # Reduce from default 100kHz
+   ```
+
+### Serial Device Detection
+
+**Symptom**: Serial device not appearing
+
+```bash
+# Watch for device connection
+dmesg -w
+# Then plug in the device
+
+# Check device attributes
+udevadm info -a /dev/ttyUSB0
+
+# Test serial communication
+screen /dev/ttyUSB0 115200
+# Or
+minicom -D /dev/ttyUSB0 -b 115200
+```
+
+---
+
+## Permission Issues
+
+### "Permission denied" Errors
+
+**Symptom**: `Permission denied: /dev/ttyUSB0`
+
+**Quick fixes**:
+
+```bash
+# Option 1: Add user to dialout group (serial devices)
+sudo usermod -a -G dialout $USER
+# Log out and back in
+
+# Option 2: Add user to i2c group (I2C devices)
+sudo usermod -a -G i2c $USER
+
+# Option 3: Create udev rule for persistent permissions
+sudo nano /etc/udev/rules.d/99-horus.rules
+```
+
+**Example udev rules**:
+
+```bash
+# /etc/udev/rules.d/99-horus.rules
+
+# USB serial devices
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    SYMLINK+="rplidar", MODE="0666"
+
+# I2C bus
+SUBSYSTEM=="i2c-dev", MODE="0666"
+
+# GPIO (Raspberry Pi)
+SUBSYSTEM=="gpio", MODE="0666"
+```
+
+Apply rules:
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+### Verify Permissions
+
+```bash
+# Check device permissions
+ls -la /dev/ttyUSB0
+# crw-rw---- 1 root dialout 188, 0 ... /dev/ttyUSB0
+
+# Check group membership
+groups $USER
+# Should include: dialout, i2c, gpio as needed
+```
+
+---
+
+## Driver Initialization Issues
+
+### "Driver not initialized"
+
+**Symptom**: `Driver error: Driver not initialized - call init() first`
+
+**Fix**: Ensure proper initialization order:
+
+```rust
+// WRONG: Using driver without init
+let mut driver = SimulationImuDriver::new();
+let data = driver.read()?;  // Error!
+
+// CORRECT: Initialize first
+let mut driver = SimulationImuDriver::new();
+driver.init()?;  // Initialize
+let data = driver.read()?;  // Now works
+```
+
+### Initialization Timeout
+
+**Symptom**: Driver init hangs or times out
+
+**Diagnostic code**:
+
+```rust
+use std::time::{Duration, Instant};
+
+fn init_with_timeout<D: Driver>(driver: &mut D, timeout: Duration) -> HorusResult<()> {
+    let start = Instant::now();
+
+    // Try to init
+    let result = driver.init();
+
+    let elapsed = start.elapsed();
+    println!("Init took: {:?}", elapsed);
+
+    if elapsed > timeout {
+        warn!("Init was slow: {:?}", elapsed);
+    }
+
+    result
+}
+```
+
+**Common causes**:
+- Device not responding (check wiring)
+- Wrong baud rate for serial devices
+- Device in sleep/low-power mode
+- Bus contention (another device hogging the bus)
+
+---
+
+## Communication Problems
+
+### Serial Communication Issues
+
+**Symptom**: Garbled data or timeouts
+
+**Diagnostic steps**:
+
+1. **Verify baud rate**:
+   ```rust
+   // Common baud rates to try
+   let baud_rates = [9600, 19200, 38400, 57600, 115200, 230400];
+   ```
+
+2. **Check serial settings**:
+   ```rust
+   // Ensure settings match device requirements
+   let config = SerialConfig {
+       baud_rate: 115200,
+       data_bits: DataBits::Eight,
+       stop_bits: StopBits::One,
+       parity: Parity::None,
+       flow_control: FlowControl::None,
+   };
+   ```
+
+3. **Monitor raw data**:
+   ```bash
+   # View raw serial data
+   cat /dev/ttyUSB0 | xxd
+
+   # Or with specific baud rate
+   stty -F /dev/ttyUSB0 115200 raw
+   cat /dev/ttyUSB0
+   ```
+
+### I2C Communication Failures
+
+**Symptom**: Intermittent read failures
+
+**Diagnostic code**:
+
+```rust
+fn diagnose_i2c_issues(bus: &str, address: u8) {
+    // Test multiple reads
+    let mut success = 0;
+    let mut failures = 0;
+
+    for i in 0..100 {
+        match read_i2c_register(bus, address, 0x00) {
+            Ok(_) => success += 1,
+            Err(e) => {
+                failures += 1;
+                eprintln!("Read {} failed: {}", i, e);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    println!("Success rate: {}/100", success);
+    if failures > 0 {
+        println!("PROBLEM: {} failures detected", failures);
+        println!("Check: wiring, pull-ups, bus speed, interference");
+    }
+}
+```
+
+**Fixes**:
+- Add delays between transactions
+- Reduce bus speed
+- Check for electrical noise
+- Verify power supply is stable
+
+---
+
+## Performance Issues
+
+### High CPU Usage
+
+**Symptom**: Driver consuming excessive CPU
+
+**Diagnostic**:
+
+```rust
+fn profile_driver_performance<D: Driver>(driver: &mut D, iterations: usize) {
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        let _ = driver.read();
+    }
+
+    let elapsed = start.elapsed();
+    let per_read = elapsed / iterations as u32;
+
+    println!("Total time: {:?}", elapsed);
+    println!("Time per read: {:?}", per_read);
+    println!("Reads per second: {:.1}", iterations as f64 / elapsed.as_secs_f64());
+}
+```
+
+**Common causes**:
+- Busy-polling instead of sleeping
+- Debug logging in hot path
+- Unnecessary data copying
+- Inefficient parsing
+
+**Fixes**:
+
+```rust
+// BAD: Busy polling
+loop {
+    if driver.has_data() {
+        let data = driver.read()?;
+        break;
+    }
+    // Spins at 100% CPU!
+}
+
+// GOOD: Sleep between polls
+loop {
+    if driver.has_data() {
+        let data = driver.read()?;
+        break;
+    }
+    std::thread::sleep(Duration::from_millis(1));
+}
+
+// BETTER: Use blocking read with timeout
+let data = driver.read_with_timeout(Duration::from_millis(100))?;
+```
+
+### Slow Data Rate
+
+**Symptom**: Not receiving data at expected rate
+
+**Diagnostic**:
+
+```rust
+fn measure_actual_rate<D: Driver>(driver: &mut D, duration: Duration) {
+    let start = Instant::now();
+    let mut count = 0;
+
+    while start.elapsed() < duration {
+        if driver.read().is_ok() {
+            count += 1;
+        }
+    }
+
+    let actual_rate = count as f64 / duration.as_secs_f64();
+    println!("Actual data rate: {:.1} Hz", actual_rate);
+}
+```
+
+**Fixes**:
+- Check device sample rate configuration
+- Verify scheduler is running node at correct frequency
+- Check for bottlenecks in data pipeline
+- Profile subscriber processing time
+
+---
+
+## Debug Logging
+
+### Enable Detailed Logging
+
+```bash
+# Set log level
+export RUST_LOG=horus=debug
+
+# Or per-module logging
+export RUST_LOG=horus::driver=trace,horus::scheduler=debug
+
+# Run your application
+cargo run
+```
+
+### Add Custom Debug Points
+
+```rust
+use tracing::{debug, trace, instrument};
+
+impl MyDriver {
+    #[instrument(skip(self))]
+    pub fn read(&mut self) -> HorusResult<SensorData> {
+        trace!("Starting read operation");
+
+        let raw = self.read_raw()?;
+        debug!("Raw data: {:?}", raw);
+
+        let parsed = self.parse_data(&raw)?;
+        debug!("Parsed data: {:?}", parsed);
+
+        Ok(parsed)
+    }
+}
+```
+
+### Runtime Debug Info
+
+```rust
+impl MyDriver {
+    pub fn debug_info(&self) -> String {
+        format!(
+            "MyDriver Status:\n\
+             - Status: {:?}\n\
+             - Backend: {}\n\
+             - Reads: {}\n\
+             - Errors: {}\n\
+             - Last error: {:?}\n\
+             - Uptime: {:?}",
+            self.status,
+            self.backend,
+            self.read_count,
+            self.error_count,
+            self.last_error,
+            self.start_time.elapsed()
+        )
+    }
+}
+```
+
+---
+
+## Common Error Messages
+
+| Error | Likely Cause | Solution |
+|-------|--------------|----------|
+| `No such file or directory: /dev/i2c-1` | I2C not enabled | Enable I2C in raspi-config |
+| `Permission denied: /dev/ttyUSB0` | Not in dialout group | `sudo usermod -a -G dialout $USER` |
+| `Resource temporarily unavailable` | Device busy | Check for other processes using device |
+| `Connection timed out` | Device not responding | Check wiring and power |
+| `Invalid argument` | Wrong configuration | Verify baud rate, address, etc. |
+| `No device at address 0x68` | Wrong address or disconnected | Run i2cdetect, check wiring |
+| `Feature not available` | Missing Cargo feature | Add feature to Cargo.toml |
+
+---
+
+## Diagnostic Script
+
+Create a script to automate common checks:
+
+```bash
+#!/bin/bash
+# horus-diagnose.sh - Diagnose common driver issues
+
+echo "=== HORUS Driver Diagnostic ==="
+echo
+
+echo "1. Checking user groups..."
+groups $USER
+
+echo
+echo "2. Checking serial devices..."
+ls -la /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || echo "No serial devices found"
+
+echo
+echo "3. Checking I2C buses..."
+ls -la /dev/i2c-* 2>/dev/null || echo "No I2C buses found"
+
+if [ -e /dev/i2c-1 ]; then
+    echo
+    echo "4. Scanning I2C bus 1..."
+    i2cdetect -y 1 2>/dev/null || echo "i2cdetect failed (try with sudo)"
+fi
+
+echo
+echo "5. Checking recent USB events..."
+dmesg | grep -i usb | tail -5
+
+echo
+echo "6. Checking for device conflicts..."
+fuser /dev/ttyUSB* /dev/i2c-* 2>/dev/null
+
+echo
+echo "=== Diagnostic complete ==="
+```
+
+---
+
+## Getting Help
+
+If you're still stuck:
+
+1. **Check the logs** with `RUST_LOG=debug`
+2. **Search existing issues** on GitHub
+3. **Include in bug reports**:
+   - Full error message
+   - Output of diagnostic script
+   - HORUS version (`cargo tree -p horus`)
+   - Hardware description
+   - Configuration file (sanitized)
+
+---
+
+## See Also
+
+- [Driver Error Handling](/rust/library/drivers/error-handling) - Error recovery patterns
+- [Driver Testing Guide](/rust/library/drivers/testing) - Testing strategies
+- [Simulation to Hardware Workflow](/rust/library/drivers/workflow) - Development lifecycle
+- [Hardware Drivers](/rust/library/drivers) - Driver overview

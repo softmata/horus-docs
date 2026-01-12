@@ -132,7 +132,6 @@ The documentation emphasizes HORUS's production-grade performance:
 - **Discord Community**: https://discord.gg/hEZC3ev2Nf
 - **Issues**: https://github.com/softmata/horus/issues
 - **Discussions**: https://github.com/softmata/horus/discussions
-- **Crates.io**: https://crates.io/search?q=horus
 
 ## License
 

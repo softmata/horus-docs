@@ -1,0 +1,624 @@
+---
+title: "Multi-Driver Scenarios"
+description: "Coordinating multiple drivers: sensor fusion, differential drive, synchronized actuators, and redundancy patterns"
+weight: 26
+---
+
+# Multi-Driver Scenarios
+
+Real robots require multiple drivers working together. This guide covers patterns for coordinating sensors, actuators, and building robust multi-driver systems.
+
+---
+
+## Common Multi-Driver Architectures
+
+### 1. Differential Drive Robot
+
+A typical two-wheeled robot:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Differential Drive Robot                   │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│   ┌─────────┐     ┌──────────────────┐     ┌─────────────┐   │
+│   │  IMU    │────▶│  Sensor Fusion   │────▶│ Localization│   │
+│   │ Driver  │     │     Node         │     │    Node     │   │
+│   └─────────┘     └──────────────────┘     └─────────────┘   │
+│                           ▲                       │           │
+│   ┌─────────┐             │                       ▼           │
+│   │Encoder  │─────────────┘               ┌─────────────┐     │
+│   │ Driver  │                             │  Path       │     │
+│   │(Left)   │                             │  Planner    │     │
+│   └─────────┘                             └─────────────┘     │
+│                                                   │           │
+│   ┌─────────┐                                     ▼           │
+│   │Encoder  │                             ┌─────────────┐     │
+│   │ Driver  │                             │ Differential│     │
+│   │(Right)  │                             │   Drive     │     │
+│   └─────────┘                             │    Node     │     │
+│                                           └─────────────┘     │
+│                                            /          \       │
+│                                           ▼            ▼      │
+│                                    ┌─────────┐  ┌─────────┐   │
+│                                    │ Motor   │  │ Motor   │   │
+│                                    │ Driver  │  │ Driver  │   │
+│                                    │ (Left)  │  │ (Right) │   │
+│                                    └─────────┘  └─────────┘   │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 2. Sensor Fusion Architecture
+
+Multiple sensors feeding into fusion:
+
+```
+┌─────────┐
+│  IMU    │──┐
+│ Driver  │  │
+└─────────┘  │
+             │      ┌──────────────────┐      ┌─────────────┐
+┌─────────┐  ├─────▶│  Sensor Fusion   │─────▶│   Output    │
+│  GPS    │──┤      │  (EKF/UKF)       │      │   Pose      │
+│ Driver  │  │      └──────────────────┘      └─────────────┘
+└─────────┘  │
+             │
+┌─────────┐  │
+│Encoders │──┘
+│ Driver  │
+└─────────┘
+```
+
+---
+
+## Differential Drive Implementation
+
+### Configuration
+
+**drivers.yaml**:
+```yaml
+drivers:
+  # IMU for orientation
+  imu:
+    backend: mpu6050
+    i2c_bus: 1
+    i2c_address: 0x68
+    fps: 100
+
+  # Left wheel motor
+  motor_left:
+    backend: gpio_pwm
+    pin: 18
+    direction_pin: 23
+    frequency: 1000
+
+  # Right wheel motor
+  motor_right:
+    backend: gpio_pwm
+    pin: 19
+    direction_pin: 24
+    frequency: 1000
+
+  # Left wheel encoder
+  encoder_left:
+    backend: gpio_encoder
+    pin_a: 5
+    pin_b: 6
+    ticks_per_rev: 1440
+
+  # Right wheel encoder
+  encoder_right:
+    backend: gpio_encoder
+    pin_a: 12
+    pin_b: 13
+    ticks_per_rev: 1440
+```
+
+### Differential Drive Node
+
+```rust
+use horus::prelude::*;
+
+pub struct DifferentialDriveNode {
+    // Subscribers
+    cmd_vel_sub: Subscriber<Twist>,
+
+    // Publishers
+    motor_left_pub: Publisher<MotorCommand>,
+    motor_right_pub: Publisher<MotorCommand>,
+
+    // Robot parameters
+    wheel_base: f64,      // meters between wheels
+    wheel_radius: f64,    // meters
+    max_speed: f64,       // m/s
+}
+
+impl DifferentialDriveNode {
+    pub fn new(
+        cmd_topic: &str,
+        left_topic: &str,
+        right_topic: &str,
+        wheel_base: f64,
+    ) -> HorusResult<Self> {
+        Ok(Self {
+            cmd_vel_sub: Subscriber::new(cmd_topic)?,
+            motor_left_pub: Publisher::new(left_topic)?,
+            motor_right_pub: Publisher::new(right_topic)?,
+            wheel_base,
+            wheel_radius: 0.05, // 5cm wheels
+            max_speed: 1.0,
+        })
+    }
+
+    fn twist_to_wheel_speeds(&self, twist: &Twist) -> (f64, f64) {
+        // Convert linear + angular velocity to wheel speeds
+        let linear = twist.linear[0];  // Forward velocity
+        let angular = twist.angular[2]; // Rotation around Z
+
+        // Differential drive kinematics
+        let v_left = linear - (angular * self.wheel_base / 2.0);
+        let v_right = linear + (angular * self.wheel_base / 2.0);
+
+        // Convert to wheel angular velocity
+        let omega_left = v_left / self.wheel_radius;
+        let omega_right = v_right / self.wheel_radius;
+
+        // Clamp to max speed
+        let max_omega = self.max_speed / self.wheel_radius;
+        (
+            omega_left.clamp(-max_omega, max_omega),
+            omega_right.clamp(-max_omega, max_omega),
+        )
+    }
+}
+
+impl Node for DifferentialDriveNode {
+    fn name(&self) -> &str {
+        "differential_drive"
+    }
+
+    fn process(&mut self, _ctx: &mut NodeContext) -> HorusResult<()> {
+        // Read command velocity
+        if let Some(cmd_vel) = self.cmd_vel_sub.try_recv()? {
+            // Convert to wheel speeds
+            let (left_speed, right_speed) = self.twist_to_wheel_speeds(&cmd_vel);
+
+            // Send to motors
+            self.motor_left_pub.publish(&MotorCommand::velocity(left_speed))?;
+            self.motor_right_pub.publish(&MotorCommand::velocity(right_speed))?;
+        }
+
+        Ok(())
+    }
+}
+```
+
+---
+
+## Sensor Fusion Implementation
+
+### Combining IMU, GPS, and Encoders
+
+```rust
+use horus::prelude::*;
+use horus_algorithms::EKF;
+
+pub struct SensorFusionNode {
+    // Subscribers
+    imu_sub: Subscriber<Imu>,
+    gps_sub: Subscriber<NavSatFix>,
+    encoder_left_sub: Subscriber<EncoderReading>,
+    encoder_right_sub: Subscriber<EncoderReading>,
+
+    // Publisher
+    pose_pub: Publisher<Pose>,
+
+    // State estimator
+    ekf: EKF,
+
+    // Robot parameters
+    wheel_base: f64,
+    wheel_radius: f64,
+
+    // Last encoder readings for delta
+    last_left_ticks: i64,
+    last_right_ticks: i64,
+}
+
+impl SensorFusionNode {
+    pub fn new() -> HorusResult<Self> {
+        Ok(Self {
+            imu_sub: Subscriber::new("imu")?,
+            gps_sub: Subscriber::new("gps")?,
+            encoder_left_sub: Subscriber::new("encoder/left")?,
+            encoder_right_sub: Subscriber::new("encoder/right")?,
+            pose_pub: Publisher::new("pose")?,
+            ekf: EKF::new_with_defaults(),
+            wheel_base: 0.3,
+            wheel_radius: 0.05,
+            last_left_ticks: 0,
+            last_right_ticks: 0,
+        })
+    }
+
+    fn process_imu(&mut self, imu: &Imu) {
+        // IMU provides angular velocity (high frequency)
+        self.ekf.predict_with_gyro(&imu.angular_velocity);
+
+        // And orientation update from accelerometer
+        self.ekf.update_orientation(&imu.linear_acceleration);
+    }
+
+    fn process_encoders(&mut self, left: &EncoderReading, right: &EncoderReading) {
+        // Calculate wheel deltas
+        let delta_left = left.ticks - self.last_left_ticks;
+        let delta_right = right.ticks - self.last_right_ticks;
+
+        self.last_left_ticks = left.ticks;
+        self.last_right_ticks = right.ticks;
+
+        // Convert to distance
+        let ticks_per_rev = 1440.0;
+        let dist_left = (delta_left as f64 / ticks_per_rev) * 2.0 * std::f64::consts::PI * self.wheel_radius;
+        let dist_right = (delta_right as f64 / ticks_per_rev) * 2.0 * std::f64::consts::PI * self.wheel_radius;
+
+        // Odometry update
+        self.ekf.update_odometry(dist_left, dist_right, self.wheel_base);
+    }
+
+    fn process_gps(&mut self, gps: &NavSatFix) {
+        // GPS provides absolute position (low frequency, noisy)
+        if gps.status >= 0 { // Has fix
+            self.ekf.update_position(gps.latitude, gps.longitude, gps.position_covariance);
+        }
+    }
+}
+
+impl Node for SensorFusionNode {
+    fn name(&self) -> &str {
+        "sensor_fusion"
+    }
+
+    fn process(&mut self, _ctx: &mut NodeContext) -> HorusResult<()> {
+        // Process all available IMU data (high priority)
+        while let Some(imu) = self.imu_sub.try_recv()? {
+            self.process_imu(&imu);
+        }
+
+        // Process encoder data
+        if let (Some(left), Some(right)) = (
+            self.encoder_left_sub.try_recv()?,
+            self.encoder_right_sub.try_recv()?
+        ) {
+            self.process_encoders(&left, &right);
+        }
+
+        // Process GPS if available
+        if let Some(gps) = self.gps_sub.try_recv()? {
+            self.process_gps(&gps);
+        }
+
+        // Publish fused pose
+        let pose = self.ekf.get_pose();
+        self.pose_pub.publish(&pose)?;
+
+        Ok(())
+    }
+}
+```
+
+---
+
+## Synchronized Actuator Control
+
+### Multi-Joint Robot Arm
+
+```rust
+pub struct RobotArmController {
+    joints: Vec<JointDriver>,
+    trajectory_sub: Subscriber<JointTrajectory>,
+    state_pub: Publisher<JointState>,
+}
+
+impl RobotArmController {
+    pub fn new(num_joints: usize) -> HorusResult<Self> {
+        let mut joints = Vec::with_capacity(num_joints);
+
+        for i in 0..num_joints {
+            joints.push(JointDriver::new(&format!("joint_{}", i))?);
+        }
+
+        Ok(Self {
+            joints,
+            trajectory_sub: Subscriber::new("trajectory")?,
+            state_pub: Publisher::new("joint_state")?,
+        })
+    }
+
+    fn execute_synchronized_move(&mut self, targets: &[f64]) -> HorusResult<()> {
+        // Calculate move time based on longest move
+        let current_positions: Vec<f64> = self.joints
+            .iter()
+            .map(|j| j.get_position())
+            .collect();
+
+        let max_distance = current_positions
+            .iter()
+            .zip(targets.iter())
+            .map(|(c, t)| (t - c).abs())
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap_or(0.0);
+
+        let move_time = max_distance / self.max_velocity();
+
+        // Calculate velocity for each joint to finish simultaneously
+        for (i, joint) in self.joints.iter_mut().enumerate() {
+            let distance = targets[i] - current_positions[i];
+            let velocity = distance / move_time;
+            joint.set_velocity(velocity)?;
+        }
+
+        // Start all joints
+        for joint in &mut self.joints {
+            joint.start_move()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Node for RobotArmController {
+    fn name(&self) -> &str {
+        "arm_controller"
+    }
+
+    fn process(&mut self, _ctx: &mut NodeContext) -> HorusResult<()> {
+        // Process trajectory commands
+        if let Some(trajectory) = self.trajectory_sub.try_recv()? {
+            for point in &trajectory.points {
+                self.execute_synchronized_move(&point.positions)?;
+            }
+        }
+
+        // Publish current joint state
+        let state = JointState {
+            positions: self.joints.iter().map(|j| j.get_position()).collect(),
+            velocities: self.joints.iter().map(|j| j.get_velocity()).collect(),
+            efforts: self.joints.iter().map(|j| j.get_effort()).collect(),
+        };
+        self.state_pub.publish(&state)?;
+
+        Ok(())
+    }
+}
+```
+
+---
+
+## Redundant Driver Patterns
+
+### Redundant IMU Configuration
+
+```rust
+pub struct RedundantImuDriver {
+    primary: Box<dyn ImuDriver>,
+    secondary: Box<dyn ImuDriver>,
+    active: RedundantMode,
+    error_count: usize,
+    threshold: usize,
+}
+
+enum RedundantMode {
+    Primary,
+    Secondary,
+    Voting,  // Use both, compare results
+}
+
+impl RedundantImuDriver {
+    pub fn new(
+        primary: Box<dyn ImuDriver>,
+        secondary: Box<dyn ImuDriver>,
+    ) -> Self {
+        Self {
+            primary,
+            secondary,
+            active: RedundantMode::Primary,
+            error_count: 0,
+            threshold: 5,
+        }
+    }
+
+    fn read_with_voting(&mut self) -> HorusResult<Imu> {
+        let primary_result = self.primary.read();
+        let secondary_result = self.secondary.read();
+
+        match (primary_result, secondary_result) {
+            (Ok(p), Ok(s)) => {
+                // Both succeeded - average the results
+                Ok(self.average_readings(&p, &s))
+            }
+            (Ok(p), Err(e)) => {
+                warn!("Secondary IMU failed: {}. Using primary only.", e);
+                Ok(p)
+            }
+            (Err(e), Ok(s)) => {
+                warn!("Primary IMU failed: {}. Using secondary only.", e);
+                Ok(s)
+            }
+            (Err(e1), Err(e2)) => {
+                Err(HorusError::driver(format!(
+                    "Both IMUs failed: primary={}, secondary={}", e1, e2
+                )))
+            }
+        }
+    }
+
+    fn average_readings(&self, a: &Imu, b: &Imu) -> Imu {
+        Imu {
+            linear_acceleration: [
+                (a.linear_acceleration[0] + b.linear_acceleration[0]) / 2.0,
+                (a.linear_acceleration[1] + b.linear_acceleration[1]) / 2.0,
+                (a.linear_acceleration[2] + b.linear_acceleration[2]) / 2.0,
+            ],
+            angular_velocity: [
+                (a.angular_velocity[0] + b.angular_velocity[0]) / 2.0,
+                (a.angular_velocity[1] + b.angular_velocity[1]) / 2.0,
+                (a.angular_velocity[2] + b.angular_velocity[2]) / 2.0,
+            ],
+            timestamp: a.timestamp.max(b.timestamp),
+        }
+    }
+}
+
+impl ImuDriver for RedundantImuDriver {
+    fn read(&mut self) -> HorusResult<Imu> {
+        match self.active {
+            RedundantMode::Primary => {
+                match self.primary.read() {
+                    Ok(data) => {
+                        self.error_count = 0;
+                        Ok(data)
+                    }
+                    Err(e) => {
+                        self.error_count += 1;
+                        if self.error_count >= self.threshold {
+                            warn!("Switching to secondary IMU");
+                            self.active = RedundantMode::Secondary;
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            RedundantMode::Secondary => self.secondary.read(),
+            RedundantMode::Voting => self.read_with_voting(),
+        }
+    }
+
+    // ... other trait methods
+}
+```
+
+---
+
+## Health Aggregation
+
+### System-Wide Health Monitoring
+
+```rust
+pub struct HealthAggregator {
+    drivers: HashMap<String, Box<dyn HealthMonitored>>,
+    health_pub: Publisher<SystemHealth>,
+}
+
+pub trait HealthMonitored {
+    fn health(&self) -> DriverHealth;
+    fn name(&self) -> &str;
+}
+
+#[derive(Clone)]
+pub struct SystemHealth {
+    pub overall: HealthStatus,
+    pub driver_health: HashMap<String, DriverHealth>,
+    pub timestamp: u64,
+}
+
+impl HealthAggregator {
+    pub fn check_health(&self) -> SystemHealth {
+        let mut driver_health = HashMap::new();
+        let mut worst_status = HealthStatus::Healthy;
+
+        for (name, driver) in &self.drivers {
+            let health = driver.health();
+            driver_health.insert(name.clone(), health.clone());
+
+            // Track worst status
+            if health.status > worst_status {
+                worst_status = health.status;
+            }
+        }
+
+        SystemHealth {
+            overall: worst_status,
+            driver_health,
+            timestamp: get_timestamp_ns(),
+        }
+    }
+}
+
+impl Node for HealthAggregator {
+    fn name(&self) -> &str {
+        "health_aggregator"
+    }
+
+    fn process(&mut self, _ctx: &mut NodeContext) -> HorusResult<()> {
+        let health = self.check_health();
+
+        // Log warnings for degraded drivers
+        for (name, status) in &health.driver_health {
+            if status.status == HealthStatus::Degraded {
+                warn!("Driver {} is degraded: {}", name, status.message);
+            } else if status.status == HealthStatus::Unhealthy {
+                error!("Driver {} is unhealthy: {}", name, status.message);
+            }
+        }
+
+        self.health_pub.publish(&health)?;
+        Ok(())
+    }
+}
+```
+
+---
+
+## Scheduler Configuration
+
+### Running Multi-Driver Systems
+
+```rust
+fn main() -> HorusResult<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Fast tier: Sensors (100Hz)
+    scheduler.add(Box::new(ImuNode::new()?), 10, Some(true));
+    scheduler.add(Box::new(EncoderNode::new("left")?), 10, Some(true));
+    scheduler.add(Box::new(EncoderNode::new("right")?), 10, Some(true));
+
+    // Medium tier: Fusion and control (50Hz)
+    scheduler.add(Box::new(SensorFusionNode::new()?), 20, None);
+    scheduler.add(Box::new(DifferentialDriveNode::new()?), 20, None);
+
+    // Slow tier: Planning and GPS (10Hz)
+    scheduler.add(Box::new(GpsNode::new()?), 100, Some(true));
+    scheduler.add(Box::new(PathPlannerNode::new()?), 100, None);
+
+    // Health monitoring (1Hz)
+    scheduler.add(Box::new(HealthAggregator::new()?), 1000, None);
+
+    // Run the system
+    scheduler.run()?;
+
+    Ok(())
+}
+```
+
+---
+
+## Best Practices
+
+1. **Separate concerns** - Each driver handles one device
+2. **Use publishers/subscribers** - Decouple drivers from consumers
+3. **Appropriate scheduling** - Fast sensors need high frequency
+4. **Health monitoring** - Track all driver health centrally
+5. **Graceful degradation** - Have fallback strategies
+6. **Synchronized control** - Coordinate actuators for smooth motion
+7. **Time synchronization** - Use timestamps for sensor fusion
+
+---
+
+## See Also
+
+- [Hardware Drivers](/rust/library/drivers) - Driver overview
+- [Driver Testing Guide](/rust/library/drivers/testing) - Testing strategies
+- [Driver Error Handling](/rust/library/drivers/error-handling) - Error patterns
+- [Scheduler](/rust/core/scheduler) - Node scheduling

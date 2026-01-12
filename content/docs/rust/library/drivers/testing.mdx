@@ -1,0 +1,521 @@
+---
+title: "Driver Testing Guide"
+description: "Testing strategies for HORUS drivers: unit tests, integration tests, and hardware simulation"
+weight: 22
+---
+
+# Driver Testing Guide
+
+Testing drivers is critical for building reliable robotics systems. HORUS provides multiple strategies for testing drivers without requiring physical hardware.
+
+---
+
+## Testing Philosophy
+
+HORUS drivers follow a **simulation-first** approach:
+
+1. **Develop with simulation** - No hardware needed
+2. **Test with simulation** - Fast, deterministic tests
+3. **Validate with hardware** - Final verification only
+4. **Deploy with confidence** - Same API, different backend
+
+```
+Development Cycle:
+┌─────────────────────────────────────────────────────────┐
+│  Write Code → Sim Tests → Hardware Tests → Deploy       │
+│      ↑                                      │           │
+│      └──────────── Fix & Iterate ───────────┘           │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Unit Testing Drivers
+
+### Testing Lifecycle
+
+Every driver should have lifecycle tests:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horus::prelude::*;
+
+    #[test]
+    fn test_driver_lifecycle() {
+        let mut driver = SimulationImuDriver::new();
+
+        // 1. Initial state
+        assert_eq!(driver.status(), DriverStatus::Uninitialized);
+
+        // 2. Initialization
+        driver.init().unwrap();
+        assert_eq!(driver.status(), DriverStatus::Ready);
+
+        // 3. Reading (transitions to Running)
+        let data = driver.read().unwrap();
+        assert_eq!(driver.status(), DriverStatus::Running);
+
+        // 4. Shutdown
+        driver.shutdown().unwrap();
+        assert_eq!(driver.status(), DriverStatus::Shutdown);
+    }
+}
+```
+
+### Testing Data Output
+
+Validate that drivers produce sensible data:
+
+```rust
+#[test]
+fn test_imu_data_validity() {
+    let mut driver = SimulationImuDriver::new();
+    driver.init().unwrap();
+
+    let data = driver.read().unwrap();
+
+    // Check gravity is approximately correct (Z-axis ~9.81 m/s²)
+    assert!((data.linear_acceleration[2] - 9.81).abs() < 0.5);
+
+    // Check angular velocity is reasonable (not spinning wildly)
+    for &omega in &data.angular_velocity {
+        assert!(omega.abs() < 10.0); // rad/s
+    }
+
+    // Check timestamp is valid
+    assert!(data.timestamp > 0);
+}
+```
+
+### Testing Configuration
+
+Test that configuration options work correctly:
+
+```rust
+#[test]
+fn test_driver_configuration() {
+    // Custom config
+    let config = SimulationImuConfig {
+        sample_rate: 200.0,
+        add_noise: false,
+        accel_noise_std: 0.0,
+        gyro_noise_std: 0.0,
+    };
+
+    let driver = SimulationImuDriver::with_config(config);
+    assert_eq!(driver.sample_rate(), Some(200.0));
+}
+
+#[test]
+fn test_yaml_config_loading() {
+    let yaml = r#"
+        backend: simulation
+        sample_rate: 100
+        add_noise: true
+    "#;
+
+    let config: SingleDriverConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(config.backend, "simulation");
+}
+```
+
+---
+
+## Testing with Simulation Drivers
+
+### Simulation Driver Benefits
+
+Every HORUS driver type has a simulation implementation:
+
+| Driver Type | Simulation Driver | Features |
+|-------------|------------------|----------|
+| IMU | `SimulationImuDriver` | Synthetic gravity, configurable noise |
+| Motor | `SimulationMotorDriver` | Speed tracking, position feedback |
+| Camera | `SimulationCameraDriver` | Generated test patterns |
+| LiDAR | `SimulationLidarDriver` | Synthetic scan data |
+| GPS | `SimulationGpsDriver` | Simulated waypoints |
+| Joystick | `SimulationJoystickDriver` | Programmable input |
+
+### Configuring Noise for Realistic Tests
+
+```rust
+use horus::prelude::*;
+
+#[test]
+fn test_with_realistic_noise() {
+    let config = SimulationImuConfig {
+        sample_rate: 100.0,
+        add_noise: true,
+        accel_noise_std: 0.05,  // 0.05 m/s² noise
+        gyro_noise_std: 0.01,   // 0.01 rad/s noise
+    };
+
+    let mut driver = SimulationImuDriver::with_config(config);
+    driver.init().unwrap();
+
+    // Read multiple samples
+    let samples: Vec<_> = (0..100)
+        .map(|_| driver.read().unwrap())
+        .collect();
+
+    // Check variance exists (noise is present)
+    let z_values: Vec<f64> = samples.iter()
+        .map(|s| s.linear_acceleration[2])
+        .collect();
+
+    let mean = z_values.iter().sum::<f64>() / z_values.len() as f64;
+    let variance = z_values.iter()
+        .map(|x| (x - mean).powi(2))
+        .sum::<f64>() / z_values.len() as f64;
+
+    // Should have some variance from noise
+    assert!(variance > 0.0001);
+}
+```
+
+### Simulating Input Events
+
+For input drivers like joystick/keyboard:
+
+```rust
+#[test]
+fn test_joystick_input_simulation() {
+    let mut joystick = SimulationJoystickDriver::new();
+    joystick.init().unwrap();
+
+    // Simulate joystick movement
+    joystick.simulate_axis(0, 0.75);  // Left stick X
+    joystick.simulate_axis(1, -0.5);  // Left stick Y
+    joystick.simulate_button_press(0); // A button
+
+    let input = joystick.read().unwrap();
+
+    assert!((input.left_x - 0.75).abs() < 0.01);
+    assert!((input.left_y - (-0.5)).abs() < 0.01);
+    assert!(input.buttons[0]);
+}
+
+#[test]
+fn test_keyboard_input_simulation() {
+    let mut keyboard = SimulationKeyboardDriver::new();
+    keyboard.init().unwrap();
+
+    // Simulate WASD input
+    keyboard.simulate_key_press(KEY_W);
+    keyboard.simulate_key_press(KEY_SPACE);
+
+    let input = keyboard.read().unwrap();
+
+    assert!(input.is_key_pressed(KEY_W));
+    assert!(input.is_key_pressed(KEY_SPACE));
+    assert!(!input.is_key_pressed(KEY_S));
+}
+```
+
+---
+
+## Integration Testing
+
+### Testing Node + Driver Integration
+
+```rust
+#[cfg(test)]
+mod integration_tests {
+    use horus::prelude::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_imu_node_publishes_data() {
+        // Create scheduler
+        let mut scheduler = Scheduler::new();
+
+        // Create IMU node with simulation backend
+        let imu_node = ImuNode::builder()
+            .with_topic("test.imu")
+            .with_backend(ImuBackend::Simulation)
+            .build()
+            .unwrap();
+
+        scheduler.add(Box::new(imu_node), 100, Some(true));
+
+        // Create subscriber to capture data
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+
+        let subscriber = TestSubscriberNode::new("test.imu", move |data: Imu| {
+            received_clone.lock().unwrap().push(data);
+        });
+
+        scheduler.add(Box::new(subscriber), 100, None);
+
+        // Run for a short time
+        scheduler.run_for(Duration::from_millis(100)).unwrap();
+
+        // Verify data was received
+        let data = received.lock().unwrap();
+        assert!(!data.is_empty(), "Should have received IMU data");
+    }
+}
+```
+
+### Testing Multiple Drivers Together
+
+```rust
+#[test]
+fn test_sensor_fusion_pipeline() {
+    let mut scheduler = Scheduler::new();
+
+    // Create sensor nodes
+    let imu = ImuNode::new().unwrap();
+    let gps = GpsNode::new().unwrap();
+
+    // Create fusion node that combines both
+    let localization = LocalizationNode::builder()
+        .with_imu_topic("imu")
+        .with_gps_topic("gps")
+        .build()
+        .unwrap();
+
+    scheduler.add(Box::new(imu), 100, Some(true));
+    scheduler.add(Box::new(gps), 10, Some(true));
+    scheduler.add(Box::new(localization), 50, None);
+
+    // Run and verify pose output
+    scheduler.run_for(Duration::from_millis(200)).unwrap();
+
+    // Subscribe to check pose output
+    let pose_hub = Hub::<Pose>::new("pose").unwrap();
+    // Verify pose was computed
+}
+```
+
+---
+
+## Testing Hardware Drivers (When Available)
+
+### Conditional Hardware Tests
+
+Use feature flags to enable hardware tests:
+
+```rust
+#[cfg(all(test, feature = "mpu6050-imu"))]
+mod hardware_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires MPU6050 hardware"]
+    fn test_mpu6050_connection() {
+        let mut driver = Mpu6050Driver::new("/dev/i2c-1", 0x68)
+            .expect("Failed to create driver - is hardware connected?");
+
+        driver.init().expect("Failed to initialize MPU6050");
+
+        let data = driver.read().expect("Failed to read from MPU6050");
+
+        // Verify reasonable data
+        assert!(data.linear_acceleration[2] > 8.0); // Gravity present
+        assert!(data.linear_acceleration[2] < 12.0);
+    }
+}
+```
+
+Run hardware tests with:
+
+```bash
+# Run all tests including hardware
+cargo test --features mpu6050-imu -- --include-ignored
+
+# Run only hardware tests
+cargo test --features mpu6050-imu hardware_tests -- --include-ignored
+```
+
+### Hardware Test Best Practices
+
+```rust
+#[cfg(all(test, feature = "i2c-hardware"))]
+mod hw_tests {
+    use super::*;
+
+    /// Helper to skip test if hardware not available
+    fn require_i2c() -> Result<(), String> {
+        if !std::path::Path::new("/dev/i2c-1").exists() {
+            return Err("I2C bus not available".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_i2c_scan() {
+        if require_i2c().is_err() {
+            println!("Skipping: I2C not available");
+            return;
+        }
+
+        let mut i2c = LinuxI2cDriver::new("/dev/i2c-1").unwrap();
+        i2c.init().unwrap();
+
+        // Scan for devices
+        let devices = i2c.scan().unwrap();
+        println!("Found {} I2C devices", devices.len());
+    }
+}
+```
+
+---
+
+## Mock Drivers for Advanced Testing
+
+### Creating Test-Specific Mocks
+
+```rust
+/// Mock driver that records all calls for verification
+pub struct MockMotorDriver {
+    pub calls: Vec<MockCall>,
+    pub speed: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum MockCall {
+    Init,
+    SetSpeed(f64),
+    Stop,
+    Shutdown,
+}
+
+impl MockMotorDriver {
+    pub fn new() -> Self {
+        Self {
+            calls: Vec::new(),
+            speed: 0.0,
+        }
+    }
+
+    pub fn init(&mut self) -> HorusResult<()> {
+        self.calls.push(MockCall::Init);
+        Ok(())
+    }
+
+    pub fn set_speed(&mut self, speed: f64) -> HorusResult<()> {
+        self.calls.push(MockCall::SetSpeed(speed));
+        self.speed = speed;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> HorusResult<()> {
+        self.calls.push(MockCall::Stop);
+        self.speed = 0.0;
+        Ok(())
+    }
+}
+
+#[test]
+fn test_controller_uses_motor_correctly() {
+    let mut motor = MockMotorDriver::new();
+
+    // Run your control logic
+    motor.init().unwrap();
+    motor.set_speed(0.5).unwrap();
+    motor.set_speed(0.75).unwrap();
+    motor.stop().unwrap();
+
+    // Verify call sequence
+    assert!(matches!(motor.calls[0], MockCall::Init));
+    assert!(matches!(motor.calls[1], MockCall::SetSpeed(s) if (s - 0.5).abs() < 0.01));
+    assert!(matches!(motor.calls[2], MockCall::SetSpeed(s) if (s - 0.75).abs() < 0.01));
+    assert!(matches!(motor.calls[3], MockCall::Stop));
+}
+```
+
+### Dependency Injection for Testability
+
+```rust
+/// Robot controller that accepts any motor implementation
+pub struct RobotController<M: MotorControl> {
+    motor: M,
+}
+
+pub trait MotorControl {
+    fn set_speed(&mut self, speed: f64) -> HorusResult<()>;
+    fn stop(&mut self) -> HorusResult<()>;
+}
+
+impl<M: MotorControl> RobotController<M> {
+    pub fn new(motor: M) -> Self {
+        Self { motor }
+    }
+
+    pub fn move_forward(&mut self, speed: f64) -> HorusResult<()> {
+        self.motor.set_speed(speed.clamp(-1.0, 1.0))
+    }
+}
+
+// In production:
+// let controller = RobotController::new(GpioMotorDriver::new(...)?);
+
+// In tests:
+// let controller = RobotController::new(MockMotorDriver::new());
+```
+
+---
+
+## Test Organization
+
+### Recommended Test Structure
+
+```
+my_driver/
+├── src/
+│   ├── lib.rs
+│   ├── driver.rs
+│   └── simulation.rs
+├── tests/
+│   ├── unit_tests.rs       # Fast, no hardware
+│   ├── integration_tests.rs # Node/scheduler tests
+│   └── hardware_tests.rs    # Requires hardware (ignored by default)
+└── Cargo.toml
+```
+
+### Running Tests
+
+```bash
+# Run all unit tests (simulation only)
+cargo test
+
+# Run with verbose output
+cargo test -- --nocapture
+
+# Run specific test
+cargo test test_driver_lifecycle
+
+# Run integration tests
+cargo test --test integration_tests
+
+# Run hardware tests (when hardware connected)
+cargo test --features full-hardware -- --include-ignored
+
+# Run tests with coverage
+cargo tarpaulin --out Html
+```
+
+---
+
+## Best Practices
+
+1. **Always test with simulation first** - Catch bugs before touching hardware
+2. **Test the full lifecycle** - Init, read/write, shutdown
+3. **Test edge cases** - Invalid config, disconnection, error conditions
+4. **Use `#[ignore]` for hardware tests** - Don't break CI
+5. **Test configuration loading** - Verify YAML/TOML parsing
+6. **Test error handling** - Ensure graceful degradation
+7. **Mock dependencies** - Isolate units under test
+
+---
+
+## See Also
+
+- [Hardware Drivers](/rust/library/drivers) - Driver overview
+- [Driver Error Handling](/rust/library/drivers/error-handling) - Error patterns
+- [Simulation to Hardware](/rust/library/drivers/workflow) - Deployment workflow
+- [Driver Troubleshooting](/rust/library/drivers/troubleshooting) - Debug common issues

@@ -1,0 +1,724 @@
+---
+title: "Driver Plugin Development"
+description: "Create distributable driver plugins for hardware not covered by horus_library"
+weight: 20
+---
+
+# Driver Plugin Development
+
+When HORUS doesn't include a driver for your hardware, you have three options:
+
+1. **Simple standalone driver** - Plain struct with methods (easiest)
+2. **Driver plugin** - Distributable package using `DriverPlugin` trait (this guide)
+3. **Contribute to horus_library** - Open a PR to add your driver
+
+This guide covers **option 2**: creating a full driver plugin that can be distributed via the HORUS package registry or loaded dynamically at runtime.
+
+---
+
+## When to Use Plugins
+
+Use the plugin system when you want to:
+
+- **Distribute** your driver for others to use
+- **Dynamically load** drivers at runtime without recompilation
+- **Support hot-reloading** for development
+- **Integrate with hardware auto-discovery**
+- **Publish to the HORUS package registry**
+
+For simple one-off drivers in your project, see [Creating Custom Drivers](/rust/library/drivers#creating-custom-drivers).
+
+---
+
+## Plugin Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     DriverLoader                             │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐      │
+│  │   Static    │    │   Dynamic   │    │   Hybrid    │      │
+│  │   Plugins   │    │   Plugins   │    │    Mode     │      │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘      │
+└─────────┼──────────────────┼──────────────────┼─────────────┘
+          │                  │                  │
+          ▼                  ▼                  ▼
+    ┌───────────────────────────────────────────────┐
+    │              DriverPlugin Trait                │
+    │  ┌─────────────────────────────────────────┐  │
+    │  │  manifest()  → PluginManifest           │  │
+    │  │  probe()     → Vec<ProbeResult>         │  │
+    │  │  create()    → Box<dyn Any + Send>      │  │
+    │  │  health()    → PluginHealth             │  │
+    │  └─────────────────────────────────────────┘  │
+    └───────────────────────────────────────────────┘
+```
+
+---
+
+## Driver Loading Modes
+
+HORUS supports three driver loading modes configured in `horus.yaml`:
+
+```yaml
+driver_mode: hybrid  # static, dynamic, or hybrid
+
+plugins:
+  search_paths:
+    - ~/.horus/drivers
+    - /usr/local/lib/horus/drivers
+
+  # For hybrid mode
+  static:
+    - imu
+    - motor
+  dynamic:
+    - camera-fancy
+    - lidar-velodyne
+```
+
+| Mode | Description | Pros | Cons |
+|------|-------------|------|------|
+| **static** | Compiled into binary | Zero runtime overhead | Requires recompilation |
+| **dynamic** | Loaded at runtime via `dlopen` | Hot-reload, no recompilation | Small overhead |
+| **hybrid** | Core static, specialized dynamic | Best of both | More complex config |
+
+---
+
+## Core Types
+
+### PluginManifest
+
+Describes your plugin's metadata, capabilities, and requirements:
+
+```rust
+use horus_core::plugin::{PluginManifest, BackendInfo, SystemDependency};
+use horus_core::driver::DriverCategory;
+use std::collections::HashMap;
+
+let manifest = PluginManifest {
+    // Required: Unique identifier (use reverse-domain style)
+    id: "horus-imu-mpu6050".into(),
+
+    // Required: Human-readable name
+    name: "MPU6050 IMU Driver".into(),
+
+    // Required: Semver version
+    version: "1.0.0".into(),
+
+    // Required: Driver category
+    category: DriverCategory::Sensor,
+
+    // Required: Brief description
+    description: "Driver for MPU6050 6-axis IMU via I2C".into(),
+
+    // Optional: Author/maintainer
+    author: Some("Your Name".into()),
+
+    // Optional: SPDX license identifier
+    license: Some("MIT OR Apache-2.0".into()),
+
+    // Optional: Source repository
+    repository: Some("https://github.com/you/horus-imu-mpu6050".into()),
+
+    // Required: Backends provided by this plugin
+    backends: vec![
+        BackendInfo {
+            id: "mpu6050".into(),
+            name: "MPU6050".into(),
+            description: "MPU6050 via I2C".into(),
+            hardware_ids: vec!["i2c:0x68".into(), "i2c:0x69".into()],
+        },
+    ],
+
+    // Optional: System dependencies
+    system_deps: vec![
+        SystemDependency {
+            name: "i2c-dev".into(),
+            kind: "kernel-module".into(),
+            required: true,
+            check_cmd: Some("lsmod | grep -q i2c_dev".into()),
+        },
+    ],
+
+    // Required: Compatible HORUS versions (semver range)
+    horus_version: ">=0.5.0, <1.0.0".into(),
+
+    // Optional: Supported platforms (default: ["linux"])
+    platforms: vec!["linux".into()],
+
+    // Optional: Feature flags
+    features: vec![],
+
+    // Optional: Extra metadata
+    extra: HashMap::new(),
+};
+```
+
+### BackendInfo
+
+Describes a specific driver backend within your plugin:
+
+```rust
+use horus_core::plugin::BackendInfo;
+
+let backend = BackendInfo {
+    // Unique ID within this plugin
+    id: "mpu6050".into(),
+
+    // Human-readable name
+    name: "MPU6050 6-DOF IMU".into(),
+
+    // Description
+    description: "InvenSense MPU6050 via I2C bus".into(),
+
+    // Hardware identifiers for auto-detection
+    // Format: "bus:identifier"
+    hardware_ids: vec![
+        "i2c:0x68".into(),  // Default I2C address
+        "i2c:0x69".into(),  // Alternative address (AD0 high)
+    ],
+};
+```
+
+**Hardware ID Formats:**
+
+| Bus | Format | Example |
+|-----|--------|---------|
+| I2C | `i2c:ADDRESS` | `i2c:0x68` |
+| USB | `usb:VID:PID` | `usb:1234:5678` |
+| Serial | `serial:PATTERN` | `serial:/dev/ttyUSB*` |
+| SPI | `spi:BUS:CS` | `spi:0:0` |
+
+### ProbeResult
+
+Result of hardware detection:
+
+```rust
+use horus_core::plugin::ProbeResult;
+
+// Hardware detected successfully
+let detected = ProbeResult::detected("mpu6050", "/dev/i2c-1")
+    .with_metadata("address", "0x68")
+    .with_message("MPU6050 found at 0x68");
+
+// Detection with confidence score
+let maybe = ProbeResult::with_confidence("mpu6050", 0.7, Some("/dev/i2c-1".into()))
+    .with_message("Device responds but ID register unclear");
+
+// Hardware not found
+let not_found = ProbeResult::not_detected("mpu6050")
+    .with_message("No device at 0x68 or 0x69");
+```
+
+### PluginHealth
+
+Health status for monitoring:
+
+```rust
+use horus_core::plugin::PluginHealth;
+
+// Plugin is healthy
+let healthy = PluginHealth::healthy("my-plugin");
+
+// Plugin has issues
+let unhealthy = PluginHealth::unhealthy("my-plugin", "I2C bus not accessible");
+```
+
+---
+
+## Implementing DriverPlugin
+
+### The DriverPlugin Trait
+
+```rust
+use horus_core::plugin::{DriverPlugin, PluginManifest, ProbeResult, PluginHealth};
+use horus_core::driver::SingleDriverConfig;
+use horus_core::error::HorusResult;
+use std::any::Any;
+
+pub trait DriverPlugin: Send + Sync {
+    /// Get the plugin manifest
+    fn manifest(&self) -> PluginManifest;
+
+    /// Probe for hardware
+    fn probe(&self, backend_id: &str) -> Vec<ProbeResult>;
+
+    /// Create a driver instance
+    fn create(
+        &self,
+        backend_id: &str,
+        config: &SingleDriverConfig,
+    ) -> HorusResult<Box<dyn Any + Send + Sync>>;
+
+    /// Get health status
+    fn health(&self) -> PluginHealth;
+
+    /// Called when plugin loads (optional)
+    fn on_load(&self) -> HorusResult<()> { Ok(()) }
+
+    /// Called when plugin unloads (optional)
+    fn on_unload(&self) {}
+}
+```
+
+### Complete Example: MPU6050 IMU Plugin
+
+```rust
+use horus_core::plugin::{
+    DriverPlugin, PluginManifest, BackendInfo, ProbeResult, PluginHealth
+};
+use horus_core::driver::{DriverCategory, SingleDriverConfig, DriverStatus};
+use horus_core::error::{HorusResult, HorusError};
+use horus_messages::Imu;
+use std::any::Any;
+use std::collections::HashMap;
+
+// ============================================================
+// Step 1: Define Your Driver Struct
+// ============================================================
+
+pub struct Mpu6050Driver {
+    bus: String,
+    address: u8,
+    status: DriverStatus,
+    // Add your hardware handle here
+}
+
+impl Mpu6050Driver {
+    pub fn new(bus: &str, address: u8) -> HorusResult<Self> {
+        Ok(Self {
+            bus: bus.to_string(),
+            address,
+            status: DriverStatus::Uninitialized,
+        })
+    }
+
+    pub fn init(&mut self) -> HorusResult<()> {
+        // Initialize I2C, configure sensor registers
+        // ...
+        self.status = DriverStatus::Ready;
+        Ok(())
+    }
+
+    pub fn read(&mut self) -> HorusResult<Imu> {
+        // Read from I2C registers, convert to Imu message
+        let mut imu = Imu::new();
+        // ... populate imu data
+        Ok(imu)
+    }
+
+    pub fn status(&self) -> &DriverStatus {
+        &self.status
+    }
+}
+
+// ============================================================
+// Step 2: Define the Plugin Struct
+// ============================================================
+
+pub struct Mpu6050Plugin;
+
+impl DriverPlugin for Mpu6050Plugin {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: "horus-imu-mpu6050".into(),
+            name: "MPU6050 IMU Driver".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            category: DriverCategory::Sensor,
+            description: "Driver for MPU6050 6-axis IMU".into(),
+            author: Some(env!("CARGO_PKG_AUTHORS").into()),
+            license: Some("MIT OR Apache-2.0".into()),
+            repository: Some("https://github.com/softmata/horus".into()),
+            backends: vec![
+                BackendInfo {
+                    id: "mpu6050".into(),
+                    name: "MPU6050".into(),
+                    description: "MPU6050 via I2C".into(),
+                    hardware_ids: vec!["i2c:0x68".into(), "i2c:0x69".into()],
+                },
+            ],
+            system_deps: vec![],
+            horus_version: ">=0.5.0".into(),
+            platforms: vec!["linux".into()],
+            features: vec![],
+            extra: HashMap::new(),
+        }
+    }
+
+    fn probe(&self, backend_id: &str) -> Vec<ProbeResult> {
+        let mut results = Vec::new();
+
+        // Only probe if backend matches or empty (probe all)
+        if !backend_id.is_empty() && backend_id != "mpu6050" {
+            return vec![ProbeResult::not_detected(backend_id)];
+        }
+
+        // Scan I2C buses for MPU6050
+        for bus in ["/dev/i2c-0", "/dev/i2c-1"] {
+            for addr in [0x68u8, 0x69u8] {
+                if Self::check_device(bus, addr) {
+                    results.push(
+                        ProbeResult::detected("mpu6050", bus)
+                            .with_metadata("address", format!("0x{:02X}", addr))
+                            .with_message(format!("MPU6050 found at {}", bus))
+                    );
+                }
+            }
+        }
+
+        if results.is_empty() {
+            results.push(ProbeResult::not_detected("mpu6050"));
+        }
+
+        results
+    }
+
+    fn create(
+        &self,
+        backend_id: &str,
+        config: &SingleDriverConfig,
+    ) -> HorusResult<Box<dyn Any + Send + Sync>> {
+        if backend_id != "mpu6050" {
+            return Err(HorusError::driver(format!(
+                "Unknown backend: {}", backend_id
+            )));
+        }
+
+        // Get configuration
+        let bus = config.port.clone()
+            .or_else(|| config.get_option("bus"))
+            .unwrap_or_else(|| "/dev/i2c-1".into());
+
+        let address = config.i2c_address.unwrap_or(0x68);
+
+        // Create and initialize driver
+        let mut driver = Mpu6050Driver::new(&bus, address)?;
+        driver.init()?;
+
+        Ok(Box::new(driver))
+    }
+
+    fn health(&self) -> PluginHealth {
+        PluginHealth::healthy("horus-imu-mpu6050")
+    }
+
+    fn on_load(&self) -> HorusResult<()> {
+        // Check system dependencies
+        // e.g., verify i2c-dev module is loaded
+        Ok(())
+    }
+}
+
+impl Mpu6050Plugin {
+    fn check_device(bus: &str, address: u8) -> bool {
+        // Try to communicate with the device
+        // Return true if MPU6050 responds correctly
+        // In real code: open I2C bus, read WHO_AM_I register
+        false // Placeholder
+    }
+}
+
+// ============================================================
+// Step 3: Export Entry Point (for dynamic loading)
+// ============================================================
+
+/// Entry point for dynamic plugin loading
+///
+/// HORUS loads plugins by calling this function.
+/// The function name MUST be exactly "horus_driver_entry".
+#[no_mangle]
+pub extern "C" fn horus_driver_entry() -> Box<dyn DriverPlugin> {
+    Box::new(Mpu6050Plugin)
+}
+```
+
+---
+
+## Using Your Plugin
+
+### Static Registration
+
+For plugins compiled into your binary:
+
+```rust
+use horus_core::plugin::{DriverLoader, DriverLoaderConfig, DriverMode};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create loader in static mode
+    let config = DriverLoaderConfig {
+        mode: DriverMode::Static,
+        ..Default::default()
+    };
+    let mut loader = DriverLoader::new(config);
+
+    // Register your plugin
+    loader.register_static(Box::new(Mpu6050Plugin));
+
+    // Initialize
+    loader.initialize()?;
+
+    // List available drivers
+    println!("Available: {:?}", loader.available_drivers());
+
+    // Create driver from plugin
+    let imu_config = SingleDriverConfig::i2c("mpu6050", 1, 0x68);
+    let driver = loader.create_driver("horus-imu-mpu6050", "mpu6050", &imu_config)?;
+
+    // Downcast to your driver type
+    let imu: Box<Mpu6050Driver> = driver.downcast()
+        .map_err(|_| "Type mismatch")?;
+
+    Ok(())
+}
+```
+
+### Dynamic Loading
+
+For plugins distributed as shared libraries:
+
+```yaml
+# horus.yaml
+driver_mode: dynamic
+
+plugins:
+  search_paths:
+    - ~/.horus/drivers
+    - ./plugins
+```
+
+```rust
+use horus_core::plugin::{DriverLoader, DriverLoaderConfig, DriverMode};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = DriverLoaderConfig {
+        mode: DriverMode::Dynamic,
+        search_paths: vec!["~/.horus/drivers".into()],
+        auto_discover: true,
+        ..Default::default()
+    };
+
+    let mut loader = DriverLoader::new(config);
+    loader.initialize()?; // Scans search paths for .so files
+
+    // Plugin is auto-discovered and available
+    let driver = loader.create_driver("horus-imu-mpu6050", "mpu6050", &config)?;
+
+    Ok(())
+}
+```
+
+### Auto-Detection
+
+Let HORUS find the best backend automatically:
+
+```rust
+use horus_core::plugin::AutoDetectable;
+
+// Probe hardware and create driver from first detected backend
+let driver = loader.auto_create_driver("horus-imu-mpu6050", &config)?;
+```
+
+---
+
+## Building for Distribution
+
+### Cargo.toml
+
+```toml
+[package]
+name = "horus-imu-mpu6050"
+version = "1.0.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+license = "MIT OR Apache-2.0"
+description = "MPU6050 IMU driver plugin for HORUS"
+repository = "https://github.com/you/horus-imu-mpu6050"
+keywords = ["horus", "robotics", "imu", "mpu6050"]
+categories = ["science::robotics", "hardware-support"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]  # cdylib for dynamic loading
+
+[dependencies]
+horus_core = "0.5"
+horus_messages = "0.5"
+linux-i2cdev = "0.6"  # Your hardware dependencies
+
+[features]
+default = []
+```
+
+### Build Commands
+
+```bash
+# Build shared library for dynamic loading
+cargo build --release
+
+# Output: target/release/libhorus_imu_mpu6050.so
+
+# Install to HORUS plugin directory
+cp target/release/libhorus_imu_mpu6050.so ~/.horus/drivers/
+```
+
+---
+
+## Publishing to Registry
+
+### Package Metadata
+
+Create `horus-plugin.yaml` in your package root:
+
+```yaml
+type: driver-plugin
+category: sensor
+subcategory: imu
+
+hardware:
+  - name: MPU6050
+    manufacturer: InvenSense
+    interface: i2c
+    addresses: [0x68, 0x69]
+
+platforms:
+  - linux-x86_64
+  - linux-aarch64
+
+dependencies:
+  system:
+    - name: i2c-tools
+      package: i2c-tools  # apt package name
+```
+
+### Publish
+
+```bash
+# Login to registry
+horus registry login
+
+# Publish
+horus publish
+```
+
+---
+
+## Error Handling
+
+Use HORUS's error types for consistency:
+
+```rust
+use horus_core::error::{HorusError, HorusResult};
+use horus_core::plugin::PluginError;
+
+// Creating errors
+let err = HorusError::driver("I2C bus not accessible");
+let err = HorusError::config("Invalid address format");
+
+// Plugin-specific errors
+let err = PluginError::NotFound("/path/to/plugin.so".into());
+let err = PluginError::BackendNotFound("unknown-backend".into());
+let err = PluginError::VersionMismatch {
+    required: ">=0.5.0".into(),
+    found: "0.4.0".into(),
+};
+
+// In your create() implementation
+fn create(&self, backend_id: &str, config: &SingleDriverConfig)
+    -> HorusResult<Box<dyn Any + Send + Sync>>
+{
+    if backend_id != "mpu6050" {
+        return Err(HorusError::driver(format!(
+            "Unknown backend '{}'. Available: mpu6050", backend_id
+        )));
+    }
+
+    let address = config.i2c_address.ok_or_else(|| {
+        HorusError::config("i2c_address is required for MPU6050")
+    })?;
+
+    // ...
+}
+```
+
+---
+
+## Hot Reloading (Advanced)
+
+For development, implement `HotReloadable`:
+
+```rust
+use horus_core::plugin::HotReloadable;
+
+impl HotReloadable for Mpu6050Plugin {
+    fn can_hot_reload(&self) -> bool {
+        // Return false if active instances would be invalidated
+        true
+    }
+
+    fn prepare_hot_reload(&self) -> HorusResult<()> {
+        // Save state before unloading
+        Ok(())
+    }
+
+    fn complete_hot_reload(&self) -> HorusResult<()> {
+        // Restore state after reloading
+        Ok(())
+    }
+}
+```
+
+---
+
+## Testing Your Plugin
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest() {
+        let plugin = Mpu6050Plugin;
+        let manifest = plugin.manifest();
+
+        assert_eq!(manifest.id, "horus-imu-mpu6050");
+        assert!(manifest.supports_current_platform());
+        assert!(manifest.is_compatible_with("0.5.0"));
+    }
+
+    #[test]
+    fn test_probe_not_found() {
+        let plugin = Mpu6050Plugin;
+        let results = plugin.probe("mpu6050");
+
+        // Without hardware, should report not detected
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_health() {
+        let plugin = Mpu6050Plugin;
+        let health = plugin.health();
+
+        assert!(health.healthy);
+    }
+
+    #[test]
+    fn test_create_with_config() {
+        let plugin = Mpu6050Plugin;
+        let config = SingleDriverConfig::i2c("mpu6050", 1, 0x68);
+
+        // This will fail without hardware, but tests the path
+        let result = plugin.create("mpu6050", &config);
+        // Assert based on your implementation
+    }
+}
+```
+
+---
+
+## See Also
+
+- [Hardware Drivers](/rust/library/drivers) - Driver overview and usage
+- [Built-in Nodes](/rust/library/built-in-nodes) - Pre-built nodes using drivers
+- [Hardware Discovery](/development/hardware-discovery) - Auto-detection system
+- [Package Management](/package-management/package-management) - Publishing packages
