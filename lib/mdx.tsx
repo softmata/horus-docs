@@ -147,7 +147,7 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
           const className = codeElement?.className || '';
           const code = codeElement?.children?.toString() || '';
 
-          // If we have a code block with language, use our CodeBlock component
+          // If we have a code block with language, use CodeBlock
           if (className) {
             return <CodeBlock className={className}>{code}</CodeBlock>;
           }

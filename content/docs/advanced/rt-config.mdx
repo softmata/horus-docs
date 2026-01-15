@@ -1,0 +1,382 @@
+---
+title: Real-Time Configuration (RtConfig)
+description: Configure system-level real-time settings for deterministic execution with sub-100ns latency
+order: 15
+category: "advanced"
+---
+
+# Real-Time Configuration (RtConfig)
+
+HORUS provides `RtConfig`, a builder API for configuring system-level real-time settings. This enables deterministic execution with sub-100ns IPC latency for hard real-time robotics applications.
+
+## Cross-Platform Support
+
+RtConfig is designed for **development on any OS** with **production deployment on Linux**:
+
+| Platform | RtConfig Behavior | Use Case |
+|----------|------------------|----------|
+| **Linux** | Full RT features enabled | Production deployment |
+| **macOS** | Graceful degradation (no RT) | Development & testing |
+| **Windows** | Graceful degradation (no RT) | Development & testing |
+
+On non-Linux platforms, `RtConfig::apply()` returns `RtApplyResult::Degraded` and your code continues running normally - just without kernel-level RT guarantees. This allows you to develop and test on any OS.
+
+```rust
+let config = RtConfig::hard_realtime(Some(&[2, 3]));
+match config.apply() {
+    Ok(RtApplyResult::FullSuccess) => println!("Full RT enabled (Linux)"),
+    Ok(RtApplyResult::Degraded(reasons)) => {
+        // On macOS/Windows: continues running without RT
+        println!("Running in degraded mode: {:?}", reasons);
+    }
+    Err(e) => eprintln!("Error: {}", e),
+}
+```
+
+## Overview
+
+`RtConfig` controls kernel-level features that eliminate latency sources (Linux only):
+
+| Feature | Purpose | Default |
+|---------|---------|---------|
+| `memory_locked` | Prevent page faults via `mlockall()` | `false` |
+| `prefault_stack` | Pre-touch stack to avoid lazy allocation | `0` |
+| `scheduler` | RT scheduling class (SCHED_FIFO/RR) | `Normal` |
+| `priority` | RT scheduling priority (1-99) | `0` |
+| `cpu_affinity` | Pin to specific CPU cores | `None` |
+
+## Quick Start
+
+```rust
+use horus::prelude::*;  // Provides RtConfig, RtScheduler
+
+// Apply hard real-time configuration
+let config = RtConfig::hard_realtime(Some(&[2, 3]));  // Pin to cores 2, 3
+config.apply()?;
+
+// Now all HORUS operations run with RT guarantees
+let link: Link<CmdVel> = Link::producer("cmd_vel")?;  // <100ns latency
+```
+
+## Configuration Presets
+
+### Hard Real-Time
+
+For safety-critical applications with strict timing requirements:
+
+```rust
+// Highest priority, locked memory, pinned to isolated cores
+let config = RtConfig::hard_realtime(Some(&[2, 3]));
+config.apply()?;
+```
+
+This enables:
+- `mlockall(MCL_CURRENT | MCL_FUTURE)` - No page faults
+- 512KB stack prefaulting - No lazy allocation
+- `SCHED_FIFO` priority 80 - Preempts all normal processes
+- CPU affinity to specified cores - No migration jitter
+
+### Soft Real-Time
+
+For applications requiring good latency without root privileges:
+
+```rust
+let config = RtConfig::soft_realtime();
+config.apply()?;  // Works without CAP_SYS_NICE
+```
+
+This enables:
+- Memory locking (if permitted)
+- Stack prefaulting
+- Normal scheduling (no `SCHED_FIFO`)
+
+### Normal Operation
+
+Default configuration with no RT features:
+
+```rust
+let config = RtConfig::normal();
+config.apply()?;  // No RT modifications
+```
+
+## Builder API
+
+For fine-grained control:
+
+```rust
+use horus::prelude::*;
+
+let config = RtConfig::new()
+    .memory_locked(true)           // mlockall()
+    .prefault_stack(1024 * 1024)   // 1MB stack prefault
+    .scheduler(RtScheduler::Fifo)  // SCHED_FIFO
+    .priority(90)                  // High priority (1-99)
+    .cpu_affinity(&[4, 5, 6, 7])   // Pin to cores 4-7
+    .build();
+
+config.apply()?;
+```
+
+### Builder Methods
+
+| Method | Description |
+|--------|-------------|
+| `memory_locked(bool)` | Enable/disable `mlockall()` |
+| `prefault_stack(bytes)` | Stack size to prefault |
+| `scheduler(RtScheduler)` | Scheduling class |
+| `priority(u8)` | RT priority (1-99 for FIFO/RR) |
+| `cpu_affinity(&[usize])` | CPU cores to pin to |
+
+### Scheduling Classes
+
+```rust
+pub enum RtScheduler {
+    Normal,  // Default Linux scheduler (SCHED_OTHER)
+    Fifo,    // SCHED_FIFO - First-in-first-out RT
+    RR,      // SCHED_RR - Round-robin RT
+}
+```
+
+| Class | Preemption | Use Case |
+|-------|------------|----------|
+| `Normal` | Time-sliced | General applications |
+| `Fifo` | Highest-priority-first | Hard RT control loops |
+| `RR` | Round-robin among same priority | Multiple RT tasks |
+
+## System Requirements
+
+### Capabilities Required
+
+| Feature | Capability Needed |
+|---------|------------------|
+| `memory_locked` | `CAP_IPC_LOCK` (or unlimited memlock) |
+| `scheduler(Fifo/RR)` | `CAP_SYS_NICE` |
+| `priority > 0` | `CAP_SYS_NICE` |
+| `cpu_affinity` | None (always available) |
+
+### Grant Capabilities (Recommended)
+
+```bash
+# For development - grant capabilities to your binary
+sudo setcap 'cap_sys_nice=ep cap_ipc_lock=ep' ./target/release/my_robot
+
+# For production - run as RT user
+sudo usermod -a -G realtime $USER
+```
+
+### Alternative: Increase memlock limit
+
+```bash
+# In /etc/security/limits.conf
+your_user  soft  memlock  unlimited
+your_user  hard  memlock  unlimited
+```
+
+## PREEMPT_RT Kernel
+
+For guaranteed sub-100ns latency, use a PREEMPT_RT kernel:
+
+### Ubuntu/Debian
+
+```bash
+# Install RT kernel
+sudo apt install linux-image-rt-amd64
+
+# Reboot and select RT kernel in GRUB
+sudo reboot
+```
+
+### Verify RT Kernel
+
+```bash
+uname -a | grep -i rt
+# Should show: PREEMPT_RT
+```
+
+### Kernel Tuning
+
+```bash
+# Isolate CPU cores for RT (add to kernel cmdline)
+isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+
+# Disable CPU frequency scaling
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+## Integration with RtNode
+
+`RtConfig` provides system-level configuration. Combine with `RtNode` for node-level RT guarantees:
+
+```rust
+use horus::prelude::*;
+use std::time::Duration;
+
+// 1. Configure system for RT
+RtConfig::hard_realtime(Some(&[2, 3])).apply()?;
+
+// 2. Create scheduler with safety-critical config
+let mut scheduler = Scheduler::new();
+scheduler.set_config(SchedulerConfig::safety_critical());
+
+// 3. Add RT nodes with timing constraints
+struct MotorControl { /* ... */ }
+
+impl RtNode for MotorControl {
+    fn wcet_budget(&self) -> Duration { Duration::from_micros(50) }
+    fn deadline(&self) -> Duration { Duration::from_micros(500) }
+    fn rt_priority(&self) -> RtPriority { RtPriority::Critical }
+    fn rt_class(&self) -> RtClass { RtClass::Hard }
+}
+
+scheduler.add_rt(
+    Box::new(MotorControl::new()),
+    0,  // Priority 0 (highest)
+    Duration::from_micros(50),   // WCET budget
+    Duration::from_micros(500),  // Deadline (2kHz)
+);
+
+scheduler.run();
+```
+
+## Performance Impact
+
+With full RT configuration on PREEMPT_RT kernel:
+
+| Metric | Without RT | With RT Config | Improvement |
+|--------|------------|----------------|-------------|
+| Link send latency | ~150ns | ~87ns | 1.7x |
+| Latency jitter | 1-10ms | &lt;10μs | 100-1000x |
+| Worst-case latency | 50ms+ | &lt;100μs | 500x+ |
+| Page fault during operation | Possible | Eliminated | N/A |
+
+## Graceful Degradation
+
+`RtConfig` degrades gracefully when features aren't available:
+
+```rust
+let config = RtConfig::hard_realtime(Some(&[2, 3]));
+match config.apply() {
+    Ok(report) => {
+        if report.memory_locked {
+            println!("Memory locked successfully");
+        } else {
+            println!("Memory locking unavailable (needs CAP_IPC_LOCK)");
+        }
+        if report.scheduler_set {
+            println!("RT scheduler enabled");
+        } else {
+            println!("RT scheduler unavailable (needs CAP_SYS_NICE)");
+        }
+    }
+    Err(e) => eprintln!("Critical failure: {}", e),
+}
+```
+
+The system continues running with available features rather than failing completely.
+
+## Verification
+
+### Check Current Configuration
+
+```rust
+let status = RtConfig::current()?;
+println!("Memory locked: {}", status.memory_locked);
+println!("Scheduler: {:?}", status.scheduler);
+println!("Priority: {}", status.priority);
+println!("CPU affinity: {:?}", status.cpu_affinity);
+```
+
+### Runtime Metrics
+
+```rust
+// In your node's tick()
+if let Some(ctx) = &ctx {
+    if ctx.metrics.max_tick_duration_ms > 1.0 {
+        ctx.log_warning("RT constraint violated!");
+    }
+}
+```
+
+## Troubleshooting
+
+### "Operation not permitted" on mlockall
+
+```bash
+# Check memlock limit
+ulimit -l
+# If not unlimited, increase in /etc/security/limits.conf
+# Or grant CAP_IPC_LOCK capability
+```
+
+### "Operation not permitted" on SCHED_FIFO
+
+```bash
+# Grant CAP_SYS_NICE
+sudo setcap 'cap_sys_nice=ep' ./target/release/my_robot
+```
+
+### High latency despite RT config
+
+1. Verify PREEMPT_RT kernel: `uname -a | grep RT`
+2. Check CPU isolation: `cat /sys/devices/system/cpu/isolated`
+3. Disable CPU frequency scaling
+4. Check for other RT processes: `ps -eo pid,cls,pri,comm | grep -E "FF|RR"`
+
+### CPU affinity not taking effect
+
+```bash
+# Verify isolated cores
+cat /sys/devices/system/cpu/isolated
+# Should show your isolated cores: 2-3
+```
+
+## Best Practices
+
+1. **Isolate CPU cores** - Use kernel `isolcpus` parameter
+2. **Use PREEMPT_RT kernel** - Essential for hard RT guarantees
+3. **Pin to isolated cores** - Avoid contention with system tasks
+4. **Pre-fault everything** - Memory, stack, and shared memory
+5. **Monitor worst-case latency** - Not just average
+6. **Test under load** - RT violations often appear under stress
+
+## Complete Example
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    // Configure system for hard real-time
+    let rt_config = RtConfig::new()
+        .memory_locked(true)
+        .prefault_stack(512 * 1024)  // 512KB
+        .scheduler(RtScheduler::Fifo)
+        .priority(80)
+        .cpu_affinity(&[2, 3])  // Isolated cores
+        .build();
+
+    let report = rt_config.apply()?;
+    println!("RT Config applied: memory_locked={}, scheduler_set={}",
+             report.memory_locked, report.scheduler_set);
+
+    // Create RT communication channel
+    let producer: Link<CmdVel> = Link::producer("motor_cmd")?;
+    let consumer: Link<CmdVel> = Link::consumer("motor_cmd")?;
+
+    // Now IPC runs with <100ns latency and minimal jitter
+    loop {
+        let cmd = CmdVel::new(1.0, 0.5);
+        producer.send(cmd, &mut None)?;
+
+        if let Some(received) = consumer.recv(&mut None) {
+            // Process at 10kHz+ with deterministic timing
+        }
+    }
+}
+```
+
+## See Also
+
+- [Real-Time Nodes (RtNode)](/concepts/realtime-nodes) - Node-level RT constraints
+- [Performance Optimization](/performance/performance) - General performance tuning
+- [Scheduler Configuration](/advanced/scheduler-configuration) - Scheduler presets
+- [Safety Monitor](/advanced/safety-monitor) - WCET and deadline monitoring

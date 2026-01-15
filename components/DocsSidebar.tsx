@@ -200,6 +200,15 @@ const sections: SidebarSection[] = [
         title: "Drivers",
         href: "/rust/library/drivers",
         order: 5,
+        children: [
+          { title: "DriverLoader Configuration", href: "/rust/library/drivers/driver-loader", order: 1 },
+          { title: "Error Handling Patterns", href: "/rust/library/drivers/error-handling", order: 2 },
+          { title: "Multi-Driver Scenarios", href: "/rust/library/drivers/multi-driver", order: 3 },
+          { title: "Plugin Development", href: "/rust/library/drivers/plugin-development", order: 4 },
+          { title: "Testing Guide", href: "/rust/library/drivers/testing", order: 5 },
+          { title: "Troubleshooting", href: "/rust/library/drivers/troubleshooting", order: 6 },
+          { title: "Hardware Workflow", href: "/rust/library/drivers/workflow", order: 7 },
+        ]
       },
       {
         title: "Examples",
@@ -312,6 +321,7 @@ const sections: SidebarSection[] = [
       { title: "Record & Replay", href: "/advanced/record-replay", order: 13 },
       { title: "Redundancy", href: "/advanced/redundancy", order: 14 },
       { title: "Telemetry", href: "/advanced/telemetry", order: 15 },
+      { title: "Real-Time Configuration", href: "/advanced/rt-config", order: 16 },
     ],
   },
   {
