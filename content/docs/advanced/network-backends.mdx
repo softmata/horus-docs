@@ -15,7 +15,7 @@ HORUS provides advanced network backends for high-performance distributed commun
 | **BatchUDP** | ~10µs | 200K+ pkt/s | Local network |
 | **io_uring** | 3-5µs | High | Linux low-latency |
 | **QUIC** | ~1ms | High | WAN, reliable |
-| **SmartTransport** | Auto | Auto | General purpose |
+| **Zenoh** | ~100µs | High | ROS2 interop, mesh |
 
 ## QUIC Transport
 
@@ -39,7 +39,7 @@ horus_core = { version = "0.1", features = ["quic"] }
 ### Configuration
 
 ```rust
-use horus::prelude::*; // Provides {QuicConfig, QuicTransport}
+use horus::communication::network::{QuicConfig, QuicTransport};
 
 // Default configuration
 let config = QuicConfig::default();
@@ -65,7 +65,7 @@ let config = QuicConfig::high_throughput();
 ### Client Usage
 
 ```rust
-use horus::prelude::*; // Provides {QuicConfig, QuicTransport}
+use horus::communication::network::{QuicConfig, QuicTransport};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -92,12 +92,12 @@ async fn main() -> std::io::Result<()> {
 ### Server Usage
 
 ```rust
-use horus::prelude::*; // Provides {QuicConfig, QuicTransport, generate_self_signed_cert}
+use horus::communication::network::{QuicConfig, QuicTransport, get_or_create_cert};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     // Generate self-signed certificate for development
-    let (certs, key) = generate_self_signed_cert()?;
+    let (certs, key) = get_or_create_cert()?;
 
     let bind_addr: SocketAddr = "0.0.0.0:9000".parse().unwrap();
 
@@ -159,7 +159,7 @@ horus_core = { version = "0.1", features = ["io-uring-net"] }
 ### Configuration
 
 ```rust
-use horus::prelude::*; // Provides {RealIoUringConfig, RealIoUringBackend}
+use horus::communication::network::{RealIoUringConfig, RealIoUringBackend};
 
 // Default configuration
 let config = RealIoUringConfig::default();
@@ -186,7 +186,7 @@ let config = RealIoUringConfig::low_latency();
 ### Basic Usage
 
 ```rust
-use horus::prelude::*; // Provides {RealIoUringBackend, RealIoUringConfig, is_real_io_uring_available}
+use horus::communication::network::{RealIoUringBackend, RealIoUringConfig, is_real_io_uring_available};
 
 // Check availability
 if !is_real_io_uring_available() {
@@ -273,7 +273,7 @@ Transparent compression for large messages:
 ### Configuration
 
 ```rust
-use horus::prelude::*; // Provides {CompressionConfig, CompressionAlgo, Compressor}
+use horus::communication::network::{CompressionConfig, CompressionAlgo, Compressor};
 
 // LZ4 for real-time
 let config = CompressionConfig::lz4();
@@ -322,7 +322,7 @@ let decompressed = compressor.decompress(
 ### Network Packets
 
 ```rust
-use horus::prelude::*; // Provides CompressedPacket
+use horus::communication::network::CompressedPacket;
 
 // Create packet from compressed data
 let packet = CompressedPacket::from_compressed(compressed);
@@ -336,43 +336,43 @@ let packet: CompressedPacket = bincode::deserialize(&received)?;
 let data = packet.decompress(&compressor)?;
 ```
 
-## Smart Transport
-
-Auto-selects the best transport based on conditions:
-
-```rust
-use horus::prelude::*; // Provides SmartTransport
-
-// Auto-selects based on:
-// - Local network → BatchUDP or io_uring
-// - WAN → QUIC
-// - Reliability needed → QUIC
-// - Low latency needed → io_uring
-
-let transport = SmartTransport::new()?;
-transport.send(addr, data).await?;
-```
-
 ## Message Batching
 
 Batch multiple messages for efficiency:
 
 ```rust
-use horus::prelude::*; // Provides MessageBatcher
+use horus::communication::network::{MessageBatcher, BatchConfig};
 
-let mut batcher = MessageBatcher::new(
-    1024,  // Max batch size bytes
-    10,    // Max messages per batch
-    Duration::from_millis(5),  // Max wait time
-);
+// Create batcher with configuration
+let config = BatchConfig::default();  // 100 messages, 60KB, 5ms timeout
+let mut batcher = MessageBatcher::new("sensor_data", config);
 
-// Add messages
-batcher.add(message1)?;
-batcher.add(message2)?;
+// Low latency config (smaller batches, shorter timeout)
+let config = BatchConfig::low_latency();  // 10 messages, 500µs timeout
+let mut batcher = MessageBatcher::new("control_cmd", config);
 
-// Get batch when ready
-if let Some(batch) = batcher.get_batch() {
-    send_batch(&batch)?;
+// High throughput config (larger batches, longer timeout)
+let config = BatchConfig::high_throughput();  // 500 messages, 20ms timeout
+let mut batcher = MessageBatcher::new("telemetry", config);
+
+// Add messages - returns Some(batch) when batch is full
+let payload = bincode::serialize(&sensor_data)?;
+if let Some(batch) = batcher.add(payload) {
+    // Batch is full, send it
+    let bytes = batch.encode()?;
+    send_udp(&bytes)?;
+}
+
+// Check timeout - call periodically to flush incomplete batches
+if let Some(batch) = batcher.check_timeout() {
+    let bytes = batch.encode()?;
+    send_udp(&bytes)?;
+}
+
+// Force flush current batch
+if let Some(batch) = batcher.flush() {
+    let bytes = batch.encode()?;
+    send_udp(&bytes)?;
 }
 ```
 
@@ -381,21 +381,48 @@ if let Some(batch) = batcher.get_batch() {
 Adaptive congestion control for network stability:
 
 ```rust
-use horus::prelude::*; // Provides {CongestionController, DropPolicy}
+use horus::communication::network::{CongestionController, CongestionConfig, CongestionResult, DropPolicy};
 
-let controller = CongestionController::new(DropPolicy::DropOldest);
+// Default config (error on buffer full)
+let config = CongestionConfig::default();
+let mut controller = CongestionController::new(config);
 
-// Check if we can send
-if controller.can_send() {
-    send(data)?;
-    controller.record_send(data.len());
+// Drop oldest messages when congested
+let config = CongestionConfig::drop_oldest();
+let mut controller = CongestionController::new(config);
+
+// Rate limiting (messages per second)
+let config = CongestionConfig::rate_limited(1000);  // 1000 msg/sec
+let mut controller = CongestionController::new(config);
+
+// Blocking mode (waits for space)
+let config = CongestionConfig::blocking();
+let mut controller = CongestionController::new(config);
+
+// Try to send a message
+let payload = bincode::serialize(&sensor_data)?;
+let priority = 5;  // Higher = more important
+match controller.try_send(payload, priority) {
+    CongestionResult::Accepted => {
+        // Message queued for sending
+    }
+    CongestionResult::Dropped(reason) => {
+        // Message was dropped due to congestion
+        eprintln!("Dropped: {:?}", reason);
+    }
+    CongestionResult::RetryAfter(duration) => {
+        // Rate limited, retry after duration
+        std::thread::sleep(duration);
+    }
 }
 
-// Record acknowledgment
-controller.record_ack();
+// Pop next message to send
+if let Some(payload) = controller.pop() {
+    send_udp(&payload)?;
+}
 
-// Record timeout (congestion signal)
-controller.record_timeout();
+// Check buffer utilization
+println!("Buffer {}% full", controller.utilization());
 ```
 
 ## Best Practices
@@ -413,8 +440,8 @@ if is_wan || needs_reliability {
     use_quic();
 }
 
-// General purpose → SmartTransport
-use_smart_transport();
+// Default → BatchUDP
+use_batch_udp();
 ```
 
 ### 2. Enable Compression for Large Data
@@ -433,11 +460,13 @@ let config = CompressionConfig {
 
 ```rust
 // For high-frequency small messages
-let batcher = MessageBatcher::new(
-    MTU_SIZE - HEADERS,  // Fill MTU
-    100,                 // Up to 100 messages
-    Duration::from_millis(1),  // 1ms max latency
-);
+let config = BatchConfig {
+    max_messages: 100,           // Up to 100 messages
+    max_bytes: 60000,            // ~MTU minus headers
+    flush_timeout: Duration::from_millis(1),  // 1ms max latency
+    enabled: true,
+};
+let mut batcher = MessageBatcher::new("sensor_topic", config);
 ```
 
 ## Zenoh Transport (ROS2 Bridge)
@@ -463,7 +492,7 @@ horus_core = { version = "0.1", features = ["zenoh-transport"] }
 ### Basic Configuration
 
 ```rust
-use horus::prelude::*; // Provides {ZenohConfig, ZenohMode}
+use horus::communication::network::ZenohConfig;
 
 // HORUS mode (default)
 let config = ZenohConfig::new()
@@ -484,7 +513,7 @@ let config = ZenohConfig::mesh("fleet1")
 ### QoS Presets
 
 ```rust
-use horus::prelude::*; // Provides {ZenohQos, Reliability, HistoryPolicy, Durability}
+use horus::communication::network::{ZenohQos, Reliability, HistoryPolicy, Durability};
 
 // Sensor data: best-effort, small history, deadline/lifespan constraints
 let sensor_qos = ZenohQos::sensor_data();
@@ -512,7 +541,7 @@ let custom_qos = ZenohQos::default()
 Full ROS2 service protocol (request/response):
 
 ```rust
-use horus::prelude::*; // Provides {Ros2ServiceConfig, ServiceRegistry, TriggerRequest, TriggerResponse}
+use horus::communication::network::{Ros2ServiceConfig, Ros2ServiceClient, Ros2ServiceServer};
 
 // Create service client
 let config = Ros2ServiceConfig::new("/robot", "trigger_action");
@@ -533,7 +562,7 @@ let server = Ros2ServiceServer::new(zenoh_session, config, |req| {
 Full ROS2 action protocol (5 topics: send_goal, cancel_goal, get_result, status, feedback):
 
 ```rust
-use horus::prelude::*; // Provides {Ros2ActionClient, Ros2ActionServer, Ros2ActionConfig, GoalStatus, SendGoalRequest}
+use horus::communication::network::{Ros2ActionClient, Ros2ActionServer, Ros2ActionConfig, GoalStatus};
 
 // Create action client
 let config = Ros2ActionConfig::new("/robot", "navigate_to_pose");
@@ -568,7 +597,10 @@ let server = Ros2ActionServer::new(zenoh_session, config,
 Full ROS2 parameter protocol (list/get/set/describe/events):
 
 ```rust
-use horus::prelude::*; // Provides {LocalParameterStore, Parameter, ParameterValue, ParameterDescriptor, ParameterType}
+use horus::communication::network::{
+    LocalParameterStore, Parameter, ParameterValue, ParameterDescriptor, ParameterType,
+    Ros2ParameterClient, Ros2ParameterServer,
+};
 
 // Create local parameter store
 let store = LocalParameterStore::new("/robot_controller");

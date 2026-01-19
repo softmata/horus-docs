@@ -78,13 +78,13 @@ Nodes don't run continuously - they **tick**. Each tick is a discrete unit of wo
 ```rust
 fn tick(&mut self, ctx: Option<&mut NodeInfo>) {
     // Read inputs
-    let sensor_data = self.sensor_hub.recv(ctx);
+    let sensor_data = self.sensor_topic.recv(ctx);
 
     // Process
     let command = self.compute_response(sensor_data);
 
     // Write outputs
-    self.command_hub.send(command, ctx);
+    self.command_topic.send(command, ctx);
 }
 ```
 
@@ -104,7 +104,7 @@ Nodes need to exchange data. HORUS provides two communication primitives, each o
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 20}}}%%
 flowchart TB
-    subgraph HUB["Hub (Pub/Sub)"]
+    subgraph TOPIC["Topic (Pub/Sub)"]
         direction LR
         P1["Publisher"] --> T["Topic"]
         P2["Publisher"] --> T
@@ -113,9 +113,9 @@ flowchart TB
         T --> S3["Subscriber"]
     end
 
-    subgraph LINK["Link (Point-to-Point)"]
+    subgraph SPSC["Topic SPSC (Point-to-Point)"]
         direction LR
-        PR["Producer"] --> LK["Link"] --> CO["Consumer"]
+        PR["Producer"] --> LK["Topic"] --> CO["Consumer"]
     end
 `}
   caption="Two Communication Patterns for Different Needs"
@@ -123,56 +123,56 @@ flowchart TB
 
 | Pattern | Use When | Example |
 |---------|----------|---------|
-| **Hub** | Multiple readers need the same data | Camera images → multiple vision algorithms |
-| **Link** | Strict ordering between two nodes | Sensor → filter → controller pipeline |
+| **Topic** | Multiple readers need the same data | Camera images → multiple vision algorithms |
+| **Topic** | Strict ordering between two nodes | Sensor → filter → controller pipeline |
 
-### Hub: Broadcast to Many
+### Topic (MPMC): Broadcast to Many
 
-Hub implements **publish-subscribe** messaging. Any node can publish to a topic, and any number of nodes can subscribe.
+Topic implements **publish-subscribe** messaging. Any node can publish to a topic, and any number of nodes can subscribe.
 
 ```rust
 // Camera node publishes images
-let image_pub: Hub<Image> = Hub::new("camera.image")?;
+let image_pub: Topic<Image> = Topic::new("camera.image")?;
 image_pub.send(frame, ctx)?;
 
 // Multiple subscribers receive the same image
-let image_sub: Hub<Image> = Hub::new("camera.image")?;
+let image_sub: Topic<Image> = Topic::new("camera.image")?;
 if let Some(frame) = image_sub.recv(ctx) {
     // Process frame
 }
 ```
 
-**Hub characteristics:**
+**Topic MPMC characteristics:**
 - Many-to-many communication
 - Latest-value semantics (subscribers get most recent)
-- ~481ns round-trip latency
+- ~~167ns round-trip latency
 - Automatic network transport for distributed systems
 
-### Link: Fast Pipeline
+### Topic (SPSC): Fast Pipeline
 
-Link implements **point-to-point** channels. One producer, one consumer, guaranteed ordering.
+Topic SPSC implements **point-to-point** channels. One producer, one consumer, guaranteed ordering.
 
 ```rust
 // Producer side
-let link = Link::<SensorData>::producer("sensor_pipeline")?;
+let link = Topic::<SensorData>::new("sensor_pipeline")?;
 link.send(&data)?;
 
 // Consumer side
-let link = Link::<SensorData>::consumer("sensor_pipeline")?;
+let link = Topic::<SensorData>::new("sensor_pipeline")?;
 if let Some(data) = link.recv() {
     // Process in order
 }
 ```
 
-**Link characteristics:**
+**Topic characteristics:**
 - One-to-one communication
 - FIFO ordering guaranteed
-- ~248ns round-trip latency
+- ~~85ns round-trip latency
 - Ideal for processing pipelines
 
 ### Cross-Process Communication
 
-Both Hub and Link work transparently across process boundaries using shared memory:
+Topic work transparently across process boundaries using shared memory:
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
@@ -308,7 +308,7 @@ let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::U8)?;
 let data = pool.data_slice_mut(&tensor);
 camera.capture_into(data);
 
-// Send through Hub - only the descriptor is copied, not the image
+// Send through Topic - only the descriptor is copied, not the image
 image_pub.send(tensor, ctx)?;
 ```
 
@@ -328,7 +328,7 @@ import horus
 import numpy as np
 
 # Receive tensor from Rust node
-tensor = hub.recv()
+tensor = topic.recv()
 
 # Zero-copy numpy view - no data copied!
 array = np.array(tensor, copy=False)
@@ -353,9 +353,9 @@ flowchart LR
     MOT["<b>Motors</b><br/>Executes movement"]
 
     CAM -->|"Image<br/>(zero-copy)"| DET
-    DET -->|"Detections<br/>(Hub)"| NAV
-    NAV -->|"Velocity<br/>(Hub)"| CTRL
-    CTRL -->|"PWM<br/>(Link)"| MOT
+    DET -->|"Detections<br/>(Topic MPMC)"| NAV
+    NAV -->|"Velocity<br/>(Topic MPMC)"| CTRL
+    CTRL -->|"PWM<br/>(Topic SPSC)"| MOT
 `}
   caption="Perception-Planning-Control Pipeline"
 />
@@ -363,9 +363,9 @@ flowchart LR
 | Connection | Mechanism | Why |
 |------------|-----------|-----|
 | Camera → Detector | TensorPool | Large image, zero-copy |
-| Detector → Planner | Hub | Multiple planners might subscribe |
-| Planner → Controller | Hub | Monitoring tools can observe |
-| Controller → Motors | Link | Strict ordering, lowest latency |
+| Detector → Planner | Topic | Multiple planners might subscribe |
+| Planner → Controller | Topic | Monitoring tools can observe |
+| Controller → Motors | Topic | Strict ordering, lowest latency |
 
 **Total pipeline latency:** Under 2 microseconds for message passing.
 
@@ -375,8 +375,8 @@ flowchart LR
 
 | Metric | Value |
 |--------|-------|
-| Hub round-trip | ~481ns |
-| Link round-trip | ~248ns |
+| Topic MPMC round-trip | ~~167ns |
+| Topic SPSC round-trip | ~~85ns |
 | JIT-compiled tick | ~37ns |
 | TensorPool allocation | ~100ns |
 | Message serialization | ~50-200ns |
@@ -388,7 +388,7 @@ flowchart LR
 HORUS is built on these principles:
 
 1. **Nodes are the unit of composition** - Build robots by connecting nodes
-2. **Communication is explicit** - No hidden data flow, everything goes through Hub or Link
+2. **Communication is explicit** - No hidden data flow, everything goes through Topic
 3. **The scheduler is your friend** - Let it optimize; don't fight it
 4. **Zero-copy by default** - Large data should never be copied unnecessarily
 5. **Safety is not optional** - Circuit breakers, watchdogs, and black boxes are built in
@@ -399,5 +399,5 @@ HORUS is built on these principles:
 
 - **[Quick Start](/getting-started/quick-start)** - Build your first HORUS application
 - **[Core Concepts: Nodes](/concepts/core-concepts-nodes)** - Deep dive into the node model
-- **[Core Concepts: Hub](/concepts/core-concepts-hub)** - Advanced pub/sub patterns
+- **[Core Concepts: Topic](/concepts/core-concepts-topic)** - Advanced pub/sub patterns
 - **[Scheduler Configuration](/advanced/scheduler-configuration)** - Tuning for real-time

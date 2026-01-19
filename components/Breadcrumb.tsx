@@ -40,8 +40,8 @@ const segmentLabels: Record<string, string> = {
   // Core concepts
   "core": "Overview",
   "core-concepts-nodes": "Nodes",
-  "core-concepts-hub": "Hub (MPMC)",
-  "core-concepts-link": "Link (SPSC)",
+  "core-concepts-topic": "Topic (Pub/Sub)",
+  "core-concepts-podtopic": "PodTopic (Ultra-Fast)",
   "core-concepts-scheduler": "Scheduler",
   "core-concepts-shared-memory": "Shared Memory",
   "communication-overview": "Communication Patterns",
@@ -77,8 +77,8 @@ const segmentLabels: Record<string, string> = {
 
   // API files
   "api-node": "Node",
-  "api-hub": "Hub",
-  "api-link": "Link",
+  "api-topic": "Topic",
+  "api-podtopic": "PodTopic",
   "api-scheduler": "Scheduler",
 };
 

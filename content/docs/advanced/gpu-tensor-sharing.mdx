@@ -25,15 +25,23 @@ After reading this guide, you will understand:
 
 Traditional robotics frameworks copy data through CPU memory:
 
-```
-Process A (Perception)     Process B (Planning)
-┌─────────────────┐       ┌─────────────────┐
-│ GPU: Run YOLO   │       │ GPU: Path Plan  │
-│       ↓         │       │       ↑         │
-│ GPU → CPU copy  │──────→│ CPU → GPU copy  │
-└─────────────────┘ IPC   └─────────────────┘
-        ~2ms                      ~2ms
-```
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    subgraph A["Process A (Perception)"]
+        A1["GPU: Run YOLO"]
+        A2["GPU → CPU copy<br/>~2ms"]
+        A1 --> A2
+    end
+    subgraph B["Process B (Planning)"]
+        B1["CPU → GPU copy<br/>~2ms"]
+        B2["GPU: Path Plan"]
+        B1 --> B2
+    end
+    A2 -->|"IPC"| B1
+`}
+  caption="Traditional approach: 4ms+ latency for GPU-CPU-GPU copies"
+/>
 
 This adds **4ms+ latency** per frame for a 1080p image.
 
@@ -41,15 +49,28 @@ This adds **4ms+ latency** per frame for a 1080p image.
 
 HORUS uses CUDA IPC to share GPU memory directly:
 
-```
-Process A (Perception)     Process B (Planning)
-┌─────────────────┐       ┌─────────────────┐
-│ GPU: Run YOLO   │       │ GPU: Path Plan  │
-│       ↓         │       │       ↑         │
-│ IPC Handle (64B)│──────→│ Open IPC Handle │
-└─────────────────┘       └─────────────────┘
-        ~1μs                      ~1μs
-```
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    subgraph A["Process A (Perception)"]
+        A1["GPU: Run YOLO"]
+        A2["IPC Handle (64B)<br/>~1μs"]
+        A1 --> A2
+    end
+    subgraph B["Process B (Planning)"]
+        B1["Open IPC Handle<br/>~1μs"]
+        B2["GPU: Path Plan"]
+        B1 --> B2
+    end
+    A2 -->|"64 bytes"| B1
+    subgraph GPU["Same Physical GPU Memory"]
+        M["Shared Memory"]
+    end
+    A1 -.-> M
+    B2 -.-> M
+`}
+  caption="HORUS approach: Only 64-byte IPC handle transferred, same GPU memory accessed"
+/>
 
 Only a 64-byte handle is transferred. Both processes access the **same physical GPU memory**.
 
@@ -116,7 +137,7 @@ let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::F32)?;
 // Get IPC handle to share (64 bytes)
 let ipc_handle = tensor.ipc_handle_bytes();
 
-// Send ipc_handle through Hub/Link/socket to Process B...
+// Send ipc_handle through Topic/socket to Process B...
 
 // Process B: Open shared GPU memory
 let pool = CudaTensorPool::open(1, 0)?;
@@ -156,24 +177,28 @@ torch_tensor = torch.as_tensor(gpu_tensor)  # Uses __cuda_array_interface__
 
 The `CudaTensorPool` manages GPU memory with IPC support:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CudaTensorPool Design                     │
-├─────────────────────────────────────────────────────────────┤
-│  Process A (Owner)              Process B (Consumer)         │
-│  ┌─────────────────┐            ┌─────────────────┐         │
-│  │ cudaMalloc      │            │                 │         │
-│  │    ↓            │            │                 │         │
-│  │ GPU Memory      │════════════│ GPU Memory      │         │
-│  │ (same physical) │ IPC Handle │ (same physical) │         │
-│  │    ↓            │  64 bytes  │    ↓            │         │
-│  │ IpcGetHandle    │───────────→│ IpcOpenHandle   │         │
-│  └─────────────────┘            └─────────────────┘         │
-│                                                              │
-│  Shared Memory (CPU): Stores metadata + IPC handles          │
-│  /dev/shm/horus/cuda_pool_{id}_{device}                     │
-└─────────────────────────────────────────────────────────────┘
-```
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 20}}}%%
+flowchart TB
+    subgraph POOL["CudaTensorPool Design"]
+        subgraph A["Process A (Owner)"]
+            A1["cudaMalloc"]
+            A2["GPU Memory<br/>(same physical)"]
+            A3["IpcGetHandle"]
+            A1 --> A2 --> A3
+        end
+        subgraph B["Process B (Consumer)"]
+            B1["IpcOpenHandle"]
+            B2["GPU Memory<br/>(same physical)"]
+            B1 --> B2
+        end
+        A3 -->|"IPC Handle<br/>64 bytes"| B1
+        A2 <-.->|"Same Physical Memory"| B2
+        SHM["Shared Memory (CPU)<br/>/dev/shm/horus/cuda_pool_{id}_{device}<br/>Stores metadata + IPC handles"]
+    end
+`}
+  caption="CudaTensorPool architecture: Owner allocates, consumer opens via IPC handle"
+/>
 
 ### Memory Layout
 
@@ -183,36 +208,40 @@ Each tensor slot stores:
 - Atomic reference count
 - Generation counter (ABA prevention)
 
-## Integration with Hub/Link
+## Integration with Topic
 
 ### Sending GPU Tensors
 
-GPU tensors integrate with HORUS Hub and Link communication:
+GPU tensors integrate with HORUS Topic by sending the 64-byte IPC handle:
 
 ```rust
 use horus::prelude::*;
 
 // Allocate GPU tensor
-let handle = TensorHandle::alloc(pool, &[640, 480, 3], TensorDtype::F32, TensorDevice::Cuda0)?;
+let pool = CudaTensorPool::new(1, 0, CudaTensorPoolConfig::default())?;
+let tensor = pool.alloc(&[640, 480, 3], TensorDtype::F32)?;
 
-// Fill with data (e.g., from camera)
+// Fill with data (e.g., from camera kernel)
 // ...
 
-// Send through Hub - only 64-byte handle is copied!
-hub.send(handle.tensor().clone())?;
+// Get IPC handle bytes (64 bytes)
+let ipc_handle = tensor.ipc_handle_bytes().to_vec();
+
+// Send IPC handle through Topic - only 64 bytes transferred!
+topic.send(IpcHandleMsg { handle: ipc_handle, shape: vec![640, 480, 3] })?;
 ```
 
 ### Receiving GPU Tensors
 
 ```rust
-// Receiver gets tensor descriptor
-let tensor = hub.recv()?;
+// Receiver gets IPC handle message
+let msg: IpcHandleMsg = topic.recv()?;
 
-// Wrap in handle - this opens the IPC handle if from another process
-let handle = TensorHandle::from_ipc(tensor, pool)?;
+// Open the IPC handle to access shared GPU memory
+let pool = CudaTensorPool::open(1, 0)?;
+let (gpu_ptr, tensor) = pool.import_ipc(&msg.handle, &msg.shape, TensorDtype::F32)?;
 
-// Access GPU memory directly
-let gpu_ptr = handle.data_ptr();  // Points to shared GPU memory
+// gpu_ptr points directly to shared GPU memory - zero copy!
 ```
 
 ## Performance Characteristics
@@ -297,7 +326,7 @@ use horus::prelude::*;
 
 struct PerceptionNode {
     pool: CudaTensorPool,
-    output: Hub<HorusTensor>,
+    output: Topic<CudaTensor>,  // Topic of GPU tensor descriptors
 }
 
 impl Node for PerceptionNode {
@@ -308,7 +337,7 @@ impl Node for PerceptionNode {
         // Run YOLO inference (fills tensor on GPU)
         self.run_inference(&tensor);
 
-        // Send IPC handle - receiver gets same GPU memory!
+        // Send tensor descriptor - only 64-byte IPC handle is relevant!
         self.output.send(tensor).unwrap();
     }
 }
@@ -318,17 +347,17 @@ impl Node for PerceptionNode {
 // planning_node.rs
 struct PlanningNode {
     pool: CudaTensorPool,
-    input: Hub<HorusTensor>,
+    input: Topic<CudaTensor>,  // Receives GPU tensor descriptors
 }
 
 impl Node for PlanningNode {
     fn tick(&mut self, _ctx: &mut NodeInfo) {
         if let Some(tensor) = self.input.recv() {
-            // Import GPU tensor - zero copy!
+            // Import GPU tensor via IPC handle - zero copy!
             let (gpu_ptr, _) = self.pool.import_ipc(
                 &tensor.ipc_handle,
-                &[100, 7],
-                TensorDtype::F32
+                &tensor.shape[..tensor.ndim as usize],
+                tensor.dtype
             ).unwrap();
 
             // Use GPU pointer directly for planning
@@ -551,7 +580,7 @@ use horus::prelude::*;
 
 // Allocate pinned host memory
 let size = 1024 * 1024 * 4;  // 4MB
-let pinned_ptr = cuda_ffi::host_malloc(size)?;
+let pinned_ptr = cuda_ffi::malloc_host(size)?;
 
 // Register existing memory as pinned
 let buffer: Vec<f32> = vec![0.0; 1_000_000];

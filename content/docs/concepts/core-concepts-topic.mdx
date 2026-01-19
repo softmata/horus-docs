@@ -1,25 +1,25 @@
 ---
-title: Core Concepts - Hub
+title: Core Concepts - Topic
 description: Understanding HORUS pub/sub communication system
 order: 6
 ---
 
-# Hub and Pub/Sub
+# Topic and Pub/Sub
 
 ## Key Takeaways
 
 After reading this guide, you will understand:
-- How Hub provides zero-copy, lock-free pub/sub communication with sub-microsecond latency (313ns send-only / 481ns round-trip)
+- How Topic provides zero-copy, lock-free pub/sub communication with sub-microsecond latency (313ns send-only / ~167ns round-trip)
 - The send() and recv() methods for publishing and subscribing to typed topics
 - Communication patterns (one-to-one, one-to-many, many-to-one, many-to-many) for different architectures
 - How shared memory in /dev/shm enables processes to communicate without serialization
-- When to use Hub for real-time, single-machine communication vs network-based messaging
+- When to use Topic for real-time, single-machine communication vs network-based messaging
 
-The Hub is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **313ns send-only / 481ns round-trip latency** (vs Link's 87ns/248ns).
+The Topic is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **313ns send-only / ~167ns round-trip latency**.
 
-## What is a Hub?
+## What is a Topic?
 
-A `Hub<T>` is a **typed communication channel** that connects publishers and subscribers through shared memory. Multiple nodes can publish to the same topic, and multiple nodes can subscribe to the same topic.
+A `Topic<T>` is a **typed communication channel** that connects publishers and subscribers through shared memory. Multiple nodes can publish to the same topic, and multiple nodes can subscribe to the same topic.
 
 ### Key Features
 
@@ -31,25 +31,24 @@ A `Hub<T>` is a **typed communication channel** that connects publishers and sub
 
 **Cache-Aligned**: Optimized memory layout prevents false sharing
 
-**Sub-Microsecond Latency**: 87ns/248ns (Link) / 313ns/481ns (Hub) send-only/round-trip for small messages (16B)
+**Sub-Microsecond Latency**: 313ns/~167ns send-only/round-trip for small messages (16B)
 
 **Linear Scaling**: Latency scales linearly with message size
 
 ## Basic Usage
 
-### Creating a Hub
+### Creating a Topic
 
 ```rust
 use horus::prelude::*;
 
-// Create a Hub for f32 values on topic "velocity"
-let hub: Hub<f32> = Hub::new("velocity")?;
+// Create a Topic for f32 values on topic "velocity"
+let topic: Topic<f32> = Topic::new("velocity")?;
 ```
 
 The generic type `T` must implement:
-- `Clone`: For copying data
-- `Debug`: For logging
-- `Send`: For thread safety
+- `Pod` (Plain Old Data): For zero-copy shared memory operations
+- `Zeroable`: For safe initialization
 
 ### Publishing Messages
 
@@ -57,13 +56,13 @@ The generic type `T` must implement:
 use horus::prelude::*;
 
 struct Publisher {
-    velocity_pub: Hub<f32>,
+    velocity_pub: Topic<f32>,
 }
 
 impl Publisher {
     fn new() -> Result<Self> {
         Ok(Self {
-            velocity_pub: Hub::new("velocity")?,
+            velocity_pub: Topic::new("velocity")?,
         })
     }
 }
@@ -81,8 +80,8 @@ impl Node for Publisher {
             Ok(()) => {
                 // Message sent successfully
             }
-            Err(msg) => {
-                // Failed to send, msg contains the original value
+            Err(e) => {
+                // Failed to send
             }
         }
     }
@@ -95,13 +94,13 @@ impl Node for Publisher {
 use horus::prelude::*;
 
 struct Subscriber {
-    velocity_sub: Hub<f32>,
+    velocity_sub: Topic<f32>,
 }
 
 impl Subscriber {
     fn new() -> Result<Self> {
         Ok(Self {
-            velocity_sub: Hub::new("velocity")?,
+            velocity_sub: Topic::new("velocity")?,
         })
     }
 }
@@ -125,16 +124,16 @@ impl Node for Subscriber {
 
 ## Transport Options
 
-Hub supports both local and network transports transparently:
+Topic supports both local and network transports transparently:
 
 ### Local Shared Memory (Default)
 
 ```rust
 // Automatically uses local shared memory
-let hub: Hub<SensorData> = Hub::new("sensors")?;
+let topic: Topic<SensorData> = Topic::new("sensors")?;
 ```
 
-**Performance**: 313ns send-only / 481ns round-trip
+**Performance**: 313ns send-only / ~167ns round-trip
 **Use case**: All nodes on same machine
 **Pros**: Ultra-fast, deterministic, zero-copy
 
@@ -142,15 +141,15 @@ let hub: Hub<SensorData> = Hub::new("sensors")?;
 
 ```rust
 // Automatically uses network backend
-let hub: Hub<SensorData> = Hub::new("sensors@192.168.1.5")?;
-let hub: Hub<SensorData> = Hub::new("sensors@192.168.1.5:8000")?;  // Custom port
+let topic: Topic<SensorData> = Topic::new("sensors@192.168.1.5")?;
+let topic: Topic<SensorData> = Topic::new("sensors@192.168.1.5:8000")?;  // Custom port
 ```
 
-**Performance**: &lt;50µs latency
+**Performance**: <50µs latency
 **Use case**: Nodes distributed across multiple machines
 **Pros**: Multi-machine, fault isolation, scalable
 
-**Important**: The Hub pattern (MPMC pub/sub) works identically with both transports - only the endpoint syntax changes!
+**Important**: The Topic pattern (MPMC pub/sub) works identically with both transports - only the endpoint syntax changes!
 
 See [Communication Transport](/concepts/communication-transport) for detailed comparison and [Network Communication](/concepts/network-communication) for multi-machine setup.
 
@@ -159,20 +158,20 @@ See [Communication Transport](/concepts/communication-transport) for detailed co
 ### The send() Method
 
 ```rust
-pub fn send(&self, msg: T, ctx: &mut Option<&mut NodeInfo>) -> Result<(), T>
+pub fn send(&self, msg: T, ctx: &mut Option<&mut NodeInfo>) -> HorusResult<()>
 ```
 
 **Parameters**:
-- `msg`: Message to send (moved into the function)
+- `msg`: Message to send
 - `ctx`: Optional NodeInfo for logging
 
 **Returns**:
 - `Ok(())`: Message sent successfully
-- `Err(msg)`: Failed to send, returns the original message
+- `Err(e)`: Failed to send
 
 **How it works**:
 - Writes data directly to shared memory using zero-copy design
-- Measures IPC latency (248-437ns for small messages)
+- Measures IPC latency (~85-437ns for small messages)
 - Automatically logs publish events when `ctx` is provided
 - Non-blocking operation - returns immediately
 
@@ -191,79 +190,10 @@ pub fn recv(&self, ctx: &mut Option<&mut NodeInfo>) -> Option<T>
 
 **How it works**:
 - Reads directly from shared memory without serialization
-- Measures IPC latency (248-437ns for small messages)
+- Measures IPC latency (~85-437ns for small messages)
 - Automatically logs subscribe events when `ctx` is provided
 - Non-blocking operation - returns immediately if no data available
-- Returns a clone of the message data
-
-## Connection States
-
-Hub tracks connection state through an atomic enum:
-
-```rust
-pub enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    Reconnecting,
-    Failed,
-}
-```
-
-### Checking Connection State
-
-```rust
-pub fn get_connection_state(&self) -> ConnectionState {
-    // Returns current connection state
-}
-```
-
-### State Transitions
-
-```
-Disconnected  Connecting  Connected
-                               ->
-                          Reconnecting  Connected
-                               ->
-                            Failed
-```
-
-## Performance Metrics
-
-Hub tracks detailed performance metrics atomically:
-
-```rust
-pub struct AtomicHubMetrics {
-    pub messages_sent: AtomicU64,
-    pub messages_received: AtomicU64,
-    pub send_failures: AtomicU64,
-    pub recv_failures: AtomicU64,
-}
-
-pub struct HubMetrics {
-    pub messages_sent: u64,
-    pub messages_received: u64,
-    pub send_failures: u64,
-    pub recv_failures: u64,
-    pub last_activity: Option<Instant>,
-}
-```
-
-### Accessing Metrics
-
-```rust
-let hub: Hub<f32> = Hub::new("velocity")?;
-
-// Send some messages (requires mutable ctx)
-let mut ctx: Option<&mut NodeInfo> = None;
-hub.send(1.0, &mut ctx).ok();
-hub.send(2.0, &mut ctx).ok();
-
-// Get metrics
-let metrics = hub.get_metrics();
-eprintln!("Total sent: {}", metrics.messages_sent);
-eprintln!("Send failures: {}", metrics.send_failures);
-```
+- Returns a copy of the message data
 
 ## Communication Patterns
 
@@ -274,7 +204,7 @@ Single publisher, single subscriber:
 ```rust
 // Publisher
 struct PubNode {
-    data_pub: Hub<f32>,
+    data_pub: Topic<f32>,
 }
 
 impl Node for PubNode {
@@ -287,7 +217,7 @@ impl Node for PubNode {
 
 // Subscriber
 struct SubNode {
-    data_sub: Hub<f32>,
+    data_sub: Topic<f32>,
 }
 
 impl Node for SubNode {
@@ -295,7 +225,9 @@ impl Node for SubNode {
 
     fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
         if let Some(data) = self.data_sub.recv(&mut ctx) {
-            ctx.log_info(&format!("Got: {}", data));
+            if let Some(ref mut c) = ctx {
+                c.log_info(&format!("Got: {}", data));
+            }
         }
     }
 }
@@ -308,20 +240,20 @@ Single publisher, multiple subscribers:
 ```rust
 // One publisher
 struct Broadcaster {
-    broadcast_pub: Hub<String>,
+    broadcast_pub: Topic<String>,
 }
 
 // Multiple subscribers
 struct Listener1 {
-    broadcast_sub: Hub<String>,
+    broadcast_sub: Topic<String>,
 }
 
 struct Listener2 {
-    broadcast_sub: Hub<String>,
+    broadcast_sub: Topic<String>,
 }
 
 struct Listener3 {
-    broadcast_sub: Hub<String>,
+    broadcast_sub: Topic<String>,
 }
 
 // All subscribers receive the same message
@@ -334,16 +266,16 @@ Multiple publishers, single subscriber:
 ```rust
 // Multiple publishers
 struct Sensor1 {
-    reading_pub: Hub<f32>,
+    reading_pub: Topic<f32>,
 }
 
 struct Sensor2 {
-    reading_pub: Hub<f32>,
+    reading_pub: Topic<f32>,
 }
 
 // Single aggregator
 struct Aggregator {
-    reading_sub: Hub<f32>,
+    reading_sub: Topic<f32>,
 }
 
 impl Node for Aggregator {
@@ -365,13 +297,13 @@ Multiple publishers and subscribers:
 ```rust
 // All nodes can publish and subscribe to the same topic
 struct Agent1 {
-    state_pub: Hub<RobotState>,
-    state_sub: Hub<RobotState>,
+    state_pub: Topic<RobotState>,
+    state_sub: Topic<RobotState>,
 }
 
 struct Agent2 {
-    state_pub: Hub<RobotState>,
-    state_sub: Hub<RobotState>,
+    state_pub: Topic<RobotState>,
+    state_sub: Topic<RobotState>,
 }
 
 // Agents share state with each other
@@ -385,12 +317,12 @@ struct Agent2 {
 
 ```rust
 // CORRECT - Use dots
-let hub = Hub::new("sensors.lidar");
-let hub = Hub::new("robot.cmd_vel");
+let topic = Topic::new("sensors.lidar");
+let topic = Topic::new("robot.cmd_vel");
 
 // WRONG - Do NOT use slashes
-let hub = Hub::new("sensors.lidar");   // Will cause errors!
-let hub = Hub::new("robot.cmd_vel");   // Will cause errors!
+let topic = Topic::new("sensors/lidar");   // Will cause errors!
+let topic = Topic::new("robot/cmd_vel");   // Will cause errors!
 ```
 
 **Why dots instead of slashes?**
@@ -399,7 +331,7 @@ HORUS uses shared memory files in `/dev/shm` for ultra-low latency communication
 
 ```
 Topic: "sensors.lidar"  →  /dev/shm/horus_default_sensors.lidar
-Topic: "sensors.lidar"  →  /dev/shm/horus_default_sensors/lidar  (ERROR!)
+Topic: "sensors/lidar"  →  /dev/shm/horus_default_sensors/lidar  (ERROR!)
 ```
 
 When you use a slash in the topic name, the system interprets it as a subdirectory path. Since that directory doesn't exist, you get a **"No such file or directory"** error.
@@ -417,15 +349,15 @@ ROS uses slashes (`/sensor/lidar`) because it uses a network-based naming servic
 
 **Use descriptive names**:
 ```rust
-let hub = Hub::new("cmd_vel");           // Good
-let hub = Hub::new("data");              // Too vague
+let topic = Topic::new("cmd_vel");           // Good
+let topic = Topic::new("data");              // Too vague
 ```
 
 **Follow conventions**:
 ```rust
-let hub = Hub::new("sensor.lidar");      // Hierarchical
-let hub = Hub::new("robot1.cmd_vel");    // Namespaced
-let hub = Hub::new("diagnostics.cpu");   // Categorized
+let topic = Topic::new("sensor.lidar");      // Hierarchical
+let topic = Topic::new("robot1.cmd_vel");    // Namespaced
+let topic = Topic::new("diagnostics.cpu");   // Categorized
 ```
 
 **Be consistent**:
@@ -449,14 +381,15 @@ Avoid using these patterns:
 ### Send Errors
 
 ```rust
-match hub.send(data, &mut ctx) {
+match topic.send(data, &mut ctx) {
     Ok(()) => {
         // Success
     }
-    Err(original_data) => {
+    Err(e) => {
         // Failed to send - shared memory full or not available
-        // original_data contains the message that couldn't be sent
-        ctx.log_warning("Failed to publish message");
+        if let Some(ref mut c) = ctx {
+            c.log_warning("Failed to publish message");
+        }
     }
 }
 ```
@@ -469,7 +402,7 @@ match hub.send(data, &mut ctx) {
 - Shared memory not initialized
 
 ```rust
-match hub.recv(&mut ctx) {
+match topic.recv(&mut ctx) {
     Some(data) => {
         // Process data
     }
@@ -484,44 +417,42 @@ match hub.recv(&mut ctx) {
 
 ### Valid Message Types
 
-Messages must implement `Clone + Debug + Send`:
+Messages must implement `Pod` (Plain Old Data) from the `bytemuck` crate:
 
 ```rust
+use bytemuck::{Pod, Zeroable};
+
 // Simple types work out of the box
-Hub::<f32>::new("float_topic");
-Hub::<bool>::new("bool_topic");
-Hub::<u32>::new("int_topic");
+Topic::<f32>::new("float_topic");
+Topic::<bool>::new("bool_topic");
+Topic::<u32>::new("int_topic");
 
 // Structs need derives
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
 struct MyMessage {
     x: f32,
     y: f32,
 }
 
-Hub::<MyMessage>::new("my_topic");
+Topic::<MyMessage>::new("my_topic");
 
 // Arrays work
-Hub::<[f32; 100]>::new("array_topic");
-
-// Strings work
-Hub::<String>::new("string_topic");
+Topic::<[f32; 100]>::new("array_topic");
 ```
 
 ### Invalid Message Types
 
 ```rust
-// Missing Clone
-struct NoClone {
-    data: f32,
-}
-// Hub::<NoClone>::new("topic"); // Won't compile
-
-// Missing Send
+// Types with pointers won't work
 struct NoSend {
-    ptr: *const u8,  // Raw pointers are !Send
+    ptr: *const u8,  // Raw pointers are not Pod
 }
-// Hub::<NoSend>::new("topic"); // Won't compile
+// Topic::<NoSend>::new("topic"); // Won't compile
+
+// Types with heap allocations won't work
+// Topic::<String>::new("topic"); // Won't compile - String is not Pod
+// Topic::<Vec<f32>>::new("topic"); // Won't compile - Vec is not Pod
 ```
 
 ## Advanced Usage
@@ -549,7 +480,7 @@ Cache the last received message:
 
 ```rust
 struct BufferedSubscriber {
-    data_sub: Hub<f32>,
+    data_sub: Topic<f32>,
     last_value: Option<f32>,
 }
 
@@ -574,7 +505,7 @@ Publish at a specific rate:
 
 ```rust
 struct RateLimitedPublisher {
-    data_pub: Hub<f32>,
+    data_pub: Topic<f32>,
     tick_count: u32,
     publish_every_n_ticks: u32,
 }
@@ -612,7 +543,7 @@ impl Node for FilteringSubscriber {
 
 ### Location
 
-Hub stores data in `/dev/shm` (Linux shared memory):
+Topic stores data in `/dev/shm` (Linux shared memory):
 
 ```bash
 # View HORUS shared memory segments
@@ -648,7 +579,7 @@ HORUS automatically cleans up when nodes shut down gracefully (Ctrl+C).
 
 | Message Type | Size | Latency (round-trip) |
 |--------------|------|---------|
-| CmdVel | 16B | ~481ns |
+| CmdVel | 16B | ~~167ns |
 | IMU | 304B | ~940ns |
 | LaserScan | 1.5KB | ~2.2µs |
 | PointCloud | 120KB | ~360µs |
@@ -668,7 +599,7 @@ HORUS achieves sub-microsecond latency across different message sizes:
 
 > **Measurement Note**: All latencies are **send-only** (one-direction publish). For round-trip, approximately double these values.
 
-| Message Type | Size | Hub (send-only) |
+| Message Type | Size | Topic (send-only) |
 |--------------|------|---------------|
 | CmdVel | 16B | ~313ns |
 | IMU | 304B | ~500ns |
@@ -683,27 +614,25 @@ Choose the right message type for your data:
 
 ```rust
 // Good: Fixed-size array for known dimensions
-Hub::<[f32; 3]>::new("position");
+Topic::<[f32; 3]>::new("position");
 
-// Bad: Vec requires heap allocation
-Hub::<Vec<f32>>::new("position");
+// Bad: Vec requires heap allocation (not Pod)
+// Topic::<Vec<f32>>::new("position"); // Won't compile
 ```
 
-### Minimize Cloning
+### Keep Messages Small
 
-Hub clones messages internally. Keep messages small:
+Topic uses zero-copy shared memory. Keep messages appropriately sized:
 
 ```rust
 // Good: Small struct
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
 struct Pose {
     x: f32,
     y: f32,
     theta: f32,
 }
-
-// Consider Arc for large data
-Hub::<Arc<LargeData>>::new("big_data");
 ```
 
 ### Check recv() Every Tick
@@ -724,8 +653,10 @@ fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
 Don't ignore send errors:
 
 ```rust
-if let Err(data) = self.pub.send(data, &mut ctx) {
-        ctx.log_warning("Publish failed");
+if let Err(e) = self.pub.send(data, &mut ctx) {
+    if let Some(ref mut c) = ctx {
+        c.log_warning("Publish failed");
+    }
 }
 ```
 
@@ -734,4 +665,4 @@ if let Err(data) = self.pub.send(data, &mut ctx) {
 - Learn about the [Scheduler](/concepts/core-concepts-scheduler) for orchestrating nodes
 - Understand [Shared Memory](/concepts/core-concepts-shared-memory) internals
 - Explore [Message Types](/concepts/message-types) for standard robotics messages
-- Read the [API Reference](/rust/api) for complete Hub documentation
+- Read the [API Reference](/rust/api) for complete Topic documentation

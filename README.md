@@ -43,11 +43,11 @@ content/
    ── remote-deployment.mdx          # Deploy to robots
    ── library-reference.mdx          # Standard library components
    ── core-concepts-nodes.mdx
-   ── core-concepts-hub.mdx
+   ── core-concepts-topic.mdx
    ── core-concepts-scheduler.mdx
    ── core-concepts-shared-memory.mdx
    ── api-node.mdx                   # Node API reference
-   ── api-hub.mdx                    # Hub API reference
+   ── api-topic.mdx                  # Topic API reference
    ── api-scheduler.mdx              # Scheduler API reference
    ── message-types.mdx
    ── examples.mdx
@@ -63,7 +63,7 @@ content/
 - Installation, Quick Start, node! Macro
 
 **Core Concepts**
-- Nodes, Hub (MPMC), Scheduler, Shared Memory
+- Nodes, Topic (Pub/Sub), PodTopic (Ultra-Fast), Scheduler, Shared Memory
 
 **Guides**
 - Monitor, Parameters, CLI Reference
@@ -73,7 +73,7 @@ content/
 - Message Types, Examples, Performance, Multi-Language
 
 **API Reference**
-- Node, Hub, Scheduler APIs
+- Node, Topic, PodTopic, Scheduler APIs
 
 ## Tech Stack
 
@@ -122,7 +122,7 @@ General guidelines:
 
 The documentation emphasizes HORUS's production-grade performance:
 
-- **87ns-313ns** latency for real robotics messages (Link wait-free / Hub lock-free)
+- **~50ns-167ns** latency for real robotics messages (PodTopic ~50ns / Topic SPSC ~85ns / Topic MPMC ~167ns)
 - Production benchmarks with serde serialization
 - Real-world message types (CmdVel, LaserScan, IMU, etc.)
 

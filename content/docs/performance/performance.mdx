@@ -41,7 +41,7 @@ All performance features use **graceful degradation** - your code runs everywher
 
 ```rust
 #[repr(align(64))]  // Cache-line aligned
-pub struct Hub<T> {
+pub struct Topic<T> {
     // Prevents false sharing between cores
 }
 ```
@@ -52,9 +52,9 @@ pub struct Hub<T> {
 
 ### Wait-Free & Lock-Free Operations
 
-**Wait-free Link (SPSC)**: 87ns send-only latency - no CAS loops, bounded constant time
+**Wait-free Topic (SPSC)**: 87ns send-only latency - no CAS loops, bounded constant time
 
-**Lock-free Hub (MPMC)**: 313ns send-only latency - CAS-based for multi-producer coordination
+**Lock-free Topic (MPMC)**: 313ns send-only latency - CAS-based for multi-producer coordination
 
 **Per-consumer tracking**: Each subscriber maintains independent position
 
@@ -64,7 +64,7 @@ pub struct Hub<T> {
 
 > **Measurement Note**: All latencies are **send-only** (one-direction publish). For round-trip (send+receive), approximately double these values.
 
-| Message Type | Size | Hub (send-only) | Link (send-only) | ROS2 DDS | Speedup |
+| Message Type | Size | MPMC (send-only) | SPSC (send-only) | ROS2 DDS | Speedup |
 |--------------|------|-------------|--------------|----------|---------|
 | CmdVel | 16B | ~313ns | 87ns | 50-100µs | **230-575x** |
 | IMU | 304B | ~500ns | ~160ns | 80-150µs | **160-940x** |
@@ -76,8 +76,8 @@ pub struct Hub<T> {
 ### Throughput
 
 HORUS can handle:
-- **12M+ messages/second** for small messages (16B) with Link
-- **3M+ messages/second** for small messages (16B) with Hub
+- **12M+ messages/second** for small messages (16B) with Topic
+- **3M+ messages/second** for small messages (16B) with Topic
 - **1M+ messages/second** for medium messages (1KB)
 - **100K+ messages/second** for large messages (100KB)
 
@@ -179,8 +179,8 @@ RUSTFLAGS="-C target-feature=+avx2,+avx512f" cargo build --release
 
 SIMD acceleration automatically applies to:
 
-- **Link send/recv**: Small message copying (16B-1KB)
-- **Hub operations**: Ring buffer management
+- **Topic send/recv**: Small message copying (16B-1KB)
+- **Topic operations**: Ring buffer management
 - **Message serialization**: Fixed-size struct copying
 - **Shared memory operations**: Page-aligned transfers
 
@@ -239,26 +239,26 @@ pub struct BadLaserScan {
 
 ```rust
 // FAST: Typed message (Rust)
-let hub: Hub<Pose2D> = Hub::new("pose")?;
-hub.send(Pose2D::new(1.0, 2.0, 0.5), &mut ctx)?;
+let topic: Topic<Pose2D> = Topic::new("pose")?;
+topic.send(Pose2D::new(1.0, 2.0, 0.5), &mut ctx)?;
 // IPC latency: ~500ns
 
 // SLOW: Generic message
-let hub: Hub<GenericMessage> = Hub::new("pose")?;
+let topic: Topic<GenericMessage> = Topic::new("pose")?;
 let data = GenericMessage::from_value(&pose_dict)?;
-hub.send(data, &mut ctx)?;
+topic.send(data, &mut ctx)?;
 // IPC latency: ~10µs (20x slower!)
 ```
 
 ```python
-# FAST: Typed hub (Python)
+# FAST: Typed topic (Python)
 from horus import Node, Pose2D
 
 node = Node(pubs={"pose": {"type": Pose2D}})
 node.send("pose", Pose2D(x=1.0, y=2.0, theta=0.5))
 # IPC: ~500ns, Logging: ~100ns
 
-# SLOW: Generic hub
+# SLOW: Generic topic
 node = Node(pubs=["pose"])
 node.send("pose", {"x": 1.0, "y": 2.0, "theta": 0.5})
 # IPC: ~10µs, Logging: ~5µs (100x slower logging!)
@@ -319,14 +319,14 @@ Instead of sending 100 separate f32 values:
 ```rust
 // SLOW: 100 separate messages
 for value in values {
-    hub.send(value, &mut ctx).ok();  // 100 IPC operations
+    topic.send(value, &mut ctx).ok();  // 100 IPC operations
 }
 
 // FAST: One batched message
 pub struct BatchedData {
     values: [f32; 100],
 }
-hub.send(batched, &mut ctx).ok();  // 1 IPC operation
+topic.send(batched, &mut ctx).ok();  // 1 IPC operation
 ```
 
 **Speedup**: 50-100x for batched operations.
@@ -396,7 +396,7 @@ fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
 }
 ```
 
-`Hub::recv()` already clones data. Don't clone again.
+`Topic::recv()` already clones data. Don't clone again.
 
 ### Minimize Logging
 
@@ -467,8 +467,8 @@ HORUS provides optional kernel bypass networking for sub-microsecond latency req
 
 | Transport | Latency (send-only) | Throughput | Requirements |
 |-----------|---------|------------|--------------|
-| Shared Memory (Link) | ~87ns | 12M+ msg/s | Local only (wait-free) |
-| Shared Memory (Hub) | ~313ns | 3M+ msg/s | Local only (lock-free) |
+| Shared Memory (Topic SPSC) | ~87ns | 12M+ msg/s | Local only (wait-free) |
+| Shared Memory (Topic MPMC) | ~313ns | 3M+ msg/s | Local only (lock-free) |
 | io_uring | 2-3µs | 500K+ msg/s | Linux 5.1+ |
 | Batch UDP | 3-5µs | 300K+ msg/s | Linux 3.0+ |
 | Standard UDP | 5-10µs | 200K+ msg/s | Cross-platform |
@@ -514,7 +514,7 @@ HORUS automatically selects the best transport based on:
 
 ```rust
 // Transport is automatically selected
-let hub: Hub<SensorData> = Hub::new("sensor@192.168.1.100:9870")?;
+let topic: Topic<SensorData> = Topic::new("sensor@192.168.1.100:9870")?;
 // Uses: io_uring > Batch UDP > Standard UDP (based on availability)
 ```
 
@@ -523,7 +523,7 @@ To check which transport was selected:
 ```rust
 // In node context
 if let Some(ctx) = &ctx {
-    ctx.log_info(&format!("Transport: {}", hub.transport_type()));
+    ctx.log_info(&format!("Transport: {}", topic.transport_type()));
 }
 ```
 
@@ -741,8 +741,8 @@ Before deployment, verify:
 use std::time::Instant;
 
 struct BenchmarkNode {
-    pub_hub: Hub<f32>,
-    sub_hub: Hub<f32>,
+    pub_topic: Topic<f32>,
+    sub_topic: Topic<f32>,
     start_time: Option<Instant>,
 }
 
@@ -750,10 +750,10 @@ impl Node for BenchmarkNode {
     fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
         // Publish
         self.start_time = Some(Instant::now());
-        self.pub_hub.send(42.0, &mut ctx).ok();
+        self.pub_topic.send(42.0, &mut ctx).ok();
 
         // Receive
-        if let Some(data) = self.sub_hub.recv(&mut ctx) {
+        if let Some(data) = self.sub_topic.recv(&mut ctx) {
             if let Some(start) = self.start_time {
                 let latency = start.elapsed();
                 println!("Round-trip latency: {:?}", latency);
@@ -767,7 +767,7 @@ impl Node for BenchmarkNode {
 
 ```rust
 struct ThroughputTest {
-    pub_hub: Hub<f32>,
+    pub_topic: Topic<f32>,
     message_count: u64,
     start_time: Instant,
 }
@@ -775,7 +775,7 @@ struct ThroughputTest {
 impl Node for ThroughputTest {
     fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
         for _ in 0..1000 {
-            self.pub_hub.send(42.0, &mut ctx).ok();
+            self.pub_topic.send(42.0, &mut ctx).ok();
             self.message_count += 1;
         }
 

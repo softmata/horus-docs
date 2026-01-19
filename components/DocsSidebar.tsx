@@ -46,8 +46,8 @@ const sections: SidebarSection[] = [
         href: "/concepts/communication-overview",
         order: 3,
         children: [
-          { title: "Hub (MPMC)", href: "/concepts/core-concepts-hub", order: 1 },
-          { title: "Link (SPSC)", href: "/concepts/core-concepts-link", order: 2 },
+          { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic", order: 1 },
+          { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic", order: 2 },
         ]
       },
       {

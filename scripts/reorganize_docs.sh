@@ -44,7 +44,7 @@ update_order "getting-started.mdx" 1
 # Core Concepts (5-8)
 echo "Core Concepts Section..."
 update_order "core-concepts-nodes.mdx" 5
-update_order "core-concepts-hub.mdx" 6
+update_order "core-concepts-topic.mdx" 6
 update_order "core-concepts-scheduler.mdx" 7
 update_order "message-types.mdx" 8
 # Note: will create second-application.mdx as order 9
@@ -69,7 +69,7 @@ echo "Advanced Topics Section..."
 # Note: will create advanced-examples.mdx as order 20
 update_order "performance.mdx" 21
 update_order "core-concepts-shared-memory.mdx" 22
-update_order "core-concepts-link.mdx" 23
+update_order "core-concepts-podtopic.mdx" 23
 update_order "architecture.mdx" 24
 update_order "benchmarks.mdx" 25
 
@@ -85,9 +85,9 @@ echo "Reference Section..."
 update_order "cli-reference.mdx" 40
 update_order "api.mdx" 41
 update_order "api-node.mdx" 41  # Will consolidate
-update_order "api-hub.mdx" 41   # Will consolidate
+update_order "api-topic.mdx" 41   # Will consolidate
 update_order "api-scheduler.mdx" 41  # Will consolidate
-update_order "api-link.mdx" 41  # Will consolidate
+update_order "api-podtopic.mdx" 41  # Will consolidate
 update_order "library-reference.mdx" 42
 update_order "goals.mdx" 43
 update_order "roadmap.mdx" 44

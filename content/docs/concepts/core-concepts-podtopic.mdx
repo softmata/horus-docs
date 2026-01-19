@@ -1,0 +1,267 @@
+---
+title: Core Concepts - PodTopic
+description: Ultra-fast zero-serialization communication for hard real-time control loops
+order: 25
+---
+
+# PodTopic and Zero-Serialization Communication
+
+PodTopic is HORUS's **ultra-fast communication primitive** for hard real-time control loops. It achieves **~50ns latency** by completely bypassing serialization - messages are transferred as raw bytes via direct memory copy.
+
+## What is PodTopic?
+
+A `PodTopic<T>` is a specialized **Single Producer Single Consumer (SPSC)** channel that only works with POD (Plain Old Data) messages. Unlike `Topic<T>` which serializes messages with bincode, PodTopic copies raw bytes directly - making it **5x faster**.
+
+### Key Features
+
+**Ultra-Low Latency**: ~50ns send/receive (vs ~85ns for Topic SPSC) - the absolute fastest IPC in HORUS
+
+**Zero Serialization**: Direct `memcpy` of raw bytes, no encoding/decoding overhead
+
+**Lock-Free**: Atomic sequence counter for synchronization, no locks or contention
+
+**Cache-Optimized**: 64-byte aligned for optimal CPU cache performance
+
+**Type Safety**: Compile-time validation through the `PodMessage` trait
+
+**Deterministic**: Constant-time operations with no allocations
+
+## Performance Comparison
+
+| Primitive | Latency | Throughput | Use Case |
+|-----------|---------|------------|----------|
+| **PodTopic** | ~50ns | 20M msgs/sec | Hard real-time control |
+| **Topic (SPSC)** | ~85ns | 12M msgs/sec | Point-to-point IPC |
+| **Topic (MPMC)** | ~167ns | 6M msgs/sec | Pub/sub with multiple consumers |
+
+## When to Use PodTopic
+
+### Use PodTopic When:
+
+- **Control loops at 1kHz+** - Motor commands, servo updates
+- **Sensor fusion** - IMU data, encoder readings at high frequency
+- **Safety-critical paths** - Emergency stop signals
+- **Every nanosecond matters** - Inner loops of real-time systems
+
+### Use Buffered Topic Instead When:
+
+- Messages contain dynamic data (Vec, String, HashMap)
+- Network communication required
+- Schema evolution needed (adding fields later)
+- Cross-language interop (Python)
+- Latency requirements are moderate (&lt;100Hz)
+
+## Basic Usage
+
+### Creating a PodTopic
+
+```rust
+use horus_core::communication::{PodTopic, PodMessage};
+
+// Producer side
+let output: PodTopic<CmdVel> = PodTopic::producer("motor_cmd")?;
+
+// Consumer side (different node/process)
+let input: PodTopic<CmdVel> = PodTopic::consumer("motor_cmd")?;
+```
+
+### Sending Messages
+
+```rust
+let cmd = CmdVel::new(1.0, 0.5);  // linear=1.0, angular=0.5
+output.send(cmd);  // ~50ns, no serialization
+```
+
+### Receiving Messages
+
+```rust
+// Non-blocking receive - returns None if no data available
+if let Some(cmd) = input.recv() {
+    apply_velocity(cmd);
+}
+
+// Polling pattern (check for data repeatedly)
+loop {
+    if let Some(cmd) = input.recv() {
+        apply_velocity(cmd);
+        break;
+    }
+    // Optional: add small delay to avoid busy-waiting
+}
+```
+
+## The PodMessage Trait
+
+PodTopic only works with types implementing `PodMessage`. This trait guarantees the type is safe for raw byte transfer.
+
+### Requirements
+
+1. **`#[repr(C)]`** - C-compatible memory layout (no Rust reordering)
+2. **`Copy + Clone`** - Bitwise copyable
+3. **`Pod + Zeroable`** - Safe to cast to/from bytes (from `bytemuck`)
+4. **No padding leaks** - All padding bytes explicitly zeroed
+5. **Fixed size** - Size known at compile time
+
+### Defining a PodMessage
+
+```rust
+use bytemuck::{Pod, Zeroable};
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct MotorCommand {
+    pub timestamp_ns: u64,    // 8 bytes
+    pub motor_id: u32,        // 4 bytes
+    pub velocity: f32,        // 4 bytes
+    pub torque: f32,          // 4 bytes
+    pub _pad: [u8; 12],       // Explicit padding to 32 bytes
+}
+
+// Safety: We've verified repr(C), no implicit padding, all fields are Pod
+unsafe impl PodMessage for MotorCommand {}
+```
+
+### Complete Manual Implementation
+
+Here's a complete example showing all the required traits:
+
+```rust
+use bytemuck::{Pod, Zeroable};
+use horus_core::communication::PodMessage;
+
+/// High-frequency motor command for servo control
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MotorCommand {
+    pub timestamp_ns: u64,    // 8 bytes
+    pub motor_id: u32,        // 4 bytes
+    pub velocity: f32,        // 4 bytes
+    pub torque: f32,          // 4 bytes
+    pub _pad: [u8; 12],       // Explicit padding to 32 bytes
+}
+
+// bytemuck traits for safe byte casting
+unsafe impl Zeroable for MotorCommand {}
+unsafe impl Pod for MotorCommand {}
+
+// HORUS PodMessage trait for ultra-fast IPC
+unsafe impl PodMessage for MotorCommand {}
+
+// Now works with PodTopic
+let link: PodTopic<MotorCommand> = PodTopic::producer("motor")?;
+```
+
+**Important**: The struct size should be a power of 2 or cache-line aligned (64 bytes) for optimal performance.
+
+## Built-in POD Messages
+
+These HORUS messages implement `PodMessage` and work with PodTopic:
+
+| Message | Size | Description |
+|---------|------|-------------|
+| `CmdVel` | 16 bytes | 2D velocity command (linear + angular + timestamp) |
+| `Pose2D` | 32 bytes | 2D position and orientation (x, y, theta, timestamp) |
+| `Twist` | 56 bytes | 3D linear and angular velocity + timestamp |
+| `Transform` | 64 bytes | 3D transformation (translation + quaternion rotation) |
+| `Point3` | 24 bytes | 3D point (x, y, z) |
+| `Vector3` | 24 bytes | 3D vector (x, y, z) |
+| `Quaternion` | 32 bytes | Rotation quaternion (x, y, z, w) |
+
+```rust
+use horus_core::communication::PodTopic;
+
+// All these work with PodTopic out of the box
+let vel: PodTopic<CmdVel> = PodTopic::producer("cmd_vel")?;
+let pose: PodTopic<Pose2D> = PodTopic::producer("robot_pose")?;
+let twist: PodTopic<Twist> = PodTopic::producer("velocity")?;
+```
+
+**Note**: For sensor data like IMU or force measurements that require serialization or have variable sizes, use standard `Topic<T>` instead of `PodTopic`.
+
+## Complete Example
+
+```rust
+use horus_core::communication::PodTopic;
+use std::time::{Duration, Instant};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // High-frequency motor control loop (producer side)
+    let cmd_topic: PodTopic<CmdVel> = PodTopic::producer("motor_cmd")?;
+    let feedback_topic: PodTopic<Pose2D> = PodTopic::consumer("odometry")?;
+
+    let rate = Duration::from_micros(500);  // 2kHz control loop
+    let mut last_tick = Instant::now();
+
+    loop {
+        // Read latest odometry (non-blocking)
+        let pose = feedback_topic.recv();
+
+        // Compute control output
+        let cmd = compute_velocity_command(pose);
+
+        // Send command (~50ns)
+        cmd_topic.send(cmd).ok();
+
+        // Rate limiting
+        let elapsed = last_tick.elapsed();
+        if elapsed < rate {
+            std::thread::sleep(rate - elapsed);
+        }
+        last_tick = Instant::now();
+    }
+}
+
+fn compute_velocity_command(pose: Option<Pose2D>) -> CmdVel {
+    // PID control logic here
+    CmdVel::new(0.5, 0.1)
+}
+```
+
+## Trade-offs
+
+### Pros
+
+- **5x faster** than serialized Topic
+- **Zero allocations** - no heap usage during send/recv
+- **Predictable timing** - constant-time operations
+- **Cache-friendly** - aligned memory access
+
+### Cons
+
+- **No schema evolution** - struct changes break binary compatibility
+- **Fixed-size only** - no Vec, String, or dynamic types
+- **Local only** - no network support (use Topic for network)
+- **Unsafe trait** - requires careful implementation
+- **Platform-dependent** - endianness and alignment assumptions
+
+## Debugging
+
+### Check Topic Status
+
+```rust
+let topic: PodTopic<CmdVel> = PodTopic::producer("motor_cmd")?;
+println!("Topic: {}", topic.name());
+println!("Has messages: {}", topic.has_messages());
+
+// Check for new data by attempting to receive
+if let Some(msg) = topic.recv() {
+    println!("Received: {:?}", msg);
+} else {
+    println!("No new data available");
+}
+```
+
+### Common Issues
+
+**"Invalid POD Topic magic"** - Producer hasn't initialized the topic yet. Ensure producer starts before consumer.
+
+**"Size mismatch"** - Producer and consumer using different message types or versions. Ensure both sides use the same struct definition.
+
+**No data received** - Check that producer is actually calling `send()`. PodTopic is single-slot - old data is overwritten.
+
+## See Also
+
+- [Topic (General IPC)](/concepts/core-concepts-topic) - For serialized messages and network support
+- [Topic (Pub/Sub)](/concepts/core-concepts-topic) - For multi-consumer scenarios
+- [Message Types](/concepts/message-types) - Built-in message definitions
+- [Real-Time Configuration](/advanced/rt-config) - System-level RT settings

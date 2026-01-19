@@ -191,7 +191,8 @@ function extractFromFile(filePath, relativePath) {
   const blocks = [];
 
   // Regex to match fenced code blocks with optional language
-  const codeBlockRegex = /^```(\w*)\s*$/;
+  // Supports: ```rust, ```rust,ignore, ```bash:filename.sh, etc.
+  const codeBlockRegex = /^```([^\s`]*)\s*$/;
 
   let inCodeBlock = false;
   let currentBlock = null;
@@ -215,7 +216,10 @@ function extractFromFile(filePath, relativePath) {
       if (line.match(/^```\s*$/)) {
         // End of code block
         const code = currentCode.join('\n');
-        const language = currentBlock.language.toLowerCase();
+        const fullLang = currentBlock.language.toLowerCase();
+        // Extract base language (before comma or colon) for classification
+        // Handles: rust, rust,ignore, bash:filename.sh, etc.
+        const language = fullLang.split(/[,:]/, 1)[0] || 'text';
 
         const isVerifiable = VERIFIABLE_LANGUAGES.includes(language);
         const isReference = REFERENCE_LANGUAGES.includes(language);
