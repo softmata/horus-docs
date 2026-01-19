@@ -53,8 +53,8 @@ export function DocsFooter() {
                 </Link>
               </li>
               <li>
-                <Link href="/built-in-nodes" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
-                  Built-in Nodes
+                <Link href="/rust/api" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                  Rust API
                 </Link>
               </li>
               <li>

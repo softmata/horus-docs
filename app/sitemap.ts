@@ -120,38 +120,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.75,
     },
 
-    // MEDIUM - Built-in Nodes (Feature Pages)
-    {
-      url: `${baseUrl}/built-in-nodes`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.75,
-    },
-    {
-      url: `${baseUrl}/built-in-nodes/lidar`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-    {
-      url: `${baseUrl}/built-in-nodes/camera`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-    {
-      url: `${baseUrl}/built-in-nodes/gps`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-    {
-      url: `${baseUrl}/built-in-nodes/imu`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-
     // MEDIUM-LOW - Development Tools
     {
       url: `${baseUrl}/development/cli-reference`,

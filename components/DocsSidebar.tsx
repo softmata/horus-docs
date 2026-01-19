@@ -85,11 +85,10 @@ const sections: SidebarSection[] = [
     title: "Rust",
     links: [
       { title: "Overview", href: "/rust", order: 0 },
-      { title: "Library Overview", href: "/rust/library", order: 1 },
       {
         title: "API Reference",
         href: "/rust/api",
-        order: 2,
+        order: 1,
         children: [
           { title: "Overview", href: "/rust/api", order: 0 },
           { title: "horus_core", href: "/rust/api/core", order: 1 },
@@ -120,100 +119,9 @@ const sections: SidebarSection[] = [
         ]
       },
       {
-        title: "Built-in Nodes",
-        href: "/rust/library/built-in-nodes",
-        order: 3,
-        children: [
-          { title: "Overview", href: "/rust/library/built-in-nodes", order: 0 },
-          // Communication Buses
-          { title: "I2C Bus", href: "/rust/library/built-in-nodes/i2c-bus", order: 1 },
-          { title: "SPI Bus", href: "/rust/library/built-in-nodes/spi-bus", order: 2 },
-          { title: "CAN Bus", href: "/rust/library/built-in-nodes/can-bus", order: 3 },
-          { title: "Serial", href: "/rust/library/built-in-nodes/serial", order: 4 },
-          { title: "Modbus", href: "/rust/library/built-in-nodes/modbus", order: 5 },
-          // Motors
-          { title: "DC Motor", href: "/rust/library/built-in-nodes/dc-motor", order: 10 },
-          { title: "BLDC Motor", href: "/rust/library/built-in-nodes/bldc-motor", order: 11 },
-          { title: "Servo Controller", href: "/rust/library/built-in-nodes/servo-controller", order: 12 },
-          { title: "Stepper Motor", href: "/rust/library/built-in-nodes/stepper-motor", order: 13 },
-          { title: "Dynamixel", href: "/rust/library/built-in-nodes/dynamixel", order: 14 },
-          { title: "Roboclaw Motor", href: "/rust/library/built-in-nodes/roboclaw-motor", order: 15 },
-          { title: "Differential Drive", href: "/rust/library/built-in-nodes/differential-drive", order: 16 },
-          // Sensors
-          { title: "Camera", href: "/rust/library/built-in-nodes/camera", order: 20 },
-          { title: "Depth Camera", href: "/rust/library/built-in-nodes/depth-camera", order: 21 },
-          { title: "IMU", href: "/rust/library/built-in-nodes/imu", order: 22 },
-          { title: "GPS", href: "/rust/library/built-in-nodes/gps", order: 23 },
-          { title: "LiDAR", href: "/rust/library/built-in-nodes/lidar", order: 24 },
-          { title: "Ultrasonic", href: "/rust/library/built-in-nodes/ultrasonic", order: 25 },
-          { title: "Encoder", href: "/rust/library/built-in-nodes/encoder", order: 26 },
-          { title: "Force Torque", href: "/rust/library/built-in-nodes/force-torque", order: 27 },
-          // Input Devices
-          { title: "Joystick", href: "/rust/library/built-in-nodes/joystick", order: 30 },
-          { title: "Keyboard Input", href: "/rust/library/built-in-nodes/keyboard-input", order: 31 },
-          { title: "Digital I/O", href: "/rust/library/built-in-nodes/digital-io", order: 32 },
-          // Perception & Vision
-          { title: "Image Processor", href: "/rust/library/built-in-nodes/image-processor", order: 40 },
-          { title: "Depth Estimation", href: "/rust/library/built-in-nodes/depth-estimation", order: 41 },
-          { title: "Visual Odometry", href: "/rust/library/built-in-nodes/visual-odometry", order: 42 },
-          { title: "Pose Estimation", href: "/rust/library/built-in-nodes/pose-estimation", order: 43 },
-          { title: "Semantic Segmentation", href: "/rust/library/built-in-nodes/semantic-segmentation", order: 44 },
-          { title: "YOLO Detector", href: "/rust/library/built-in-nodes/yolo-detector", order: 45 },
-          { title: "Collision Detector", href: "/rust/library/built-in-nodes/collision-detector", order: 46 },
-          // ML & Inference
-          { title: "Cloud LLM", href: "/rust/library/built-in-nodes/cloud-llm", order: 50 },
-          { title: "Embedding", href: "/rust/library/built-in-nodes/embedding", order: 51 },
-          { title: "ONNX Inference", href: "/rust/library/built-in-nodes/onnx-inference", order: 52 },
-          { title: "TensorRT Inference", href: "/rust/library/built-in-nodes/tensorrt-inference", order: 53 },
-          { title: "TFLite Inference", href: "/rust/library/built-in-nodes/tflite-inference", order: 54 },
-          // Navigation & Control
-          { title: "Odometry", href: "/rust/library/built-in-nodes/odometry", order: 60 },
-          { title: "Localization", href: "/rust/library/built-in-nodes/localization", order: 61 },
-          { title: "Path Planner", href: "/rust/library/built-in-nodes/path-planner", order: 62 },
-          { title: "PID Controller", href: "/rust/library/built-in-nodes/pid-controller", order: 63 },
-          // Safety & Monitoring
-          { title: "Battery Monitor", href: "/rust/library/built-in-nodes/battery-monitor", order: 70 },
-          { title: "Safety Monitor", href: "/rust/library/built-in-nodes/safety-monitor", order: 71 },
-          { title: "Emergency Stop", href: "/rust/library/built-in-nodes/emergency-stop", order: 72 },
-        ]
-      },
-      {
-        title: "Algorithms",
-        href: "/rust/library/algorithms",
-        order: 4,
-        children: [
-          { title: "Overview", href: "/rust/library/algorithms", order: 0 },
-          { title: "PID Controller", href: "/rust/library/algorithms/pid", order: 1 },
-          { title: "Kalman Filter", href: "/rust/library/algorithms/kalman-filter", order: 2 },
-          { title: "Extended Kalman Filter", href: "/rust/library/algorithms/ekf", order: 3 },
-          { title: "A* Pathfinding", href: "/rust/library/algorithms/astar", order: 4 },
-          { title: "RRT Pathfinding", href: "/rust/library/algorithms/rrt", order: 5 },
-          { title: "Pure Pursuit", href: "/rust/library/algorithms/pure-pursuit", order: 6 },
-          { title: "Differential Drive", href: "/rust/library/algorithms/differential-drive", order: 7 },
-          { title: "Occupancy Grid", href: "/rust/library/algorithms/occupancy-grid", order: 8 },
-          { title: "Sensor Fusion", href: "/rust/library/algorithms/sensor-fusion", order: 9 },
-          { title: "AABB Collision", href: "/rust/library/algorithms/aabb", order: 10 },
-          { title: "Safety Layer", href: "/rust/library/algorithms/safety-layer", order: 11 },
-        ]
-      },
-      {
-        title: "Drivers",
-        href: "/rust/library/drivers",
-        order: 5,
-        children: [
-          { title: "DriverLoader Configuration", href: "/rust/library/drivers/driver-loader", order: 1 },
-          { title: "Error Handling Patterns", href: "/rust/library/drivers/error-handling", order: 2 },
-          { title: "Multi-Driver Scenarios", href: "/rust/library/drivers/multi-driver", order: 3 },
-          { title: "Plugin Development", href: "/rust/library/drivers/plugin-development", order: 4 },
-          { title: "Testing Guide", href: "/rust/library/drivers/testing", order: 5 },
-          { title: "Troubleshooting", href: "/rust/library/drivers/troubleshooting", order: 6 },
-          { title: "Hardware Workflow", href: "/rust/library/drivers/workflow", order: 7 },
-        ]
-      },
-      {
         title: "Examples",
         href: "/rust/examples",
-        order: 6,
+        order: 2,
         children: [
           { title: "Basic Examples", href: "/rust/examples/basic-examples", order: 1 },
           { title: "Advanced Examples", href: "/rust/examples/advanced-examples", order: 2 },
@@ -251,45 +159,11 @@ const sections: SidebarSection[] = [
     ],
   },
   {
-    title: "Simulators",
-    links: [
-      { title: "Overview", href: "/simulators", order: 0 },
-      {
-        title: "Sim2D",
-        href: "/simulators/sim2d",
-        order: 1,
-        children: [
-          { title: "Overview", href: "/simulators/sim2d", order: 0 },
-          { title: "Getting Started", href: "/simulators/sim2d/getting-started", order: 1 },
-          { title: "Sensors", href: "/simulators/sim2d/sensors", order: 2 },
-          { title: "Articulated Robots", href: "/simulators/sim2d/articulated", order: 3 },
-          { title: "Configuration", href: "/simulators/sim2d/configuration", order: 4 },
-          { title: "Python API", href: "/simulators/sim2d/python-api", order: 5 },
-        ]
-      },
-      {
-        title: "Sim3D",
-        href: "/simulators/sim3d",
-        order: 2,
-        children: [
-          { title: "Overview", href: "/simulators/sim3d", order: 0 },
-          { title: "Installation", href: "/simulators/sim3d/getting-started/installation", order: 1 },
-          { title: "Quick Start", href: "/simulators/sim3d/getting-started/quick-start", order: 2 },
-          { title: "Robot Models", href: "/simulators/sim3d/getting-started/robots", order: 3 },
-          { title: "Sensors", href: "/simulators/sim3d/sensors/overview", order: 4 },
-          { title: "Physics", href: "/simulators/sim3d/physics/overview", order: 5 },
-          { title: "Reinforcement Learning", href: "/simulators/sim3d/rl/overview", order: 6 },
-        ]
-      },
-    ],
-  },
-  {
     title: "Development",
     links: [
       { title: "CLI Reference", href: "/development/cli-reference", order: 1 },
       { title: "Monitor", href: "/development/monitor", order: 2 },
       { title: "Monitor Security", href: "/development/monitor-security", order: 3 },
-      { title: "Simulation", href: "/development/simulation", order: 4 },
       { title: "Testing", href: "/development/testing", order: 5 },
       { title: "Parameters", href: "/development/parameters", order: 6 },
       { title: "Static Analysis", href: "/development/static-analysis", order: 7 },
@@ -298,9 +172,6 @@ const sections: SidebarSection[] = [
       { title: "AI Integration", href: "/development/ai-integration", order: 10 },
       { title: "ROS2 Bridge", href: "/development/ros2-bridge", order: 11 },
       { title: "Hardware Discovery", href: "/development/hardware-discovery", order: 12 },
-      { title: "Sim3D Editor", href: "/development/sim3d-editor", order: 13 },
-      { title: "Sim3D Multi-Robot", href: "/development/sim3d-multi-robot", order: 14 },
-      { title: "Sim3D Recording", href: "/development/sim3d-recording", order: 15 },
     ],
   },
   {
@@ -354,7 +225,6 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
     "Core Concepts": true,
     "Rust": true,
     "Python": true,
-    "Simulators": true,
     "Development": true,
     "Advanced Topics": true,
     "Package Management": true,

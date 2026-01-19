@@ -19,7 +19,6 @@ const segmentLabels: Record<string, string> = {
   "performance": "Performance",
   "advanced": "Advanced Topics",
   "api": "API Reference",
-  "built-in-nodes": "Built-in Nodes",
   "getting-started": "Getting Started",
 
   // Common file names
@@ -56,7 +55,6 @@ const segmentLabels: Record<string, string> = {
   // Development
   "cli-reference": "CLI Reference",
   "monitor": "Monitor",
-  "simulation": "Simulation",
   "testing": "Testing",
   "parameters": "Parameters",
   "library-reference": "Library Reference",

@@ -373,7 +373,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
             <div className="p-8 text-center">
               <div className="text-[var(--text-secondary)] mb-3">Start typing to search...</div>
               <div className="flex flex-wrap justify-center gap-2">
-                {['node', 'scheduler', 'ipc', 'python', 'simulation'].map(term => (
+                {['node', 'scheduler', 'ipc', 'python', 'testing'].map(term => (
                   <button
                     key={term}
                     onClick={() => setQuery(term)}
