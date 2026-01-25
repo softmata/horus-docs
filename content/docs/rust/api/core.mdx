@@ -29,9 +29,9 @@ pub trait Node: Send {
     fn tick(&mut self);
 
     // Optional methods with defaults
-    fn init(&mut self, ctx: &mut NodeInfo) -> Result<()> { Ok(()) }
-    fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> { Ok(()) }
-    fn on_error(&mut self, error: &str, ctx: &mut NodeInfo) { }
+    fn init(&mut self) -> Result<()> { Ok(()) }
+    fn shutdown(&mut self) -> Result<()> { Ok(()) }
+    fn on_error(&mut self, error: &str) { }
     fn get_publishers(&self) -> Vec<TopicMetadata> { vec![] }
     fn get_subscribers(&self) -> Vec<TopicMetadata> { vec![] }
 }
@@ -66,9 +66,6 @@ fn tick(&mut self)
 
 Called repeatedly by the scheduler. This is the main execution loop for the node.
 
-**Parameters:**
-- `ctx` - Optional mutable reference to node runtime context
-
 **Example:**
 ```rust
 fn tick(&mut self) {
@@ -78,10 +75,8 @@ fn tick(&mut self) {
     // Publish data
     self.publisher.send(value).ok();
 
-    // Log (must unwrap Option)
-    if let Some(ref mut c) = ctx {
-        c.log_debug(&format!("Published: {}", value));
-    }
+    // Log using hlog! macro
+    hlog!(debug, "Published: {}", value);
 }
 ```
 
@@ -92,13 +87,10 @@ fn tick(&mut self) {
 #### `init`
 
 ```rust
-fn init(&mut self, ctx: &mut NodeInfo) -> Result<()>
+fn init(&mut self) -> Result<()>
 ```
 
 Called once before the first tick. Use for initialization that may fail.
-
-**Parameters:**
-- `ctx` - Mutable reference to node runtime context
 
 **Returns:** `Result<()>` - Ok on success, Err on failure
 
@@ -109,13 +101,10 @@ Called once before the first tick. Use for initialization that may fail.
 #### `shutdown`
 
 ```rust
-fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()>
+fn shutdown(&mut self) -> Result<()>
 ```
 
 Called when the scheduler is stopping. Use for cleanup.
-
-**Parameters:**
-- `ctx` - Mutable reference to node runtime context
 
 **Returns:** `Result<()>` - Ok on success, Err on failure
 
@@ -126,16 +115,15 @@ Called when the scheduler is stopping. Use for cleanup.
 #### `on_error`
 
 ```rust
-fn on_error(&mut self, error: &str, ctx: &mut NodeInfo)
+fn on_error(&mut self, error: &str)
 ```
 
 Called when an error occurs during tick execution.
 
 **Parameters:**
 - `error` - Error message string
-- `ctx` - Mutable reference to node runtime context
 
-**Default:** Logs the error
+**Default:** Logs the error using `hlog!`
 
 ---
 
@@ -163,8 +151,8 @@ impl Node for TemperatureSensor {
         "temperature_sensor"
     }
 
-    fn init(&mut self, ctx: &mut NodeInfo) -> Result<()> {
-        ctx.log_info("Temperature sensor initialized");
+    fn init(&mut self) -> Result<()> {
+        hlog!(info, "Temperature sensor initialized");
         Ok(())
     }
 
@@ -176,8 +164,8 @@ impl Node for TemperatureSensor {
         self.sample_count += 1;
     }
 
-    fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> {
-        ctx.log_info(&format!("Sensor shutdown after {} samples", self.sample_count));
+    fn shutdown(&mut self) -> Result<()> {
+        hlog!(info, "Sensor shutdown after {} samples", self.sample_count);
         Ok(())
     }
 }
@@ -246,7 +234,7 @@ let topic: Topic<Image> = Topic::new_with_capacity("camera.image", 16)?;
 pub fn from_config(topic_name: &str) -> Result<Self>
 ```
 
-Creates a Topic from configuration file (`horus.toml`).
+Creates a Topic from configuration file (`horus.yaml`).
 
 **Parameters:**
 - `topic_name` - Name of the topic in config file
@@ -254,10 +242,11 @@ Creates a Topic from configuration file (`horus.toml`).
 **Returns:** `Result\<Topic\<T\>\>`
 
 **Config Example:**
-```toml
-[topics.camera]
-topic = "camera.image"
-capacity = 16
+```yaml
+topics:
+  camera:
+    topic: camera.image
+    capacity: 16
 ```
 
 ```rust
@@ -271,38 +260,34 @@ let topic: Topic<Image> = Topic::from_config("camera")?;
 #### `send`
 
 ```rust
-pub fn send(&self, msg: T, ctx: &mut Option<&mut NodeInfo>) -> Result<(), T>
+pub fn send(&self, msg: T) -> Result<(), T>
 ```
 
-Sends a message to the topic. Non-blocking, ~200ns latency.
+Sends a message to the topic. Non-blocking, ~200ns latency. Zero-overhead (no metrics).
 
 **Parameters:**
 - `msg` - Message to send
-- `ctx` - Mutable reference to optional node context (for metrics tracking)
 
 **Returns:** `Result<(), T>` - Ok on success, Err(msg) if buffer is full
 
 **Example:**
 ```rust
-// Inside tick()
 self.publisher.send(42.0).ok();
-
-// Outside node context
-topic.send(data, &mut None).ok();
 ```
+
+**Variants:**
+- `send_tracked(&self, msg: T)` - Same but updates internal metrics
+- `send_logged(&self, msg: T)` - Same but logs message summary (requires `T: LogSummary`)
 
 ---
 
 #### `recv`
 
 ```rust
-pub fn recv(&self, ctx: &mut Option<&mut NodeInfo>) -> Option<T>
+pub fn recv(&self) -> Option<T>
 ```
 
-Receives the latest message from the topic. Non-blocking.
-
-**Parameters:**
-- `ctx` - Mutable reference to optional node context
+Receives the latest message from the topic. Non-blocking. Zero-overhead (no metrics).
 
 **Returns:** `Option\<T\>` - Some(message) if available, None otherwise
 
@@ -312,6 +297,10 @@ if let Some(value) = self.subscriber.recv() {
     // Process value
 }
 ```
+
+**Variants:**
+- `recv_tracked(&self)` - Same but updates internal metrics
+- `recv_logged(&self)` - Same but logs message summary (requires `T: LogSummary`)
 
 ---
 
@@ -515,52 +504,19 @@ Enables safety monitoring with deadline miss threshold.
 #### `add`
 
 ```rust
-pub fn add(
-    &mut self,
-    node: Box<dyn Node>,
-    priority: u32,
-    logging_enabled: Option<bool>,
-) -> &mut Self
+pub fn add<N: Node + 'static>(&mut self, node: N) -> NodeBuilder<'_>
 ```
 
-Adds a node to the scheduler.
+Adds a node using the fluent builder API. Returns a `NodeBuilder` for configuring the node.
 
-**Parameters:**
-- `node` - Boxed node instance
-- `priority` - Execution priority (0 = highest)
-- `logging_enabled` - Enable logging for this node (None = false)
+**Returns:** `NodeBuilder` for chaining configuration
 
-**Returns:** `&mut Self` for chaining
-
-**Example:**
-```rust
-scheduler
-    .add(Box::new(SensorNode::new()?), 0, Some(true))
-    .add(Box::new(ControlNode::new()?), 1, Some(true))
-    .add(Box::new(LoggerNode::new()?), 100, None);
-```
-
----
-
-#### `add_with_tier`
-
-```rust
-pub fn add_with_tier(
-    &mut self,
-    node: Box<dyn Node>,
-    priority: u32,
-    tier: NodeTier,
-) -> &mut Self
-```
-
-Adds a node with explicit tier annotation for deterministic optimization. Use this to declare node execution characteristics at compile time.
-
-**Parameters:**
-- `node` - Boxed node instance
-- `priority` - Execution priority (0 = highest)
-- `tier` - Explicit execution tier (see NodeTier enum)
-
-**Returns:** `&mut Self` for chaining
+**NodeBuilder Methods:**
+- `.order(priority)` - Set execution priority (0 = highest)
+- `.tier(NodeTier::*)` - Set explicit execution tier
+- `.rate_hz(freq)` - Set custom tick rate
+- `.rt()` - Mark as real-time node
+- `.done()` - Finalize and add the node
 
 **NodeTier Options:**
 - `NodeTier::Jit` - Ultra-fast (&lt;1μs), JIT compiled
@@ -574,11 +530,10 @@ Adds a node with explicit tier annotation for deterministic optimization. Use th
 ```rust
 use horus::prelude::*;
 
-scheduler
-    .add_with_tier(Box::new(pid_controller), 0, NodeTier::Jit)
-    .add_with_tier(Box::new(sensor_reader), 1, NodeTier::Fast)
-    .add_with_tier(Box::new(cloud_sync), 5, NodeTier::AsyncIO)
-    .add_with_tier(Box::new(data_logger), 10, NodeTier::Background);
+scheduler.add(pid_controller).order(0).tier(NodeTier::Jit).done();
+scheduler.add(sensor_reader).order(1).tier(NodeTier::Fast).done();
+scheduler.add(cloud_sync).order(5).tier(NodeTier::AsyncIO).done();
+scheduler.add(data_logger).order(10).tier(NodeTier::Background).done();
 ```
 
 ---
@@ -740,21 +695,13 @@ use horus::prelude::*;
 use std::time::Duration;
 
 fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new()
-        .with_name("robot_controller")
-        .with_capacity(10);
+    let mut scheduler = Scheduler::new();
 
-    // Add nodes with priorities
-    scheduler
-        .add(Box::new(EmergencyStop::new()?), 0, Some(true))
-        .add(Box::new(MotorController::new()?), 1, Some(true))
-        .add(Box::new(SensorTopic::new()?), 2, Some(true))
-        .add(Box::new(DataLogger::new()?), 100, Some(false));
-
-    // Configure rates
-    scheduler
-        .set_node_rate("motor_controller", 1000.0)
-        .set_node_rate("data_logger", 10.0);
+    // Add nodes with priorities using fluent API
+    scheduler.add(EmergencyStop::new()?).order(0).done();
+    scheduler.add(MotorController::new()?).order(1).rate_hz(1000.0).done();
+    scheduler.add(SensorTopic::new()?).order(2).done();
+    scheduler.add(DataLogger::new()?).order(100).rate_hz(10.0).done();
 
     // Run for 60 seconds
     scheduler.run_for(Duration::from_secs(60))?;
@@ -765,153 +712,35 @@ fn main() -> Result<()> {
 
 ---
 
-## NodeInfo
+## hlog! Macro
 
-Runtime context provided to nodes during execution.
-
-```rust
-pub struct NodeInfo { /* fields omitted */ }
-```
-
-### Constructors
-
-#### `new`
+The `hlog!` macro provides structured logging for nodes. Use it instead of println or other logging methods.
 
 ```rust
-pub fn new(name: String, logging_enabled: bool) -> Self
+hlog!(level, "message", args...);
 ```
 
-Creates a new NodeInfo instance.
-
----
-
-### Accessors
-
-#### `name`
+### Log Levels
 
 ```rust
-pub fn name(&self) -> &str
+hlog!(trace, "Detailed trace info");
+hlog!(debug, "Debug information: {}", value);
+hlog!(info, "Node initialized");
+hlog!(warn, "Potential issue: {}", issue);
+hlog!(error, "Error occurred: {}", err);
 ```
 
-Returns the node name.
-
----
-
-#### `state`
-
-```rust
-pub fn state(&self) -> &NodeState
-```
-
-Returns current node state.
-
----
-
-#### `metrics`
-
-```rust
-pub fn metrics(&self) -> &NodeMetrics
-```
-
-Returns node metrics.
-
----
-
-#### `config`
-
-```rust
-pub fn config(&self) -> &NodeConfig
-```
-
-Returns node configuration.
-
----
-
-### Logging
-
-#### `log_info`
-
-```rust
-pub fn log_info(&mut self, msg: &str)
-```
-
-Logs an info message.
-
----
-
-#### `log_debug`
-
-```rust
-pub fn log_debug(&mut self, msg: &str)
-```
-
-Logs a debug message.
-
----
-
-#### `log_warning`
-
-```rust
-pub fn log_warning(&mut self, msg: &str)
-```
-
-Logs a warning message.
-
----
-
-#### `log_error`
-
-```rust
-pub fn log_error(&mut self, msg: &str)
-```
-
-Logs an error message.
-
----
-
-### State Management
-
-#### `transition_to_error`
-
-```rust
-pub fn transition_to_error(&mut self, reason: String)
-```
-
-Transitions node to error state.
-
----
-
-#### `transition_to_crashed`
-
-```rust
-pub fn transition_to_crashed(&mut self, reason: String)
-```
-
-Transitions node to crashed state.
-
----
-
-#### `restart`
-
-```rust
-pub fn restart(&mut self) -> Result<()>
-```
-
-Attempts to restart the node.
-
----
-
-### Usage Pattern
+### Example
 
 ```rust
 fn tick(&mut self) {
-    // Pass ctx to Topic methods
     self.publisher.send(data).ok();
+    hlog!(debug, "Published data: {:?}", data);
+}
 
-    // Access NodeInfo (must unwrap Option)
-    if let Some(ref mut c) = ctx {
-        c.log_info("Processing complete");
-    }
+fn init(&mut self) -> Result<()> {
+    hlog!(info, "Sensor initialized");
+    Ok(())
 }
 ```
 

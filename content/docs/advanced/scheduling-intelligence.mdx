@@ -1,342 +1,228 @@
 ---
 title: "Scheduling Intelligence"
-description: "Runtime profiling, automatic tier classification, and dependency analysis for optimal node execution"
+description: "Automatic tier classification and node optimization"
 weight: 36
 ---
 
 # Scheduling Intelligence
 
-HORUS includes an intelligent scheduling system that automatically profiles node execution characteristics and optimizes scheduling decisions. The system learns node behavior during a learning phase and classifies nodes into execution tiers for optimal performance.
+<Callout type="info" title="Do I Need This?">
 
-## Overview
+**No, tiers work automatically.** When you enable learning with `scheduler.enable_learning()` or use `Scheduler::high_performance()`, HORUS automatically:
+1. Profiles your nodes for ~100 ticks
+2. Classifies them by behavior (fast, slow, I/O-heavy, etc.)
+3. Optimizes execution for each type
 
-The scheduling intelligence system includes:
+**Most users never need to think about tiers.** This page explains how to optionally annotate nodes and what happens under the hood.
 
-- **RuntimeProfiler**: Collects execution statistics using Welford's algorithm
-- **TierClassifier**: Assigns nodes to execution tiers based on characteristics
-- **DependencyGraph**: Analyzes pub/sub relationships for parallel execution
-- **OfflineProfiler**: Pre-computed execution profiles for deterministic systems
+**When this page IS useful:**
+- You want deterministic startup (skip learning phase)
+- Forcing a specific tier for a node
+- Understanding why nodes execute differently
 
-## Runtime Profiler
+</Callout>
 
-The `RuntimeProfiler` collects real-time statistics about node execution:
+## Why Tiers Exist
 
-### Creating a Profiler
+Different nodes have different needs:
 
-```rust
-use horus::prelude::*;
+| Node Type | Example | Problem | Solution (Tier) |
+|-----------|---------|---------|-----------------|
+| Fast math | PID controller | Overhead from function calls | **Jit**: JIT compile to native code |
+| Blocking I/O | Camera reader | Blocks the scheduler | **AsyncIO**: Run in async runtime |
+| Slow/unreliable | Flaky sensor | Can crash or hang | **Isolated**: Process isolation |
+| Normal | Most nodes | None | **Fast**: Inline execution |
 
-// Create with 100-tick learning phase
-let mut profiler = RuntimeProfiler::new(100);
+Without tiers, a slow camera node would block your fast control loop. Tiers let different nodes run in appropriate ways.
 
-// Or use default (100 ticks)
-let mut profiler = RuntimeProfiler::new_default();
-```
+## Node Tier Annotation
 
-### Recording Execution Times
-
-```rust
-use std::time::{Duration, Instant};
-
-// During node execution
-let start = Instant::now();
-node.tick();
-let duration = start.elapsed();
-
-// Record the execution time
-profiler.record("sensor_node", duration);
-
-// Advance tick counter
-profiler.tick();
-```
-
-### Recording Failures
-
-```rust
-// Record node failures (for Isolated tier classification)
-profiler.record_node_failure("motor_controller");
-```
-
-### Checking Learning Progress
-
-```rust
-// Check if learning is complete
-if profiler.is_learning_complete() {
-    println!("Learning phase finished!");
-}
-
-// Get progress (0.0 to 1.0)
-let progress = profiler.learning_progress();
-println!("Learning: {:.0}%", progress * 100.0);
-```
-
-## Node Statistics
-
-The profiler tracks comprehensive statistics for each node:
+Use `NodeTier` to explicitly declare a node's execution characteristics:
 
 ```rust
 use horus::prelude::*;
 
-if let Some(stats) = profiler.get_stats("sensor_node") {
-    println!("Average: {:.2}µs", stats.avg_us);
-    println!("Std Dev: {:.2}µs", stats.stddev_us);
-    println!("Min: {:.2}µs", stats.min_us);
-    println!("Max: {:.2}µs", stats.max_us);
-    println!("Samples: {}", stats.count);
+let mut scheduler = Scheduler::new();
 
-    // Characteristics
-    println!("Deterministic: {}", stats.is_deterministic);
-    println!("I/O Heavy: {}", stats.is_io_heavy);
-    println!("CPU Bound: {}", stats.is_cpu_bound);
+// Annotate nodes with their tier
+scheduler.add(pid_node).order(0).tier(NodeTier::Jit).done();
+scheduler.add(sensor_node).order(1).tier(NodeTier::Fast).done();
+scheduler.add(camera_node).order(2).tier(NodeTier::AsyncIO).done();
+scheduler.add(logger_node).order(5).tier(NodeTier::Background).done();
 
-    // Failure tracking
-    println!("Failure rate: {:.1}%", stats.failure_rate * 100.0);
-}
+scheduler.run();
+```
+
+### Available Tiers
+
+| Tier | Use For | Latency | Execution |
+|------|---------|---------|-----------|
+| `NodeTier::Jit` | Ultra-fast math (<1µs) | 20-50ns | JIT compiled |
+| `NodeTier::Fast` | Sensors, filters (<10µs) | 50-100ns | Inline |
+| `NodeTier::Normal` | Algorithms (<100µs) | ~1µs | Standard |
+| `NodeTier::AsyncIO` | Network, file I/O | 10-100µs | Async executor |
+| `NodeTier::Background` | Logging, diagnostics | 1-100ms | Thread pool |
+| `NodeTier::Isolated` | Unreliable/untrusted | 1-10ms | Process isolation |
+| `NodeTier::Auto` | Let system decide | Varies | Based on profile |
+
+### Tier Descriptions
+
+```rust
+// Get human-readable description
+let tier = NodeTier::Jit;
+println!("{}", tier.description());
+// Output: "JIT compiled (<1μs)"
+```
+
+## Automatic Classification
+
+If you don't annotate nodes, HORUS classifies them automatically during a learning phase:
+
+```rust
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new();
+
+// Enable learning (profiles nodes for ~100 ticks)
+scheduler.enable_learning();
+
+// Add nodes without explicit tiers
+scheduler.add(sensor_node).order(0).done();
+scheduler.add(filter_node).order(1).done();
+
+// During the first ~100 ticks, HORUS profiles execution times
+// After learning, nodes are automatically assigned optimal tiers
+scheduler.run();
 ```
 
 ### Classification Criteria
 
-| Characteristic | Criteria |
-|----------------|----------|
-| Deterministic | Coefficient of variation < 10% |
-| I/O Heavy | CV > 30% AND max > 2× average |
-| CPU Bound | Average > 100µs AND CV < 20% |
-| High Failure Rate | Failure rate > 20% (10+ samples) |
+The scheduler internally classifies nodes based on:
 
-## Tier Classifier
+| Characteristic | Detection | Tier Assignment |
+|----------------|-----------|-----------------|
+| High failure rate (>20%) | Tracks failures | → Isolated |
+| Ultra-fast (<5µs) + deterministic | Low variance | → Jit |
+| I/O heavy (high variance) | CV >30%, spikes | → AsyncIO |
+| Fast (<1ms) | Execution time | → Fast |
+| Everything else | Default | → Background |
 
-The `TierClassifier` assigns nodes to execution tiers based on profiler data:
+## Deterministic Mode (Skip Learning)
 
-```rust
-use horus::prelude::*;
-
-// Create classifier from profiler data
-let classifier = TierClassifier::from_profiler(&profiler);
-
-// Get tier for a specific node
-if let Some(tier) = classifier.get_tier("sensor_node") {
-    println!("Tier: {}", tier.name());
-    println!("Expected latency: {}", tier.latency_range());
-}
-
-// Get all nodes in a tier
-let ultra_fast = classifier.get_nodes_in_tier(ExecutionTier::UltraFast);
-println!("JIT-eligible nodes: {:?}", ultra_fast);
-```
-
-### Execution Tiers
-
-| Tier | Criteria | Latency | Execution Method |
-|------|----------|---------|------------------|
-| **UltraFast** | &lt;5µs, deterministic | 20-50ns | JIT compiled |
-| **Fast** | &lt;1ms | 50-100ns | Inline |
-| **AsyncIO** | I/O heavy | 10-100µs | Async executor |
-| **Isolated** | High failure rate | 1-10ms | Process isolation |
-| **Background** | Everything else | 1-100ms | Thread pool |
-
-### Classification Priority
-
-```rust
-// Classification priority (highest to lowest):
-// 1. High failure rate → Isolated (process isolation for safety)
-// 2. Ultra-fast + deterministic → UltraFast (JIT compilation)
-// 3. I/O heavy → AsyncIO (async executor)
-// 4. Fast (<1ms) → Fast (inline execution)
-// 5. Default → Background (thread pool)
-```
-
-### Tier Statistics
-
-```rust
-let stats = classifier.tier_stats();
-
-println!("Total nodes: {}", stats.total_nodes);
-println!("UltraFast: {} ({:.1}%)",
-    stats.ultra_fast,
-    stats.ultra_fast_percent()
-);
-println!("Parallel capable: {:.1}%",
-    stats.parallel_capable_percent()
-);
-```
-
-## Dependency Graph
-
-The `DependencyGraph` analyzes pub/sub relationships to identify parallel execution opportunities:
+For production systems that need deterministic startup:
 
 ```rust
 use horus::prelude::*;
 
-// Define nodes with their pub/sub topics
-let nodes = vec![
-    ("sensor", vec!["raw_data".to_string()], vec![]),
-    ("filter", vec!["filtered".to_string()], vec!["raw_data".to_string()]),
-    ("detector", vec!["objects".to_string()], vec!["filtered".to_string()]),
-    ("logger", vec![], vec!["raw_data".to_string()]),
-];
+// Option 1: Annotate all nodes explicitly
+let mut scheduler = Scheduler::new();
+scheduler.add(node1).tier(NodeTier::Jit).done();
+scheduler.add(node2).tier(NodeTier::Fast).done();
+// No learning phase needed - deterministic startup
 
-let graph = DependencyGraph::from_nodes(&nodes);
+// Option 2: Use offline profiles
+let mut scheduler = Scheduler::new();
+scheduler.load_profile("profiles/robot.json")?;
+// Tiers loaded from pre-computed profile
 ```
 
-### Topological Levels
+### Creating Offline Profiles
 
-Nodes at the same level can execute in parallel:
-
-```rust
-println!("Execution levels:");
-for (i, level) in graph.levels.iter().enumerate() {
-    println!("  Level {}: {:?}", i, level);
-}
-
-// Output:
-// Level 0: ["sensor"]           <- No dependencies
-// Level 1: ["filter", "logger"] <- Depend on sensor
-// Level 2: ["detector"]         <- Depends on filter
-```
-
-### Parallel Groups
-
-Find nodes that can execute truly in parallel (no path between them):
-
-```rust
-println!("Parallel groups:");
-for group in &graph.parallel_groups {
-    println!("  {:?}", group);
-}
-
-// Nodes in the same group have no dependencies
-```
-
-### Graph Statistics
-
-```rust
-let stats = graph.stats();
-
-println!("Total nodes: {}", stats.total_nodes);
-println!("Total edges: {}", stats.total_edges);
-println!("Levels: {}", stats.num_levels);
-println!("Parallel groups: {}", stats.num_parallel_groups);
-println!("Max parallel: {}", stats.max_parallel_nodes);
-
-// Check for cycles (invalid in pub/sub)
-if graph.has_cycles() {
-    eprintln!("Warning: Dependency cycle detected!");
-}
-```
-
-## Profiler Summary
-
-Generate a summary report:
-
-```rust
-let summary = profiler.summary();
-
-println!("=== Profiler Summary ===");
-println!("Total nodes: {}", summary.total_nodes);
-println!("Ultra-fast nodes: {}", summary.ultra_fast_nodes);
-println!("I/O heavy nodes: {}", summary.io_heavy_nodes);
-println!("CPU bound nodes: {}", summary.cpu_bound_nodes);
-println!("Avg execution: {:.2}µs", summary.avg_execution_us);
-println!("Learning: {}",
-    if summary.learning_complete { "Complete" } else { "In progress" }
-);
-
-// Detailed statistics
-profiler.print_stats();
-```
-
-## Integration with Scheduler
-
-The scheduler integrates all intelligence components:
+Profile your system once in a controlled environment:
 
 ```rust
 use horus::prelude::*;
 
-let config = SchedulerConfig {
-    // Enable profiling
-    profiling_enabled: true,
-    learning_ticks: 100,
+// Create offline profiler
+let mut profiler = OfflineProfiler::new();
 
-    // Enable tier-based execution
-    tier_execution_enabled: true,
+// Profile each node
+profiler.profile_node("sensor", || {
+    sensor_node.tick();
+});
 
-    // Enable JIT for ultra-fast nodes
-    jit_enabled: true,
+profiler.profile_node("filter", || {
+    filter_node.tick();
+});
 
-    ..Default::default()
-};
-
-let mut scheduler = Scheduler::new().with_config(config);
-
-// Add nodes
-scheduler.add(Box::new(sensor_node), 0, Some(true));
-scheduler.add(Box::new(filter_node), 1, Some(true));
-
-// Run - profiling happens automatically
-for _ in 0..1000 {
-    scheduler.tick();
-
-    // After learning phase, tiers are assigned
-    if scheduler.is_learning_complete() {
-        // Nodes now execute in optimized tiers
-    }
-}
+// Save profile for production use
+profiler.save("profiles/robot.json")?;
 ```
 
-## Forcing Classifications
-
-For testing or known node characteristics:
+### Loading Profiles
 
 ```rust
-// Force all nodes to be classified as ultra-fast
-profiler.force_ultra_fast_classification = true;
+use horus::prelude::*;
 
-// Force all nodes to be classified as async I/O
-profiler.force_async_io_classification = true;
+// Load pre-computed profile
+let profile = ProfileData::load("profiles/robot.json")?;
+
+// Apply to scheduler
+let mut scheduler = Scheduler::new();
+scheduler.apply_profile(&profile);
+
+// Nodes now use profiled tiers - no learning phase
+scheduler.run();
 ```
 
 ## Best Practices
 
-### 1. Appropriate Learning Phase
+### 1. Start Without Annotations
+
+Let the system classify nodes automatically. Only annotate when needed:
 
 ```rust
-// Short for real-time critical (faster startup)
-let profiler = RuntimeProfiler::new(50);
+// Good: Let HORUS decide
+scheduler.add(my_node).done();
 
-// Long for complex systems (better accuracy)
-let profiler = RuntimeProfiler::new(500);
+// Only annotate when you know better than the profiler
+scheduler.add(critical_pid).tier(NodeTier::Jit).done();
 ```
 
-### 2. Monitor Tier Changes
+### 2. Use Offline Profiles for Production
 
 ```rust
-// After learning phase
-let classifier = TierClassifier::from_profiler(&profiler);
-classifier.print_classification();
+// Development: Enable learning
+scheduler.enable_learning();
 
-// Check for unexpected results
-let isolated = classifier.get_nodes_in_tier(ExecutionTier::Isolated);
-if !isolated.is_empty() {
-    log::warn!("Nodes with high failure rates: {:?}", isolated);
+// Production: Use offline profile for deterministic startup
+scheduler.load_profile("production.json")?;
+```
+
+### 3. Monitor Classification Results
+
+```rust
+// After learning phase completes
+if scheduler.is_learning_complete() {
+    scheduler.print_tier_summary();
 }
 ```
 
-### 3. Validate Dependency Graph
+## How It Works Internally
 
-```rust
-let graph = DependencyGraph::from_nodes(&nodes);
+<Callout type="note" title="Implementation Details">
 
-if graph.has_cycles() {
-    panic!("Invalid pub/sub configuration: cycle detected");
-}
+The following describes internal behavior. You don't need to understand this to use HORUS effectively.
 
-if graph.stats().num_levels == graph.stats().total_nodes {
-    log::warn!("No parallelism possible - fully sequential graph");
-}
-```
+</Callout>
+
+When learning is enabled, HORUS:
+
+1. **Profiles** each node for ~100 ticks using Welford's algorithm for stable statistics
+2. **Analyzes** execution characteristics:
+   - Mean and standard deviation of execution time
+   - Coefficient of variation (determinism)
+   - Failure rate
+   - I/O patterns (high variance indicates blocking I/O)
+3. **Classifies** nodes into internal execution tiers
+4. **Optimizes** execution:
+   - Ultra-fast nodes → JIT compiled
+   - I/O-heavy nodes → Async executor
+   - Unreliable nodes → Process isolation
+   - Normal nodes → Inline execution
 
 ## See Also
 
-- [JIT Compilation](/advanced/jit-compilation) - Ultra-fast execution
-- [Execution Modes](/advanced/execution-modes) - Execution strategies
+- [JIT Compilation](/advanced/jit-compilation) - Ultra-fast execution details
+- [Execution Modes](/advanced/execution-modes) - Scheduler-level strategies
 - [Scheduler Configuration](/advanced/scheduler-configuration) - Full configuration options
