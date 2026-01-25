@@ -72,16 +72,16 @@ impl Node for Publisher {
         "Publisher"
     }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         let velocity = 1.5;
 
-        // Send message
-        match self.velocity_pub.send(velocity, &mut ctx) {
+        // Send message (zero-overhead)
+        match self.velocity_pub.send(velocity) {
             Ok(()) => {
                 // Message sent successfully
             }
-            Err(e) => {
-                // Failed to send
+            Err(_returned_msg) => {
+                // Buffer full - message returned
             }
         }
     }
@@ -110,13 +110,11 @@ impl Node for Subscriber {
         "Subscriber"
     }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        // Receive message
-        if let Some(velocity) = self.velocity_sub.recv(&mut ctx) {
+    fn tick(&mut self) {
+        // Receive message (zero-overhead)
+        if let Some(velocity) = self.velocity_sub.recv() {
             // Process the received message
-            if let Some(ref mut c) = ctx {
-                c.log_info(&format!("Received velocity: {}", velocity));
-            }
+            println!("Received velocity: {}", velocity);
         }
     }
 }
@@ -155,34 +153,37 @@ See [Communication Transport](/concepts/communication-transport) for detailed co
 
 ## Send and Receive
 
+> **Note**: HORUS v0.3+ uses a [zero-overhead IPC architecture](/concepts/zero-overhead-ipc) where introspection is separated from the hot path. The `send()` and `recv()` methods have zero logging overhead.
+
 ### The send() Method
 
 ```rust
-pub fn send(&self, msg: T, ctx: &mut Option<&mut NodeInfo>) -> HorusResult<()>
+pub fn send(&self, msg: T) -> Result<(), T>
 ```
 
 **Parameters**:
 - `msg`: Message to send
-- `ctx`: Optional NodeInfo for logging
 
 **Returns**:
 - `Ok(())`: Message sent successfully
-- `Err(e)`: Failed to send
+- `Err(msg)`: Buffer full - original message returned
 
 **How it works**:
 - Writes data directly to shared memory using zero-copy design
-- Measures IPC latency (~85-437ns for small messages)
-- Automatically logs publish events when `ctx` is provided
+- **Zero introspection overhead** - no timing, no logging
 - Non-blocking operation - returns immediately
+- Returns the message on failure (buffer full)
+
+**For introspection**, use `send_logged()` which requires `T: LogSummary`:
+```rust
+topic.send_logged(msg)?;  // Records timing and logs to introspection buffer
+```
 
 ### The recv() Method
 
 ```rust
-pub fn recv(&self, ctx: &mut Option<&mut NodeInfo>) -> Option<T>
+pub fn recv(&self) -> Option<T>
 ```
-
-**Parameters**:
-- `ctx`: Optional NodeInfo for logging
 
 **Returns**:
 - `Some(msg)`: Message received
@@ -190,10 +191,16 @@ pub fn recv(&self, ctx: &mut Option<&mut NodeInfo>) -> Option<T>
 
 **How it works**:
 - Reads directly from shared memory without serialization
-- Measures IPC latency (~85-437ns for small messages)
-- Automatically logs subscribe events when `ctx` is provided
+- **Zero introspection overhead** - no timing, no logging
 - Non-blocking operation - returns immediately if no data available
 - Returns a copy of the message data
+
+**For introspection**, use `recv_logged()` which requires `T: LogSummary`:
+```rust
+if let Some(data) = topic.recv_logged() { ... }
+```
+
+See [Zero-Overhead IPC Architecture](/concepts/zero-overhead-ipc) for details on when to use `send()` vs `send_logged()`.
 
 ## Communication Patterns
 
@@ -210,8 +217,8 @@ struct PubNode {
 impl Node for PubNode {
     fn name(&self) -> &'static str { "PubNode" }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        self.data_pub.send(42.0, &mut ctx).ok();
+    fn tick(&mut self) {
+        self.data_pub.send(42.0).ok();
     }
 }
 
@@ -223,11 +230,9 @@ struct SubNode {
 impl Node for SubNode {
     fn name(&self) -> &'static str { "SubNode" }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        if let Some(data) = self.data_sub.recv(&mut ctx) {
-            if let Some(ref mut c) = ctx {
-                c.log_info(&format!("Got: {}", data));
-            }
+    fn tick(&mut self) {
+        if let Some(data) = self.data_sub.recv() {
+            println!("Got: {}", data);
         }
     }
 }
@@ -281,9 +286,9 @@ struct Aggregator {
 impl Node for Aggregator {
     fn name(&self) -> &'static str { "Aggregator" }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         // Receives from any publisher on this topic
-        if let Some(reading) = self.reading_sub.recv(&mut ctx) {
+        if let Some(reading) = self.reading_sub.recv() {
             self.process(reading);
         }
     }
@@ -381,15 +386,14 @@ Avoid using these patterns:
 ### Send Errors
 
 ```rust
-match topic.send(data, &mut ctx) {
+match topic.send(data) {
     Ok(()) => {
         // Success
     }
-    Err(e) => {
-        // Failed to send - shared memory full or not available
-        if let Some(ref mut c) = ctx {
-            c.log_warning("Failed to publish message");
-        }
+    Err(returned_data) => {
+        // Buffer full - original message returned
+        // You can retry, drop, or log the failure
+        log::warn!("Buffer full, message not sent");
     }
 }
 ```
@@ -402,7 +406,7 @@ match topic.send(data, &mut ctx) {
 - Shared memory not initialized
 
 ```rust
-match topic.recv(&mut ctx) {
+match topic.recv() {
     Some(data) => {
         // Process data
     }
@@ -463,12 +467,12 @@ Only publish when certain conditions are met:
 
 ```rust
 impl Node for ConditionalPublisher {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         let data = self.read_sensor();
 
         // Only publish if above threshold
         if data > self.threshold {
-            self.alert_pub.send(data, &mut ctx).ok();
+            self.alert_pub.send(data).ok();
         }
     }
 }
@@ -485,9 +489,9 @@ struct BufferedSubscriber {
 }
 
 impl Node for BufferedSubscriber {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         // Update cached value if new message available
-        if let Some(value) = self.data_sub.recv(&mut ctx) {
+        if let Some(value) = self.data_sub.recv() {
             self.last_value = Some(value);
         }
 
@@ -511,12 +515,12 @@ struct RateLimitedPublisher {
 }
 
 impl Node for RateLimitedPublisher {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         self.tick_count += 1;
 
         // Publish every 10 ticks (~6 Hz at 60 FPS)
         if self.tick_count % self.publish_every_n_ticks == 0 {
-            self.data_pub.send(42.0, &mut ctx).ok();
+            self.data_pub.send(42.0).ok();
         }
     }
 }
@@ -528,8 +532,8 @@ Filter messages before processing:
 
 ```rust
 impl Node for FilteringSubscriber {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        if let Some(data) = self.data_sub.recv(&mut ctx) {
+    fn tick(&mut self) {
+        if let Some(data) = self.data_sub.recv() {
             // Only process valid data
             if data.is_valid() && data.quality > 0.8 {
                 self.process(data);
@@ -640,9 +644,9 @@ struct Pose {
 Always check for new messages:
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+fn tick(&mut self) {
     // Check EVERY tick
-    if let Some(msg) = self.sub.recv(&mut ctx) {
+    if let Some(msg) = self.sub.recv() {
         self.process(msg);
     }
 }
@@ -653,10 +657,9 @@ fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
 Don't ignore send errors:
 
 ```rust
-if let Err(e) = self.pub.send(data, &mut ctx) {
-    if let Some(ref mut c) = ctx {
-        c.log_warning("Publish failed");
-    }
+if let Err(returned_data) = self.pub.send(data) {
+    // Buffer full - handle appropriately
+    log::warn!("Publish failed - buffer full");
 }
 ```
 

@@ -1,0 +1,356 @@
+---
+title: Zero-Overhead IPC Architecture
+description: Understanding HORUS's separated introspection design for maximum performance
+order: 5
+---
+
+# Zero-Overhead IPC Architecture
+
+HORUS v0.3+ introduces a **zero-overhead IPC architecture** that separates introspection from the hot path. This design ensures that `send()` and `recv()` have minimal latency regardless of whether monitoring tools are attached.
+
+## Key Takeaways
+
+After reading this guide, you will understand:
+- Why introspection was separated from IPC operations
+- The difference between `send()` (zero-overhead) and `send_logged()` (introspection)
+- How external tools monitor Topics without affecting performance
+- Performance characteristics of each backend
+
+## The Problem: Introspection Overhead
+
+In traditional robotics frameworks, logging and timing are embedded in every message operation:
+
+```rust
+// OLD DESIGN (embedded introspection)
+pub fn send(&self, msg: T, ctx: &mut Option<&mut NodeInfo>) -> HorusResult<()> {
+    let start = Instant::now();           // +10-20ns
+
+    // Write to shared memory
+    self.backend.push(msg)?;
+
+    let elapsed = start.elapsed();        // +10-20ns
+    if let Some(ref mut c) = ctx {
+        c.record_ipc_latency(elapsed);    // +50-100ns (logging)
+        c.log_pub(&self.name, &msg);      // +100-500ns (serialization)
+    }
+    Ok(())
+}
+```
+
+This adds **170-640ns of overhead** to every message, even when no one is monitoring!
+
+## The Solution: Separated Introspection
+
+HORUS separates introspection from the hot path:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      HORUS IPC Architecture                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   HOT PATH (Zero Overhead)          INTROSPECTION (Opt-in)         │
+│   ┌─────────────────────┐          ┌─────────────────────┐         │
+│   │  topic.send(msg)    │          │ topic.send_logged() │         │
+│   │  topic.recv()       │          │ topic.recv_logged() │         │
+│   │                     │          │                     │         │
+│   │  - No timing        │          │ + Timing measured   │         │
+│   │  - No logging       │          │ + Logs to buffer    │         │
+│   │  - No syscalls      │          │ + Metrics updated   │         │
+│   │  - ~50-600ns        │          │ + ~200-1000ns       │         │
+│   └─────────────────────┘          └─────────────────────┘         │
+│                                                                     │
+│   EXTERNAL INTROSPECTION (Passive)                                 │
+│   ┌─────────────────────────────────────────────────────────┐      │
+│   │  horus monitor          - Reads /dev/shm metadata       │      │
+│   │  horus topic echo       - Subscribes to topic           │      │
+│   │  horus topic hz         - Measures message rate         │      │
+│   │                                                          │      │
+│   │  Zero impact on publishers!                              │      │
+│   └─────────────────────────────────────────────────────────┘      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## API Reference
+
+### Zero-Overhead Operations
+
+#### `send(msg) -> Result<(), T>`
+
+Sends a message with zero introspection overhead.
+
+```rust
+use horus::prelude::*;
+
+let topic: Topic<f32> = Topic::new("sensor")?;
+
+// Zero-overhead send - just the IPC operation
+topic.send(42.0)?;
+```
+
+**Characteristics:**
+- No timing measurement
+- No logging or tracing
+- No syscalls beyond the atomic operations
+- Returns the message on failure (buffer full)
+- **Latency: 50-600ns** depending on backend
+
+#### `recv() -> Option<T>`
+
+Receives a message with zero introspection overhead.
+
+```rust
+// Zero-overhead receive - just reads from shared memory
+if let Some(value) = topic.recv() {
+    process(value);
+}
+```
+
+**Characteristics:**
+- Non-blocking (returns `None` if no message)
+- No timing measurement
+- No logging
+- **Latency: 50-600ns** depending on backend
+
+### Introspection Operations (Opt-in)
+
+#### `send_logged(msg) -> Result<(), T>`
+
+Sends a message with full introspection. Requires `T: LogSummary`.
+
+```rust
+use horus::prelude::*;
+
+#[derive(Clone, Copy, Pod, Zeroable, LogSummary)]
+#[repr(C)]
+struct SensorData {
+    temperature: f32,
+    pressure: f32,
+}
+
+let topic: Topic<SensorData> = Topic::new("sensors")?;
+
+// Introspection-enabled send
+topic.send_logged(SensorData { temperature: 25.0, pressure: 101.3 })?;
+```
+
+**What it does:**
+1. Records `Instant::now()` before send
+2. Performs the IPC operation
+3. Calculates elapsed time
+4. Writes to introspection log buffer
+5. Updates topic metrics
+
+**Latency:** +200-500ns overhead
+
+#### `recv_logged() -> Option<T>`
+
+Receives with introspection. Requires `T: LogSummary`.
+
+```rust
+if let Some(data) = topic.recv_logged() {
+    // Timing and logging recorded automatically
+    process(data);
+}
+```
+
+## External Introspection
+
+HORUS provides external tools that monitor Topics without affecting publishers:
+
+### `horus monitor`
+
+The TUI monitor reads shared memory metadata directly:
+
+```bash
+horus monitor
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  HORUS Monitor                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Topic           │ Rate   │ Publishers │ Subscribers │ Size       │
+│  ──────────────────────────────────────────────────────────────────│
+│  sensors/lidar   │ 40 Hz  │ 1          │ 2           │ 1.5 KB     │
+│  robot/cmd_vel   │ 100 Hz │ 1          │ 1           │ 16 B       │
+│  camera/image    │ 30 Hz  │ 1          │ 3           │ 921 KB     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+- Scans `/dev/shm/horus/topics/` directory
+- Reads file metadata (size, mtime, accessing PIDs)
+- Calculates message rate from timestamps
+- **Zero impact on publishers** - reads existing shared memory
+
+### `horus topic echo <name>`
+
+Subscribes to a topic and prints messages:
+
+```bash
+horus topic echo sensors
+```
+
+**How it works:**
+- Creates a new subscriber to the topic
+- Reads messages like any other node
+- Publishers are unaware of the extra subscriber
+
+### `horus topic hz <name>`
+
+Measures message publication rate:
+
+```bash
+horus topic hz cmd_vel
+# Output: average rate: 100.02 Hz
+```
+
+## Backend Performance
+
+### Latency by Backend
+
+| Backend | Latency | Use Case |
+|---------|---------|----------|
+| **DirectChannel** | ~3-5ns | Same-thread pipelines |
+| **SpscIntra** | ~25ns | Same-process, 1:1 |
+| **MpmcIntra** | ~80ns | Same-process, N:M |
+| **SpscShm** | ~85ns | Cross-process, 1:1 |
+| **MpmcShm** | ~167ns | Cross-process, N:M (default) |
+| **PodShm** | ~50ns | Cross-process, POD types |
+
+### Absolute Latency Guarantees
+
+HORUS CI enforces these maximum latencies:
+
+| Backend | Maximum | Typical |
+|---------|---------|---------|
+| **MpmcShm** | 600ns | ~167ns |
+| **SpscShm** | 200ns | ~85ns |
+| **MpmcIntra** | 100ns | ~80ns |
+| **SpscIntra** | 50ns | ~25ns |
+
+If benchmarks exceed these thresholds, CI fails.
+
+## When to Use Each API
+
+### Use `send()` / `recv()` (Zero-Overhead)
+
+- Production code
+- Real-time control loops
+- High-frequency sensors (>100 Hz)
+- Latency-critical paths
+- When external tools provide sufficient monitoring
+
+```rust
+// Control loop - zero overhead critical
+impl Node for MotorController {
+    fn tick(&mut self) {
+        if let Some(cmd) = self.cmd_sub.recv() {
+            let output = self.compute_control(cmd);
+            self.motor_pub.send(output).ok();
+        }
+    }
+}
+```
+
+### Use `send_logged()` / `recv_logged()` (Introspection)
+
+- Development and debugging
+- Low-frequency topics (<10 Hz)
+- When you need timing data in your node
+- System health monitoring topics
+
+```rust
+// Health status - introspection useful, low frequency
+impl Node for HealthMonitor {
+    fn tick(&mut self) {
+        let status = self.collect_health();
+        // Log this for debugging - only 1 Hz so overhead is fine
+        self.status_pub.send_logged(status).ok();
+    }
+}
+```
+
+### Use External Tools
+
+- Monitoring production systems
+- Debugging without code changes
+- Measuring actual throughput
+- Comparing before/after optimizations
+
+```bash
+# Monitor without touching code
+horus topic hz cmd_vel
+horus topic echo sensors
+horus monitor
+```
+
+## Migrating from Old API
+
+If you're upgrading from HORUS v0.2.x, see the [Migration Guide](/development/migration-zero-overhead).
+
+**Quick summary:**
+
+```rust
+// OLD (v0.2.x) - ctx parameter required
+topic.send(msg)?;
+topic.recv()
+
+// NEW (v0.3+) - zero-overhead by default
+topic.send(msg)?;
+topic.recv()
+
+// NEW - opt-in introspection
+topic.send_logged(msg)?;
+topic.recv_logged()
+```
+
+## Design Rationale
+
+### Why Separate Introspection?
+
+1. **Predictable Performance**: Control loops need guaranteed latency
+2. **Opt-in Overhead**: Pay only for what you use
+3. **External Observability**: Monitor without code changes
+4. **Production Ready**: Same code runs in debug and production
+
+### Why Not Use Conditional Compilation?
+
+```rust
+// We considered this but rejected it:
+#[cfg(feature = "introspection")]
+let start = Instant::now();
+```
+
+**Problems:**
+- Different binaries for debug vs production
+- Can't enable introspection on running system
+- Feature flags cascade through dependencies
+
+### Why Return `Result<(), T>` Instead of `HorusResult<()>`?
+
+The new `send()` returns the message on failure:
+
+```rust
+match topic.send(data) {
+    Ok(()) => { /* sent */ }
+    Err(data) => {
+        // Buffer full - data returned so you can retry or handle
+        log::warn!("Buffer full, dropping message");
+    }
+}
+```
+
+This allows:
+- Retrying with the same data
+- Logging the failed message
+- Implementing backpressure
+- Zero allocations on error path
+
+## Next Steps
+
+- [Topic Communication](/concepts/core-concepts-topic) - Full Topic API reference
+- [Migration Guide](/development/migration-zero-overhead) - Upgrading from v0.2.x
+- [Benchmarks](/performance/benchmarks) - Detailed performance data
+- [Backend Selection](/concepts/communication-transport) - Choosing the right backend

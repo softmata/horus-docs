@@ -43,7 +43,7 @@ pub trait Node: Send {
     fn name(&self) -> &'static str;
 
     // Required - your main logic runs here
-    fn tick(&mut self, ctx: Option<&mut NodeInfo>);
+    fn tick(&mut self);
 
     // Optional - setup when node starts
     fn init(&mut self, ctx: &mut NodeInfo) -> Result<()>;
@@ -74,7 +74,7 @@ When using the `node!` macro, the name is auto-generated from the struct name (e
 node! {
     SensorNode {
         name: "imu_front",  // Explicit name instead of "sensor_node"
-        tick(ctx) { ... }
+        tick() { ... }
     }
 }
 ```
@@ -84,7 +84,7 @@ This explicit name is used everywhere: scheduler logs, monitor display, and log 
 **tick()**: Main execution loop called repeatedly by the scheduler
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+fn tick(&mut self) {
     // Your node logic here
 }
 ```
@@ -186,11 +186,11 @@ impl Node for LifecycleDemo {
         Ok(())
     }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         // Called REPEATEDLY in main loop (~60 FPS default)
         self.counter += 1;
 
-        ctx.log_debug(&format!("Tick #{}", self.counter));
+        log::debug!("Tick #{}", self.counter);
     }
 
     fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> {
@@ -245,25 +245,27 @@ ctx.log_error("Sensor disconnected");
 ctx.log_debug(&format!("Position: ({}, {})", x, y));
 ```
 
-### Pub/Sub Logging (Automatic)
+### Pub/Sub Logging
 
-When you pass `ctx` to `Topic::send()` or `Topic::recv()`, HORUS automatically logs IPC operations:
+With the zero-overhead IPC, `send()` and `recv()` no longer take `ctx`. For introspection, use external tools or `send_logged()`:
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-    // Automatic pub logging - just pass ctx to send()
-    self.velocity_pub.send(1.5, &mut ctx).ok();
-    // Output: [12:34:56.789] [IPC: 437ns | Tick: 12μs] MyNode --PUB--> 'cmd_vel' = 1.5
+fn tick(&mut self) {
+    // Zero-overhead IPC (no logging)
+    self.velocity_pub.send(1.5).ok();
 
-    // Automatic sub logging - just pass ctx to recv()
-    if let Some(scan) = self.lidar_sub.recv(&mut ctx) {
-        // Output: [12:34:56.789] [IPC: 142ns | Tick: 8μs] MyNode <--SUB-- 'laser_scan' = LaserScan { ... }
+    // With logging (for debugging) - requires LogSummary trait
+    self.velocity_pub.send_logged(1.5).ok();
+    // Output: [12:34:56.789] MyNode --PUB--> 'cmd_vel' = 1.5
+
+    // Subscribe (zero-overhead)
+    if let Some(scan) = self.lidar_sub.recv() {
         self.process(scan);
     }
 }
 ```
 
-**You don't need to call any logging methods manually** - Topic handles it automatically when you pass `ctx`.
+For monitoring without code changes, use CLI tools: `horus topic echo`, `horus topic hz`, `horus monitor`.
 
 ### Performance Metrics
 
@@ -288,16 +290,18 @@ pub struct NodeMetrics {
 }
 ```
 
-Access metrics in your node:
+Access metrics via the scheduler or `init()`/`shutdown()` methods:
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-    if let Some(ctx) = ctx {
-        let avg_duration = ctx.metrics.avg_tick_duration_ms;
-        if avg_duration > 1.0 {
-            ctx.log_warning("Tick duration exceeding 1ms");
-        }
-    }
+fn init(&mut self, ctx: &mut NodeInfo) -> Result<()> {
+    // Metrics are available in init/shutdown via ctx
+    ctx.log_info(&format!("Starting with priority {}", ctx.priority));
+    Ok(())
+}
+
+fn tick(&mut self) {
+    // tick() doesn't have ctx - use internal state tracking if needed
+    self.tick_count += 1;
 }
 ```
 
@@ -394,9 +398,9 @@ impl Node for SensorNode {
         "SensorNode"
     }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         let data = 42.0; // Read sensor
-        self.data_pub.send(data, &mut ctx).ok();
+        self.data_pub.send(data).ok();
     }
 }
 ```
@@ -412,9 +416,9 @@ node! {
     name: SensorNode,
     publishers: [sensor_data: f32],
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         let data = 42.0;
-        self.sensor_data.send(data, &mut ctx).ok();
+        self.sensor_data.send(data).ok();
     }
 }
 ```
@@ -435,9 +439,9 @@ struct Publisher {
 }
 
 impl Node for Publisher {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         let data = self.generate_data();
-        self.data_pub.send(data, &mut ctx).ok();
+        self.data_pub.send(data).ok();
     }
 }
 ```
@@ -450,8 +454,8 @@ struct Subscriber {
 }
 
 impl Node for Subscriber {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        if let Some(data) = self.data_sub.recv(&mut ctx) {
+    fn tick(&mut self) {
+        if let Some(data) = self.data_sub.recv() {
             self.process(data);
         }
     }
@@ -467,10 +471,10 @@ struct Filter {
 }
 
 impl Node for Filter {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        if let Some(input) = self.input_sub.recv(&mut ctx) {
+    fn tick(&mut self) {
+        if let Some(input) = self.input_sub.recv() {
             let output = input * 2.0;
-            self.output_pub.send(output, &mut ctx).ok();
+            self.output_pub.send(output).ok();
         }
     }
 }
@@ -486,10 +490,10 @@ struct Aggregator {
 }
 
 impl Node for Aggregator {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        if let (Some(a), Some(b)) = (self.input_a.recv(&mut ctx), self.input_b.recv(&mut ctx)) {
+    fn tick(&mut self) {
+        if let (Some(a), Some(b)) = (self.input_a.recv(), self.input_b.recv()) {
             let result = a + b;
-            self.output_pub.send(result, &mut ctx).ok();
+            self.output_pub.send(result).ok();
         }
     }
 }
@@ -503,13 +507,13 @@ The tick method should complete quickly (ideally &lt;1ms):
 
 ```rust
 // GOOD: Fast computation
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+fn tick(&mut self) {
     let result = self.compute_quickly();
-    self.pub.send(result, &mut ctx).ok();
+    self.pub.send(result).ok();
 }
 
 // BAD: Blocking I/O
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+fn tick(&mut self) {
     let data = std::fs::read_to_string("file.txt").unwrap(); // Blocks!
     // ...
 }
@@ -658,9 +662,9 @@ impl Node for MyMotorController {
         Ok(())
     }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         // Process commands
-        if let Some(cmd) = self.cmd_sub.recv(&mut ctx) {
+        if let Some(cmd) = self.cmd_sub.recv() {
             self.velocity = cmd.velocity;
             self.send_velocity(self.velocity);
         }
@@ -670,7 +674,7 @@ impl Node for MyMotorController {
             velocity: self.velocity,
             position: self.position,
         };
-        self.status_pub.send(status, &mut ctx).ok();
+        self.status_pub.send(status).ok();
     }
 
     fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> {
@@ -718,13 +722,14 @@ fn init(&mut self, ctx: &mut NodeInfo) -> Result<()> {
 }
 ```
 
-### Check ctx Before Logging
+### Use Standard Logging in tick()
 
-The context is optional in tick():
+Since `tick()` no longer receives `ctx`, use the `log` crate for logging:
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-        ctx.log_info("This is safe");
+fn tick(&mut self) {
+    log::info!("Processing data");
+    log::debug!("Detailed debug info: {:?}", self.state);
 }
 ```
 
@@ -764,8 +769,8 @@ If init() returns an error, the node transitions to **Error** state and won't ru
 Handle errors in tick() without panicking:
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
-    match self.data_sub.recv(&mut ctx) {
+fn tick(&mut self) {
+    match self.data_sub.recv() {
         Some(data) => self.process(data),
         None => {
             // No data available - this is normal
@@ -793,7 +798,7 @@ fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> {
 Run logic only under certain conditions:
 
 ```rust
-fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+fn tick(&mut self) {
     self.tick_count += 1;
 
     // Execute every 10 ticks
@@ -820,10 +825,10 @@ struct RobotController {
 }
 
 impl Node for RobotController {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         match self.state {
             RobotState::Idle => {
-                if let Some(cmd) = self.cmd_sub.recv(&mut ctx) {
+                if let Some(cmd) = self.cmd_sub.recv() {
                     self.state = RobotState::Moving;
                 }
             }
@@ -854,12 +859,12 @@ struct Synchronizer {
 }
 
 impl Node for Synchronizer {
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         // Update cached values
-        if let Some(a) = self.topic_a.recv(&mut ctx) {
+        if let Some(a) = self.topic_a.recv() {
             self.last_a = Some(a);
         }
-        if let Some(b) = self.topic_b.recv(&mut ctx) {
+        if let Some(b) = self.topic_b.recv() {
             self.last_b = Some(b);
         }
 
@@ -953,9 +958,9 @@ Always implement `shutdown()` for nodes that control actuators:
 impl Node for MyMotorController {
     fn name(&self) -> &'static str { "MyMotorController" }
 
-    fn tick(&mut self, mut ctx: Option<&mut NodeInfo>) {
+    fn tick(&mut self) {
         // Normal operation - motors running
-        self.motor_pub.send(self.velocity, &mut ctx).ok();
+        self.motor_pub.send(self.velocity).ok();
     }
 
     fn shutdown(&mut self, ctx: &mut NodeInfo) -> Result<()> {
@@ -963,7 +968,7 @@ impl Node for MyMotorController {
 
         // CRITICAL: Stop all motors
         self.velocity = 0.0;
-        self.motor_pub.send(0.0, &mut None).ok();
+        self.motor_pub.send(0.0).ok();
 
         // Close hardware connections
         if let Some(port) = self.serial_port.take() {
