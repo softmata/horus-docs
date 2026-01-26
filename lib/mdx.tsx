@@ -16,6 +16,7 @@ import matter from 'gray-matter';
 import { compileMDX } from 'next-mdx-remote/rsc';
 import remarkGfm from 'remark-gfm';
 import CodeBlock from '@/components/CodeBlock';
+import Callout from '@/components/Callout';
 import {
   LatencyComparisonChart,
   LatencyScalingChart,
@@ -96,6 +97,8 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
         },
       },
       components: {
+        // Callout component for notes, warnings, etc.
+        Callout,
         // Benchmark charts
         LatencyComparisonChart,
         LatencyScalingChart,
