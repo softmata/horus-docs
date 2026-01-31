@@ -46,9 +46,7 @@ use horus::prelude::*;
 let topic: Topic<f32> = Topic::new("velocity")?;
 ```
 
-The generic type `T` must implement:
-- `Pod` (Plain Old Data): For zero-copy shared memory operations
-- `Zeroable`: For safe initialization
+The generic type `T` just needs standard derives: `Clone`, `Serialize`, `Deserialize`. See [Message Types](#message-types) below for details.
 
 ### Publishing Messages
 
@@ -417,46 +415,81 @@ match topic.recv() {
 }
 ```
 
-## Type Constraints
+## Message Types
 
-### Valid Message Types
+### What Types Can I Use?
 
-Messages must implement `Pod` (Plain Old Data) from the `bytemuck` crate:
+Most types work with `Topic` - just add standard derives:
 
 ```rust
-use bytemuck::{Pod, Zeroable};
+use serde::{Serialize, Deserialize};
 
 // Simple types work out of the box
-Topic::<f32>::new("float_topic");
-Topic::<bool>::new("bool_topic");
-Topic::<u32>::new("int_topic");
+let topic: Topic<f32> = Topic::new("float_topic")?;
+let topic: Topic<bool> = Topic::new("bool_topic")?;
+let topic: Topic<u32> = Topic::new("int_topic")?;
 
-// Structs need derives
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-#[repr(C)]
+// Custom structs - just add derives
+#[derive(Clone, Serialize, Deserialize)]
 struct MyMessage {
     x: f32,
     y: f32,
+    name: String,  // Strings work!
 }
 
-Topic::<MyMessage>::new("my_topic");
+let topic: Topic<MyMessage> = Topic::new("my_topic")?;
 
-// Arrays work
-Topic::<[f32; 100]>::new("array_topic");
+// Collections work too
+#[derive(Clone, Serialize, Deserialize)]
+struct SensorBatch {
+    readings: Vec<f32>,
+    timestamp: u64,
+}
+
+let topic: Topic<SensorBatch> = Topic::new("batch_topic")?;
 ```
 
-### Invalid Message Types
+### Automatic Optimization
+
+HORUS automatically detects simple types (no heap allocations) and uses a faster zero-copy path. You don't need to do anything - it just works:
 
 ```rust
-// Types with pointers won't work
-struct NoSend {
-    ptr: *const u8,  // Raw pointers are not Pod
+// Simple struct - HORUS auto-optimizes (~50ns latency)
+#[derive(Clone, Serialize, Deserialize)]
+struct MotorCommand {
+    velocity: f32,
+    torque: f32,
 }
-// Topic::<NoSend>::new("topic"); // Won't compile
 
-// Types with heap allocations won't work
-// Topic::<String>::new("topic"); // Won't compile - String is not Pod
-// Topic::<Vec<f32>>::new("topic"); // Won't compile - Vec is not Pod
+// Struct with String - still works (~167ns latency)
+#[derive(Clone, Serialize, Deserialize)]
+struct LogMessage {
+    level: u8,
+    message: String,
+}
+
+// Both work the same way - HORUS picks the best path
+let motor: Topic<MotorCommand> = Topic::new("motor")?;
+let logs: Topic<LogMessage> = Topic::new("logs")?;
+```
+
+### Required Traits
+
+Your message types need these standard traits (all auto-derived):
+
+| Trait | Why | How to Get It |
+|-------|-----|---------------|
+| `Clone` | Messages may be copied | `#[derive(Clone)]` |
+| `Serialize` | For storage/network | `#[derive(Serialize)]` |
+| `Deserialize` | For storage/network | `#[derive(Deserialize)]` |
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct MyMessage {
+    // your fields
+}
 ```
 
 ## Advanced Usage
@@ -583,7 +616,7 @@ HORUS automatically cleans up when nodes shut down gracefully (Ctrl+C).
 
 | Message Type | Size | Latency (round-trip) |
 |--------------|------|---------|
-| CmdVel | 16B | ~~167ns |
+| CmdVel | 16B | ~167ns |
 | IMU | 304B | ~940ns |
 | LaserScan | 1.5KB | ~2.2µs |
 | PointCloud | 120KB | ~360µs |
@@ -617,11 +650,9 @@ HORUS achieves sub-microsecond latency across different message sizes:
 Choose the right message type for your data:
 
 ```rust
-// Good: Fixed-size array for known dimensions
-Topic::<[f32; 3]>::new("position");
-
-// Bad: Vec requires heap allocation (not Pod)
-// Topic::<Vec<f32>>::new("position"); // Won't compile
+// Both work - HORUS auto-optimizes based on type
+Topic::<[f32; 3]>::new("position")?;      // Fixed array: ~50ns (zero-copy)
+Topic::<Vec<f32>>::new("position")?;      // Vec: ~167ns (serialized)
 ```
 
 ### Keep Messages Small
@@ -629,9 +660,8 @@ Topic::<[f32; 3]>::new("position");
 Topic uses zero-copy shared memory. Keep messages appropriately sized:
 
 ```rust
-// Good: Small struct
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-#[repr(C)]
+// Good: Small struct - auto-optimized by HORUS
+#[derive(Clone, Serialize, Deserialize)]
 struct Pose {
     x: f32,
     y: f32,
