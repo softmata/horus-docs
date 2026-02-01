@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import mermaid from 'mermaid';
+import type { MermaidConfig } from 'mermaid';
 
 // HORUS brand colors
 const HORUS_COLORS = {
@@ -139,7 +139,13 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
   const [svg, setSvg] = useState<string>('');
   const [isDark, setIsDark] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isMounted, setIsMounted] = useState(false);
   const idRef = useRef(`mermaid-${Math.random().toString(36).substr(2, 9)}`);
+
+  // Only render on client side
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   // Theme detection
   useEffect(() => {
@@ -173,9 +179,12 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
 
   // Render diagram
   const renderDiagram = useCallback(async () => {
-    if (!chart) return;
+    if (!chart || !isMounted) return;
 
     try {
+      // Dynamically import mermaid only on client side
+      const mermaid = (await import('mermaid')).default;
+
       // Initialize mermaid with current theme
       mermaid.initialize({
         startOnLoad: false,
@@ -189,7 +198,7 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
           useMaxWidth: true,
         },
         ...(isDark ? darkThemeConfig : lightThemeConfig),
-      });
+      } as MermaidConfig);
 
       // Generate unique ID for this render
       const id = `${idRef.current}-${Date.now()}`;
@@ -202,11 +211,34 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
       console.error('Mermaid rendering error:', err);
       setError(err instanceof Error ? err.message : 'Failed to render diagram');
     }
-  }, [chart, isDark]);
+  }, [chart, isDark, isMounted]);
 
   useEffect(() => {
     renderDiagram();
   }, [renderDiagram]);
+
+  // Show loading state during SSR and initial client render
+  if (!isMounted || (!svg && !error)) {
+    return (
+      <figure className="my-8">
+        <div
+          className="overflow-x-auto p-6 rounded-lg border flex justify-center items-center"
+          style={{
+            backgroundColor: '#111827',
+            borderColor: '#374151',
+            minHeight: '200px',
+          }}
+        >
+          <span style={{ color: '#9ca3af' }}>Loading diagram...</span>
+        </div>
+        {caption && (
+          <figcaption className="mt-2 text-center text-sm" style={{ color: '#9ca3af' }}>
+            {caption}
+          </figcaption>
+        )}
+      </figure>
+    );
+  }
 
   if (error) {
     return (
