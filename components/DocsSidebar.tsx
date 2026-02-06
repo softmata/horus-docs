@@ -65,9 +65,7 @@ const sections: SidebarSection[] = [
       { title: "message! Macro", href: "/concepts/message-macro", order: 7 },
       { title: "Message Types", href: "/concepts/message-types", order: 8 },
       { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 9 },
-      { title: "Hybrid Nodes", href: "/concepts/hybrid-nodes", order: 10 },
-      { title: "HFrame Transforms", href: "/concepts/hframe", order: 11 },
-      { title: "Robot Architectures", href: "/concepts/robot-architectures", order: 12 },
+      { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
       { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
       {
         title: "Orchestration",
