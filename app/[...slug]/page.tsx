@@ -10,13 +10,13 @@ import type { Metadata } from 'next';
 export const dynamicParams = false;
 
 interface PageProps {
-  params: {
+  params: Promise<{
     slug: string[];
-  };
+  }>;
 }
 
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
-  const { slug } = params;
+  const { slug } = await params;
   const docPath = ['docs', ...slug];
   const doc = await getDoc(docPath);
 
@@ -112,7 +112,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 }
 
 export default async function DocPage({ params }: PageProps) {
-  const { slug } = params;
+  const { slug } = await params;
 
   // Always prepend 'docs' to the path
   const docPath = ['docs', ...slug];
