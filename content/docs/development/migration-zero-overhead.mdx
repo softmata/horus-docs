@@ -16,14 +16,14 @@ This guide helps you migrate from HORUS v0.2.x (embedded introspection) to v0.3+
 |-----------|--------------|-------------|
 | Create topic (default) | `Topic::new("name")?` | `Topic::new("name")?` |
 | Create topic (with logging) | N/A (always logged) | `Topic::new("name")?.with_logging()` |
-| Send | `topic.send(msg)?` | `topic.send(msg)?` (only method) |
+| Send | `topic.send(msg)?` | `topic.send(msg)` (infallible) |
 | Receive | `topic.recv()` | `topic.recv()` (only method) |
 
 ### Return Type Changes
 
 | Method | v0.2.x | v0.3+ |
 |--------|--------|-------|
-| `send()` | `HorusResult<()>` | `Result<(), T>` |
+| `send()` | `HorusResult<()>` | `()` (infallible) |
 | `recv()` | `Option<T>` | `Option<T>` (unchanged) |
 
 ## Step-by-Step Migration
@@ -45,13 +45,14 @@ impl Node for MyNode {
 impl Node for MyNode {
     fn tick(&mut self) {
         let data = SensorData { x: 1.0, y: 2.0 };
-        self.sensor_pub.send(data).ok();
+        self.sensor_pub.send(data);
     }
 }
 ```
 
 **Changes:**
 - Remove `&mut ctx` parameter from `send()`
+- Remove `.ok()` — `send()` is now infallible
 - The `tick()` method no longer takes a `ctx` parameter at all
 
 ### Step 2: Update `recv()` Calls
@@ -74,9 +75,9 @@ fn tick(&mut self) {
 }
 ```
 
-### Step 3: Update Error Handling
+### Step 3: Remove Error Handling from `send()`
 
-The new `send()` returns `Result<(), T>` instead of `HorusResult<()>`:
+The new `send()` is infallible — it returns `()` instead of `Result`. Ring buffers overwrite the oldest message when full ("keep last" semantics).
 
 **Before (v0.2.x):**
 ```rust
@@ -90,17 +91,11 @@ match self.pub.send(data) {
 
 **After (v0.3+):**
 ```rust
-match self.pub.send(data) {
-    Ok(()) => { /* success */ }
-    Err(returned_data) => {
-        // Buffer full - message returned to you
-        log::warn!("Buffer full, message not sent");
-        // Can retry: self.pub.send(returned_data)?
-    }
-}
+// Just send — always succeeds
+self.pub.send(data);
 ```
 
-**Key difference:** On failure, you get the original message back, not an error type.
+**Key difference:** No error handling needed. Buffer full = oldest message overwritten.
 
 ### Step 4: Add Introspection Where Needed
 
@@ -144,7 +139,7 @@ impl Node for HealthMonitor {
             memory_mb: 512,
         };
         // Just use send() — logging happens automatically
-        self.health_pub.send(status).ok();
+        self.health_pub.send(status);
     }
 }
 ```
@@ -193,7 +188,7 @@ impl Node for SimplePublisher {
     fn name(&self) -> &'static str { "SimplePublisher" }
 
     fn tick(&mut self) {
-        self.data_pub.send(42.0).ok();
+        self.data_pub.send(42.0);
     }
 }
 ```
@@ -249,7 +244,7 @@ impl Node for MyNode {
             let result = self.process(data);
 
             // Zero-overhead send
-            self.output_pub.send(result).ok();
+            self.output_pub.send(result);
         }
     }
 }
@@ -257,26 +252,17 @@ impl Node for MyNode {
 
 Note: `NodeInfo` is still available in `init()` and `shutdown()` for lifecycle logging.
 
-### Pattern 4: Retry on Buffer Full
+### Pattern 4: Fire-and-Forget Send
 
-The new API returns the message on failure, enabling retry:
+The new API is infallible — ring buffers overwrite the oldest message when full:
 
 **After (v0.3+):**
 ```rust
 fn tick(&mut self) {
     let data = self.compute_output();
 
-    // Retry loop with backoff
-    let mut msg = data;
-    for attempt in 0..3 {
-        match self.output_pub.send(msg) {
-            Ok(()) => break,
-            Err(returned) => {
-                msg = returned;  // Got message back
-                std::thread::sleep(Duration::from_micros(10));
-            }
-        }
-    }
+    // Just send — always succeeds
+    self.output_pub.send(data);
 }
 ```
 
@@ -291,7 +277,7 @@ node! {
         pub { readings: f32 -> "sensor.readings" }
 
         tick() {
-            self.readings.send(42.0).ok();
+            self.readings.send(42.0);
         }
     }
 }
@@ -304,7 +290,7 @@ node! {
         pub { readings: f32 -> "sensor.readings" }
 
         tick() {
-            self.readings.send(42.0).ok();
+            self.readings.send(42.0);
         }
     }
 }
@@ -335,7 +321,7 @@ impl LogSummary for RobotPose {
 let topic: Topic<RobotPose> = Topic::new("robot_pose")?.with_logging();
 
 // Now send() automatically logs via LogSummary
-topic.send(pose)?;
+topic.send(pose);
 ```
 
 Or use the `horus_message!` macro which auto-implements `LogSummary`:
@@ -364,7 +350,7 @@ error[E0061]: this method takes 1 argument but 2 arguments were supplied
 
 **Fix:** Remove the `&mut ctx` argument:
 ```rust
-self.pub.send(data)?;
+self.pub.send(data);
 ```
 
 ### Error: "`with_logging()` requires `LogSummary`"
@@ -385,20 +371,15 @@ impl LogSummary for MyMessage {
 let topic = Topic::new("my_topic")?.with_logging();
 ```
 
-### Error: Type mismatch on error handling
+### Error: Unused result from `send()`
 
-```
-error[E0308]: mismatched types
-expected enum `HorusError`, found struct `MyMessage`
-```
-
-**Fix:** Update error handling for new return type:
+If you see warnings about unused `Result`, you're using an old version. Update to v0.3+ where `send()` is infallible:
 ```rust
-// Old
-if let Err(e) = topic.send(msg) { ... }
+// Old - returned Result<(), T>
+topic.send(msg).ok();
 
-// New
-if let Err(returned_msg) = topic.send(msg) { ... }
+// New - returns (), no .ok() needed
+topic.send(msg);
 ```
 
 ## Performance Comparison
@@ -416,7 +397,7 @@ Before deploying migrated code:
 
 - [ ] All `send(msg, )` calls updated to `send(msg)`
 - [ ] All `recv(&mut ctx)` calls updated to `recv()`
-- [ ] Error handling updated for `Result<(), T>` return type
+- [ ] Error handling removed from `send()` calls (now infallible)
 - [ ] `LogSummary` implemented for types used with `.with_logging()`
 - [ ] Tests updated and passing
 - [ ] Benchmarks verified (should be faster!)
