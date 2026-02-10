@@ -1,6 +1,6 @@
 ---
 title: "Scheduling Intelligence"
-description: "Automatic tier classification and node optimization"
+description: "Node tier annotations and offline profiling for optimized execution"
 weight: 36
 ---
 
@@ -13,11 +13,10 @@ Different nodes have different needs:
 | Node Type | Example | Problem | Solution (Tier) |
 |-----------|---------|---------|-----------------|
 | Fast math | PID controller | Overhead from function calls | **UltraFast**: Highest-priority inline execution |
-| Blocking I/O | Camera reader | Blocks the scheduler | **AsyncIO**: Run in async runtime |
-| Slow/unreliable | Flaky sensor | Can crash or hang | **Isolated**: Process isolation |
+| Blocking I/O | Camera reader | Blocks the scheduler | **AsyncIO**: Annotate for I/O awareness |
 | Normal | Most nodes | None | **Fast**: Inline execution |
 
-Without tiers, a slow camera node would block your fast control loop. Tiers let different nodes run in appropriate ways.
+Tiers let you declare a node's execution characteristics so the scheduler can make informed decisions.
 
 ## Node Tier Annotation
 
@@ -31,7 +30,6 @@ let mut scheduler = Scheduler::new();
 // Annotate nodes with their tier
 scheduler.add(pid_node).order(0).tier(NodeTier::UltraFast).done();
 scheduler.add(sensor_node).order(1).tier(NodeTier::Fast).done();
-scheduler.add(camera_node).order(2).tier(NodeTier::AsyncIO).done();
 scheduler.add(logger_node).order(5).tier(NodeTier::Background).done();
 
 scheduler.run();
@@ -39,15 +37,14 @@ scheduler.run();
 
 ### Available Tiers
 
-| Tier | Use For | Latency | Execution |
-|------|---------|---------|-----------|
-| `NodeTier::UltraFast` | Ultra-fast math (<1µs) | 20-50ns | Inline (highest priority) |
-| `NodeTier::Fast` | Sensors, filters (<10µs) | 50-100ns | Inline |
-| `NodeTier::Normal` | Algorithms (<100µs) | ~1µs | Standard |
-| `NodeTier::AsyncIO` | Network, file I/O | 10-100µs | Async executor |
-| `NodeTier::Background` | Logging, diagnostics | 1-100ms | Thread pool |
-| `NodeTier::Isolated` | Unreliable/untrusted | 1-10ms | Process isolation |
-| `NodeTier::Auto` | Let system decide | Varies | Based on profile |
+| Tier | Use For | Description |
+|------|---------|-------------|
+| `NodeTier::UltraFast` | Ultra-fast math (<1us) | Inline execution (highest priority) |
+| `NodeTier::Fast` | Sensors, filters (<10us) | Inline execution |
+| `NodeTier::Normal` | Algorithms (<100us) | Standard scheduling |
+| `NodeTier::AsyncIO` | Network, file I/O | I/O-bound operations |
+| `NodeTier::Background` | Logging, diagnostics | Low-priority operations |
+| `NodeTier::Auto` | Let system decide | Based on profile data |
 
 ### Tier Descriptions
 
@@ -55,65 +52,14 @@ scheduler.run();
 // Get human-readable description
 let tier = NodeTier::UltraFast;
 println!("{}", tier.description());
-// Output: "Ultra-fast inline (<1μs)"
+// Output: "Ultra-fast inline (<1us)"
 ```
 
-## Automatic Classification
+## Offline Profiling
 
-If you don't annotate nodes, HORUS classifies them automatically during a learning phase:
+Profile your system once in a controlled environment, then use the results in production for deterministic startup:
 
-```rust
-use horus::prelude::*;
-
-let mut scheduler = Scheduler::new();
-
-// Enable learning (profiles nodes for ~100 ticks)
-scheduler.enable_learning();
-
-// Add nodes without explicit tiers
-scheduler.add(sensor_node).order(0).done();
-scheduler.add(filter_node).order(1).done();
-
-// During the first ~100 ticks, HORUS profiles execution times
-// After learning, nodes are automatically assigned optimal tiers
-scheduler.run();
-```
-
-### Classification Criteria
-
-The scheduler internally classifies nodes based on:
-
-| Characteristic | Detection | Tier Assignment |
-|----------------|-----------|-----------------|
-| High failure rate (>20%) | Tracks failures | → Isolated |
-| Ultra-fast (<5µs) + deterministic | Low variance | → UltraFast |
-| I/O heavy (high variance) | CV >30%, spikes | → AsyncIO |
-| Fast (<1ms) | Execution time | → Fast |
-| Everything else | Default | → Background |
-
-## Deterministic Mode (Skip Learning)
-
-For production systems that need deterministic startup:
-
-```rust
-use horus::prelude::*;
-
-// Option 1: Annotate all nodes explicitly
-let mut scheduler = Scheduler::new();
-scheduler.add(node1).tier(NodeTier::UltraFast).done();
-scheduler.add(node2).tier(NodeTier::Fast).done();
-// No learning phase needed - deterministic startup
-
-// Option 2: Use offline profiles
-let profile = ProfileData::load("profiles/robot.bin")?;
-let mut scheduler = Scheduler::new();
-scheduler.add(node1).tier(profile.get_tier("node1")).done();
-// Tiers loaded from pre-computed profile
-```
-
-### Creating Offline Profiles
-
-Profile your system once in a controlled environment:
+### Creating Profiles
 
 ```rust
 use horus::prelude::*;
@@ -156,70 +102,47 @@ let mut scheduler = Scheduler::new();
 scheduler.add(sensor_node).tier(profile.get_tier("sensor")).done();
 scheduler.add(filter_node).tier(profile.get_tier("filter")).done();
 
-// Nodes now use profiled tiers - no learning phase
+// Nodes now use profiled tiers - deterministic startup
 scheduler.run();
 ```
 
 ## Best Practices
 
-### 1. Start Without Annotations
+### 1. Start Simple
 
-Let the system classify nodes automatically. Only annotate when needed:
+Most nodes work fine without tier annotations:
 
 ```rust
-// Good: Let HORUS decide
+// Good: Let HORUS use defaults
 scheduler.add(my_node).done();
 
-// Only annotate when you know better than the profiler
+// Only annotate when you have specific performance needs
 scheduler.add(critical_pid).tier(NodeTier::UltraFast).done();
 ```
 
 ### 2. Use Offline Profiles for Production
 
 ```rust
-// Development: Enable learning for auto-classification
-scheduler.enable_learning();
+// Development: Profile your nodes
+let mut profiler = OfflineProfiler::new("production", 100);
+// ... record execution times ...
+let profile = profiler.finalize();
+profile.save("production.bin")?;
 
-// Production: Load saved profile and apply tiers explicitly
+// Production: Load saved profile
 let profile = ProfileData::load("production.bin")?;
 let mut scheduler = Scheduler::new();
 scheduler.add(node1).tier(profile.get_tier("node1")).done();
-// Deterministic startup - no learning phase needed
+// Deterministic startup with optimized tiers
 ```
 
-### 3. Use Profiler to Monitor Classification
+### 3. Inspect Profile Results
 
 ```rust
-// Use OfflineProfiler to inspect classification results
 let profile = profiler.finalize();
-for (name, node_profile) in &profile.nodes {
-    println!("  {} -> {:?} (avg: {:.1}µs)",
-        name, node_profile.tier, node_profile.avg_us);
-}
+profile.print_summary();
+// Shows each node's tier, average execution time, and characteristics
 ```
-
-## How It Works Internally
-
-<Callout type="note" title="Implementation Details">
-
-The following describes internal behavior. You don't need to understand this to use HORUS effectively.
-
-</Callout>
-
-When learning is enabled, HORUS:
-
-1. **Profiles** each node for ~100 ticks using Welford's algorithm for stable statistics
-2. **Analyzes** execution characteristics:
-   - Mean and standard deviation of execution time
-   - Coefficient of variation (determinism)
-   - Failure rate
-   - I/O patterns (high variance indicates blocking I/O)
-3. **Classifies** nodes into internal execution tiers
-4. **Optimizes** execution:
-   - Ultra-fast nodes → Inline execution (highest priority)
-   - I/O-heavy nodes → Async executor
-   - Unreliable nodes → Process isolation
-   - Normal nodes → Standard scheduling
 
 ## See Also
 
