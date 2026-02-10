@@ -104,7 +104,6 @@ const allPages: DocLink[] = [
   { title: "GPU Tensor Sharing", href: "/advanced/gpu-tensor-sharing" },
   { title: "Network Backends", href: "/advanced/network-backends" },
   { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence" },
-  { title: "JIT Compilation", href: "/advanced/jit-compilation" },
   { title: "BlackBox Recorder", href: "/advanced/blackbox" },
   { title: "Circuit Breaker", href: "/advanced/circuit-breaker" },
   { title: "Safety Monitor", href: "/advanced/safety-monitor" },
