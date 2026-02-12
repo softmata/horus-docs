@@ -25,16 +25,27 @@ The fundamental trait for all computation units in HORUS.
 
 ```rust
 pub trait Node: Send {
+    // Required
     fn name(&self) -> &'static str;
     fn tick(&mut self);
 
-    // Optional methods with defaults
+    // Optional lifecycle
     fn init(&mut self) -> Result<()> { Ok(()) }
     fn shutdown(&mut self) -> Result<()> { Ok(()) }
-    fn on_error(&mut self, error: &str) { }
+    fn on_error(&mut self, error: &str) { hlog!(error, "Node error: {}", error); }
+
+    // Optional metadata
+    fn publishers(&self) -> Vec<TopicMetadata> { Vec::new() }
+    fn subscribers(&self) -> Vec<TopicMetadata> { Vec::new() }
+    fn priority(&self) -> u32 { 50 }
     fn rate_hz(&self) -> Option<f64> { None }
-    fn get_publishers(&self) -> Vec<TopicMetadata> { vec![] }
-    fn get_subscribers(&self) -> Vec<TopicMetadata> { vec![] }
+    fn config(&self) -> NodeConfig { NodeConfig::default() }
+    fn is_healthy(&self) -> bool { true }
+
+    // Optional checkpoint/restore
+    fn checkpoint_state(&self) -> Option<Vec<u8>> { None }
+    fn restore_state(&mut self, data: &[u8]) -> Result<()> { Ok(()) }
+    fn supports_checkpointing(&self) -> bool { false }
 }
 ```
 
@@ -149,6 +160,121 @@ fn rate_hz(&self) -> Option<f64> {
 
 ---
 
+#### `publishers`
+
+```rust
+fn publishers(&self) -> Vec<TopicMetadata>
+```
+
+Returns the list of topics this node publishes to. Override this if your node publishes to topics — the default returns empty, which may hide connectivity issues during debugging.
+
+**Returns:** `Vec<TopicMetadata>`
+
+**Default:** Returns empty `Vec`
+
+---
+
+#### `subscribers`
+
+```rust
+fn subscribers(&self) -> Vec<TopicMetadata>
+```
+
+Returns the list of topics this node subscribes to. Override this if your node subscribes to topics.
+
+**Returns:** `Vec<TopicMetadata>`
+
+**Default:** Returns empty `Vec`
+
+---
+
+#### `priority`
+
+```rust
+fn priority(&self) -> u32
+```
+
+Returns the node's execution priority. Lower numbers = higher priority.
+
+**Returns:** `u32` - Priority level (default: 50)
+
+**Default:** Returns `50` (normal priority)
+
+---
+
+#### `config`
+
+```rust
+fn config(&self) -> NodeConfig
+```
+
+Returns the node's configuration (restart policy, timeouts, etc.).
+
+**Returns:** `NodeConfig`
+
+**Default:** Returns `NodeConfig::default()`
+
+---
+
+#### `is_healthy`
+
+```rust
+fn is_healthy(&self) -> bool
+```
+
+Health check for the node. Override this for production nodes to report actual health status. The default always returns `true`, which may mask real issues.
+
+**Returns:** `bool`
+
+**Default:** Returns `true`
+
+---
+
+#### `checkpoint_state`
+
+```rust
+fn checkpoint_state(&self) -> Option<Vec<u8>>
+```
+
+Serializes node state for checkpointing. Override to save internal state during checkpoints.
+
+**Returns:** `Option<Vec<u8>>` - `Some(bytes)` with serialized state, or `None` if no state to checkpoint
+
+**Default:** Returns `None`
+
+---
+
+#### `restore_state`
+
+```rust
+fn restore_state(&mut self, data: &[u8]) -> Result<()>
+```
+
+Restores node state from a checkpoint. Called during recovery after a crash.
+
+**Parameters:**
+- `data` - Serialized state previously returned by `checkpoint_state()`
+
+**Returns:** `Result<()>`
+
+**Default:** Returns `Ok(())`
+
+---
+
+#### `supports_checkpointing`
+
+```rust
+fn supports_checkpointing(&self) -> bool
+```
+
+Returns whether this node supports checkpointing. Used by the scheduler to determine which nodes need state persistence.
+
+**Returns:** `bool`
+
+**Default:** Returns `false`
+
+---
+
 ### Example Implementation
 
 ```rust
@@ -197,7 +323,7 @@ impl Node for TemperatureSensor {
 
 ## Topic
 
-Generic multi-producer, multi-consumer (MPMC) pub/sub channel using shared memory.
+Unified typed pub/sub channel with automatic backend selection. Topic auto-selects the optimal IPC backend based on message type and usage patterns.
 
 ```rust
 pub struct Topic<T> { /* fields omitted */ }
@@ -205,26 +331,50 @@ pub struct Topic<T> { /* fields omitted */ }
 
 ### Type Parameters
 
-- `T` - Message type. Must implement: `Send + Sync + Clone + Debug + Serialize + DeserializeOwned + 'static`
+- `T` - Message type. Must implement: `Clone + Send + Sync + Serialize + DeserializeOwned + 'static`
+
+### Backend Selection
+
+Topic automatically selects the fastest backend for your use case:
+
+| Backend | Latency | Use Case |
+|---------|---------|----------|
+| DirectChannel | ~3-5ns | Same-thread only |
+| SpscIntra | ~18ns | In-process, 1 producer + 1 consumer |
+| MpscIntra | ~26ns | In-process, many producers + 1 consumer |
+| SpmcIntra | ~40ns | In-process, 1 producer + many consumers |
+| MpmcIntra | ~80ns | In-process, many-to-many |
+| PodShm | ~50ns | Cross-process, POD types (zero-copy) |
+| SpscShm | ~85ns | Cross-process, 1:1 |
+| MpscShm | ~65ns | Cross-process, many:1 |
+| SpmcShm | ~70ns | Cross-process, 1:many |
+| MpmcShm | ~167ns | Cross-process, many:many |
+| Network | varies | UDP/Unix socket/Zenoh |
 
 ### Constructors
 
 #### `new`
 
 ```rust
-pub fn new(topic_name: &str) -> Result<Self>
+pub fn new(name: impl Into<String>) -> Result<Self>
 ```
 
-Creates a new Topic with default capacity (1024 messages).
+Creates a new Topic with automatic backend selection and auto-sized capacity. Capacity is auto-calculated based on message size (one 4KB page of slots, clamped to 16-1024).
+
+Parses the topic name/endpoint to select the appropriate backend:
+- `"topic"` → Local shared memory (MpmcShm)
+- `"topic@host:port"` → Network backend
+- `"topic@zenoh"` → Zenoh transport
 
 **Parameters:**
-- `topic_name` - Unique identifier for the topic
+- `name` - Topic name or endpoint string
 
-**Returns:** `Result\<Topic\<T\>\>`
+**Returns:** `Result<Topic<T>>`
 
 **Example:**
 ```rust
 let topic: Topic<f32> = Topic::new("sensor.temperature")?;
+let net_topic: Topic<f32> = Topic::new("sensor@192.168.1.5")?;
 ```
 
 ---
@@ -232,20 +382,62 @@ let topic: Topic<f32> = Topic::new("sensor.temperature")?;
 #### `with_capacity`
 
 ```rust
-pub fn with_capacity(topic_name: &str, capacity: usize) -> Result<Self>
+pub fn with_capacity(name: impl Into<String>, capacity: usize) -> Result<Self>
 ```
 
-Creates a Topic with custom buffer capacity.
+Creates a Topic with explicit buffer capacity.
 
 **Parameters:**
-- `topic_name` - Unique identifier for the topic
-- `capacity` - Maximum number of messages in buffer
+- `name` - Topic name or endpoint string
+- `capacity` - Ring buffer capacity (must be power of 2 for ring backends)
 
-**Returns:** `Result\<Topic\<T\>\>`
+**Returns:** `Result<Topic<T>>`
 
 **Example:**
 ```rust
 let topic: Topic<Image> = Topic::with_capacity("camera.image", 16)?;
+```
+
+---
+
+#### `publish`
+
+```rust
+pub fn publish(descriptor: TopicDescriptor<T>) -> Result<Self>
+```
+
+Creates a topic from a type-safe descriptor (publishing side). Use with the `topics!` macro for compile-time checked topic names.
+
+**Example:**
+```rust
+use horus::prelude::*;
+
+topics! {
+    CMD_VEL: CmdVel = "cmd_vel",
+}
+
+let publisher = Topic::publish(CMD_VEL)?;
+publisher.send(CmdVel { linear: 1.0, angular: 0.0 });
+```
+
+---
+
+#### `subscribe`
+
+```rust
+pub fn subscribe(descriptor: TopicDescriptor<T>) -> Result<Self>
+```
+
+Creates a topic from a type-safe descriptor (subscribing side).
+
+**Example:**
+```rust
+topics! {
+    SENSOR_DATA: f64 = "sensor_data",
+}
+
+let sub = Topic::subscribe(SENSOR_DATA)?;
+if let Some(value) = sub.recv() { /* ... */ }
 ```
 
 ---
@@ -257,11 +449,6 @@ pub fn from_config_named(topic_name: &str) -> Result<Self>
 ```
 
 Creates a Topic from configuration file (`horus.toml` or `horus.yaml`).
-
-**Parameters:**
-- `topic_name` - Name of the topic in config file
-
-**Returns:** `Result\<Topic\<T\>\>`
 
 **Config search paths:**
 1. `./horus.toml` or `./horus.yaml`
@@ -284,8 +471,6 @@ pub fn with_logging(self) -> Self
 
 Enables logging and metrics collection on this topic. When enabled, every `send()` and `recv()` call automatically records metrics and logs message summaries. Requires `T: LogSummary`.
 
-This is a builder method that returns the topic, so it can be chained with construction.
-
 **Returns:** `Self` - The topic with logging enabled
 
 **Example:**
@@ -305,9 +490,9 @@ let logged_topic: Topic<f32> = Topic::new("sensor.temperature")?.with_logging();
 pub fn send(&self, msg: T)
 ```
 
-Sends a message to the topic. Non-blocking, infallible, ~200ns latency.
+Sends a message to the topic. Non-blocking, infallible. Uses ring buffer "keep last" semantics — oldest message overwritten when buffer is full.
 
-If `.with_logging()` was called on this topic, metrics and message summaries are automatically recorded. Otherwise, this is a zero-overhead operation. Uses ring buffer "keep last" semantics — oldest message overwritten when buffer is full.
+If `.with_logging()` was called, metrics and message summaries are automatically recorded. Otherwise, zero-overhead.
 
 **Parameters:**
 - `msg` - Message to send
@@ -327,9 +512,7 @@ pub fn recv(&self) -> Option<T>
 
 Receives the latest message from the topic. Non-blocking.
 
-If `.with_logging()` was called on this topic, metrics and message summaries are automatically recorded. Otherwise, this is a zero-overhead operation.
-
-**Returns:** `Option\<T\>` - Some(message) if available, None otherwise
+**Returns:** `Option<T>` - Some(message) if available, None otherwise
 
 **Example:**
 ```rust
@@ -340,10 +523,22 @@ if let Some(value) = self.subscriber.recv() {
 
 ---
 
-#### `get_topic_name`
+#### `has_messages`
 
 ```rust
-pub fn get_topic_name(&self) -> &str
+pub fn has_messages(&self) -> bool
+```
+
+Checks if messages are available without consuming them.
+
+**Returns:** `bool`
+
+---
+
+#### `name`
+
+```rust
+pub fn name(&self) -> &str
 ```
 
 Returns the topic name.
@@ -352,27 +547,37 @@ Returns the topic name.
 
 ---
 
-#### `get_metrics`
+#### `metrics`
 
 ```rust
-pub fn get_metrics(&self) -> TopicMetrics
+pub fn metrics(&self) -> TopicMetrics
 ```
 
-Returns current metrics snapshot.
+Returns current metrics snapshot (sent/received counts, failure counts).
 
 **Returns:** `TopicMetrics`
 
 ---
 
-#### `get_connection_state`
+#### `connection_state`
 
 ```rust
-pub fn get_connection_state(&self) -> ConnectionState
+pub fn connection_state(&self) -> ConnectionState
 ```
 
-Returns current connection state.
+Returns current connection state. Always `Connected` for local shared memory backends; reflects actual status for network backends.
 
 **Returns:** `ConnectionState`
+
+---
+
+#### `backend_type`
+
+```rust
+pub fn backend_type(&self) -> &'static str
+```
+
+Returns the active backend name (for debugging). Examples: `"DirectChannel"`, `"SpscIntra"`, `"MpmcShm"`, `"Network"`.
 
 ---
 
@@ -394,17 +599,110 @@ Topic::new("topic@*")?;
 
 ---
 
-## Topic SPSC Mode
+## TopicConfig
 
-Single-producer, single-consumer (SPSC) lock-free channel for point-to-point communication.
+Builder for advanced Topic configuration. Use when you need explicit control over backend selection, access patterns, or process topology.
 
 ```rust
-pub struct Topic<T> { /* fields omitted */ }
+pub struct TopicConfig {
+    pub name: String,
+    pub capacity: u32,
+    pub create: bool,
+    pub is_producer: bool,
+    pub access_pattern: AccessPattern,
+    pub topology: ProcessTopology,
+    pub backend_hint: BackendHint,
+}
 ```
 
-### Type Parameters
+### Builder Methods
 
-- `T` - Message type
+```rust
+TopicConfig::new("sensor_data")
+    .with_capacity(256)
+    .as_producer()              // or .as_consumer()
+    .with_access_pattern(AccessPattern::Spsc)
+    .with_topology(ProcessTopology::CrossProcess)
+    .with_backend(BackendHint::Auto)   // or force a specific backend
+    .same_thread()              // convenience: SameThread + Spsc
+    .same_process()             // convenience: SameProcess topology
+    .cross_process()            // convenience: CrossProcess topology
+    .spsc()                     // convenience: Spsc pattern
+    .mpmc()                     // convenience: Mpmc pattern
+```
+
+### AccessPattern
+
+```rust
+pub enum AccessPattern {
+    Spsc,   // Single Producer, Single Consumer
+    Spmc,   // Single Producer, Multiple Consumers
+    Mpsc,   // Multiple Producers, Single Consumer
+    Mpmc,   // Multiple Producers, Multiple Consumers (default)
+}
+```
+
+### ProcessTopology
+
+```rust
+pub enum ProcessTopology {
+    SameThread,    // Fastest path (~3-5ns)
+    SameProcess,   // Different threads (~25-80ns)
+    CrossProcess,  // Via shared memory (~50-167ns, default)
+}
+```
+
+### BackendHint
+
+```rust
+pub enum BackendHint {
+    Auto,            // Automatic selection (default)
+    DirectChannel,   // Same-thread only (~3-5ns)
+    SpscIntra,       // Same-process SPSC (~25ns)
+    SpscShm,         // Cross-process SPSC (~85ns)
+    PodShm,          // Cross-process POD (~50ns)
+    MpmcShm,         // Cross-process MPMC (~167ns)
+    MpscIntra,       // Same-process MPSC (~35ns)
+    SpmcIntra,       // Same-process SPMC (~40ns)
+    MpmcIntra,       // Same-process MPMC (~80ns)
+    MpscShm,         // Cross-process MPSC (~65ns)
+    SpmcShm,         // Cross-process SPMC (~70ns)
+    Network,         // UDP/Unix socket/Zenoh
+    NetworkZenoh,    // Zenoh transport
+}
+```
+
+---
+
+## TopicDescriptor and topics! Macro
+
+Type-safe topic descriptors for compile-time checked topic names and message types.
+
+```rust
+/// Define type-safe topic descriptors
+topics! {
+    SENSOR_DATA: f64 = "sensor_data",
+    MOTOR_CMD: MotorCommand = "motor_cmd",
+}
+
+// Compile-time type checking — wrong type won't compile
+let pub_topic: Topic<f64> = Topic::publish(SENSOR_DATA)?;
+let sub_topic: Topic<f64> = Topic::subscribe(SENSOR_DATA)?;
+```
+
+### TopicDescriptor
+
+```rust
+pub struct TopicDescriptor<T> {
+    name: &'static str,
+    _marker: PhantomData<T>,
+}
+
+impl<T> TopicDescriptor<T> {
+    pub const fn new(name: &'static str) -> Self;
+    pub const fn name(&self) -> &'static str;
+}
+```
 
 ---
 
@@ -793,23 +1091,37 @@ pub type HorusResult<T> = Result<T>;
 
 ```rust
 pub enum NodeState {
+    Uninitialized,
     Initializing,
     Running,
     Paused,
+    Stopping,
+    Stopped,
     Error(String),
     Crashed(String),
-    Stopped,
 }
 ```
+
+| State | Description |
+|-------|-------------|
+| `Uninitialized` | Created but not yet added to scheduler |
+| `Initializing` | Running `init()` method |
+| `Running` | Actively executing `tick()` |
+| `Paused` | Temporarily suspended |
+| `Stopping` | Running `shutdown()` method |
+| `Stopped` | Clean shutdown complete |
+| `Error(String)` | Recoverable error with message |
+| `Crashed(String)` | Unrecoverable error, node terminated |
 
 ### HealthStatus
 
 ```rust
 pub enum HealthStatus {
-    Healthy,
-    Degraded,
-    Unhealthy,
-    Unknown,
+    Healthy = 0,
+    Warning = 1,
+    Error = 2,
+    Critical = 3,
+    Unknown = 4,
 }
 ```
 
@@ -834,10 +1146,17 @@ pub enum ConnectionState {
 ```rust
 pub struct NodeMetrics {
     pub total_ticks: u64,
+    pub successful_ticks: u64,
+    pub failed_ticks: u64,
+    pub avg_tick_duration_ms: f64,
+    pub max_tick_duration_ms: f64,
+    pub min_tick_duration_ms: f64,
+    pub last_tick_duration_ms: f64,
+    pub messages_sent: u64,
+    pub messages_received: u64,
     pub errors_count: u64,
-    pub last_tick_duration_ns: u64,
-    pub avg_tick_duration_ns: u64,
-    pub max_tick_duration_ns: u64,
+    pub warnings_count: u64,
+    pub uptime_seconds: f64,
 }
 ```
 
@@ -845,11 +1164,17 @@ pub struct NodeMetrics {
 
 ```rust
 pub struct NodeConfig {
+    pub max_tick_duration_ms: Option<u64>,
     pub restart_on_failure: bool,
     pub max_restart_attempts: u32,
-    pub tick_timeout_ms: u64,
+    pub restart_delay_ms: u64,
+    pub log_level: String,
+    pub custom_params: HashMap<String, String>,
+    pub circuit_breaker: Option<CircuitBreaker>,
 }
 ```
+
+Default: `max_tick_duration_ms = Some(1000)`, `restart_on_failure = true`, `max_restart_attempts = 3`, `restart_delay_ms = 1000`, `log_level = "INFO"`.
 
 ### TopicMetrics
 
@@ -859,7 +1184,6 @@ pub struct TopicMetrics {
     pub messages_received: u64,
     pub send_failures: u64,
     pub recv_failures: u64,
-    pub last_activity: Option<Instant>,
 }
 ```
 
@@ -906,12 +1230,17 @@ pub trait Subscriber<T>: Send + Sync + Clone + Debug {
 
 ## Performance
 
-| Operation | Latency | Notes |
-|-----------|---------|-------|
-| `Topic::send()` | **87ns** | Wait-free SPSC |
-| `Topic::recv()` | ~175ns | Wait-free SPSC |
-| `Topic::send_recv()` | ~262ns | Round-trip |
-| `Topic::send()` | **313ns** | Lock-free MPMC |
-| `Topic::recv()` | ~313ns | Lock-free MPMC |
+| Backend | send() Latency | Notes |
+|---------|---------------|-------|
+| DirectChannel | ~3-5ns | Same-thread only |
+| SpscIntra | ~18ns | In-process SPSC |
+| MpscIntra | ~26ns | In-process MPSC |
+| SpmcIntra | ~40ns | In-process SPMC |
+| MpmcIntra | ~80ns | In-process MPMC |
+| PodShm | ~50ns | Cross-process, POD types |
+| MpscShm | ~65ns | Cross-process MPSC |
+| SpmcShm | ~70ns | Cross-process SPMC |
+| SpscShm | ~85ns | Cross-process SPSC |
+| MpmcShm | ~167ns | Cross-process MPMC |
 
-**Note:** Topic SPSC is 72% faster than Topic MPMC for single-producer/single-consumer scenarios. Use Topic SPSC for control loops, Topic for multi-subscriber topics.
+Topic automatically selects the fastest backend based on message type and detected access pattern. Use `topic.backend_type()` to see which backend was selected.
