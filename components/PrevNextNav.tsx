@@ -43,9 +43,6 @@ const allPages: DocLink[] = [
   { title: "Real-Time Nodes", href: "/concepts/realtime-nodes" },
   { title: "HFrame Transforms", href: "/concepts/hframe" },
   { title: "Multi-Language", href: "/concepts/multi-language" },
-  { title: "Orchestration", href: "/concepts/orchestration" },
-  { title: "State Machines", href: "/concepts/state-machines" },
-  { title: "Mission Planner", href: "/concepts/mission-planner" },
 
   // Rust
   { title: "Rust Overview", href: "/rust" },
