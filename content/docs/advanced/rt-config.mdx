@@ -78,17 +78,16 @@ This enables:
 
 ### Soft Real-Time
 
-For applications requiring good latency without root privileges:
+For applications requiring good latency with round-robin scheduling:
 
 ```rust
 let config = RtConfig::soft_realtime();
-config.apply()?;  // Works without CAP_SYS_NICE
+config.apply()?;  // Requires CAP_SYS_NICE for SCHED_RR
 ```
 
 This enables:
-- Memory locking (if permitted)
-- Stack prefaulting
-- Normal scheduling (no `SCHED_FIFO`)
+- `SCHED_RR` (round-robin RT scheduling) at priority 50
+- No memory locking (can run without `CAP_IPC_LOCK`)
 
 ### Normal Operation
 
@@ -122,10 +121,12 @@ config.apply()?;
 | Method | Description |
 |--------|-------------|
 | `memory_locked(bool)` | Enable/disable `mlockall()` |
-| `prefault_stack(bytes)` | Stack size to prefault |
+| `prefault_stack(bytes)` | Stack size in bytes to prefault |
 | `scheduler(RtScheduler)` | Scheduling class |
-| `priority(u8)` | RT priority (1-99 for FIFO/RoundRobin) |
+| `priority(i32)` | RT priority (1-99 for FIFO/RoundRobin) |
 | `cpu_affinity(&[usize])` | CPU cores to pin to |
+| `warn_on_degradation(bool)` | Log warnings when features degrade |
+| `fail_on_degradation(bool)` | Fail instead of degrading |
 
 ### Scheduling Classes
 
@@ -134,7 +135,7 @@ pub enum RtScheduler {
     Normal,      // Default Linux scheduler (SCHED_OTHER)
     Fifo,        // SCHED_FIFO - First-in-first-out RT
     RoundRobin,  // SCHED_RR - Round-robin RT
-    Deadline,    // SCHED_DEADLINE - For periodic tasks (Linux 3.14+)
+    Deadline,    // SCHED_DEADLINE - For periodic tasks (not yet implemented)
 }
 ```
 
@@ -258,45 +259,99 @@ With full RT configuration on PREEMPT_RT kernel:
 ```rust
 let config = RtConfig::hard_realtime(Some(&[2, 3]));
 match config.apply() {
-    Ok(report) => {
-        if report.memory_locked {
-            println!("Memory locked successfully");
-        } else {
-            println!("Memory locking unavailable (needs CAP_IPC_LOCK)");
-        }
-        if report.scheduler_set {
-            println!("RT scheduler enabled");
-        } else {
-            println!("RT scheduler unavailable (needs CAP_SYS_NICE)");
+    Ok(RtApplyResult::FullSuccess) => {
+        println!("Full RT enabled");
+    }
+    Ok(RtApplyResult::Degraded(reasons)) => {
+        // System continues with available features
+        for reason in &reasons {
+            match reason {
+                RtDegradation::MemoryLockUnavailable(msg) => {
+                    println!("Memory locking unavailable: {}", msg);
+                }
+                RtDegradation::SchedulerDegraded(msg) => {
+                    println!("RT scheduler unavailable: {}", msg);
+                }
+                RtDegradation::PriorityClamped { requested, actual } => {
+                    println!("Priority clamped: {} -> {}", requested, actual);
+                }
+                RtDegradation::AffinityUnavailable(msg) => {
+                    println!("CPU affinity unavailable: {}", msg);
+                }
+                RtDegradation::NoPreemptRt => {
+                    println!("PREEMPT_RT kernel not detected");
+                }
+            }
         }
     }
-    Err(e) => eprintln!("Critical failure: {}", e),
+    Ok(RtApplyResult::Failed(msg)) => {
+        eprintln!("RT config failed: {}", msg);
+    }
+    Err(e) => eprintln!("IO error: {}", e),
 }
 ```
 
-The system continues running with available features rather than failing completely.
+Use `warn_on_degradation(true)` to automatically log warnings, or `fail_on_degradation(true)` to return an error instead of degrading.
 
 ## Verification
 
-### Check Current Configuration
+### Check Current Scheduler and Affinity
 
 ```rust
-let status = RtConfig::current()?;
-println!("Memory locked: {}", status.memory_locked);
-println!("Scheduler: {:?}", status.scheduler);
-println!("Priority: {}", status.priority);
-println!("CPU affinity: {:?}", status.cpu_affinity);
+// Get current thread's scheduler and priority
+let (scheduler, priority) = RtConfig::get_current_scheduler()?;
+println!("Scheduler: {:?}, Priority: {}", scheduler, priority);
+
+// Get current thread's CPU affinity
+let cpus = RtConfig::get_current_affinity()?;
+println!("CPU affinity: {:?}", cpus);
 ```
 
-### Runtime Metrics
+### Detect System RT Capabilities
 
 ```rust
-// In your node's tick()
-// Logging with hlog!
-    if ctx.metrics.max_tick_duration_ms > 1.0 {
-        hlog!(warn, "RT constraint violated!");
-    }
-}
+// Get detailed kernel RT information
+let info = RtKernelInfo::detect();
+println!("PREEMPT_RT: {}", info.preempt_rt);
+println!("Kernel: {}", info.kernel_version);
+println!("Max RT priority: {}", info.max_rt_priority);
+println!("mlockall permitted: {}", info.mlockall_permitted);
+println!("CPU count: {}", info.cpu_count);
+```
+
+### Find Best CPUs for RT
+
+```rust
+// Get recommended CPUs for RT tasks (prefers isolated + nohz_full cores)
+let rt_cpus = get_rt_recommended_cpus(2);
+println!("Recommended RT CPUs: {:?}", rt_cpus);
+
+// Or get full CPU info
+let cpu_info = RtCpuInfo::detect();
+println!("{}", cpu_info.summary());
+```
+
+## Helper Functions
+
+HORUS provides standalone helper functions for common RT operations:
+
+```rust
+use horus::prelude::*;
+
+// Pin current thread to a single CPU core
+pin_thread_to_core(2)?;
+
+// Detect kernel-isolated CPUs (from isolcpus boot parameter)
+let isolated = detect_isolated_cpus();
+
+// Detect tickless CPUs (from nohz_full boot parameter)
+let nohz = detect_nohz_full_cpus();
+
+// Get recommended CPUs for RT (prefers isolated+nohz_full, then isolated, etc.)
+let best_cpus = get_rt_recommended_cpus(2);
+
+// Prefault stack memory to avoid page faults
+prefault_stack(512 * 1024);  // 512KB
 ```
 
 ## Troubleshooting
@@ -356,9 +411,15 @@ fn main() -> Result<()> {
         .cpu_affinity(&[2, 3])  // Isolated cores
         .build();
 
-    let report = rt_config.apply()?;
-    println!("RT Config applied: memory_locked={}, scheduler_set={}",
-             report.memory_locked, report.scheduler_set);
+    match rt_config.apply()? {
+        RtApplyResult::FullSuccess => println!("Full RT configuration applied"),
+        RtApplyResult::Degraded(reasons) => {
+            println!("RT applied with degradation: {:?}", reasons);
+        }
+        RtApplyResult::Failed(msg) => {
+            return Err(HorusError::config(format!("RT config failed: {}", msg)));
+        }
+    }
 
     // Create RT communication channel
     let producer: Topic<CmdVel> = Topic::new("motor_cmd")?;

@@ -62,8 +62,7 @@ const sections: SidebarSection[] = [
       },
       { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 5 },
       { title: "node! Macro", href: "/concepts/node-macro", order: 6 },
-      { title: "message! Macro", href: "/concepts/message-macro", order: 7 },
-      { title: "Message Types", href: "/concepts/message-types", order: 8 },
+      { title: "Message Types", href: "/concepts/message-types", order: 7 },
       { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 9 },
       { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
       { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
@@ -95,7 +94,7 @@ const sections: SidebarSection[] = [
               { title: "Diagnostics", href: "/rust/api/diagnostics-messages", order: 3 },
               { title: "Force", href: "/rust/api/force-messages", order: 4 },
               { title: "Geometry", href: "/rust/api/geometry-messages", order: 5 },
-              { title: "I/O", href: "/rust/api/io-messages", order: 6 },
+
               { title: "ML", href: "/rust/api/ml-messages", order: 7 },
               { title: "Navigation", href: "/rust/api/navigation-messages", order: 8 },
               { title: "Perception", href: "/rust/api/perception-messages", order: 9 },
@@ -183,6 +182,15 @@ const sections: SidebarSection[] = [
     ],
   },
   {
+    title: "Plugins",
+    links: [
+      { title: "Overview", href: "/plugins", order: 0 },
+      { title: "Creating CLI Plugins", href: "/plugins/creating-plugins", order: 1 },
+      { title: "Driver Plugins", href: "/plugins/driver-plugins", order: 2 },
+      { title: "Managing Plugins", href: "/plugins/managing-plugins", order: 3 },
+    ],
+  },
+  {
     title: "Package Management",
     links: [
       { title: "Overview", href: "/package-management/package-management", order: 1 },
@@ -214,6 +222,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
     "Python": true,
     "Development": true,
     "Advanced Topics": true,
+    "Plugins": true,
     "Package Management": true,
     "Performance": true,
   });

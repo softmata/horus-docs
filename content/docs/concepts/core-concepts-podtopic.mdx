@@ -1,267 +1,257 @@
 ---
-title: Core Concepts - PodTopic
-description: Ultra-fast zero-serialization communication for hard real-time control loops
+title: Core Concepts - POD Types
+description: How HORUS auto-detects POD types for zero-serialization, ultra-fast communication
 order: 25
 ---
 
-# PodTopic and Zero-Serialization Communication
+# POD Types and Zero-Serialization
 
-PodTopic is HORUS's **ultra-fast communication primitive** for hard real-time control loops. It achieves **~50ns latency** by completely bypassing serialization - messages are transferred as raw bytes via direct memory copy.
+When you use `Topic<T>`, HORUS **automatically detects** whether your message type is POD (Plain Old Data). POD types bypass serialization entirely — messages are transferred as raw bytes via direct memory copy, achieving **~50ns latency** instead of ~167ns with bincode serialization.
 
-## What is PodTopic?
+You don't need a separate API. The same `Topic::new()` call automatically selects the fastest path for your type.
 
-A `PodTopic<T>` is a specialized **Single Producer Single Consumer (SPSC)** channel that only works with POD (Plain Old Data) messages. Unlike `Topic<T>` which serializes messages with bincode, PodTopic copies raw bytes directly - making it **5x faster**.
+## How Auto-Detection Works
 
-### Key Features
-
-**Ultra-Low Latency**: ~50ns send/receive (vs ~85ns for Topic SPSC) - the absolute fastest IPC in HORUS
-
-**Zero Serialization**: Direct `memcpy` of raw bytes, no encoding/decoding overhead
-
-**Lock-Free**: Atomic sequence counter for synchronization, no locks or contention
-
-**Cache-Optimized**: 64-byte aligned for optimal CPU cache performance
-
-**Type Safety**: Compile-time validation through the `PodMessage` trait
-
-**Deterministic**: Constant-time operations with no allocations
-
-## Performance Comparison
-
-| Primitive | Latency | Throughput | Use Case |
-|-----------|---------|------------|----------|
-| **PodTopic** | ~50ns | 20M msgs/sec | Hard real-time control |
-| **Topic (SPSC)** | ~85ns | 12M msgs/sec | Point-to-point IPC |
-| **Topic (MPMC)** | ~167ns | 6M msgs/sec | Pub/sub with multiple consumers |
-
-## When to Use PodTopic
-
-### Use PodTopic When:
-
-- **Control loops at 1kHz+** - Motor commands, servo updates
-- **Sensor fusion** - IMU data, encoder readings at high frequency
-- **Safety-critical paths** - Emergency stop signals
-- **Every nanosecond matters** - Inner loops of real-time systems
-
-### Use Buffered Topic Instead When:
-
-- Messages contain dynamic data (Vec, String, HashMap)
-- Network communication required
-- Schema evolution needed (adding fields later)
-- Cross-language interop (Python)
-- Latency requirements are moderate (&lt;100Hz)
-
-## Basic Usage
-
-### Creating a PodTopic
+At topic creation time, HORUS checks:
 
 ```rust
-use horus_core::communication::{PodTopic, PodMessage};
-
-// Producer side
-let output: PodTopic<CmdVel> = PodTopic::producer("motor_cmd")?;
-
-// Consumer side (different node/process)
-let input: PodTopic<CmdVel> = PodTopic::consumer("motor_cmd")?;
-```
-
-### Sending Messages
-
-```rust
-let cmd = CmdVel::new(1.0, 0.5);  // linear=1.0, angular=0.5
-output.send(cmd);  // ~50ns, no serialization
-```
-
-### Receiving Messages
-
-```rust
-// Non-blocking receive - returns None if no data available
-if let Some(cmd) = input.recv() {
-    apply_velocity(cmd);
-}
-
-// Polling pattern (check for data repeatedly)
-loop {
-    if let Some(cmd) = input.recv() {
-        apply_velocity(cmd);
-        break;
-    }
-    // Optional: add small delay to avoid busy-waiting
+fn is_pod<T>() -> bool {
+    !std::mem::needs_drop::<T>() && std::mem::size_of::<T>() > 0
 }
 ```
 
-## The PodMessage Trait
+- **No destructor** — The type has no `Drop` impl (no heap pointers like `String`, `Vec`, `Box`)
+- **Non-zero size** — Not a zero-sized type
 
-PodTopic only works with types implementing `PodMessage`. This trait guarantees the type is safe for raw byte transfer.
-
-### Requirements
-
-1. **`#[repr(C)]`** - C-compatible memory layout (no Rust reordering)
-2. **`Copy + Clone`** - Bitwise copyable
-3. **`Pod + Zeroable`** - Safe to cast to/from bytes (from `bytemuck`)
-4. **No padding leaks** - All padding bytes explicitly zeroed
-5. **Fixed size** - Size known at compile time
-
-### Defining a PodMessage
+If both are true, HORUS uses the zero-copy memcpy path. If not, it falls back to bincode serialization. This happens transparently — you always use the same `Topic<T>` API:
 
 ```rust
-use bytemuck::{Pod, Zeroable};
+use horus::prelude::*;
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct MotorCommand {
-    pub timestamp_ns: u64,    // 8 bytes
-    pub motor_id: u32,        // 4 bytes
-    pub velocity: f32,        // 4 bytes
-    pub torque: f32,          // 4 bytes
-    pub _pad: [u8; 12],       // Explicit padding to 32 bytes
-}
+// POD type - auto-detected, uses zero-copy memcpy (~50ns cross-process)
+let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+cmd_topic.send(CmdVel::new(1.0, 0.5));
 
-// Safety: We've verified repr(C), no implicit padding, all fields are Pod
-unsafe impl PodMessage for MotorCommand {}
+// Non-POD type - auto-detected, uses bincode serialization (~167ns cross-process)
+let log_topic: Topic<String> = Topic::new("log")?;
+log_topic.send("Motor started".to_string());
 ```
 
-### Complete Manual Implementation
+## Performance Impact
 
-Here's a complete example showing all the required traits:
+POD detection affects which cross-process backend is selected:
 
-```rust
-use bytemuck::{Pod, Zeroable};
-use horus_core::communication::PodMessage;
+| Backend | POD Required | Latency | Use Case |
+|---------|-------------|---------|----------|
+| PodShm | Yes | ~50ns | Broadcast to multiple consumers |
+| MpscShm | Yes | ~65ns | Many producers, one consumer |
+| SpmcShm | Yes | ~70ns | One producer, many consumers |
+| SpscShm | Yes | ~85ns | Point-to-point |
+| MpmcShm | No | ~167ns | Many-to-many (non-POD fallback) |
 
-/// High-frequency motor command for servo control
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MotorCommand {
-    pub timestamp_ns: u64,    // 8 bytes
-    pub motor_id: u32,        // 4 bytes
-    pub velocity: f32,        // 4 bytes
-    pub torque: f32,          // 4 bytes
-    pub _pad: [u8; 12],       // Explicit padding to 32 bytes
-}
-
-// bytemuck traits for safe byte casting
-unsafe impl Zeroable for MotorCommand {}
-unsafe impl Pod for MotorCommand {}
-
-// HORUS PodMessage trait for ultra-fast IPC
-unsafe impl PodMessage for MotorCommand {}
-
-// Now works with PodTopic
-let link: PodTopic<MotorCommand> = PodTopic::producer("motor")?;
-```
-
-**Important**: The struct size should be a power of 2 or cache-line aligned (64 bytes) for optimal performance.
+Same-process backends (DirectChannel, SpscIntra, MpmcIntra) handle both POD and non-POD types efficiently since no shared memory serialization is needed.
 
 ## Built-in POD Messages
 
-These HORUS messages implement `PodMessage` and work with PodTopic:
+All standard HORUS message types implement `PodMessage` and automatically use the fast path:
 
-| Message | Size | Description |
-|---------|------|-------------|
-| `CmdVel` | 16 bytes | 2D velocity command (linear + angular + timestamp) |
-| `Pose2D` | 32 bytes | 2D position and orientation (x, y, theta, timestamp) |
-| `Twist` | 56 bytes | 3D linear and angular velocity + timestamp |
-| `Transform` | 64 bytes | 3D transformation (translation + quaternion rotation) |
-| `Point3` | 24 bytes | 3D point (x, y, z) |
-| `Vector3` | 24 bytes | 3D vector (x, y, z) |
-| `Quaternion` | 32 bytes | Rotation quaternion (x, y, z, w) |
+### Geometry
+
+| Message | Description |
+|---------|-------------|
+| `CmdVel` | 2D velocity command (linear + angular) |
+| `Pose2D` | 2D position and orientation |
+| `Twist` | 3D linear and angular velocity |
+| `TransformStamped` | 3D transformation with timestamp |
+| `Point3` | 3D point |
+| `Vector3` | 3D vector |
+| `Quaternion` | Rotation quaternion |
+
+### Sensors
+
+| Message | Description |
+|---------|-------------|
+| `Imu` | Inertial measurement unit data |
+| `LaserScan` | 2D laser range data |
+| `Odometry` | Position/velocity estimate |
+| `Range` | Single distance measurement |
+| `BatteryState` | Battery level and status |
+| `NavSatFix` | GPS position |
+
+### Control
+
+| Message | Description |
+|---------|-------------|
+| `MotorCommand` | Individual motor control |
+| `DifferentialDriveCommand` | Differential drive control |
+| `ServoCommand` | Servo position/velocity |
+| `JointCommand` | Joint-level control |
+| `PwmCommand` | PWM signal output |
+| `StepperCommand` | Stepper motor control |
+| `TrajectoryPoint` | Trajectory waypoint |
+| `PidConfig` | PID controller parameters |
+
+### Diagnostics
+
+| Message | Description |
+|---------|-------------|
+| `Heartbeat` | Liveness signal |
+| `NodeHeartbeat` | Per-node health status |
+| `Status` | General status report |
+| `EmergencyStop` | Emergency stop signal |
+| `SafetyStatus` | Safety system state |
+| `ResourceUsage` | CPU/memory usage |
+| `DiagnosticValue` | Single diagnostic measurement |
+| `DiagnosticReport` | Full diagnostic report |
+
+### Navigation
+
+| Message | Description |
+|---------|-------------|
+| `Goal` | Navigation goal |
+| `GoalResult` | Goal completion result |
+| `Waypoint` | Navigation waypoint |
+| `Path` | Sequence of waypoints |
+| `PathPlan` | Planned path |
+| `VelocityObstacle` | Velocity obstacle for avoidance |
+| `VelocityObstacles` | Set of velocity obstacles |
+
+### Force/Haptics
+
+| Message | Description |
+|---------|-------------|
+| `WrenchStamped` | Force/torque measurement |
+| `ForceCommand` | Force control command |
+| `TactileArray` | Tactile sensor array |
+| `ImpedanceParameters` | Impedance control config |
+| `ContactInfo` | Contact detection data |
+| `HapticFeedback` | Haptic output command |
+
+### Coordination
+
+| Message | Description |
+|---------|-------------|
+| `RobotState` | Robot state for fleet coordination |
+| `FleetStatus` | Fleet-wide status |
+| `TaskAssignment` | Task allocation |
+| `FormationControl` | Formation control parameters |
+| `AuctionBid` | Task auction bid |
+
+### Input
+
+| Message | Description |
+|---------|-------------|
+| `JoystickInput` | Gamepad/joystick state |
+| `KeyboardInput` | Keyboard key events |
+
+### Timing
+
+| Message | Description |
+|---------|-------------|
+| `TimeSync` | Clock synchronization |
+| `ScheduledEvent` | Timed event |
+| `Timeline` | Event timeline |
+| `ClockStats` | Clock statistics |
+
+### Tensor
+
+| Message | Description |
+|---------|-------------|
+| `HorusTensor` | Fixed-size tensor descriptor |
 
 ```rust
-use horus_core::communication::PodTopic;
+use horus::prelude::*;
 
-// All these work with PodTopic out of the box
-let vel: PodTopic<CmdVel> = PodTopic::producer("cmd_vel")?;
-let pose: PodTopic<Pose2D> = PodTopic::producer("robot_pose")?;
-let twist: PodTopic<Twist> = PodTopic::producer("velocity")?;
+// All built-in messages are POD — fast path is automatic
+let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;
+let pose: Topic<Pose2D> = Topic::new("robot_pose")?;
+let imu: Topic<Imu> = Topic::new("imu_data")?;
+let estop: Topic<EmergencyStop> = Topic::new("emergency_stop")?;
 ```
 
-**Note**: For sensor data like IMU or force measurements that require serialization or have variable sizes, use standard `Topic<T>` instead of `PodTopic`.
+## Custom POD Messages
 
-## Complete Example
+To make your own types use the fast path, implement the `PodMessage` trait:
+
+### Requirements
+
+1. **`#[repr(C)]`** — C-compatible memory layout (prevents Rust from reordering fields)
+2. **`Copy + Clone`** — Bitwise copyable, no heap allocations
+3. **`Pod + Zeroable`** — Safe to cast to/from bytes (from `bytemuck` crate)
+4. **Fixed size** — Size known at compile time (no `Vec`, `String`, or other dynamic types)
+
+### Example
 
 ```rust
-use horus_core::communication::PodTopic;
-use std::time::{Duration, Instant};
+use horus::prelude::*;
+use bytemuck::{Pod, Zeroable};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // High-frequency motor control loop (producer side)
-    let cmd_topic: PodTopic<CmdVel> = PodTopic::producer("motor_cmd")?;
-    let feedback_topic: PodTopic<Pose2D> = PodTopic::consumer("odometry")?;
-
-    let rate = Duration::from_micros(500);  // 2kHz control loop
-    let mut last_tick = Instant::now();
-
-    loop {
-        // Read latest odometry (non-blocking)
-        let pose = feedback_topic.recv();
-
-        // Compute control output
-        let cmd = compute_velocity_command(pose);
-
-        // Send command (~50ns)
-        cmd_topic.send(cmd);
-
-        // Rate limiting
-        let elapsed = last_tick.elapsed();
-        if elapsed < rate {
-            std::thread::sleep(rate - elapsed);
-        }
-        last_tick = Instant::now();
-    }
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct MotorFeedback {
+    pub timestamp_ns: u64,    // 8 bytes
+    pub motor_id: u32,        // 4 bytes
+    pub velocity: f32,        // 4 bytes
+    pub current_amps: f32,    // 4 bytes
+    pub temperature_c: f32,   // 4 bytes
 }
 
-fn compute_velocity_command(pose: Option<Pose2D>) -> CmdVel {
-    // PID control logic here
-    CmdVel::new(0.5, 0.1)
-}
+// bytemuck traits for safe byte casting
+unsafe impl Zeroable for MotorFeedback {}
+unsafe impl Pod for MotorFeedback {}
+
+// HORUS PodMessage trait for ultra-fast IPC
+unsafe impl PodMessage for MotorFeedback {}
+
+// Now Topic<MotorFeedback> automatically uses the POD fast path
+let feedback: Topic<MotorFeedback> = Topic::new("motor.feedback")?;
+feedback.send(MotorFeedback {
+    timestamp_ns: 0,
+    motor_id: 1,
+    velocity: 3.14,
+    current_amps: 0.5,
+    temperature_c: 45.0,
+});
 ```
 
-## Trade-offs
+**Important**: Custom POD types also need `Clone + Serialize + DeserializeOwned` since `Topic<T>` requires these bounds. The serialization traits are used as a fallback if the type ever goes through a non-POD code path (e.g., logging).
 
-### Pros
+### Rules for POD Safety
 
-- **5x faster** than serialized Topic
-- **Zero allocations** - no heap usage during send/recv
-- **Predictable timing** - constant-time operations
-- **Cache-friendly** - aligned memory access
+The `PodMessage` trait is `unsafe` because incorrect implementations can cause data corruption. Ensure:
 
-### Cons
+- **No implicit padding** — All struct fields should pack naturally without gaps, or use explicit padding fields (`_pad: [u8; N]`)
+- **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`, `bool`) and fixed-size arrays of primitives
+- **No enums with discriminants** — Unless `#[repr(C)]` or `#[repr(u8)]` with explicit values
+- **Consistent layout** — The struct must have the same binary layout on all target platforms
 
-- **No schema evolution** - struct changes break binary compatibility
-- **Fixed-size only** - no Vec, String, or dynamic types
-- **Local only** - no network support (use Topic for network)
-- **Unsafe trait** - requires careful implementation
-- **Platform-dependent** - endianness and alignment assumptions
+## When Types Are Not POD
 
-## Debugging
-
-### Check Topic Status
+Types containing heap-allocated data are automatically detected as non-POD:
 
 ```rust
-let topic: PodTopic<CmdVel> = PodTopic::producer("motor_cmd")?;
-println!("Topic: {}", topic.name());
-println!("Has messages: {}", topic.has_messages());
-
-// Check for new data by attempting to receive
-if let Some(msg) = topic.recv() {
-    println!("Received: {:?}", msg);
-} else {
-    println!("No new data available");
-}
+// These are NOT POD - HORUS auto-detects and uses bincode serialization
+Topic<String>        // String has Drop (heap-allocated)
+Topic<Vec<f32>>      // Vec has Drop (heap-allocated)
+Topic<HashMap<K,V>>  // HashMap has Drop
 ```
 
-### Common Issues
+Non-POD types use bincode serialization through shared memory. This is still fast (~167ns cross-process) but ~3x slower than the POD path. For most applications, this difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
 
-**"Invalid POD Topic magic"** - Producer hasn't initialized the topic yet. Ensure producer starts before consumer.
+## Cache-Line Optimization
 
-**"Size mismatch"** - Producer and consumer using different message types or versions. Ensure both sides use the same struct definition.
+For POD types that are small enough (type size + 8 bytes &le; 64 bytes), HORUS uses a **co-located layout** where the sequence number and message data share the same CPU cache line:
 
-**No data received** - Check that producer is actually calling `send()`. PodTopic is single-slot - old data is overwritten.
+```
+[ sequence (8 bytes) | message data | padding ] = 64 bytes (one cache line)
+```
+
+This reduces inter-core cache transfers from 2 to 1 when reading messages, providing an additional performance boost for small POD messages like `CmdVel` (16 bytes), `Pose2D` (32 bytes), and `Twist` (56 bytes).
+
+Larger POD types still use the zero-copy memcpy path but with separate cache lines for the sequence number and data.
 
 ## See Also
 
-- [Topic (General IPC)](/concepts/core-concepts-topic) - For serialized messages and network support
-- [Topic (Pub/Sub)](/concepts/core-concepts-topic) - For multi-consumer scenarios
-- [Message Types](/concepts/message-types) - Built-in message definitions
-- [Real-Time Configuration](/advanced/rt-config) - System-level RT settings
+- **[Topic](/concepts/core-concepts-topic)** — The unified communication API
+- **[Message Types](/concepts/message-types)** — Full message type reference
+- **[Architecture](/concepts/architecture)** — How communication fits into the HORUS architecture

@@ -1,0 +1,253 @@
+---
+title: Creating CLI Plugins
+description: Build custom CLI plugins that extend the horus command
+order: 1
+---
+
+# Creating CLI Plugins
+
+A CLI plugin is a standalone binary that adds a subcommand to `horus`. When a user runs `horus mycommand`, HORUS discovers your plugin binary and executes it, passing through all arguments.
+
+## Zero-Config Convention
+
+Any Rust package named `horus-*` with a `[[bin]]` target is automatically detected as a plugin. No extra configuration required.
+
+**Example:** A package named `horus-sim3d` with `[[bin]] name = "sim3d"` automatically provides the `horus sim3d` command.
+
+## Step-by-Step Guide
+
+### Step 1: Create a New Rust Project
+
+```bash
+cargo new horus-mycommand
+cd horus-mycommand
+```
+
+### Step 2: Set Up Cargo.toml
+
+```toml
+[package]
+name = "horus-mycommand"
+version = "0.1.0"
+edition = "2021"
+description = "My custom HORUS plugin"
+
+[[bin]]
+name = "mycommand"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+```
+
+The key points:
+
+- Package name starts with `horus-`
+- The `[[bin]]` name defines the subcommand (users will run `horus mycommand`)
+- Use `clap` or similar for argument parsing
+
+### Step 3: Implement the Plugin
+
+```rust
+// src/main.rs
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "mycommand", about = "My custom HORUS command")]
+struct Cli {
+    /// Target to operate on
+    #[arg(short, long)]
+    target: Option<String>,
+
+    /// Enable verbose output
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    // Check if running as a HORUS plugin
+    if std::env::var("HORUS_PLUGIN").is_ok() {
+        let horus_version = std::env::var("HORUS_VERSION")
+            .unwrap_or_else(|_| "unknown".to_string());
+        if cli.verbose {
+            eprintln!("Running as HORUS plugin (HORUS v{})", horus_version);
+        }
+    }
+
+    // Your plugin logic here
+    match cli.target {
+        Some(target) => println!("Operating on: {}", target),
+        None => println!("No target specified. Use --help for usage."),
+    }
+}
+```
+
+### Step 4: Build and Test Locally
+
+```bash
+# Build the plugin
+cargo build --release
+
+# Test it standalone
+./target/release/mycommand --help
+
+# Test it as a HORUS plugin (simulating the environment)
+HORUS_PLUGIN=1 HORUS_VERSION=0.1.0 ./target/release/mycommand --target foo
+```
+
+### Step 5: Install Locally
+
+To test with the actual `horus` CLI, install the binary where HORUS can find it:
+
+```bash
+# Option A: Copy to global plugin bin directory
+mkdir -p ~/.horus/bin
+cp target/release/mycommand ~/.horus/bin/horus-mycommand
+
+# Option B: Install via horus from a local path
+horus plugins install horus-mycommand --local
+```
+
+Now `horus mycommand --help` should work.
+
+## Environment Variables
+
+HORUS sets these environment variables when executing plugins:
+
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `HORUS_PLUGIN` | `1` | Always set when running as a plugin |
+| `HORUS_VERSION` | e.g., `0.1.7` | Version of the HORUS CLI |
+
+Your plugin inherits the user's `stdin`, `stdout`, and `stderr`, so interactive prompts and colored output work normally.
+
+## Plugin Discovery
+
+HORUS discovers plugin binaries in this order:
+
+1. **Project `plugins.lock`** &mdash; `.horus/plugins.lock` in the current project
+2. **Global `plugins.lock`** &mdash; `~/.horus/plugins.lock`
+3. **Project bin directory** &mdash; `.horus/bin/horus-*`
+4. **Global bin directory** &mdash; `~/.horus/bin/horus-*`
+5. **System PATH** &mdash; Any `horus-*` binary in `$PATH`
+
+The first match wins. This means project-level plugins always override global ones.
+
+## Plugin Metadata (Optional)
+
+While zero-config works, you can add metadata for richer plugin listings. Add a `[package.metadata.horus]` section to your `Cargo.toml`:
+
+```toml
+[package.metadata.horus]
+plugin_type = "cli"
+commands = ["mycommand"]
+description = "My custom HORUS command"
+min_horus_version = "0.1.0"
+```
+
+Or add a `plugin` section to `horus.yaml`:
+
+```yaml
+name: horus-mycommand
+version: "0.1.0"
+description: My custom HORUS command
+
+plugin:
+  type: cli
+  commands:
+    - name: mycommand
+      description: My custom HORUS command
+  min_horus_version: "0.1.0"
+```
+
+## Security
+
+When a plugin is installed through the registry, HORUS records a SHA-256 checksum of the binary. Before each execution, the checksum is verified:
+
+- If the binary has been modified, HORUS refuses to run it
+- Run `horus plugin verify` to check all plugin integrity
+- Reinstall a plugin with `horus plugins install <name>` if verification fails
+
+## Example: A Complete Plugin
+
+Here is a minimal but complete plugin that queries HORUS topic statistics:
+
+```rust
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "topic-stats", about = "Show topic statistics summary")]
+struct Cli {
+    /// Shared memory directory
+    #[arg(long, default_value = "/dev/shm/horus")]
+    shm_dir: PathBuf,
+
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    if !cli.shm_dir.exists() {
+        eprintln!("No HORUS topics found at {}", cli.shm_dir.display());
+        std::process::exit(1);
+    }
+
+    let mut topics = Vec::new();
+    for entry in std::fs::read_dir(&cli.shm_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let size = entry.metadata()?.len();
+            topics.push((name, size));
+        }
+    }
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&topics)?);
+    } else {
+        println!("Found {} topics:", topics.len());
+        for (name, size) in &topics {
+            println!("  {} ({} bytes)", name, size);
+        }
+    }
+
+    Ok(())
+}
+```
+
+**Cargo.toml:**
+
+```toml
+[package]
+name = "horus-topic-stats"
+version = "0.1.0"
+edition = "2021"
+description = "Show HORUS topic statistics"
+
+[[bin]]
+name = "topic-stats"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+```
+
+After building and installing, users run:
+
+```bash
+horus topic-stats
+horus topic-stats --json
+```
+
+## Next Steps
+
+- **[Publishing Plugins](/package-management/package-management#publishing-packages)** &mdash; Publish your plugin to the HORUS registry
+- **[Managing Plugins](/plugins/managing-plugins)** &mdash; Install, enable/disable, and verify plugins
+- **[Driver Plugins](/plugins/driver-plugins)** &mdash; Build hardware driver plugins instead

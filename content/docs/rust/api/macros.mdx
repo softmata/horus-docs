@@ -23,16 +23,20 @@ Declarative macro for creating HORUS nodes with minimal boilerplate.
 ```rust
 node! {
     NodeName {
-        pub { ... }       // Publishers (optional)
-        sub { ... }       // Subscribers (optional)
-        data { ... }      // Internal state (optional)
-        tick { ... }      // Main loop (required)
-        init { ... }      // Initialization (optional)
-        shutdown { ... }  // Cleanup (optional)
-        impl { ... }      // Custom methods (optional)
+        name: "custom_name",  // Custom node name (optional)
+        rate 100.0     // Tick rate in Hz (optional)
+        pub { ... }    // Publishers (optional)
+        sub { ... }    // Subscribers (optional)
+        data { ... }   // Internal state (optional)
+        tick { ... }   // Main loop (required)
+        init { ... }   // Initialization (optional)
+        shutdown { ... } // Cleanup (optional)
+        impl { ... }   // Custom methods (optional)
     }
 }
 ```
+
+Only the node name and `tick` are required. Everything else is optional.
 
 ### Sections
 
@@ -103,23 +107,25 @@ tick {
 
 #### `init` - Initialization
 
-Called once before the first tick.
+Called once before the first tick. The block must return `Ok(())` on success (it generates `fn init(&mut self) -> Result<()>`).
 
 ```rust
 init {
     hlog!(info, "Node starting");
     self.buffer.reserve(1000);
+    Ok(())
 }
 ```
 
 #### `shutdown` - Cleanup
 
-Called once when the scheduler stops.
+Called once when the scheduler stops. Must return `Ok(())` on success (generates `fn shutdown(&mut self) -> Result<()>`).
 
 ```rust
 shutdown {
     hlog!(info, "Node stopping");
     // Close files, save state, etc.
+    Ok(())
 }
 ```
 
@@ -143,10 +149,11 @@ impl {
 
 The macro generates:
 
-1. **Struct definition** with all fields
-2. **`new()` constructor** that initializes Topics
-3. **`Node` trait implementation**
-4. **`Default` trait implementation**
+1. **`pub struct NodeName`** with `Topic<T>` fields for publishers/subscribers and your data fields
+2. **`impl NodeName { pub fn new() -> Self }`** constructor that creates all Topics
+3. **`impl Node for NodeName`** with `name()`, `tick()`, optional `init()`, `shutdown()`, `publishers()`, `subscribers()`, and `rate_hz()`
+4. **`impl Default for NodeName`** that calls `Self::new()`
+5. **`impl NodeName { ... }`** for any methods from the `impl` section
 
 ```rust
 // This macro call:
@@ -159,22 +166,22 @@ node! {
 }
 
 // Generates approximately:
-struct SensorNode {
+pub struct SensorNode {
     data: Topic<f32>,
     count: u32,
 }
 
 impl SensorNode {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            data: Topic::new("sensor")?,
+    pub fn new() -> Self {
+        Self {
+            data: Topic::new("sensor").expect("Failed to create publisher 'sensor'"),
             count: 0,
-        })
+        }
     }
 }
 
 impl Node for SensorNode {
-    fn name(&self) -> &'static str { "SensorNode" }
+    fn name(&self) -> &'static str { "sensor_node" }  // Auto snake_case
     fn tick(&mut self) {
         self.count += 1;
     }
@@ -182,10 +189,12 @@ impl Node for SensorNode {
 
 impl Default for SensorNode {
     fn default() -> Self {
-        Self::new().expect("Failed to create SensorNode")
+        Self::new()
     }
 }
 ```
+
+The struct name is converted to snake_case for the node name (e.g., `SensorNode` becomes `"sensor_node"`), unless overridden with `name:`.
 
 ### Examples
 
@@ -275,6 +284,7 @@ node! {
         init {
             hlog!(info, "Initializing...");
             self.initialized = true;
+            Ok(())
         }
 
         tick {
@@ -285,6 +295,7 @@ node! {
 
         shutdown {
             hlog!(info, "Total ticks: {}", self.tick_count);
+            Ok(())
         }
     }
 }
@@ -306,9 +317,8 @@ node! {
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
-    scheduler.add(MyNode::new()?).order(0).done();
-    scheduler.run()?;
-    Ok(())
+    scheduler.add(MyNode::new()).order(0).done();
+    scheduler.run()
 }
 ```
 
@@ -320,19 +330,24 @@ Derive macro for implementing the `LogSummary` trait with default `Debug` format
 
 ### When to Use
 
-Use `#[derive(LogSummary)]` when you define a custom message struct and need the `LogSummary` trait (required for all types used with `Topic`). For most types, the default `Debug` output is sufficient.
+Use `#[derive(LogSummary)]` when you need `Topic::with_logging()` on a custom message type. `LogSummary` is **not** required for basic `Topic::new()` — only for the opt-in introspection mode.
+
+The derive requires `Debug` on the type since it generates a `Debug`-based implementation.
 
 ```rust
-use horus_macros::LogSummary;
+use horus::prelude::*;
 
-#[derive(Debug, Clone, LogSummary)]
+#[derive(Debug, Clone, Serialize, Deserialize, LogSummary)]
 pub struct MyStatus {
     pub temperature: f32,
     pub voltage: f32,
 }
+
+// Now you can use with_logging()
+let topic: Topic<MyStatus> = Topic::new("status")?.with_logging();
 ```
 
-This generates:
+The derive generates:
 
 ```rust
 impl LogSummary for MyStatus {
@@ -347,100 +362,11 @@ impl LogSummary for MyStatus {
 For large types (images, point clouds) where `Debug` output would be too verbose, implement `LogSummary` manually instead of deriving:
 
 ```rust
-use horus_core::core::LogSummary;
+use horus::prelude::*;
 
 impl LogSummary for MyLargeData {
     fn log_summary(&self) -> String {
         format!("MyLargeData({}x{}, {} bytes)", self.width, self.height, self.data.len())
-    }
-}
-```
-
-### Comparison with `message!`
-
-| Feature | `message!` | `#[derive(LogSummary)]` |
-|---------|-----------|------------------------|
-| Generates full struct | Yes | No |
-| LogSummary | Always (boilerplate) | Default or manual |
-| Custom methods | No | Yes |
-| Custom `Default` | No | Yes |
-| Serde attributes | No | Yes |
-| Doc comments on fields | No | Yes |
-
-Use `message!` for quick one-liner types. Use `#[derive(LogSummary)]` on hand-written structs that need rich APIs.
-
----
-
-## message!
-
-Macro for defining custom message types compatible with HORUS communication.
-
-### Syntax
-
-```rust
-message! {
-    MessageName {
-        field1: Type,
-        field2: Type,
-        // ...
-    }
-}
-```
-
-### Features
-
-The macro automatically implements:
-
-- `Clone`, `Debug`
-- `Serialize`, `Deserialize` (serde)
-- `LogSummary` trait for debugging
-- `Default` trait
-- Fixed-size representation for shared memory
-
-### Example
-
-```rust
-message! {
-    RobotCommand {
-        linear_velocity: f32,
-        angular_velocity: f32,
-        timestamp: u64,
-    }
-}
-
-// Usage
-let cmd = RobotCommand {
-    linear_velocity: 1.0,
-    angular_velocity: 0.5,
-    timestamp: 12345,
-};
-
-let topic: Topic<RobotCommand> = Topic::new("commands")?;
-topic.send(cmd);
-```
-
-### With Arrays
-
-```rust
-message! {
-    SensorArray {
-        values: [f32; 8],
-        valid_count: u8,
-    }
-}
-```
-
-### Complex Types
-
-```rust
-message! {
-    RobotState {
-        position: [f64; 3],
-        orientation: [f64; 4],  // quaternion
-        velocity: [f64; 6],     // linear + angular
-        status: u8,
-        battery_percent: f32,
-        timestamp: u64,
     }
 }
 ```
@@ -470,6 +396,7 @@ tick {
 ```rust
 init {
     self.buffer.reserve(1000);  // Do once
+    Ok(())
 }
 
 tick {
@@ -557,5 +484,4 @@ tick {
 ## See Also
 
 - [node! Macro Guide](/concepts/node-macro) - Detailed tutorial
-- [message! Macro Guide](/concepts/message-macro) - Custom messages
 - [horus_core API](/rust/api/core) - Core types reference

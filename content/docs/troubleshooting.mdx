@@ -322,7 +322,7 @@ echo 'export HORUS_SOURCE=/path/to/horus' >> ~/.bashrc
 #   - /usr/local/horus
 
 # Verify HORUS source is found
-horus run --build-only
+horus build
 ```
 
 **Why this happens:**
@@ -340,9 +340,6 @@ horus run --build-only
 ```bash
 # Use release mode (optimized)
 horus run --release
-
-# Or configure in horus.yaml
-mode: release
 ```
 
 ---
@@ -450,7 +447,7 @@ If you encounter issues:
 3. **Report the issue:**
    - Describe what you were doing
    - System info (OS, Rust version)
-   - GitHub: https://github.com/your-org/horus/issues
+   - GitHub: https://github.com/softmata/horus/issues
 
 ---
 
@@ -461,15 +458,18 @@ Common errors when running HORUS applications and how to fix them.
 ### Topic Creation Failed
 
 **Symptom:**
-```rust
-Error: Failed to create Topic
-thread 'main' panicked at 'Topic::new() failed'
+```
+Error: Failed to create shared memory region for topic "sensor_data"
+```
+
+Or, if your code uses `.unwrap()`:
+```
+thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: ...'
 ```
 
 **Cause:**
 - Insufficient permissions on `/dev/shm`
 - Disk space full on `/dev/shm`
-- Topic name contains invalid characters
 
 **Fix:**
 
@@ -481,7 +481,7 @@ ls -la /dev/shm
 df -h /dev/shm
 
 # Clean old HORUS shared memory
-rm -f /dev/shm/horus_*
+rm -rf /dev/shm/horus/
 
 # Fix permissions (if needed)
 sudo chmod 1777 /dev/shm
@@ -489,14 +489,10 @@ sudo chmod 1777 /dev/shm
 
 **Code Fix:**
 ```rust
-// Ensure topic names are valid (alphanumeric, underscore, slash)
-// Good:
+// Topic names become file paths on the underlying shared memory system.
+// Use simple, descriptive names:
 let topic = Topic::new("sensor_data")?;
-let topic = Topic::new("robot.cmd_vel")?;
-
-// Bad (will fail):
-let topic = Topic::new("sensor data")?;  // Space
-let topic = Topic::new("temp@sensor")?;  // Special char
+let topic = Topic::new("camera/front/raw")?;  // Slashes create subdirectories
 ```
 
 ---
@@ -535,10 +531,8 @@ let sub_topic = Topic::new("temperature")?;  // Now matches!
 // Add logging to publisher
 fn tick(&mut self) {
     let data = 42.0;
-    match self.pub_topic.send(data) {
-        Ok(()) => hlog!(info, "Published successfully"),
-        Err(_) => hlog!(error, "Publish failed!"),
-    }
+    self.pub_topic.send(data);
+    hlog!(debug, "Published data: {}", data);
 }
 ```
 
@@ -655,17 +649,15 @@ If you see "Tick started" but never "Tick completed", the hang is in your code.
 
 ---
 
-### Message Size Errors
+### Messages Silently Dropped
 
 **Symptom:**
-```
-Error: Message too large for shared memory
-thread 'main' panicked at 'send() failed'
-```
+Publisher sends messages but subscriber never receives them, and no error is reported.
 
 **Cause:**
-- Message type is too large for shared memory buffer
-- Trying to send very large arrays or strings
+- For serialized (non-POD) messages: the serialized data exceeds the slot size
+- Ring buffer is full and all retry attempts failed
+- `send()` is lossy — it retries briefly then drops the message silently
 
 **Fix:**
 
@@ -673,50 +665,23 @@ thread 'main' panicked at 'send() failed'
 ```rust
 use std::mem::size_of;
 
-#[derive(Clone, Debug)]
-struct LargeMessage {
-    data: [f32; 100000],  // 400KB!
-}
-
-fn main() {
-    println!("Message size: {} bytes", size_of::<LargeMessage>());
-}
+// POD messages always fit (slot = size_of::<T>())
+// Non-POD messages must serialize within the slot size (default 8KB)
+println!("Message size: {} bytes", size_of::<MyMessage>());
 ```
 
-**2. Reduce Message Size:**
+**2. Keep Messages Reasonably Sized:**
 ```rust
-// BAD: Huge array
+// Large fixed-size arrays increase shared memory usage
 struct SensorData {
-    readings: [f32; 100000],  // 400KB
-}
-
-// GOOD: Smaller, reasonable size
-struct SensorData {
-    readings: [f32; 100],  // 400 bytes
+    readings: [f32; 100],  // 400 bytes — reasonable
 }
 ```
 
-**3. Split Large Data:**
-```rust
-// Send data in chunks
-for chunk in large_data.chunks(100) {
-    let msg = ChunkMessage {
-        data: chunk.to_vec(),
-        index: i,
-    };
-    self.pub_topic.send(msg);
-}
-```
-
-**4. Use Arc for Large Data:**
-```rust
-use std::sync::Arc;
-
-// Share large data without copying
-type LargeData = Arc<Vec<f32>>;
-
-let data = Arc::new(vec![0.0; 100000]);
-self.pub_topic.send(Arc::clone(&data));
+**3. Use Monitor to Check:**
+```bash
+# The monitor shows send failure counts per topic
+horus monitor
 ```
 
 ---

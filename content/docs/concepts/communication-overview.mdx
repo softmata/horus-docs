@@ -1,295 +1,287 @@
 ---
 title: Communication Patterns Overview
-description: Understanding MPMC vs SPSC communication patterns in HORUS
+description: Understanding HORUS communication primitives — Topics, Actions, and Network
 order: 20
 ---
 
 # Communication Patterns Overview
 
-HORUS provides `Topic<T>` as the unified communication primitive that automatically selects the optimal backend based on your usage pattern. Understanding the two fundamental patterns helps you design efficient robotics systems.
+HORUS provides two communication primitives that cover all robotics messaging needs:
 
-## Automatic Backend Selection
+| Pattern | Purpose | Example |
+|---------|---------|---------|
+| **Topic** | Streaming data (pub/sub) | Sensor readings, motor commands, video frames |
+| **Action** | Long-running tasks (goal/feedback/result) | Navigation, arm motion, calibration |
 
-`Topic::new()` uses **AdaptiveTopic** to auto-detect the optimal backend from 10 paths:
+Both work locally (shared memory) and across machines (network transport via configuration).
 
-| Backend | Latency | Pattern | Scope |
-|---------|---------|---------|-------|
-| DirectChannel | ~3ns | 1P:1C | Same thread |
-| SpscIntra | ~18ns | 1P:1C | Same process |
-| SpmcIntra | ~24ns | 1P:NC | Same process |
-| MpscIntra | ~26ns | NP:1C | Same process |
-| MpmcIntra | ~36ns | NP:NC | Same process |
-| PodShm | ~50ns | POD types | Cross-process |
-| MpscShm | ~65ns | NP:1C | Cross-process |
-| SpmcShm | ~70ns | 1P:NC | Cross-process |
-| SpscShm | ~85ns | 1P:1C | Cross-process |
-| MpmcShm | ~167ns | NP:NC | Cross-process |
+## Topic: Streaming Pub/Sub
 
-## Two Core Patterns
-
-### MPMC: Many-to-Many Pub/Sub
-
-**Pattern**: Multiple publishers → Multiple subscribers
-**Use Case**: Broadcasting, flexible topologies, logging
-**Semantics**: Buffered queue, all messages delivered
+`Topic<T>` is the primary communication primitive. It provides lock-free, zero-copy pub/sub with automatic backend selection from 10 optimized paths.
 
 ```rust
-// Auto-detected MPMC - just use Topic::new()
-let pub_topic: Topic<SensorData> = Topic::new("sensors")?;
-pub_topic.send(data);
+use horus::prelude::*;
 
-// Many subscribers receive the same data
-let sub1: Topic<SensorData> = Topic::new("sensors")?;
-let sub2: Topic<SensorData> = Topic::new("sensors")?;
-let sub3: Topic<SensorData> = Topic::new("sensors")?;
-```
+// Create a topic — backend is auto-detected
+let pub_topic: Topic<f32> = Topic::new("sensor.temperature")?;
+pub_topic.send(25.3);
 
-### SPSC: Point-to-Point
-
-**Pattern**: One producer → One consumer
-**Use Case**: Control loops, critical paths, 1P1C pipelines
-**Semantics**: Latest value only (for real-time performance)
-
-```rust
-// Explicit SPSC - use producer()/consumer() for guaranteed 1P:1C
-let output: Topic<ImuData> = Topic::producer("imu_raw")?;
-output.send(data);
-
-// Consumer (exactly one)
-let input: Topic<ImuData> = Topic::consumer("imu_raw")?;
-if let Some(data) = input.recv() {
-    process(data);
+// Any number of subscribers can listen
+let sub_topic: Topic<f32> = Topic::new("sensor.temperature")?;
+if let Some(temp) = sub_topic.recv() {
+    hlog!(info, "Temperature: {}", temp);
 }
 ```
 
-## Decision Matrix
+### Automatic Backend Selection
 
-| Criteria | Use MPMC (Topic::new) | Use SPSC (Topic::producer/consumer) |
-|----------|----------------------|-------------------------------------|
-| **Number of Consumers** | Multiple subscribers | Exactly one consumer |
-| **Message Delivery** | All messages buffered | Latest value only |
-| **Latency (local)** | ~36-167ns | ~18-85ns |
-| **Latency (network)** | &lt;50µs | 5-15µs |
-| **Use Case** | Broadcasting, monitoring | Control loops, pipelines |
-| **Topology** | Dynamic, flexible | Fixed, point-to-point |
-| **Semantics** | Every message matters | Latest value matters |
+You never choose a backend — HORUS detects the optimal one automatically based on:
+- **Topology**: Same thread, same process, or cross-process
+- **Participants**: How many publishers and subscribers
+- **Type**: Whether the message type is POD (Plain Old Data)
 
-## Key Differences
+| Backend | Latency | When Selected |
+|---------|---------|---------------|
+| **DirectChannel** | ~3ns | Same thread, single publisher and consumer |
+| **SpscIntra** | ~18ns | Same process, 1 publisher, 1 consumer |
+| **SpmcIntra** | ~24ns | Same process, 1 publisher, many consumers |
+| **MpscIntra** | ~26ns | Same process, many publishers, 1 consumer |
+| **MpmcIntra** | ~36ns | Same process, many-to-many |
+| **PodShm** | ~50ns | Cross-process, POD type |
+| **MpscShm** | ~65ns | Cross-process, many publishers, 1 consumer |
+| **SpmcShm** | ~70ns | Cross-process, 1 publisher, many consumers |
+| **SpscShm** | ~85ns | Cross-process, 1 publisher, 1 consumer |
+| **MpmcShm** | ~167ns | Cross-process, many-to-many |
 
-### 1. Message Semantics
+The backend can change at runtime — if a second subscriber joins a 1P1C topic, HORUS automatically migrates from SPSC to SPMC without dropping messages.
 
-**MPMC (Buffering)**:
-- Messages are queued
-- All messages are delivered to all subscribers
-- If buffer fills, oldest messages dropped
-- Perfect for: Logging, event streams, commands
+### Key Characteristics
 
-**SPSC (Latest Value)**:
-- Single slot, always overwrites
-- Consumer gets latest value only
-- Older unread values are lost
-- Perfect for: Sensor readings, state updates, control signals
+- **Infallible send**: `send()` always succeeds. Ring buffer overwrites oldest message when full ("keep last" semantics).
+- **Non-blocking recv**: `recv()` returns `Option<T>`. Returns `None` if no message available.
+- **Zero introspection overhead**: No timing, logging, or tracing in the default path. Opt-in via `with_logging()`.
 
-### 2. Performance
+For full Topic API details, see [Topic Communication](/concepts/core-concepts-topic).
 
-**MPMC (Topic::new)**:
-- ~36ns (same process) to ~167ns (cross-process)
-- &lt;50µs latency (network)
-- Slightly slower due to MPMC coordination
+## Action: Long-Running Tasks
 
-**SPSC (Topic::producer/consumer)**:
-- ~18ns (same process) to ~85ns (cross-process)
-- 5-15µs latency (network)
-- Faster due to SPSC optimization (no contention)
+Actions handle tasks that take time to complete and benefit from progress feedback and cancellation. They follow the **Goal / Feedback / Result** pattern.
 
-### 3. Topology Flexibility
+### Defining an Action
 
-**MPMC (Topic::new)**:
 ```rust
-// Can add/remove subscribers dynamically
-let logger: Topic<Event> = Topic::new("events")?;
-let monitor: Topic<Event> = Topic::new("events")?;
-let analyzer: Topic<Event> = Topic::new("events")?;
-// All receive the same events
-```
+use horus::prelude::*;
 
-**SPSC (Topic::producer/consumer)**:
-```rust
-// Fixed 1P1C topology
-let producer: Topic<Data> = Topic::producer("data")?;
-let consumer: Topic<Data> = Topic::consumer("data")?;
-// Exactly one of each - adding another consumer won't work
-```
+#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
+pub struct NavigateGoal {
+    pub target_x: f64,
+    pub target_y: f64,
+}
 
-## When to Use Topic
+#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
+pub struct NavigateFeedback {
+    pub distance_remaining: f64,
+    pub progress_percent: f32,
+}
 
-**Broadcasting to multiple nodes**
-```rust
-// One camera feeds multiple processors
-let camera_pub: Topic<Image> = Topic::new("camera")?;
-// subscriber 1: face detection
-// subscriber 2: object tracking
-// subscriber 3: recording/logging
-```
+#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
+pub struct NavigateResult {
+    pub success: bool,
+    pub final_x: f64,
+    pub final_y: f64,
+}
 
-**Logging and monitoring**
-```rust
-// Many nodes publish diagnostics, one logger subscribes
-let diag_pub: Topic<DiagMsg> = Topic::new("diagnostics")?;
-let logger: Topic<DiagMsg> = Topic::new("diagnostics")?;
-```
+pub struct NavigateToGoal;
 
-**Event-driven systems**
-```rust
-// Events trigger actions in multiple subsystems
-let event_pub: Topic<EmergencyStop> = Topic::new("estop")?;
-// All motor controllers subscribe and react
-```
+impl Action for NavigateToGoal {
+    type Goal = NavigateGoal;
+    type Feedback = NavigateFeedback;
+    type Result = NavigateResult;
 
-**Flexible topologies**
-- Number of subscribers unknown at compile time
-- Nodes can join/leave during runtime
-- Pub/sub pattern from ROS/MQTT/DDS
-
-## When to Use SPSC Topic
-
-**Control loops** (high-frequency, latency-critical)
-```rust
-// IMU → State Estimator → Controller → Motors
-// Each stage connected by explicit SPSC (~18-85ns latency)
-struct FlightController {
-    imu_input: Topic<ImuData>,     // Created with Topic::consumer()
-    motor_output: Topic<MotorCommands>,  // Created with Topic::producer()
+    fn name() -> &'static str {
+        "navigate_to_goal"
+    }
 }
 ```
 
-**Point-to-point pipelines**
-```rust
-// Sensor → Filter → Processor (explicit SPSC for determinism)
-let raw_output: Topic<RawData> = Topic::producer("raw")?;
-let raw_input: Topic<RawData> = Topic::consumer("raw")?;
+### Action Server
 
-let filtered_output: Topic<FilteredData> = Topic::producer("filtered")?;
+The server receives goals and executes them:
+
+```rust
+let server = ActionServerBuilder::<NavigateToGoal>::new()
+    .on_goal(|goal| {
+        // Accept or reject the goal
+        if goal.target_x.abs() < 100.0 {
+            GoalResponse::Accept
+        } else {
+            GoalResponse::Reject("Target out of range".into())
+        }
+    })
+    .on_execute(|handle| {
+        // Execute the task, sending feedback along the way
+        let goal = handle.goal();
+        let initial_distance = compute_distance(goal);
+
+        loop {
+            let distance = compute_distance(goal);
+            handle.publish_feedback(NavigateFeedback {
+                distance_remaining: distance,
+                progress_percent: (1.0 - distance / initial_distance) * 100.0,
+            });
+
+            if handle.is_cancel_requested() {
+                return GoalOutcome::Canceled(NavigateResult {
+                    success: false, final_x: 0.0, final_y: 0.0,
+                });
+            }
+
+            if distance < 0.1 {
+                return GoalOutcome::Succeeded(NavigateResult {
+                    success: true,
+                    final_x: goal.target_x,
+                    final_y: goal.target_y,
+                });
+            }
+        }
+    })
+    .on_cancel(|_goal_id| {
+        CancelResponse::Accept
+    })
+    .build();
 ```
 
-**Latest-value semantics**
+### Action Client
+
+The client sends goals and tracks progress:
+
 ```rust
-// Always want the newest sensor reading
-let lidar: Topic<LidarScan> = Topic::new("lidar")?;
-// Old scans are irrelevant - only latest matters
+let client = ActionClientBuilder::<NavigateToGoal>::new()
+    .on_feedback(|_goal_id, feedback| {
+        hlog!(info, "Progress: {:.1}%", feedback.progress_percent);
+    })
+    .on_result(|_goal_id, status, result| {
+        match status {
+            GoalStatus::Succeeded => {
+                hlog!(info, "Arrived at ({}, {})", result.final_x, result.final_y);
+            }
+            GoalStatus::Aborted => hlog!(warn, "Navigation aborted"),
+            GoalStatus::Canceled => hlog!(info, "Navigation canceled"),
+            GoalStatus::Preempted => hlog!(info, "Navigation preempted"),
+            _ => {}
+        }
+    })
+    .build();
+
+// Send a goal
+let goal_handle = client.send_goal(NavigateGoal {
+    target_x: 5.0,
+    target_y: 3.0,
+})?;
+
+// Cancel if needed
+goal_handle.cancel();
 ```
 
-**Deterministic real-time systems**
-- Fixed topology known at compile time
-- Predictable latency critical
-- Hard real-time requirements
+### Goal Lifecycle
 
-## Hybrid Patterns
-
-You can combine both patterns in the same system:
-
-```rust
-struct RobotSystem {
-    // SPSC for critical control loop (~18-85ns)
-    imu_input: Topic<ImuData>,       // Topic::consumer()
-    motor_output: Topic<MotorCommands>,  // Topic::producer()
-
-    // MPMC for broadcasting and monitoring (~36-167ns)
-    status_topic: Topic<RobotStatus>,    // Topic::new()
-    diagnostics_topic: Topic<DiagMsg>,   // Topic::new()
-    camera_topic: Topic<Image>,          // Topic::new()
-}
+```
+Pending ──> Active ──> Succeeded
+               ├────> Aborted    (server error)
+               ├────> Canceled   (client request)
+               └────> Preempted  (higher-priority goal)
+Pending ──> Rejected             (validation failed)
 ```
 
-**Design principle**: Use explicit SPSC for the critical path, auto-detected MPMC for everything else.
+### Preemption Policies
 
-## Common Patterns
+Configure how the server handles new goals while one is active:
 
-### 1. Sensor Fusion
+| Policy | Behavior |
+|--------|----------|
+| `PreemptionPolicy::PreemptOld` | New goals cancel the active goal (default) |
+| `PreemptionPolicy::RejectNew` | New goals are rejected while one is active |
+| `PreemptionPolicy::Priority` | Higher-priority goals preempt lower ones |
+| `PreemptionPolicy::Queue { max_size }` | Goals are queued FIFO up to a limit |
+
+## Network Communication
+
+By default, Topics and Actions use shared memory for communication between processes on the same machine. For multi-machine systems, network transport is configured via TOML or YAML configuration files.
+
+### Configuration-Based Transport
+
+```toml
+# horus.toml
+[[topics]]
+name = "camera"
+endpoint = "camera@router"
+transport = "router"
+host = "192.168.1.5"
+port = 9000
+
+[[topics]]
+name = "cmd_vel"
+endpoint = "cmd_vel@zenoh/ros2"
+[topics.zenoh]
+ros2_mode = true
+connect = ["tcp/192.168.1.1:7447"]
+```
+
+### Available Transports
+
+| Transport | Use Case |
+|-----------|----------|
+| `local` | Same machine (shared memory, default) |
+| `router` | Point-to-point TCP with optional TLS |
+| `multicast` | LAN broadcast |
+| `direct` | Direct TCP connection |
+| `zenoh` | Mesh networking, cloud bridge, ROS2 interop |
+
+### Service Discovery
+
+HORUS supports zero-configuration networking via mDNS. Robots on the same network automatically discover each other without manual IP configuration.
+
+For full network details, see [Network Communication](/concepts/network-communication).
+
+## When to Use What
+
+| Scenario | Use | Why |
+|----------|-----|-----|
+| Sensor data streaming | **Topic** | Continuous data, latest value matters |
+| Motor commands | **Topic** | High frequency, low latency |
+| Camera frames | **Topic** | Streaming, multiple consumers |
+| Navigate to position | **Action** | Long-running, needs progress feedback |
+| Pick-and-place | **Action** | Multi-step, cancellable |
+| Calibration routine | **Action** | Takes time, reports progress |
+| Emergency stop | **Topic** | Must be instantaneous, no handshake |
+| Diagnostics broadcast | **Topic** | Many publishers, flexible topology |
+
+**Rule of thumb**: If it's a continuous stream of data, use **Topic**. If it's a task you'd want to start, monitor, and potentially cancel, use **Action**.
+
+## Composing Patterns
+
+A typical robot system combines all patterns:
 
 ```rust
-// Multiple sensors → One fusion node (Topic MPMC)
-let imu_pub: Topic<ImuData> = Topic::new("sensors.imu")?;
-let gps_pub: Topic<GpsData> = Topic::new("sensors.gps")?;
-let lidar_pub: Topic<LidarScan> = Topic::new("sensors.lidar")?;
-
-// Fusion node subscribes to all
-struct FusionNode {
-    imu_sub: Topic<ImuData>,
-    gps_sub: Topic<GpsData>,
+struct NavigationSystem {
+    // Topics for streaming sensor data
     lidar_sub: Topic<LidarScan>,
+    odom_sub: Topic<Odometry>,
 
-    // Fused output via Topic (high performance)
-    state_output: Topic<StateEstimate>,
+    // Topics for publishing commands
+    cmd_vel_pub: Topic<Twist>,
+    status_pub: Topic<RobotStatus>,
+
+    // Action server for goal-based navigation
+    nav_server: ActionServerNode<NavigateToGoal>,
 }
 ```
 
-### 2. Command Distribution
-
-```rust
-// One joystick → Multiple motors (MPMC)
-let joystick_pub: Topic<JoystickCmd> = Topic::new("joystick")?;
-
-// Each motor controller subscribes
-struct MotorController {
-    cmd_sub: Topic<JoystickCmd>,      // Topic::new() for MPMC subscription
-    motor_output: Topic<MotorPWM>,    // Topic::producer() for SPSC to motor
-}
-```
-
-### 3. Pipeline Processing
-
-```rust
-// Sequential processing (explicit SPSC for determinism)
-let raw_out: Topic<RawImage> = Topic::producer("raw")?;
-let raw_in: Topic<RawImage> = Topic::consumer("raw")?;
-
-let filtered_out: Topic<FilteredImage> = Topic::producer("filtered")?;
-let filtered_in: Topic<FilteredImage> = Topic::consumer("filtered")?;
-
-// raw → filter → detector → tracker
-// Each stage: producer output → process → consumer input
-```
-
-## Transport Independence
-
-**Important**: Topic supports **local** and **network** transports!
-
-```rust
-// Local shared memory (default) - auto-selects optimal backend
-let topic: Topic<Data> = Topic::new("topic")?;           // ~36-167ns (MPMC)
-let spsc: Topic<Data> = Topic::producer("topic")?;       // ~18-85ns (SPSC)
-
-// Network (just add host to endpoint)
-let net_topic: Topic<Data> = Topic::new("topic@192.168.1.5")?;      // &lt;50µs
-let net_spsc: Topic<Data> = Topic::producer("topic@192.168.1.5")?;  // 5-15µs
-```
-
-The pattern (MPMC vs SPSC) is independent of the transport (local vs network).
-
-See [Communication Transport](/concepts/communication-transport) for details on local vs network.
-
-## Summary
-
-**MPMC (Topic::new)**:
-- Many publishers, many subscribers
-- All messages buffered and delivered
-- Flexible, dynamic topologies
-- ~36-167ns local, &lt;50µs network
-- Use for: Broadcasting, monitoring, events
-
-**SPSC (Topic::producer/consumer)**:
-- One producer, one consumer
-- Latest value only (overwrites)
-- Fixed, point-to-point topology
-- ~18-85ns local, 5-15µs network
-- Use for: Control loops, critical paths, pipelines
-
-Choose based on your **communication pattern**, not transport mechanism!
+The navigation action server subscribes to sensor topics internally, computes a path, publishes velocity commands via topics, and reports progress back to the action client — all using the same underlying shared memory infrastructure.
 
 ## Next Steps
 
-- [Topic (MPMC) Details](/concepts/core-concepts-topic) - Deep dive into Topic
-- [Topic (SPSC) Details](/concepts/core-concepts-topic) - Deep dive into Topic SPSC
-- [Communication Transport](/concepts/communication-transport) - Local vs Network
+- [Topic Details](/concepts/core-concepts-topic) - Full Topic API reference
+- [Zero-Overhead IPC](/concepts/zero-overhead-ipc) - How the hot path stays fast
+- [Communication Transport](/concepts/communication-transport) - Backend selection details
 - [Network Communication](/concepts/network-communication) - Multi-machine systems

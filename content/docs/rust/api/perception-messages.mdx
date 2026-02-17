@@ -1,20 +1,22 @@
 ---
 title: "Perception Messages"
-description: "3D perception, point cloud, and depth sensing message types"
+description: "3D perception, point cloud, depth, landmark, tracking, and segmentation message types"
 weight: 50
 ---
 
 # Perception Messages
 
-HORUS provides message types for 3D perception tasks including point clouds, depth images, bounding boxes, and plane detection.
+HORUS provides message types for 3D perception tasks. These include two categories:
+
+- **Serde-based types**: `PointCloud`, `DepthImage`, `PlaneDetection` — flexible, support variable-size data
+- **Pod (zero-copy) types**: `PointXYZ`, `Landmark`, `TrackedObject`, `SegmentationMask` — fixed-size, suitable for shared memory transport with zero serialization overhead
 
 ## PointCloud
 
-3D point cloud message compatible with ROS PointCloud2 format.
+Flexible 3D point cloud message with configurable fields (similar to ROS PointCloud2).
 
 ```rust
-use horus::prelude::*; // Provides perception::{PointCloud, PointField, PointFieldType};
-use horus::prelude::*; // Provides geometry::Point3;
+use horus::prelude::*;
 
 // Create XYZ point cloud from points
 let points = vec![
@@ -30,8 +32,9 @@ let colored_points = vec![
 ];
 let cloud = PointCloud::xyzrgb(&colored_points);
 
-// Access point count
+// Access point count and validate
 println!("Points: {}", cloud.point_count());
+println!("Valid: {}", cloud.is_valid());
 
 // Extract XYZ coordinates back
 if let Some(points) = cloud.extract_xyz() {
@@ -39,6 +42,9 @@ if let Some(points) = cloud.extract_xyz() {
         println!("({:.2}, {:.2}, {:.2})", point.x, point.y, point.z);
     }
 }
+
+// Set frame ID
+let cloud = cloud.with_frame_id("lidar_front");
 ```
 
 **Fields:**
@@ -56,12 +62,25 @@ if let Some(points) = cloud.extract_xyz() {
 | `frame_id` | `[u8; 32]` | Coordinate frame |
 | `timestamp_ns` | `u64` | Nanoseconds since epoch |
 
+**Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new()` | `PointCloud` | Create empty point cloud |
+| `xyz(points)` | `PointCloud` | Create XYZ cloud from `&[Point3]` |
+| `xyzrgb(points)` | `PointCloud` | Create XYZRGB cloud from `&[(Point3, [u8; 3])]` |
+| `add_field(field)` | `Result<(), &str>` | Add a field (max 16) |
+| `point_count()` | `u64` | Total number of points |
+| `is_valid()` | `bool` | Check data consistency |
+| `extract_xyz()` | `Option<Vec<Point3>>` | Extract XYZ coordinates |
+| `with_frame_id(id)` | `PointCloud` | Set frame ID (builder) |
+
 ### PointField
 
 Describes a field within the point cloud data:
 
 ```rust
-use horus::prelude::*; // Provides perception::{PointField, PointFieldType};
+use horus::prelude::*;
 
 // Create custom field
 let intensity = PointField::new("intensity", 12, PointFieldType::Float32, 1);
@@ -78,87 +97,118 @@ println!("Field: {}, size: {} bytes", intensity.name_str(), intensity.field_size
 | `UInt16` | `u16` | 2 bytes |
 | `Int32` | `i32` | 4 bytes |
 | `UInt32` | `u32` | 4 bytes |
-| `Float32` | `f32` | 4 bytes |
+| `Float32` | `f32` | 4 bytes (default) |
 | `Float64` | `f64` | 8 bytes |
 
-## BoundingBox3D
+## Pod Point Types (Zero-Copy)
 
-3D bounding box for object detection.
+Fixed-size point types suitable for zero-copy shared memory transport via `PodTopic`.
+
+### PointXYZ
+
+Basic 3D point (12 bytes, `#[repr(C, packed)]`).
 
 ```rust
-use horus::prelude::*; // Provides perception::BoundingBox3D;
-use horus::prelude::*; // Provides geometry::{Point3, Vector3};
+use horus::prelude::*;
 
-// Create bounding box
-let center = Point3::new(1.0, 2.0, 0.5);
-let size = Vector3::new(0.5, 0.3, 1.0);  // width, height, depth
+let point = PointXYZ::new(1.0, 2.0, 3.0);
 
-let bbox = BoundingBox3D::new(center, size)
-    .with_label("person");
+println!("Distance from origin: {:.2}m", point.distance());
 
-// Check properties
-println!("Label: {}", bbox.label_str());
-println!("Volume: {:.2} m³", bbox.volume());
-println!("Confidence: {:.2}", bbox.confidence);
-
-// Check if point is inside
-let test_point = Point3::new(1.1, 2.0, 0.6);
-if bbox.contains_point(&test_point) {
-    println!("Point is inside bounding box");
-}
-
-// Get corner points
-let corners = bbox.corners();
+let other = PointXYZ::new(4.0, 6.0, 3.0);
+println!("Distance between: {:.2}m", point.distance_to(&other));
 ```
-
-**Fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `center` | `Point3` | Box center position |
-| `size` | `Vector3` | Dimensions (width, height, depth) |
-| `orientation` | `Quaternion` | Box orientation |
-| `label` | `[u8; 32]` | Object class label |
-| `confidence` | `f32` | Detection confidence (0-1) |
-| `track_id` | `u32` | Tracking ID |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `x` | `f32` | X coordinate (meters) |
+| `y` | `f32` | Y coordinate (meters) |
+| `z` | `f32` | Z coordinate (meters) |
 
-## BoundingBoxArray3D
+### PointXYZRGB
 
-Array of 3D bounding boxes (max 32).
+3D point with RGB color (16 bytes, `#[repr(C)]`). Common for RGB-D cameras like Intel RealSense.
 
 ```rust
-use horus::prelude::*; // Provides perception::{BoundingBoxArray3D, BoundingBox3D};
-use horus::prelude::*; // Provides geometry::{Point3, Vector3};
+use horus::prelude::*;
 
-let mut boxes = BoundingBoxArray3D::new();
+let point = PointXYZRGB::new(1.0, 2.0, 3.0, 255, 0, 0); // Red point
 
-// Add bounding boxes
-let bbox1 = BoundingBox3D::new(
-    Point3::new(1.0, 0.0, 0.5),
-    Vector3::new(0.5, 0.5, 1.8)
-).with_label("person");
+// Convert from PointXYZ (defaults to white)
+let xyz = PointXYZ::new(1.0, 2.0, 3.0);
+let colored = PointXYZRGB::from_xyz(xyz);
 
-boxes.add_box(bbox1)?;
+// Get packed RGB as u32 (0xRRGGBBAA)
+let packed = point.rgb_packed();
 
-// Filter by confidence
-let high_confidence = boxes.filter_by_confidence(0.8);
-
-// Filter by label
-let people = boxes.filter_by_label("person");
+// Convert back to PointXYZ (drop color)
+let xyz_only = point.xyz();
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters) |
+| `r`, `g`, `b` | `u8` | Color components (0-255) |
+| `a` | `u8` | Alpha/padding (255 default) |
+
+### PointXYZI
+
+3D point with intensity (16 bytes, `#[repr(C)]`). Common for LiDAR sensors (Velodyne, Ouster, Livox).
+
+```rust
+use horus::prelude::*;
+
+let point = PointXYZI::new(1.0, 2.0, 3.0, 128.0);
+
+// Convert from PointXYZ (zero intensity)
+let xyz = PointXYZ::new(1.0, 2.0, 3.0);
+let with_intensity = PointXYZI::from_xyz(xyz);
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters) |
+| `intensity` | `f32` | Reflectance (typically 0-255) |
+
+### PointCloudHeader
+
+Header for array transmission of point clouds (64 bytes, `#[repr(C)]`). Sent before the point data array via IPC.
+
+```rust
+use horus::prelude::*;
+
+// Create header for different point types
+let header = PointCloudHeader::xyz(10000)
+    .with_frame_id("lidar_front")
+    .with_timestamp(timestamp_ns);
+
+// Or for colored points
+let header = PointCloudHeader::xyzrgb(5000);
+
+// Calculate total data size
+println!("Data size: {} bytes", header.data_size());
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `num_points` | `u64` | Number of points |
+| `point_type` | `u32` | 0=XYZ, 1=XYZRGB, 2=XYZI |
+| `point_stride` | `u32` | Bytes per point |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `seq` | `u64` | Sequence number |
+| `frame_id` | `[u8; 32]` | Sensor/coordinate frame |
 
 ## DepthImage
 
 Depth image from depth cameras (RealSense, Kinect, etc.).
 
 ```rust
-use horus::prelude::*; // Provides perception::DepthImage;
+use horus::prelude::*;
 
 // Create depth image
 let width = 640;
 let height = 480;
-let depths = vec![0u16; (width * height) as usize];  // Initialize with zeros
+let depths = vec![0u16; (width * height) as usize];
 
 let mut depth_image = DepthImage::new(width, height, depths);
 depth_image.min_depth = 200;   // 20cm minimum
@@ -172,13 +222,11 @@ if let Some(depth) = depth_image.get_depth(320, 240) {
     }
 }
 
-// Convert to point cloud using camera intrinsics
-let fx = 525.0;  // Focal length x
-let fy = 525.0;  // Focal length y
-let cx = 320.0;  // Principal point x
-let cy = 240.0;  // Principal point y
+// Set depth at pixel
+depth_image.set_depth(100, 100, 1500); // 1.5m
 
-let point_cloud = depth_image.to_point_cloud(fx, fy, cx, cy);
+// Convert to point cloud using camera intrinsics
+let point_cloud = depth_image.to_point_cloud(525.0, 525.0, 320.0, 240.0);
 
 // Get statistics
 let (min, max, mean) = depth_image.depth_statistics();
@@ -191,23 +239,33 @@ println!("Depth range: {:.0}-{:.0}mm, mean: {:.0}mm", min, max, mean);
 |-------|------|-------------|
 | `width` | `u32` | Image width in pixels |
 | `height` | `u32` | Image height in pixels |
-| `depths` | `Vec<u16>` | Depth values in millimeters |
-| `min_depth` | `u16` | Minimum reliable depth |
-| `max_depth` | `u16` | Maximum reliable depth |
-| `depth_scale` | `f32` | mm per unit |
+| `depths` | `Vec<u16>` | Depth values (0 = invalid) |
+| `min_depth` | `u16` | Minimum reliable depth (default: 200 = 20cm) |
+| `max_depth` | `u16` | Maximum reliable depth (default: 10000 = 10m) |
+| `depth_scale` | `f32` | mm per unit (default: 1.0) |
 | `frame_id` | `[u8; 32]` | Camera frame ID |
 | `timestamp_ns` | `u64` | Nanoseconds since epoch |
+
+**Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(width, height, depths)` | `DepthImage` | Create depth image |
+| `get_depth(x, y)` | `Option<u16>` | Get depth at pixel |
+| `set_depth(x, y, depth)` | `bool` | Set depth at pixel |
+| `is_valid_depth(depth)` | `bool` | Check if depth is within valid range |
+| `to_point_cloud(fx, fy, cx, cy)` | `PointCloud` | Convert to 3D point cloud |
+| `depth_statistics()` | `(f32, f32, f32)` | Get (min, max, mean) of valid depths |
 
 ## PlaneDetection
 
 Detected planar surface.
 
 ```rust
-use horus::prelude::*; // Provides perception::PlaneDetection;
-use horus::prelude::*; // Provides geometry::{Point3, Vector3};
+use horus::prelude::*;
 
 // Create plane detection (floor plane)
-let coefficients = [0.0, 0.0, 1.0, 0.0];  // ax + by + cz + d = 0 (horizontal plane at z=0)
+let coefficients = [0.0, 0.0, 1.0, 0.0];  // ax + by + cz + d = 0
 let center = Point3::new(0.0, 0.0, 0.0);
 let normal = Vector3::new(0.0, 0.0, 1.0);
 
@@ -217,10 +275,9 @@ let plane = PlaneDetection::new(coefficients, center, normal)
 // Check distance from point to plane
 let test_point = Point3::new(1.0, 2.0, 0.1);
 let distance = plane.distance_to_point(&test_point);
-println!("Distance to plane: {:.3}m", distance);
 
 // Check if point is on plane (within tolerance)
-if plane.contains_point(&test_point, 0.05) {  // 5cm tolerance
+if plane.contains_point(&test_point, 0.05) {
     println!("Point is on the plane");
 }
 
@@ -240,22 +297,216 @@ println!("Plane type: {}", plane.plane_type_str());
 | `plane_type` | `[u8; 16]` | Type label ("floor", "wall", etc.) |
 | `timestamp_ns` | `u64` | Nanoseconds since epoch |
 
-## PlaneArray
+### PlaneArray
 
 Array of detected planes (max 16).
 
-```rust
-use horus::prelude::*; // Provides perception::PlaneArray;
+| Field | Type | Description |
+|-------|------|-------------|
+| `planes` | `[PlaneDetection; 16]` | Array of plane detections |
+| `count` | `u8` | Number of valid planes |
+| `frame_id` | `[u8; 32]` | Source sensor frame |
+| `algorithm` | `[u8; 32]` | Detection algorithm used |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
 
-let planes = PlaneArray::default();
-println!("Detected {} planes", planes.count);
-```
+## Landmark (Zero-Copy)
 
-## Use in Nodes
+2D landmark/keypoint for pose estimation, facial landmarks, hand tracking. Pod type (16 bytes).
 
 ```rust
 use horus::prelude::*;
-use horus::prelude::*; // Provides perception::{PointCloud, DepthImage};
+
+// Create landmark with visibility
+let nose = Landmark::new(320.0, 240.0, 0.95, 0);  // (x, y, visibility, index)
+
+// Create visible landmark (visibility = 1.0)
+let eye = Landmark::visible(300.0, 220.0, 1);  // left_eye
+
+// Check visibility
+if nose.is_visible(0.5) {
+    println!("Nose detected at ({}, {})", nose.x, nose.y);
+}
+
+// Distance between landmarks
+let distance = nose.distance_to(&eye);
+```
+
+**Fields (16 bytes, `#[repr(C)]`):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x` | `f32` | X coordinate (pixels or normalized 0-1) |
+| `y` | `f32` | Y coordinate (pixels or normalized 0-1) |
+| `visibility` | `f32` | Visibility/confidence (0.0-1.0) |
+| `index` | `u32` | Landmark index (joint ID) |
+
+### Landmark3D
+
+3D landmark for 3D pose estimation, MediaPipe-style landmarks. Pod type (20 bytes, packed).
+
+```rust
+use horus::prelude::*;
+
+let landmark = Landmark3D::new(0.5, 0.3, 0.8, 0.95, 0);
+
+// Project to 2D (drops Z)
+let landmark_2d = landmark.to_2d();
+
+// 3D distance
+let other = Landmark3D::visible(0.6, 0.4, 0.9, 1);
+let dist = landmark.distance_to(&other);
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters or normalized) |
+| `visibility` | `f32` | Visibility/confidence (0.0-1.0) |
+| `index` | `u32` | Landmark index |
+
+### LandmarkArray
+
+Header for landmark array transmission. Pod type (40 bytes). Includes presets for common formats.
+
+```rust
+use horus::prelude::*;
+
+// Standard pose estimation formats
+let coco = LandmarkArray::coco_pose();           // 17 2D landmarks
+let mp_pose = LandmarkArray::mediapipe_pose();    // 33 3D landmarks
+let mp_hand = LandmarkArray::mediapipe_hand();    // 21 3D landmarks
+let mp_face = LandmarkArray::mediapipe_face();    // 468 3D landmarks
+
+// Custom array with metadata
+let header = LandmarkArray::new_2d(17)
+    .with_confidence(0.92)
+    .with_bbox(100.0, 50.0, 200.0, 300.0);
+
+println!("Data size: {} bytes", header.data_size());
+```
+
+**COCO Pose landmark indices** (available as constants in `landmark::coco`):
+
+| Index | Landmark | Index | Landmark |
+|-------|----------|-------|----------|
+| 0 | Nose | 9 | Left wrist |
+| 1 | Left eye | 10 | Right wrist |
+| 2 | Right eye | 11 | Left hip |
+| 3 | Left ear | 12 | Right hip |
+| 4 | Right ear | 13 | Left knee |
+| 5 | Left shoulder | 14 | Right knee |
+| 6 | Right shoulder | 15 | Left ankle |
+| 7 | Left elbow | 16 | Right ankle |
+| 8 | Right elbow | | |
+
+## TrackedObject (Zero-Copy)
+
+Multi-object tracking result with Kalman filter prediction. Pod type (96 bytes).
+
+```rust
+use horus::prelude::*;
+
+// Create tracked object
+let bbox = TrackingBBox::new(100.0, 100.0, 50.0, 50.0);
+let mut track = TrackedObject::new(1, bbox, 0, 0.95);
+track.set_class_name("person");
+
+// Track lifecycle
+assert!(track.is_tentative());  // New tracks start tentative
+
+track.confirm();                 // Promote to confirmed
+assert!(track.is_confirmed());
+
+// Update with new detection
+track.update(TrackingBBox::new(110.0, 105.0, 50.0, 50.0), 0.93);
+println!("Velocity: ({}, {})", track.velocity_x, track.velocity_y);
+println!("Speed: {:.1}", track.speed());
+println!("Heading: {:.2} rad", track.heading());
+
+// Handle missed detection
+track.mark_missed();
+println!("Predicted position: ({}, {})",
+    track.predicted_bbox.x, track.predicted_bbox.y);
+```
+
+**TrackedObject fields (96 bytes, `#[repr(C)]`):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bbox` | `TrackingBBox` | Current bounding box |
+| `predicted_bbox` | `TrackingBBox` | Predicted next position (Kalman) |
+| `track_id` | `u64` | Persistent tracking ID |
+| `confidence` | `f32` | Detection confidence (0.0-1.0) |
+| `class_id` | `u32` | Class ID |
+| `velocity_x`, `velocity_y` | `f32` | Velocity (pixels/frame or m/s) |
+| `accel_x`, `accel_y` | `f32` | Acceleration |
+| `age` | `u32` | Frames since first detection |
+| `hits` | `u32` | Frames with detection |
+| `time_since_update` | `u32` | Consecutive frames without detection |
+| `state` | `u32` | 0=tentative, 1=confirmed, 2=deleted |
+| `class_name` | `[u8; 16]` | Class name (max 15 chars) |
+
+**TrackingBBox fields (16 bytes):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y` | `f32` | Top-left corner (pixels) |
+| `width`, `height` | `f32` | Dimensions (pixels) |
+
+**TrackingHeader fields (32 bytes):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `num_tracks` | `u32` | Number of tracked objects |
+| `frame_id` | `u32` | Frame number |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `total_tracks` | `u64` | Total tracks created |
+| `active_tracks` | `u32` | Active confirmed tracks |
+
+## SegmentationMask (Zero-Copy)
+
+Header for segmentation masks. Pod type (64 bytes). The mask pixel data follows the header as a raw byte array.
+
+```rust
+use horus::prelude::*;
+
+// Semantic segmentation (class ID per pixel)
+let mask = SegmentationMask::semantic(1920, 1080, 80)
+    .with_frame_id("camera_front")
+    .with_timestamp(timestamp_ns);
+
+println!("Data size: {} bytes", mask.data_size());  // 1920*1080
+
+// Instance segmentation
+let mask = SegmentationMask::instance(640, 480);
+
+// Panoptic segmentation
+let mask = SegmentationMask::panoptic(640, 480, 80);
+
+// Check type
+if mask.is_panoptic() {
+    println!("Panoptic mask, u16 data: {} bytes", mask.data_size_u16());
+}
+```
+
+**Fields (64 bytes, `#[repr(C)]`):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `width` | `u32` | Image width |
+| `height` | `u32` | Image height |
+| `num_classes` | `u32` | Number of classes (semantic/panoptic) |
+| `mask_type` | `u32` | 0=semantic, 1=instance, 2=panoptic |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `seq` | `u64` | Sequence number |
+| `frame_id` | `[u8; 32]` | Camera/coordinate frame |
+
+**Common COCO class IDs** (available as constants in `segmentation::classes`):
+`BACKGROUND(0)`, `PERSON(1)`, `BICYCLE(2)`, `CAR(3)`, `MOTORCYCLE(4)`, `BUS(6)`, `TRAIN(7)`, `TRUCK(8)`
+
+## Perception Pipeline Example
+
+```rust
+use horus::prelude::*;
 
 struct PerceptionNode {
     depth_sub: Topic<DepthImage>,
@@ -281,6 +532,6 @@ impl Node for PerceptionNode {
 
 ## See Also
 
-- [Geometry Messages](/concepts/message-types#geometry-messages) - Point3, Vector3, Quaternion
-- [Vision Messages](/rust/api/vision-messages) - Image, Detection, Segmentation
+- [Vision Messages](/rust/api/vision-messages) - Image, CameraInfo, Detection, Detection3D
+- [Message Types](/concepts/message-types) - Standard message type overview
 - [Sensor Messages](/rust/api/sensor-messages) - Sensor data types

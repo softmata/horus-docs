@@ -102,17 +102,16 @@ horus run --release
 - Release: 500ns per tick
 - **100x difference** for the same code
 
-### Profile-Guided Optimization (PGO)
+### Link-Time Optimization (LTO)
 
-Enable PGO for additional 10-20% speedup:
+Enable LTO in your `Cargo.toml` for additional 10-20% speedup:
 
-```yaml
-# horus.yaml
-profile:
-  release:
-    opt-level: 3
-    lto: fat
-    codegen-units: 1
+```toml
+# Cargo.toml
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
 ```
 
 **Warning**: Slower compilation, but faster execution.
@@ -241,41 +240,17 @@ pub struct BadLaserScan {
 ### Choose Typed Messages Over Generic
 
 ```rust
-// FAST: Typed message (Rust)
+// FAST: Small, fixed-size struct
 let topic: Topic<Pose2D> = Topic::new("pose")?;
-topic.send(Pose2D::new(1.0, 2.0, 0.5));
-// IPC latency: ~500ns
+topic.send(Pose2D { x: 1.0, y: 2.0, theta: 0.5 });
+// IPC latency: ~87-313ns depending on SPSC/MPMC
 
-// SLOW: Generic message
-let topic: Topic<GenericMessage> = Topic::new("pose")?;
-let data = GenericMessage::from_value(&pose_dict)?;
-topic.send(data);
-// IPC latency: ~10µs (20x slower!)
+// SLOWER: Larger struct with more data
+let topic: Topic<SensorBundle> = Topic::new("sensors")?;
+// Latency scales linearly with message size
 ```
 
-```python
-# FAST: Typed topic (Python)
-from horus import Node, Pose2D
-
-node = Node(pubs={"pose": {"type": Pose2D}})
-node.send("pose", Pose2D(x=1.0, y=2.0, theta=0.5))
-# IPC: ~500ns, Logging: ~100ns
-
-# SLOW: Generic topic
-node = Node(pubs=["pose"])
-node.send("pose", {"x": 1.0, "y": 2.0, "theta": 0.5})
-# IPC: ~10µs, Logging: ~5µs (100x slower logging!)
-```
-
-**Performance impact at 1kHz:**
-- Typed: 0.5ms/sec overhead → **99.95% CPU available**
-- Generic: 10ms/sec overhead → **99.0% CPU available**
-
-**When to use each:**
-- **Typed**: Production code, high-frequency data (&gt;10 Hz), real-time control
-- **Generic**: Prototyping only, low-frequency config (&lt;1 Hz), truly dynamic schemas
-
-See **[Message Types: Typed vs Generic](/concepts/message-types#typed-messages-vs-generic-messages)** for detailed comparison.
+**Rule**: Use the smallest struct that represents your data. Avoid padding and unused fields.
 
 ### Choose Appropriate Precision
 
@@ -425,16 +400,23 @@ fn tick(&mut self) {
 
 ### Understanding Tick Rate
 
-The scheduler runs at a fixed rate of approximately 60 FPS (16ms per tick):
+The default scheduler runs at 60 Hz (16ms per tick). Use `SchedulerConfig` to change it:
 
 ```rust
+// Default: 60 Hz
 let scheduler = Scheduler::new();
-// Runs at ~60 FPS (16ms per tick)
+
+// Custom: 1kHz
+let config = SchedulerConfig::builder().rate_hz(1000.0).build();
+let scheduler = Scheduler::new().with_config(config);
+
+// Preset: 10kHz for high-performance
+let scheduler = Scheduler::high_performance();
 ```
 
-**Note**: The tick rate is currently hardcoded. If you need different timing for your application, ensure your nodes complete execution well within the 16ms window. Monitor node metrics to verify performance.
+See [Scheduler Configuration](/advanced/scheduler-configuration) for all presets and options.
 
-**Key Point**: Keep individual node tick() methods fast (ideally &lt;1ms) to maintain the target frame rate.
+**Key Point**: Keep individual node tick() methods fast (ideally &lt;1ms) to maintain the target tick rate.
 
 ### Use Priority Levels
 
@@ -510,22 +492,7 @@ horus build --release --enable ultra-low-latency
 
 ### Smart Transport Selection
 
-HORUS automatically selects the best transport based on:
-- Network location (local, LAN, WAN)
-- Available system features
-- Kernel version
-
-```rust
-// Transport is automatically selected
-let topic: Topic<SensorData> = Topic::new("sensor@192.168.1.100:9870")?;
-// Uses: io_uring > Batch UDP > Standard UDP (based on availability)
-```
-
-To check which transport was selected:
-
-```rust
-hlog!(info, "Transport: {}", topic.transport_type());
-```
+For network topics, HORUS automatically selects the best transport based on available system features and kernel version. Configure network endpoints through topic configuration rather than the `Topic::new()` API (which creates local shared memory topics). See [Network Backends](/advanced/network-backends) for details.
 
 ## Shared Memory Optimization
 
@@ -557,17 +524,19 @@ rm -rf /dev/shm/horus/
 
 **Stale topics** from crashes can waste space, but auto-cleanup prevents this in normal operation.
 
-### Choose Appropriate Capacity
+### Topic Memory Usage
+
+Topics use shared memory slots proportional to message size. Keep messages small to reduce memory footprint:
 
 ```rust
-// Small messages, high frequency
-ShmTopic::new("cmd_vel", 100)?;  // 100 slots
+// Small messages use less shared memory
+let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;       // 16B per slot
 
-// Large messages, low frequency
-ShmTopic::new("point_cloud", 10)?;  // 10 slots
+// Large messages use more shared memory
+let cloud: Topic<PointCloud> = Topic::new("cloud")?;    // 120KB per slot
 ```
 
-**Balance**: Memory usage vs message buffering.
+**Balance**: Message size directly affects shared memory consumption.
 
 ## Profiling and Measurement
 

@@ -81,12 +81,12 @@ let pose = Pose2D::origin();             // (0, 0, 0)
 
 ---
 
-### Transform
+### TransformStamped
 
-Full 3D transformation (translation + quaternion rotation).
+Timestamped 3D transformation (translation + quaternion rotation) for message passing.
 
 ```rust
-pub struct Transform {
+pub struct TransformStamped {
     pub translation: [f64; 3],  // [x, y, z] in meters
     pub rotation: [f64; 4],     // Quaternion [x, y, z, w]
     pub timestamp_ns: u64,
@@ -96,9 +96,9 @@ pub struct Transform {
 #### Constructors
 
 ```rust
-let tf = Transform::identity();
-let tf = Transform::new([1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]);
-let tf = Transform::from_pose_2d(&pose);
+let tf = TransformStamped::identity();
+let tf = TransformStamped::new([1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]);
+let tf = TransformStamped::from_pose_2d(&pose);
 ```
 
 #### Methods
@@ -107,6 +107,8 @@ let tf = Transform::from_pose_2d(&pose);
 |--------|-------------|
 | `is_valid()` | Check if quaternion is normalized |
 | `normalize_rotation()` | Normalize the quaternion |
+
+Note: For coordinate frame management (lookups, chains, interpolation), see [HFrame](/concepts/hframe) which uses its own `Transform` type.
 
 ---
 
@@ -512,70 +514,96 @@ pub struct PidConfig {
 
 ## GenericMessage
 
-Dynamic message type for cross-language communication.
+Dynamic message type for cross-language communication. Uses a fixed-size buffer (4KB max payload) with MessagePack serialization, making it safe for shared memory transport.
 
 ```rust
 pub struct GenericMessage {
-    // Fixed-size buffer for shared memory safety
-    // Max payload: 4KB
+    pub inline_data: [u8; 256],    // First 256 bytes (inline)
+    pub overflow_data: [u8; 3840], // Overflow up to 3840 more bytes
+    pub metadata: [u8; 256],       // Optional metadata
+    // ... internal length tracking fields
 }
 ```
+
+Total maximum payload: 4,096 bytes (`inline_data` + `overflow_data`).
 
 ### Constructors
 
 ```rust
-// From raw bytes
+// From raw bytes (returns Err if > 4KB)
 let msg = GenericMessage::new(data_vec)?;
 
-// From any serializable type
+// From any serializable type (uses MessagePack)
 let msg = GenericMessage::from_value(&my_struct)?;
 
-// With metadata
+// With metadata string (max 255 chars)
 let msg = GenericMessage::with_metadata(data, "my_type".to_string())?;
 ```
 
 ### Methods
 
-| Method | Description |
-|--------|-------------|
-| `data()` | Get payload as `Vec<u8>` |
-| `metadata()` | Get metadata string if present |
-| `to_value::<T>()` | Deserialize to typed value |
+| Method | Return Type | Description |
+|--------|-------------|-------------|
+| `data()` | `Vec<u8>` | Get payload bytes |
+| `metadata()` | `Option<String>` | Get metadata string if present |
+| `to_value::<T>()` | `Result<T, String>` | Deserialize from MessagePack to typed value |
 
 ### Example
 
 ```rust
 use std::collections::HashMap;
 
-// Send
+// Send any serializable data
 let mut data = HashMap::new();
 data.insert("x", 1.0);
 data.insert("y", 2.0);
 let msg = GenericMessage::from_value(&data)?;
 topic.send(msg);
 
-// Receive
+// Receive and deserialize
 if let Some(msg) = topic.recv() {
     let data: HashMap<String, f64> = msg.to_value()?;
     println!("x: {}", data["x"]);
 }
 ```
 
+Use typed messages (e.g., `Twist`, `Pose2D`) instead of `GenericMessage` whenever possible — they are faster (POD zero-copy) and type-safe.
+
 ---
 
-## Performance Notes
+## POD Types and Zero-Copy
 
-All message types are optimized for shared memory transport:
+Most HORUS message types are **POD** (Plain Old Data) — they use `#[repr(C)]` layout and implement the `PodMessage` trait, enabling zero-copy shared memory transport at ~50ns latency via the `PodShm` backend.
 
-| Message | Size | Notes |
-|---------|------|-------|
-| `Twist` | 64 bytes | Cache-line aligned |
-| `Pose2D` | 32 bytes | Minimal footprint |
-| `LaserScan` | ~1.5 KB | 360 range values |
-| `Image` | Variable | Use compression for large images |
-| `GenericMessage` | ~4.5 KB | Fixed-size for safety |
+**POD types** (94% of all messages): Fixed-size, no heap allocation, zero-copy capable.
+**Non-POD types**: Use `Vec` for variable-size data — serialized via MessagePack.
 
-For best performance, prefer typed messages over `GenericMessage` when possible.
+| Category | POD / Total | Non-POD Types |
+|----------|-------------|---------------|
+| Geometry | 6/6 | — |
+| Sensor | 6/6 | — |
+| Control | 8/8 | — |
+| Diagnostics | 8/8 | — |
+| Force/Haptics | 6/6 | — |
+| Coordination | 5/5 | — |
+| Detection | 4/4 | — |
+| Timing | 4/4 | — |
+| Navigation | 7/9 | `OccupancyGrid`, `CostMap` |
+| Vision | 3/5 | `Image`, `CompressedImage` |
+| Perception | 2/4 | `PointCloud`, `DepthImage` |
+
+POD detection is automatic — you don't need to configure anything. HORUS checks at topic creation time whether your type is POD and selects the optimal backend.
+
+### Size Reference
+
+| Message | Size | POD |
+|---------|------|-----|
+| `Twist` | 56 bytes | Yes |
+| `Pose2D` | 32 bytes | Yes |
+| `LaserScan` | ~1.5 KB | Yes |
+| `Imu` | ~200 bytes | Yes |
+| `Image` | Variable | No |
+| `GenericMessage` | ~4.5 KB | Yes |
 
 ---
 
@@ -589,7 +617,7 @@ For comprehensive documentation of specialized message types, see:
 | [Perception Messages](/rust/api/perception-messages) | PointCloud, DepthImage, BoundingBox3D, PlaneDetection |
 | [Control Messages](/rust/api/control-messages) | MotorCommand, ServoCommand, PwmCommand, PidConfig, JointCommand |
 | [Force & Tactile Messages](/rust/api/force-messages) | WrenchStamped, TactileArray, ImpedanceParameters, ForceCommand |
-| [I/O & Industrial Messages](/rust/api/io-messages) | DigitalIO, AnalogIO, SPI, I2C, CAN, Modbus, Serial |
+
 | [ML Messages](/rust/api/ml-messages) | Tensor, Predictions, Detection, Pose estimation, LLM |
 | [Navigation Messages](/rust/api/navigation-messages) | Goal, Path, OccupancyGrid, CostMap, VelocityObstacle |
 | [Coordination Messages](/rust/api/coordination-messages) | RobotState, FleetStatus, TaskAssignment, FormationControl |

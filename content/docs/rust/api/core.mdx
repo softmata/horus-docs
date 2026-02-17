@@ -339,17 +339,16 @@ Topic automatically selects the fastest backend for your use case:
 
 | Backend | Latency | Use Case |
 |---------|---------|----------|
-| DirectChannel | ~3-5ns | Same-thread only |
+| DirectChannel | ~3ns | Same-thread only |
 | SpscIntra | ~18ns | In-process, 1 producer + 1 consumer |
+| SpmcIntra | ~24ns | In-process, 1 producer + many consumers |
 | MpscIntra | ~26ns | In-process, many producers + 1 consumer |
-| SpmcIntra | ~40ns | In-process, 1 producer + many consumers |
-| MpmcIntra | ~80ns | In-process, many-to-many |
+| MpmcIntra | ~36ns | In-process, many-to-many |
 | PodShm | ~50ns | Cross-process, POD types (zero-copy) |
-| SpscShm | ~85ns | Cross-process, 1:1 |
 | MpscShm | ~65ns | Cross-process, many:1 |
 | SpmcShm | ~70ns | Cross-process, 1:many |
+| SpscShm | ~85ns | Cross-process, 1:1 |
 | MpmcShm | ~167ns | Cross-process, many:many |
-| Network | varies | UDP/Unix socket/Zenoh |
 
 ### Constructors
 
@@ -361,11 +360,6 @@ pub fn new(name: impl Into<String>) -> Result<Self>
 
 Creates a new Topic with automatic backend selection and auto-sized capacity. Capacity is auto-calculated based on message size (one 4KB page of slots, clamped to 16-1024).
 
-Parses the topic name/endpoint to select the appropriate backend:
-- `"topic"` → Local shared memory (MpmcShm)
-- `"topic@host:port"` → Network backend
-- `"topic@zenoh"` → Zenoh transport
-
 **Parameters:**
 - `name` - Topic name or endpoint string
 
@@ -374,7 +368,6 @@ Parses the topic name/endpoint to select the appropriate backend:
 **Example:**
 ```rust
 let topic: Topic<f32> = Topic::new("sensor.temperature")?;
-let net_topic: Topic<f32> = Topic::new("sensor@192.168.1.5")?;
 ```
 
 ---
@@ -382,20 +375,21 @@ let net_topic: Topic<f32> = Topic::new("sensor@192.168.1.5")?;
 #### `with_capacity`
 
 ```rust
-pub fn with_capacity(name: impl Into<String>, capacity: usize) -> Result<Self>
+pub fn with_capacity(name: &str, capacity: u32, slot_size: Option<usize>) -> Result<Self>
 ```
 
-Creates a Topic with explicit buffer capacity.
+Creates a Topic with explicit buffer capacity and optional slot size.
 
 **Parameters:**
-- `name` - Topic name or endpoint string
-- `capacity` - Ring buffer capacity (must be power of 2 for ring backends)
+- `name` - Topic name
+- `capacity` - Ring buffer capacity (rounded up to next power of 2)
+- `slot_size` - Optional slot size in bytes (`None` uses default)
 
 **Returns:** `Result<Topic<T>>`
 
 **Example:**
 ```rust
-let topic: Topic<Image> = Topic::with_capacity("camera.image", 16)?;
+let topic: Topic<Image> = Topic::with_capacity("camera.image", 16, None)?;
 ```
 
 ---
@@ -417,7 +411,7 @@ topics! {
 }
 
 let publisher = Topic::publish(CMD_VEL)?;
-publisher.send(CmdVel { linear: 1.0, angular: 0.0 });
+publisher.send(CmdVel::new(1.0, 0.0));
 ```
 
 ---
@@ -442,31 +436,168 @@ if let Some(value) = sub.recv() { /* ... */ }
 
 ---
 
-#### `from_config_named`
+#### `new_pod`
 
 ```rust
-pub fn from_config_named(topic_name: &str) -> Result<Self>
+pub fn new_pod(name: &str) -> Result<Self>
+where
+    T: PodMessage
 ```
 
-Creates a Topic from configuration file (`horus.toml` or `horus.yaml`).
+Creates a topic optimized for POD (Plain Old Data) types using zero-copy paths. Requires `T: PodMessage`.
 
-**Config search paths:**
-1. `./horus.toml` or `./horus.yaml`
-2. `~/.horus/config.toml` or `~/.horus/config.yaml`
-3. `/etc/horus/config.toml` or `/etc/horus/config.yaml`
+**Parameters:**
+- `name` - Topic name
+
+**Returns:** `Result<Topic<T>>`
+
+---
+
+#### `from_config`
 
 ```rust
-let topic: Topic<Image> = Topic::from_config_named("camera")?;
+pub fn from_config(config: TopicConfig) -> Result<Self>
+```
+
+Creates a Topic from a `TopicConfig` struct.
+
+**Example:**
+```rust
+let config = TopicConfig::new("camera")
+    .with_capacity(32);
+let topic: Topic<Image> = Topic::from_config(config)?;
 ```
 
 ---
 
 ### Methods
 
+#### `send`
+
+```rust
+pub fn send(&self, msg: T)
+```
+
+Sends a message to the topic. Non-blocking, infallible. Uses bounded retry with "keep last" semantics — if the buffer is full after retry, the message is dropped.
+
+If `.with_logging()` was called, metrics and message summaries are automatically recorded. Otherwise, zero-overhead.
+
+**Parameters:**
+- `msg` - Message to send
+
+**Example:**
+```rust
+self.publisher.send(42.0);
+```
+
+---
+
+#### `try_send`
+
+```rust
+pub fn try_send(&self, msg: T) -> Result<(), T>
+```
+
+Tries to send a message, returning it on failure for explicit retry. Unlike `send()`, does not retry — fails immediately if the buffer is full.
+
+**Parameters:**
+- `msg` - Message to send
+
+**Returns:** `Result<(), T>` - `Ok(())` on success, `Err(msg)` returns the message on failure
+
+**Example:**
+```rust
+match topic.try_send(data) {
+    Ok(()) => { /* sent */ }
+    Err(returned) => { /* buffer full, try again later */ }
+}
+```
+
+---
+
+#### `recv`
+
+```rust
+pub fn recv(&self) -> Option<T>
+```
+
+Receives the next message from the topic. Non-blocking.
+
+**Returns:** `Option<T>` - Some(message) if available, None otherwise
+
+**Example:**
+```rust
+if let Some(value) = self.subscriber.recv() {
+    // Process value
+}
+```
+
+---
+
+#### `try_recv`
+
+```rust
+pub fn try_recv(&self) -> Option<T>
+```
+
+Receives the next message without logging. Same as `recv()` but bypasses the logging path entirely — slightly faster when logging is enabled.
+
+**Returns:** `Option<T>` - Some(message) if available, None otherwise
+
+---
+
+#### `read_latest`
+
+```rust
+pub fn read_latest(&self) -> Option<T>
+where
+    T: Copy
+```
+
+Returns the most recent message without advancing the consumer position. Calling it multiple times returns the same message until a new one is published. Requires `T: Copy` for safety with multi-consumer backends.
+
+**Returns:** `Option<T>` - The latest published message, or None if no messages have been published
+
+**Example:**
+```rust
+// Read the latest transform without consuming it
+if let Some(transform) = tf_topic.read_latest() {
+    apply_transform(transform);
+}
+```
+
+---
+
+#### `has_message`
+
+```rust
+pub fn has_message(&self) -> bool
+```
+
+Checks if messages are available without consuming them.
+
+**Returns:** `bool`
+
+---
+
+#### `pending_count`
+
+```rust
+pub fn pending_count(&self) -> u64
+```
+
+Returns the number of pending (unconsumed) messages in the buffer.
+
+**Returns:** `u64`
+
+---
+
 #### `with_logging`
 
 ```rust
 pub fn with_logging(self) -> Self
+where
+    T: LogSummary
 ```
 
 Enables logging and metrics collection on this topic. When enabled, every `send()` and `recv()` call automatically records metrics and logs message summaries. Requires `T: LogSummary`.
@@ -484,57 +615,6 @@ let logged_topic: Topic<f32> = Topic::new("sensor.temperature")?.with_logging();
 
 ---
 
-#### `send`
-
-```rust
-pub fn send(&self, msg: T)
-```
-
-Sends a message to the topic. Non-blocking, infallible. Uses ring buffer "keep last" semantics — oldest message overwritten when buffer is full.
-
-If `.with_logging()` was called, metrics and message summaries are automatically recorded. Otherwise, zero-overhead.
-
-**Parameters:**
-- `msg` - Message to send
-
-**Example:**
-```rust
-self.publisher.send(42.0);
-```
-
----
-
-#### `recv`
-
-```rust
-pub fn recv(&self) -> Option<T>
-```
-
-Receives the latest message from the topic. Non-blocking.
-
-**Returns:** `Option<T>` - Some(message) if available, None otherwise
-
-**Example:**
-```rust
-if let Some(value) = self.subscriber.recv() {
-    // Process value
-}
-```
-
----
-
-#### `has_messages`
-
-```rust
-pub fn has_messages(&self) -> bool
-```
-
-Checks if messages are available without consuming them.
-
-**Returns:** `bool`
-
----
-
 #### `name`
 
 ```rust
@@ -547,13 +627,37 @@ Returns the topic name.
 
 ---
 
+#### `mode`
+
+```rust
+pub fn mode(&self) -> BackendMode
+```
+
+Returns the currently active backend mode.
+
+**Returns:** `BackendMode`
+
+---
+
+#### `role`
+
+```rust
+pub fn role(&self) -> TopicRole
+```
+
+Returns this participant's role (Producer, Consumer, Both, or Unregistered).
+
+**Returns:** `TopicRole`
+
+---
+
 #### `metrics`
 
 ```rust
 pub fn metrics(&self) -> TopicMetrics
 ```
 
-Returns current metrics snapshot (sent/received counts, failure counts).
+Returns current metrics snapshot (sent/received counts, failure counts, migration count).
 
 **Returns:** `TopicMetrics`
 
@@ -571,37 +675,33 @@ Returns current connection state. Always `Connected` for local shared memory bac
 
 ---
 
+#### `backend_name`
+
+```rust
+pub fn backend_name(&self) -> &'static str
+```
+
+Returns the active backend name (for debugging). Examples: `"DirectChannel"`, `"SpscIntra"`, `"MpmcShm"`.
+
+**Returns:** `&'static str`
+
+---
+
 #### `backend_type`
 
 ```rust
 pub fn backend_type(&self) -> &'static str
 ```
 
-Returns the active backend name (for debugging). Examples: `"DirectChannel"`, `"SpscIntra"`, `"MpmcShm"`, `"Network"`.
+Alias for `backend_name()`. Returns the active backend name.
 
----
-
-### Network Endpoints
-
-Topic supports network communication via endpoint syntax in the topic name:
-
-```rust
-// Local shared memory (default, fastest)
-Topic::new("topic")?;
-
-// Direct TCP connection
-Topic::new("topic@192.168.1.100")?;
-Topic::new("topic@192.168.1.100:9000")?;
-
-// Multicast discovery
-Topic::new("topic@*")?;
-```
+**Returns:** `&'static str`
 
 ---
 
 ## TopicConfig
 
-Builder for advanced Topic configuration. Use when you need explicit control over backend selection, access patterns, or process topology.
+Configuration for creating topics with specific settings. Used primarily by Python bindings and config-file-based topic creation.
 
 ```rust
 pub struct TopicConfig {
@@ -609,66 +709,40 @@ pub struct TopicConfig {
     pub capacity: u32,
     pub create: bool,
     pub is_producer: bool,
-    pub access_pattern: AccessPattern,
-    pub topology: ProcessTopology,
-    pub backend_hint: BackendHint,
 }
 ```
 
 ### Builder Methods
 
 ```rust
-TopicConfig::new("sensor_data")
+let config = TopicConfig::new("sensor_data")
     .with_capacity(256)
-    .as_producer()              // or .as_consumer()
-    .with_access_pattern(AccessPattern::Spsc)
-    .with_topology(ProcessTopology::CrossProcess)
-    .with_backend(BackendHint::Auto)   // or force a specific backend
-    .same_thread()              // convenience: SameThread + Spsc
-    .same_process()             // convenience: SameProcess topology
-    .cross_process()            // convenience: CrossProcess topology
-    .spsc()                     // convenience: Spsc pattern
-    .mpmc()                     // convenience: Mpmc pattern
+    .with_backend(BackendHint::Auto);  // Ignored — Topic auto-selects
 ```
 
-### AccessPattern
-
-```rust
-pub enum AccessPattern {
-    Spsc,   // Single Producer, Single Consumer
-    Spmc,   // Single Producer, Multiple Consumers
-    Mpsc,   // Multiple Producers, Single Consumer
-    Mpmc,   // Multiple Producers, Multiple Consumers (default)
-}
-```
-
-### ProcessTopology
-
-```rust
-pub enum ProcessTopology {
-    SameThread,    // Fastest path (~3-5ns)
-    SameProcess,   // Different threads (~25-80ns)
-    CrossProcess,  // Via shared memory (~50-167ns, default)
-}
-```
+| Method | Description |
+|--------|-------------|
+| `TopicConfig::new(name)` | Create config with defaults (capacity: 64, create: true, is_producer: true) |
+| `.with_capacity(n)` | Set ring buffer capacity |
+| `.with_backend(hint)` | Set backend hint (ignored — Topic auto-selects optimal backend) |
 
 ### BackendHint
+
+Backend hint enum (kept for API compatibility — Topic auto-selects the optimal backend regardless of hint).
 
 ```rust
 pub enum BackendHint {
     Auto,            // Automatic selection (default)
-    DirectChannel,   // Same-thread only (~3-5ns)
-    SpscIntra,       // Same-process SPSC (~25ns)
+    DirectChannel,   // Same-thread only (~3ns)
+    SpscIntra,       // Same-process SPSC (~18ns)
     SpscShm,         // Cross-process SPSC (~85ns)
     PodShm,          // Cross-process POD (~50ns)
     MpmcShm,         // Cross-process MPMC (~167ns)
-    MpscIntra,       // Same-process MPSC (~35ns)
-    SpmcIntra,       // Same-process SPMC (~40ns)
-    MpmcIntra,       // Same-process MPMC (~80ns)
+    MpscIntra,       // Same-process MPSC (~26ns)
+    SpmcIntra,       // Same-process SPMC (~24ns)
+    MpmcIntra,       // Same-process MPMC (~36ns)
     MpscShm,         // Cross-process MPSC (~65ns)
     SpmcShm,         // Cross-process SPMC (~70ns)
-    Network,         // UDP/Unix socket/Zenoh
-    NetworkZenoh,    // Zenoh transport
 }
 ```
 
@@ -708,7 +782,7 @@ impl<T> TopicDescriptor<T> {
 
 ## Scheduler
 
-Central orchestrator for node execution with priority-based scheduling. **Deterministic by default.**
+Central orchestrator for node execution with priority-based scheduling.
 
 ```rust
 pub struct Scheduler { /* fields omitted */ }
@@ -722,19 +796,143 @@ pub struct Scheduler { /* fields omitted */ }
 pub fn new() -> Self
 ```
 
-Creates a **deterministic** scheduler with default settings (~60 Hz tick rate). No learning phase, predictable execution from tick 0.
+Creates a lightweight scheduler with default settings (~60 Hz tick rate). Detects runtime capabilities (~30-100us) but does **not** apply any OS-level features. Use builder methods to opt in to features.
 
 **Returns:** `Scheduler`
 
 **Example:**
 ```rust
-// Default: deterministic, no learning phase
-let scheduler = Scheduler::new();
+let mut scheduler = Scheduler::new();
+scheduler.add(my_node).order(0).done();
+scheduler.run()?;
 ```
 
 ---
 
+#### `deploy`
+
+```rust
+pub fn deploy() -> Self
+```
+
+Production preset. Applies RT features (best-effort) + 16MB BlackBox flight recorder. Equivalent to `Scheduler::new().realtime().with_blackbox(16).with_name("Deploy")`.
+
+**Example:**
+```rust
+let mut scheduler = Scheduler::deploy();
+scheduler.add(motor_ctrl).order(0).rt().done();
+scheduler.run()?;
+```
+
+---
+
+#### `safety_critical`
+
+```rust
+pub fn safety_critical() -> Self
+```
+
+Safety-critical preset. 1 kHz tick rate, WCET enforcement, watchdog monitoring.
+
+---
+
+#### `high_performance`
+
+```rust
+pub fn high_performance() -> Self
+```
+
+High-performance preset. 10 kHz tick rate, parallel execution.
+
+---
+
+#### `hard_realtime`
+
+```rust
+pub fn hard_realtime() -> Self
+```
+
+Hard real-time preset. 1 kHz tick rate, parallel execution, strict deadlines.
+
+---
+
+#### `deterministic`
+
+```rust
+pub fn deterministic() -> Self
+```
+
+Deterministic execution preset. 60 Hz, sequential execution, deterministic clock for formal verification and testing.
+
+---
+
+### Preset Summary
+
+| Preset | Tick Rate | Use Case |
+|--------|-----------|----------|
+| `Scheduler::new()` | 60 Hz | Development, prototyping |
+| `Scheduler::deploy()` | 60 Hz | Production deployment |
+| `Scheduler::safety_critical()` | 1 kHz | Medical, safety systems |
+| `Scheduler::high_performance()` | 10 kHz | Racing, competition |
+| `Scheduler::hard_realtime()` | 1 kHz | CNC, aerospace |
+| `Scheduler::deterministic()` | 60 Hz | Formal verification, testing |
+
+---
+
 ### Builder Methods
+
+#### `tick_hz`
+
+```rust
+pub fn tick_hz(self, hz: f64) -> Self
+```
+
+Sets the global tick rate in Hz.
+
+**Example:**
+```rust
+let scheduler = Scheduler::new().tick_hz(1000.0); // 1 kHz
+```
+
+---
+
+#### `realtime`
+
+```rust
+pub fn realtime(self) -> Self
+```
+
+Applies all available RT features (best-effort, non-fatal). Attempts in order: RT priority (SCHED_FIFO), memory locking (mlockall), CPU affinity. Features that fail are recorded as degradations, not errors.
+
+**Example:**
+```rust
+let scheduler = Scheduler::new().realtime();
+
+// Check what was applied vs degraded
+for deg in scheduler.degradations() {
+    println!("{}: {}", deg.feature, deg.reason);
+}
+```
+
+---
+
+#### `with_blackbox`
+
+```rust
+pub fn with_blackbox(self, size_mb: usize) -> Self
+```
+
+Enables the BlackBox flight recorder for post-mortem analysis.
+
+**Parameters:**
+- `size_mb` - Ring buffer size in megabytes
+
+**Example:**
+```rust
+let scheduler = Scheduler::new().with_blackbox(16); // 16MB ring buffer
+```
+
+---
 
 #### `with_name`
 
@@ -742,7 +940,7 @@ let scheduler = Scheduler::new();
 pub fn with_name(self, name: &str) -> Self
 ```
 
-Sets the scheduler name.
+Sets the scheduler name for logging/monitoring.
 
 ---
 
@@ -762,23 +960,7 @@ Pre-allocates capacity for nodes (prevents runtime allocations).
 pub fn with_config(self, config: SchedulerConfig) -> Self
 ```
 
-Applies a configuration preset.
-
-**Available Presets:**
-- `SchedulerConfig::standard()` - General development
-- `SchedulerConfig::hard_realtime()` - &lt;20μs jitter
-- `SchedulerConfig::safety_critical()` - Safety monitoring and WCET enforcement
-- `SchedulerConfig::high_performance()` - Maximum throughput
-
----
-
-#### `enable_determinism`
-
-```rust
-pub fn enable_determinism(self) -> Self
-```
-
-Explicitly enables deterministic execution mode. Same as default, but more explicit for code clarity.
+Applies a `SchedulerConfig` preset.
 
 ---
 
@@ -805,28 +987,34 @@ Adds a node using the fluent builder API. Returns a `NodeBuilder` for configurin
 **Returns:** `NodeBuilder` for chaining configuration
 
 **NodeBuilder Methods:**
-- `.order(priority)` - Set execution priority (0 = highest)
-- `.tier(NodeTier::*)` - Set explicit execution tier
-- `.rate_hz(freq)` - Set custom tick rate
-- `.rt()` - Mark as real-time node
-- `.done()` - Finalize and add the node
+
+| Method | Description |
+|--------|-------------|
+| `.order(n)` | Set execution order (lower = runs first) |
+| `.priority(n)` | Alias for `.order()` |
+| `.rate_hz(hz)` | Set node-specific tick rate in Hz |
+| `.rt()` | Mark as real-time node |
+| `.wcet_us(n)` | Set WCET budget in microseconds (implies `.rt()`) |
+| `.wcet_ms(n)` | Set WCET budget in milliseconds (implies `.rt()`) |
+| `.deadline_us(n)` | Set deadline in microseconds (implies `.rt()`) |
+| `.deadline_ms(n)` | Set deadline in milliseconds (implies `.rt()`) |
+| `.tier(tier)` | Set explicit execution tier |
+| `.failure_policy(policy)` | Override failure handling policy |
+| `.done()` | Finalize and register the node |
 
 **NodeTier Options:**
-- `NodeTier::UltraFast` - Ultra-fast (&lt;1μs), inline execution
-- `NodeTier::Fast` - Fast (&lt;10μs), inline execution
-- `NodeTier::Normal` - Standard (&lt;100μs)
-- `NodeTier::AsyncIO` - Non-blocking I/O
-- `NodeTier::Background` - Low-priority (&gt;100μs)
-- `NodeTier::Isolated` - Process isolation
+- `NodeTier::UltraFast` - Ultra-fast (&lt;1us), inline execution
+- `NodeTier::Fast` - Fast (&lt;10us), inline execution (default)
+- `NodeTier::Normal` - Standard scheduling (&lt;100us+)
 
 **Example:**
 ```rust
 use horus::prelude::*;
 
-scheduler.add(pid_controller).order(0).tier(NodeTier::UltraFast).done();
-scheduler.add(sensor_reader).order(1).tier(NodeTier::Fast).done();
-scheduler.add(cloud_sync).order(5).tier(NodeTier::AsyncIO).done();
-scheduler.add(data_logger).order(10).tier(NodeTier::Background).done();
+scheduler.add(safety_monitor).order(0).rt().wcet_us(100).done();
+scheduler.add(motor_ctrl).order(5).rt().wcet_us(500).done();
+scheduler.add(sensor).order(50).rate_hz(1000.0).done();
+scheduler.add(logger).order(200).done();
 ```
 
 ---
@@ -845,16 +1033,6 @@ scheduler
     .set_node_rate("fast_sensor", 1000.0)  // 1 kHz
     .set_node_rate("slow_logger", 1.0);    // 1 Hz
 ```
-
----
-
-#### `set_node_logging`
-
-```rust
-pub fn set_node_logging(&mut self, name: &str, enabled: bool) -> &mut Self
-```
-
-Enables or disables logging for a specific node.
 
 ---
 
@@ -927,6 +1105,28 @@ Returns whether the scheduler is currently running.
 
 ---
 
+#### `current_tick`
+
+```rust
+pub fn current_tick(&self) -> u64
+```
+
+Returns the current tick number.
+
+---
+
+### Monitoring
+
+| Method | Description |
+|--------|-------------|
+| `get_metrics()` | Get `Vec<SchedulerNodeMetrics>` for all nodes |
+| `get_node_list()` | Get list of registered node names |
+| `get_node_info(name)` | Get info map for a specific node |
+| `get_monitoring_summary()` | Get (name, priority) pairs |
+| `safety_stats()` | Get WCET overruns, deadline misses, watchdog expirations |
+
+---
+
 ### OS Integration (Linux)
 
 #### `pin_to_cpu`
@@ -935,7 +1135,7 @@ Returns whether the scheduler is currently running.
 pub fn pin_to_cpu(&self, cpu_id: usize) -> Result<()>
 ```
 
-Pins scheduler thread to a specific CPU core.
+Pins scheduler thread to a specific CPU core. Linux only.
 
 ---
 
@@ -945,7 +1145,7 @@ Pins scheduler thread to a specific CPU core.
 pub fn lock_memory(&self) -> Result<()>
 ```
 
-Locks all memory pages to prevent page faults.
+Locks all memory pages to prevent page faults. Linux only. Requires `CAP_IPC_LOCK` capability or root.
 
 ---
 
@@ -956,13 +1156,13 @@ use horus::prelude::*;
 use std::time::Duration;
 
 fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
+    let mut scheduler = Scheduler::deploy();
 
     // Add nodes with priorities using fluent API
-    scheduler.add(EmergencyStop::new()?).order(0).done();
-    scheduler.add(MotorController::new()?).order(1).rate_hz(1000.0).done();
-    scheduler.add(SensorTopic::new()?).order(2).done();
-    scheduler.add(DataLogger::new()?).order(100).rate_hz(10.0).done();
+    scheduler.add(EmergencyStop::new()?).order(0).rt().done();
+    scheduler.add(MotorController::new()?).order(5).rt().wcet_us(500).done();
+    scheduler.add(SensorReader::new()?).order(50).rate_hz(1000.0).done();
+    scheduler.add(DataLogger::new()?).order(200).rate_hz(10.0).done();
 
     // Run for 60 seconds
     scheduler.run_for(Duration::from_secs(60))?;
@@ -984,7 +1184,6 @@ hlog!(level, "message", args...);
 ### Log Levels
 
 ```rust
-hlog!(trace, "Detailed trace info");
 hlog!(debug, "Debug information: {}", value);
 hlog!(info, "Node initialized");
 hlog!(warn, "Potential issue: {}", issue);
@@ -1137,6 +1336,35 @@ pub enum ConnectionState {
 }
 ```
 
+### BackendMode
+
+```rust
+pub enum BackendMode {
+    Unknown,
+    DirectChannel,
+    SpscIntra,
+    SpmcIntra,
+    MpscIntra,
+    MpmcIntra,
+    PodShm,
+    MpscShm,
+    SpmcShm,
+    SpscShm,
+    MpmcShm,
+}
+```
+
+### TopicRole
+
+```rust
+pub enum TopicRole {
+    Unregistered,
+    Producer,
+    Consumer,
+    Both,
+}
+```
+
 ---
 
 ## Structs
@@ -1226,21 +1454,23 @@ pub trait Subscriber<T>: Send + Sync + Clone + Debug {
 }
 ```
 
+> **Note:** These traits define the backend-agnostic IPC contract. Most users interact with `Topic<T>` directly, which has slightly different signatures (e.g., `Topic::send()` is infallible, `Topic::try_send()` returns `Result<(), T>`).
+
 ---
 
 ## Performance
 
 | Backend | send() Latency | Notes |
 |---------|---------------|-------|
-| DirectChannel | ~3-5ns | Same-thread only |
+| DirectChannel | ~3ns | Same-thread only |
 | SpscIntra | ~18ns | In-process SPSC |
+| SpmcIntra | ~24ns | In-process SPMC |
 | MpscIntra | ~26ns | In-process MPSC |
-| SpmcIntra | ~40ns | In-process SPMC |
-| MpmcIntra | ~80ns | In-process MPMC |
+| MpmcIntra | ~36ns | In-process MPMC |
 | PodShm | ~50ns | Cross-process, POD types |
 | MpscShm | ~65ns | Cross-process MPSC |
 | SpmcShm | ~70ns | Cross-process SPMC |
 | SpscShm | ~85ns | Cross-process SPSC |
 | MpmcShm | ~167ns | Cross-process MPMC |
 
-Topic automatically selects the fastest backend based on message type and detected access pattern. Use `topic.backend_type()` to see which backend was selected.
+Topic automatically selects the fastest backend based on message type and detected access pattern. Use `topic.backend_name()` to see which backend was selected.

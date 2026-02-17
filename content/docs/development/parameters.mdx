@@ -6,8 +6,6 @@ order: 18
 
 # Parameters Guide
 
-> ** Under Development**: The parameters system is currently under active development. The core parameter API (`ctx.params.get_*()` and `ctx.params.set()`) works as documented, but the monitor UI for parameter management and some advanced features are still being finalized. Check back for updates.
-
 Runtime parameters in HORUS provide **dynamic configuration** without recompiling code. Adjust speeds, gains, thresholds, and behaviors on-the-fly for rapid prototyping and tuning.
 
 ## Why Parameters?
@@ -22,16 +20,18 @@ let pid_kp = 1.0;
 **With parameters:**
 ```rust
 // Dynamic - change at runtime via monitor or CLI
-let max_speed = ctx.params.get_f64("motion.max_speed", 1.5);
-let pid_kp = ctx.params.get_f64("control.pid.kp", 1.0);
+let max_speed = self.params.get_f64("max_speed", 1.5);
+let pid_kp = self.params.get_f64("pid_kp", 1.0);
 ```
 
 **Benefits:**
 - **No recompilation** - Change values without rebuilding
 - **Live tuning** - Adjust while robot is running
-- **Persistence** - Saved to disk automatically
+- **Persistence** - Save/load from YAML files
 - **Sharing** - Export/import parameter sets
 - **Safety** - Fallback to defaults if missing
+- **Validation** - Range, regex, enum, and read-only constraints
+- **Versioning** - Optimistic locking for concurrent edits
 
 ## Core Concepts
 
@@ -43,25 +43,24 @@ Parameters are stored in a **thread-safe map**:
 Arc<RwLock<BTreeMap<String, Value>>>
 ```
 
-**Location:** `~/.horus/config/params.yaml`
+**Location:** `.horus/config/params.yaml` (relative to your project directory)
 
 **Format:**
 ```yaml
-motion:
-  max_speed: 1.5
-  acceleration: 0.5
-  deceleration: 0.8
-control:
-  pid:
-    kp: 1.0
-    ki: 0.1
-    kd: 0.01
-safety:
-  emergency_stop: false
-  collision_threshold: 0.3
-sensors:
-  lidar_rate_hz: 10
-  camera_resolution: [1920, 1080]
+# Flat key-value pairs (keys are plain strings)
+tick_rate: 30
+max_memory_mb: 512
+max_speed: 1.0
+max_angular_speed: 1.0
+acceleration_limit: 0.5
+lidar_rate: 10
+camera_fps: 30
+sensor_timeout_ms: 1000
+emergency_stop_distance: 0.3
+collision_threshold: 0.5
+pid_kp: 1.0
+pid_ki: 0.1
+pid_kd: 0.05
 ```
 
 ### Parameter Types
@@ -74,121 +73,143 @@ HORUS supports all JSON-compatible types:
 - **Arrays** - `Vec\<T\>` (stored as `Value::Array`)
 - **Objects** - `HashMap\<String, T\>` (stored as `Value::Object`)
 
-### Hierarchical Keys
+### Key Organization
 
-Use **dot notation** for organization:
+Keys are stored as **flat strings** in a `BTreeMap` (sorted alphabetically). Use descriptive names with underscores:
 
 ```rust
-// Good: Hierarchical structure
-ctx.params.get_f64("motion.max_speed", 1.5);
-ctx.params.get_f64("control.pid.kp", 1.0);
-ctx.params.get_i32("sensors.lidar_rate_hz", 10);
-
-// Avoid: Flat structure
-ctx.params.get_f64("max_speed", 1.5);
-ctx.params.get_f64("kp", 1.0);
+// Descriptive flat keys
+self.params.get_f64("max_speed", 1.5);
+self.params.get_f64("pid_kp", 1.0);
+self.params.get_i32("lidar_rate", 10);
 ```
 
-**Benefits:**
-- Clear organization
-- Avoid name collisions
-- Easy to export/import subsets
-- Natural grouping in monitor
+You can use dot notation as a naming convention for grouping, but note that dots are treated as literal characters — there is no automatic hierarchy:
+
+```rust
+// Dot notation is a naming convention, not a hierarchy
+self.params.get_f64("motion.max_speed", 1.5);
+self.params.get_f64("control.pid.kp", 1.0);
+```
 
 ## Using Parameters in Nodes
 
 ### Accessing Parameters
 
-Parameters are available via the `NodeInfo` context:
+Store a `RuntimeParams` instance as a field on your node struct:
 
 ```rust
-node! {
-    VelocityController {
-        data {
-            max_speed: f64 = 1.5,
-            acceleration: f64 = 0.5
-        }
+use horus::prelude::*;
 
-        init(ctx) {
-            // Load parameters on initialization
-            self.max_speed = ctx.params.get_f64("motion.max_speed", 1.5);
-            self.acceleration = ctx.params.get_f64("motion.acceleration", 0.5);
+pub struct VelocityController {
+    params: RuntimeParams,
+    max_speed: f64,
+    acceleration: f64,
+}
 
-            hlog!(info, "Max speed: {} m/s", self.max_speed);
-            hlog!(info, "Acceleration: {} m/s²", self.acceleration);
-        }
+impl VelocityController {
+    fn new() -> horus_core::Result<Self> {
+        let params = RuntimeParams::init()?;
+        let max_speed = params.get_f64("max_speed", 1.5);
+        let acceleration = params.get_f64("acceleration_limit", 0.5);
+        Ok(Self { params, max_speed, acceleration })
+    }
+}
 
-        tick() {
-            // Use parameters
-            let target_velocity = self.max_speed;
-            // ...
-        }
+impl Node for VelocityController {
+    fn name(&self) -> &'static str { "velocity_controller" }
+
+    fn init(&mut self) -> horus_core::Result<()> {
+        self.max_speed = self.params.get_f64("max_speed", 1.5);
+        self.acceleration = self.params.get_f64("acceleration_limit", 0.5);
+        hlog!(info, "Max speed: {} m/s", self.max_speed);
+        hlog!(info, "Acceleration: {} m/s²", self.acceleration);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let target_velocity = self.max_speed;
+        // Use parameters...
     }
 }
 ```
 
 ### Parameter Methods
 
-**Get with default:**
+**Type-specific getters (with default):**
 ```rust
-// If parameter doesn't exist, returns default value
-let speed = ctx.params.get_f64("motion.max_speed", 1.5);
-let enabled = ctx.params.get_bool("features.auto_mode", false);
-let rate = ctx.params.get_i32("sensors.update_rate_hz", 60);
+let speed = self.params.get_f64("max_speed", 1.5);          // f64
+let enabled = self.params.get_bool("auto_mode", false);      // bool
+let rate = self.params.get_i32("update_rate_hz", 60);        // i32
+let name = self.params.get_string("node_name", "default");   // String
 ```
 
-**Get optional:**
+**Generic get (returns `Option<T>`):**
 ```rust
-// Returns Option<T> - None if parameter doesn't exist
-if let Some(speed) = ctx.params.get::<f64>("motion.max_speed") {
+// Returns None if parameter doesn't exist or type doesn't match
+if let Some(speed) = self.params.get::<f64>("max_speed") {
     self.max_speed = speed;
 }
 ```
 
-**Set parameter:**
+**Generic get with default:**
 ```rust
-// Update parameter value
-ctx.params.set("motion.max_speed", 2.0).ok();
-
-// Set complex types
-ctx.params.set("sensors.camera_resolution", vec![1920, 1080]).ok();
+// Returns default if parameter doesn't exist
+let rate: i32 = self.params.get_or("update_rate_hz", 60);
 ```
 
-**Type-specific getters:**
+**Set parameter:**
 ```rust
-// Convenience methods with type inference
-let max_speed: f64 = ctx.params.get_f64("motion.max_speed", 1.5);
-let node_name: String = ctx.params.get_string("node.name", "default");
-let enabled: bool = ctx.params.get_bool("features.enabled", true);
-let count: i32 = ctx.params.get_i32("samples.count", 100);
-let id: i32 = ctx.params.get_i32("node.id", 0);
+// Update parameter value (validates against metadata if set)
+self.params.set("max_speed", 2.0)?;
+
+// Set complex types
+self.params.set("camera_resolution", vec![1920, 1080])?;
+```
+
+**Query methods:**
+```rust
+self.params.has("max_speed");           // bool — check if key exists
+self.params.list_keys();                // Vec<String> — all parameter keys
+self.params.get_all();                  // BTreeMap<String, Value> — all params
+self.params.remove("old_key");          // Option<Value> — remove and return
+self.params.reset()?;                   // Reset all params to defaults
+```
+
+**Persistence:**
+```rust
+// Save current params to .horus/config/params.yaml
+self.params.save_to_disk()?;
+
+// Load params from a specific YAML file
+self.params.load_from_disk(Path::new("my_params.yaml"))?;
 ```
 
 ### Live Reloading
 
 **Check for updates every tick:**
 ```rust
-node! {
-    AdaptiveController {
-        data {
-            max_speed: f64 = 1.5,
-            last_speed_check: u64 = 0
-        }
+pub struct AdaptiveController {
+    params: RuntimeParams,
+    max_speed: f64,
+    tick_count: u64,
+}
 
-        tick() {
-            // Check every 60 ticks (~1 second at 60 Hz)
-            if self.last_speed_check % 60 == 0 {
-                // Reload parameter
-                let new_speed = ctx.params.get_f64("motion.max_speed", 1.5);
+impl Node for AdaptiveController {
+    fn name(&self) -> &'static str { "adaptive_controller" }
 
-                if new_speed != self.max_speed {
-                    hlog!(info, "Speed updated: {}  {}", self.max_speed, new_speed);
-                    self.max_speed = new_speed;
-                }
+    fn tick(&mut self) {
+        // Check every 60 ticks (~1 second at 60 Hz)
+        if self.tick_count % 60 == 0 {
+            let new_speed = self.params.get_f64("max_speed", 1.5);
+
+            if new_speed != self.max_speed {
+                hlog!(info, "Speed updated: {} → {}", self.max_speed, new_speed);
+                self.max_speed = new_speed;
             }
-
-            self.last_speed_check += 1;
         }
+
+        self.tick_count += 1;
     }
 }
 ```
@@ -200,10 +221,10 @@ node! {
 **Arrays:**
 ```rust
 // Set array
-ctx.params.set("waypoints", vec![1.0, 2.5, 3.0, 4.5]).ok();
+self.params.set("waypoints", vec![1.0, 2.5, 3.0, 4.5])?;
 
 // Get array
-let waypoints: Vec<f64> = ctx.params
+let waypoints: Vec<f64> = self.params
     .get::<Vec<serde_json::Value>>("waypoints")
     .map(|v| v.iter().filter_map(|x| x.as_f64()).collect())
     .unwrap_or_default();
@@ -219,50 +240,51 @@ let config = json!({
     "port": 8080,
     "timeout_ms": 5000
 });
-ctx.params.set("network.config", config).ok();
+self.params.set("network_config", config)?;
 
-// Get nested values
-let ip = ctx.params.get_string("network.config.ip", "localhost");
-let port = ctx.params.get_i32("network.config.port", 8080);
+// Get the object back
+if let Some(config) = self.params.get::<serde_json::Map<String, serde_json::Value>>("network_config") {
+    let ip = config.get("ip").and_then(|v| v.as_str()).unwrap_or("localhost");
+    let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(8080);
+}
 ```
 
 ## Default Parameters
 
-HORUS provides sensible defaults on first run:
+When `RuntimeParams::init()` is called and no `.horus/config/params.yaml` file exists, HORUS provides these defaults:
 
 ```yaml
-# ~/.horus/config/params.yaml (auto-generated)
-motion:
-  max_linear_velocity: 1.0
-  max_angular_velocity: 1.0
-  acceleration_limit: 0.5
+# .horus/config/params.yaml (auto-generated defaults)
 
-sensors:
-  lidar_rate_hz: 10
-  camera_rate_hz: 30
-  imu_rate_hz: 100
+# System
+tick_rate: 30
+max_memory_mb: 512
 
-safety:
-  emergency_stop_enabled: true
-  collision_threshold: 0.5
-  max_tilt_angle_deg: 30.0
+# Motion
+max_speed: 1.0
+max_angular_speed: 1.0
+acceleration_limit: 0.5
 
-control:
-  pid_linear:
-    kp: 1.0
-    ki: 0.1
-    kd: 0.01
-  pid_angular:
-    kp: 1.0
-    ki: 0.1
-    kd: 0.01
+# Sensors
+lidar_rate: 10
+camera_fps: 30
+sensor_timeout_ms: 1000
+
+# Safety
+emergency_stop_distance: 0.3
+collision_threshold: 0.5
+
+# PID
+pid_kp: 1.0
+pid_ki: 0.1
+pid_kd: 0.05
 ```
 
 **Customization:**
-1. File is created on first launch
-2. Edit directly or use monitor
-3. Changes persist across restarts
-4. Delete file to reset to defaults
+1. Defaults are loaded if no params file exists in the project
+2. Edit the YAML file directly, use the monitor, or use `horus param set`
+3. Call `params.reset()` to restore defaults
+4. Call `params.save_to_disk()` to persist changes
 
 ## Managing Parameters
 
@@ -291,17 +313,48 @@ See [Monitor Guide](/development/monitor#tune-parameters-live) for API details.
 
 ### Via Code
 
-**Manual save:**
+**Save to disk:**
 ```rust
-// RuntimeParams saves automatically on set()
-// But you can force a save
-ctx.params.save_to_disk().ok();
+// Parameters are NOT auto-saved on set() — you must save explicitly
+self.params.save_to_disk()?;
 ```
 
-**Manual load:**
+**Load from disk:**
 ```rust
-// Reload from disk (useful after external edit)
-ctx.params.load_from_disk().ok();
+use std::path::Path;
+
+// Load from a specific file
+self.params.load_from_disk(Path::new(".horus/config/params.yaml"))?;
+```
+
+### Via CLI
+
+Use `horus param` to manage parameters from the command line:
+
+```bash
+# List all parameters
+horus param list
+horus param list --verbose    # Include metadata
+horus param list --json       # JSON output
+
+# Get/set values
+horus param get max_speed
+horus param set max_speed 2.0
+horus param set enabled true
+
+# Delete a parameter
+horus param delete old_key
+
+# Reset all parameters to defaults
+horus param reset
+horus param reset --force     # Skip confirmation
+
+# Save/load from files
+horus param save -o my_preset.yaml
+horus param load my_preset.yaml
+
+# Dump all parameters as YAML to stdout
+horus param dump
 ```
 
 ### Via File Edit
@@ -309,31 +362,24 @@ ctx.params.load_from_disk().ok();
 **Direct YAML editing:**
 
 ```bash
-# Edit parameters file
-vim ~/.horus/config/params.yaml
+# Edit parameters file (project-relative)
+vim .horus/config/params.yaml
 
-# Changes take effect:
-# - Immediately if node reloads
-# - On next restart if not
+# Changes take effect on next RuntimeParams::init() or load_from_disk()
 ```
 
 **Format:**
 ```yaml
 # Use spaces (2 or 4), not tabs
-motion:
-  max_speed: 2.0        # number
-  mode: "auto"          # string (quotes optional for simple strings)
-  enabled: true         # boolean
-
-sensors:
-  rates: [10, 30, 100]  # array
+max_speed: 2.0            # number
+mode: "auto"              # string (quotes optional for simple strings)
+enabled: true             # boolean
+rates: [10, 30, 100]      # array
 
 # Comments are preserved
-control:
-  pid:
-    kp: 1.0   # Proportional gain
-    ki: 0.1   # Integral gain
-    kd: 0.01  # Derivative gain
+pid_kp: 1.0    # Proportional gain
+pid_ki: 0.1    # Integral gain
+pid_kd: 0.05   # Derivative gain
 ```
 
 ## Common Patterns
@@ -341,128 +387,132 @@ control:
 ### PID Controller Tuning
 
 ```rust
-node! {
-    PIDController {
-        data {
-            kp: f64 = 1.0,
-            ki: f64 = 0.1,
-            kd: f64 = 0.01,
-            integral: f64 = 0.0,
-            last_error: f64 = 0.0
-        }
+use horus::prelude::*;
 
-        init(ctx) {
-            // Load PID gains
-            self.kp = ctx.params.get_f64("control.pid.kp", 1.0);
-            self.ki = ctx.params.get_f64("control.pid.ki", 0.1);
-            self.kd = ctx.params.get_f64("control.pid.kd", 0.01);
+pub struct PIDController {
+    params: RuntimeParams,
+    kp: f64,
+    ki: f64,
+    kd: f64,
+    integral: f64,
+    last_error: f64,
+}
 
-            hlog!(info, "PID: Kp={}, Ki={}, Kd={}", self.kp, self.ki, self.kd);
-        }
+impl Node for PIDController {
+    fn name(&self) -> &'static str { "pid_controller" }
 
-        tick() {
-            // Compute PID output
-            let error = self.compute_error();
-            self.integral += error;
-            let derivative = error - self.last_error;
+    fn init(&mut self) -> horus_core::Result<()> {
+        self.kp = self.params.get_f64("pid_kp", 1.0);
+        self.ki = self.params.get_f64("pid_ki", 0.1);
+        self.kd = self.params.get_f64("pid_kd", 0.05);
+        hlog!(info, "PID: Kp={}, Ki={}, Kd={}", self.kp, self.ki, self.kd);
+        Ok(())
+    }
 
-            let output = self.kp * error + self.ki * self.integral + self.kd * derivative;
+    fn tick(&mut self) {
+        let error = self.compute_error();
+        self.integral += error;
+        let derivative = error - self.last_error;
 
-            self.last_error = error;
+        let output = self.kp * error + self.ki * self.integral + self.kd * derivative;
+        self.last_error = error;
 
-            // Use output...
-        }
+        // Use output...
+    }
+}
 
-        impl {
-            fn compute_error(&self) -> f64 {
-                // Your error calculation
-                0.0
-            }
-        }
+impl PIDController {
+    fn compute_error(&self) -> f64 {
+        // Your error calculation
+        0.0
     }
 }
 ```
 
 **Tuning workflow:**
 1. Start robot with default gains
-2. Open monitor  Parameters
-3. Adjust `control.pid.kp/ki/kd` while robot runs
+2. Open monitor → Parameters
+3. Adjust `pid_kp`/`pid_ki`/`pid_kd` while robot runs
 4. Observe behavior in monitor metrics
 5. Repeat until satisfactory
-6. Parameters auto-save - done!
+6. Save with `horus param save` or `params.save_to_disk()`
 
 ### Feature Flags
 
 ```rust
-node! {
-    AdvancedController {
-        data {
-            enable_obstacle_avoidance: bool = false,
-            enable_path_planning: bool = false,
-            enable_localization: bool = true
+pub struct AdvancedController {
+    params: RuntimeParams,
+    enable_obstacle_avoidance: bool,
+    enable_path_planning: bool,
+    enable_localization: bool,
+}
+
+impl Node for AdvancedController {
+    fn name(&self) -> &'static str { "advanced_controller" }
+
+    fn init(&mut self) -> horus_core::Result<()> {
+        self.enable_obstacle_avoidance = self.params.get_bool("obstacle_avoidance", false);
+        self.enable_path_planning = self.params.get_bool("path_planning", false);
+        self.enable_localization = self.params.get_bool("localization", true);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        if self.enable_localization {
+            self.update_localization();
         }
-
-        init(ctx) {
-            self.enable_obstacle_avoidance = ctx.params.get_bool("features.obstacle_avoidance", false);
-            self.enable_path_planning = ctx.params.get_bool("features.path_planning", false);
-            self.enable_localization = ctx.params.get_bool("features.localization", true);
+        if self.enable_obstacle_avoidance {
+            self.avoid_obstacles();
         }
-
-        tick() {
-            if self.enable_localization {
-                self.update_localization();
-            }
-
-            if self.enable_obstacle_avoidance {
-                self.avoid_obstacles();
-            }
-
-            if self.enable_path_planning {
-                self.plan_path();
-            }
-        }
-
-        impl {
-            fn update_localization(&mut self) { /* ... */ }
-            fn avoid_obstacles(&mut self) { /* ... */ }
-            fn plan_path(&mut self) { /* ... */ }
+        if self.enable_path_planning {
+            self.plan_path();
         }
     }
+}
+
+impl AdvancedController {
+    fn update_localization(&mut self) { /* ... */ }
+    fn avoid_obstacles(&mut self) { /* ... */ }
+    fn plan_path(&mut self) { /* ... */ }
 }
 ```
 
 ### Environment-Specific Config
 
 ```rust
-node! {
-    NetworkNode {
-        data {
-            server_url: String = String::from("localhost:8080"),
-            timeout_ms: u64 = 5000,
-            retry_count: i32 = 3
-        }
+pub struct NetworkNode {
+    params: RuntimeParams,
+    server_url: String,
+    timeout_ms: u64,
+}
 
-        init(ctx) {
-            // Load environment-specific parameters
-            let env = ctx.params.get_string("environment", "development");
+impl Node for NetworkNode {
+    fn name(&self) -> &'static str { "network_node" }
 
-            match env.as_str() {
-                "production" => {
-                    self.server_url = ctx.params.get_string("network.prod_url", "prod.example.com:8080");
-                    self.timeout_ms = ctx.params.get_i32("network.prod_timeout_ms", 3000) as u64;
-                },
-                "staging" => {
-                    self.server_url = ctx.params.get_string("network.staging_url", "staging.example.com:8080");
-                    self.timeout_ms = ctx.params.get_i32("network.staging_timeout_ms", 5000) as u64;
-                },
-                _ => {
-                    self.server_url = ctx.params.get_string("network.dev_url", "localhost:8080");
-                    self.timeout_ms = ctx.params.get_i32("network.dev_timeout_ms", 10000) as u64;
-                }
+    fn init(&mut self) -> horus_core::Result<()> {
+        let env = self.params.get_string("environment", "development");
+
+        match env.as_str() {
+            "production" => {
+                self.server_url = self.params.get_string("prod_url", "prod.example.com:8080");
+                self.timeout_ms = self.params.get_i32("prod_timeout_ms", 3000) as u64;
+            },
+            "staging" => {
+                self.server_url = self.params.get_string("staging_url", "staging.example.com:8080");
+                self.timeout_ms = self.params.get_i32("staging_timeout_ms", 5000) as u64;
+            },
+            _ => {
+                self.server_url = self.params.get_string("dev_url", "localhost:8080");
+                self.timeout_ms = self.params.get_i32("dev_timeout_ms", 10000) as u64;
             }
-
-            hlog!(info, "Connecting to {} (timeout: {}ms)", self.server_url, self.timeout_ms);
         }
+
+        hlog!(info, "Connecting to {} (timeout: {}ms)", self.server_url, self.timeout_ms);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        // Network logic...
     }
 }
 ```
@@ -470,33 +520,34 @@ node! {
 ### Rate Limiting
 
 ```rust
-node! {
-    SensorPublisher {
-        data {
-            publish_rate_hz: u64 = 10,
-            last_publish: std::time::Instant = std::time::Instant::now()
-        }
+pub struct SensorPublisher {
+    params: RuntimeParams,
+    publish_rate_hz: u64,
+    last_publish: std::time::Instant,
+}
 
-        init(ctx) {
-            self.publish_rate_hz = ctx.params.get_i32("sensors.publish_rate_hz", 10) as u64;
-            hlog!(info, "Publishing at {} Hz", self.publish_rate_hz);
-        }
+impl Node for SensorPublisher {
+    fn name(&self) -> &'static str { "sensor_publisher" }
 
-        tick() {
-            let interval = std::time::Duration::from_millis(1000 / self.publish_rate_hz);
+    fn init(&mut self) -> horus_core::Result<()> {
+        self.publish_rate_hz = self.params.get_i32("publish_rate_hz", 10) as u64;
+        hlog!(info, "Publishing at {} Hz", self.publish_rate_hz);
+        Ok(())
+    }
 
-            if self.last_publish.elapsed() >= interval {
-                // Publish sensor data
-                self.publish_data(ctx);
-                self.last_publish = std::time::Instant::now();
-            }
-        }
+    fn tick(&mut self) {
+        let interval = std::time::Duration::from_millis(1000 / self.publish_rate_hz);
 
-        impl {
-            fn publish_data(&mut self, ctx: Option<&mut NodeInfo>) {
-                // Publishing logic
-            }
+        if self.last_publish.elapsed() >= interval {
+            self.publish_data();
+            self.last_publish = std::time::Instant::now();
         }
+    }
+}
+
+impl SensorPublisher {
+    fn publish_data(&mut self) {
+        // Publishing logic
     }
 }
 ```
@@ -505,48 +556,26 @@ node! {
 
 ### Naming Conventions
 
-**Use hierarchical structure:**
-```yaml
-# Good
-motion:
-  max_linear_velocity: 1.5
-  max_angular_velocity: 2.0
-control:
-  pid:
-    kp: 1.0
-    ki: 0.1
-
-# Bad
-max_linear_velocity: 1.5
-max_angular_velocity: 2.0
-pid_kp: 1.0
-pid_ki: 0.1
-```
-
 **Use descriptive names:**
 ```yaml
 # Good
-sensors:
-  lidar_scan_rate_hz: 10
-  camera_resolution_width: 1920
+lidar_scan_rate_hz: 10
+camera_resolution_width: 1920
 
 # Bad
-sensors:
-  rate: 10
-  w: 1920
+rate: 10
+w: 1920
 ```
 
-**Use consistent casing:**
+**Use consistent snake_case:**
 ```yaml
 # Good (snake_case)
-motion:
-  max_speed: 1.5
-  acceleration_limit: 0.5
+max_speed: 1.5
+acceleration_limit: 0.5
 
 # Bad (mixed casing)
-motion:
-  maxSpeed: 1.5
-  acceleration_limit: 0.5
+maxSpeed: 1.5
+acceleration_limit: 0.5
 ```
 
 ### Always Provide Defaults
@@ -555,71 +584,119 @@ motion:
 
 ```rust
 // Good - provides fallback
-let speed = ctx.params.get_f64("motion.max_speed", 1.5);
+let speed = self.params.get_f64("max_speed", 1.5);
 
 // Bad - panics if missing
-let speed = ctx.params.get::<f64>("motion.max_speed").unwrap();
+let speed = self.params.get::<f64>("max_speed").unwrap();
 ```
 
 **Use sensible defaults:**
 ```rust
 // Good - safe defaults
-let emergency_stop = ctx.params.get_bool("safety.emergency_stop", true);  // Default to safe state
-let max_speed = ctx.params.get_f64("motion.max_speed", 1.0);  // Default to slow
+let emergency_stop = self.params.get_bool("emergency_stop", true);   // Default to safe state
+let max_speed = self.params.get_f64("max_speed", 1.0);              // Default to slow
 
 // Bad - unsafe defaults
-let emergency_stop = ctx.params.get_bool("safety.emergency_stop", false);  // Unsafe!
-let max_speed = ctx.params.get_f64("motion.max_speed", 100.0);  // Too fast!
+let emergency_stop = self.params.get_bool("emergency_stop", false);  // Unsafe!
+let max_speed = self.params.get_f64("max_speed", 100.0);            // Too fast!
 ```
 
 ### Document Parameters
 
 **Add comments in YAML:**
 ```yaml
-motion:
-  # Maximum linear velocity in m/s (default: 1.5)
-  max_linear_velocity: 1.5
+# Maximum linear velocity in m/s (default: 1.0)
+max_speed: 1.0
 
-  # Maximum angular velocity in rad/s (default: 2.0)
-  max_angular_velocity: 2.0
+# Maximum angular velocity in rad/s (default: 1.0)
+max_angular_speed: 1.0
 
-control:
-  pid:
-    # Proportional gain - affects responsiveness (range: 0.1-10.0)
-    kp: 1.0
+# Proportional gain - affects responsiveness (range: 0.1-10.0)
+pid_kp: 1.0
 
-    # Integral gain - affects steady-state error (range: 0.01-1.0)
-    ki: 0.1
+# Integral gain - affects steady-state error (range: 0.01-1.0)
+pid_ki: 0.1
 
-    # Derivative gain - affects damping (range: 0.001-0.1)
-    kd: 0.01
+# Derivative gain - affects damping (range: 0.001-0.1)
+pid_kd: 0.05
 ```
 
 **Add documentation in code:**
 ```rust
-init(ctx) {
+fn init(&mut self) -> horus_core::Result<()> {
     // Load PID gains (tuning range: Kp=0.1-10, Ki=0.01-1, Kd=0.001-0.1)
-    self.kp = ctx.params.get_f64("control.pid.kp", 1.0);
-    self.ki = ctx.params.get_f64("control.pid.ki", 0.1);
-    self.kd = ctx.params.get_f64("control.pid.kd", 0.01);
+    self.kp = self.params.get_f64("pid_kp", 1.0);
+    self.ki = self.params.get_f64("pid_ki", 0.1);
+    self.kd = self.params.get_f64("pid_kd", 0.05);
+    Ok(())
 }
 ```
 
 ### Validate Parameter Values
 
-**Add bounds checking:**
+**Use built-in validation rules:**
+
+RuntimeParams supports metadata with validation rules that are checked on `set()`:
+
 ```rust
-init(ctx) {
-    // Load with validation
-    let speed = ctx.params.get_f64("motion.max_speed", 1.5);
+use horus_core::{RuntimeParams, ParamMetadata, ValidationRule};
+
+let params = RuntimeParams::init()?;
+
+// Set validation rules for a parameter
+params.set_metadata("max_speed", ParamMetadata {
+    description: Some("Maximum robot speed".to_string()),
+    unit: Some("m/s".to_string()),
+    validation: vec![ValidationRule::Range(0.0, 5.0)],
+    read_only: false,
+})?;
+
+// This succeeds:
+params.set("max_speed", 2.0)?;
+
+// This returns an error (out of range):
+params.set("max_speed", 10.0)?; // Error!
+```
+
+**Available validation rules:**
+
+| Rule | Description |
+|------|-------------|
+| `MinValue(f64)` | Minimum numeric value |
+| `MaxValue(f64)` | Maximum numeric value |
+| `Range(f64, f64)` | Numeric range (min, max) |
+| `RegexPattern(String)` | String must match regex |
+| `Enum(Vec<String>)` | Value must be one of allowed strings |
+| `MinLength(usize)` | Minimum string/array length |
+| `MaxLength(usize)` | Maximum string/array length |
+| `RequiredKeys(Vec<String>)` | Object must contain these keys |
+
+**Read-only parameters:**
+
+```rust
+params.set_metadata("version", ParamMetadata {
+    description: Some("System version".to_string()),
+    unit: None,
+    validation: vec![],
+    read_only: true,
+})?;
+
+// This returns an error:
+params.set("version", "1.0.0")?; // Error: Parameter 'version' is read-only
+```
+
+**Manual bounds checking in code:**
+```rust
+fn init(&mut self) -> horus_core::Result<()> {
+    let speed = self.params.get_f64("max_speed", 1.5);
 
     // Clamp to safe range
-    self.max_speed = speed.max(0.0).min(5.0);  // 0-5 m/s
+    self.max_speed = speed.max(0.0).min(5.0);
 
     if speed != self.max_speed {
-        hlog!(warn, "max_speed {} out of range, clamped to {}",
-            speed, self.max_speed);
+        hlog!(warn, "max_speed {} out of range, clamped to {}", speed, self.max_speed);
     }
+    Ok(())
 }
 ```
 
@@ -628,15 +705,15 @@ init(ctx) {
 **Create presets for different scenarios:**
 
 ```bash
-# Save current parameters to preset
-horus monitor
-#  Parameters tab  Export  Save as "aggressive_tuning.yaml"
+# Save current parameters to a preset file
+horus param save -o aggressive_tuning.yaml
 
-# Switch to different preset
-cp ~/.horus/config/params.yaml ~/.horus/config/params_backup.yaml
-cp aggressive_tuning.yaml ~/.horus/config/params.yaml
+# Backup current params and switch to a different preset
+cp .horus/config/params.yaml .horus/config/params_backup.yaml
+horus param load aggressive_tuning.yaml
 
-# Restart application to load new parameters
+# Dump current params to stdout for inspection
+horus param dump
 ```
 
 ## Troubleshooting
@@ -645,39 +722,39 @@ cp aggressive_tuning.yaml ~/.horus/config/params.yaml
 
 **Problem:** Parameters show default values even though YAML file exists.
 
-**Cause:** YAML syntax error or file permissions.
+**Cause:** YAML syntax error, wrong file location, or file permissions.
 
 **Solution:**
 ```bash
-# Check YAML syntax
-cat ~/.horus/config/params.yaml
+# Check file exists in the right place (project-relative)
+ls -la .horus/config/params.yaml
 
-# Validate YAML
-yamllint ~/.horus/config/params.yaml
+# Validate YAML syntax
+yamllint .horus/config/params.yaml
 
 # Check permissions
-ls -la ~/.horus/config/params.yaml
+chmod 644 .horus/config/params.yaml
 
-# Should be readable
-chmod 644 ~/.horus/config/params.yaml
+# Verify with CLI
+horus param list
 ```
 
 ### Parameters Not Saving
 
-**Problem:** Changes in monitor don't persist.
+**Problem:** Changes via `set()` don't persist after restart.
 
-**Cause:** Config directory doesn't exist or lacks write permissions.
+**Cause:** `set()` only updates in-memory storage. You must call `save_to_disk()` explicitly.
 
 **Solution:**
 ```bash
-# Create config directory
-mkdir -p ~/.horus/config
+# Create config directory if needed
+mkdir -p .horus/config
 
-# Set permissions
-chmod 755 ~/.horus/config
+# Save from CLI
+horus param save
 
-# Manually save from code
-ctx.params.save_to_disk().ok();
+# Or save from code
+self.params.save_to_disk()?;
 ```
 
 ### Type Mismatch
@@ -703,24 +780,24 @@ max_speed: 1.5
 Or use type conversion in code:
 ```rust
 // Try as number first, then parse string as fallback
-let speed = ctx.params.get_f64("motion.max_speed", 1.5);
+let speed = self.params.get_f64("max_speed", 1.5);
 ```
 
 ### Lost Parameters After Update
 
 **Problem:** Parameters reset to defaults after code update.
 
-**Cause:** Defaults overwrite file on initialization.
+**Cause:** If `.horus/config/params.yaml` is deleted or empty, `RuntimeParams::init()` loads defaults.
 
 **Solution:**
 
 Backup parameters before updating:
 ```bash
 # Backup
-cp ~/.horus/config/params.yaml ~/.horus/config/params_backup.yaml
+horus param save -o params_backup.yaml
 
 # After update, restore if needed
-cp ~/.horus/config/params_backup.yaml ~/.horus/config/params.yaml
+horus param load params_backup.yaml
 ```
 
 ## Performance Considerations
@@ -746,15 +823,10 @@ Parameters use `Arc\<RwLock\<BTreeMap\>\>`:
 
 **Good: Cache and reload periodically**
 ```rust
-data {
-    max_speed: f64 = 1.5,
-    reload_counter: u64 = 0
-}
-
-tick() {
+fn tick(&mut self) {
     // Reload every 60 ticks (~1 second)
     if self.reload_counter % 60 == 0 {
-        self.max_speed = ctx.params.get_f64("motion.max_speed", 1.5);
+        self.max_speed = self.params.get_f64("max_speed", 1.5);
     }
     self.reload_counter += 1;
 
@@ -765,15 +837,40 @@ tick() {
 
 **Bad: Read every tick unnecessarily**
 ```rust
-tick() {
+fn tick(&mut self) {
     // Wasteful - reads same value 60 times per second
-    let max_speed = ctx.params.get_f64("motion.max_speed", 1.5);
+    let max_speed = self.params.get_f64("max_speed", 1.5);
 }
 ```
+
+## Version Tracking
+
+RuntimeParams includes an optimistic locking system for concurrent edit protection:
+
+```rust
+// Get current version of a parameter
+let version = self.params.get_version("max_speed");
+
+// Set with version check — fails if another writer changed it
+self.params.set_with_version("max_speed", 2.0, version)?;
+```
+
+This prevents lost updates when multiple processes or threads modify the same parameter simultaneously.
+
+## Audit Logging
+
+Parameter changes are automatically logged to `.horus/logs/param_changes.log`:
+
+```
+[2025-01-15 14:30:00] max_speed: 1.0 -> 2.0
+[2025-01-15 14:31:15] pid_kp: 1.0 -> 1.5
+```
+
+This provides a history of all runtime parameter modifications for debugging and tuning review.
 
 ## Next Steps
 
 - **[Monitor Guide](/development/monitor)** - Manage parameters via web interface
-- **[node! Macro Guide](/concepts/node-macro)** - Learn about `init()` and `tick()` hooks
+- **[Core Concepts](/concepts/core)** - Learn about nodes, topics, and scheduling
 - **[Examples](/rust/examples/basic-examples)** - See real-world parameter usage
-- **[CLI Reference](/development/cli-reference)** - Command-line parameter tools
+- **[CLI Reference](/development/cli-reference#horus-param)** - `horus param` command reference

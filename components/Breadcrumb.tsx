@@ -48,7 +48,6 @@ const segmentLabels: Record<string, string> = {
   "communication-configuration": "Configuration",
   "network-communication": "Network",
   "node-macro": "node! Macro",
-  "message-macro": "message! Macro",
   "message-types": "Message Types",
   "realtime-nodes": "Real-Time Nodes",
 

@@ -1,137 +1,186 @@
 ---
 title: Communication Configuration
-description: Managing endpoints with configuration files
+description: Configuring HORUS topics and endpoints with configuration files
 order: 23
 ---
 
 # Communication Configuration
 
-Managing endpoints through configuration files makes your code environment-agnostic and easier to deploy across development, staging, and production environments.
-
-## Why Use Configuration Files?
-
-**Without configuration** (hardcoded):
-```rust
-// Development machine
-let topic: Topic<Status> = Topic::new("status")?;  // Local
-
-// Production robot
-let topic: Topic<Status> = Topic::new("status@192.168.1.100")?;  // Network
-// Need to change code for different environments!
-```
-
-**With configuration** (environment-agnostic):
-```rust
-// Same code for dev and production!
-let topic: Topic<Status> = Topic::from_config("status")?;
-// Endpoint loaded from config file
-```
+HORUS provides a configuration system for defining topic endpoints in config files, supporting both TOML and YAML formats.
 
 ## Configuration File Format
 
-HORUS uses YAML for configuration:
+HORUS supports both TOML and YAML configuration files with a `hubs` section that defines endpoint configurations:
+
+### YAML Format
 
 **horus.yaml**:
 ```yaml
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry@192.168.1.100:8000
-
+hubs:
   camera:
     name: camera
-    endpoint: camera@192.168.1.50:9000
+    transport: local
 
-  motors:
-    name: motors
-    endpoint: motors  # Local shared memory
+  sensor:
+    name: sensor
+    transport: direct
+    host: 192.168.1.5
+    port: 9000
+
+  telemetry:
+    name: telemetry
+    endpoint: telemetry@router
+```
+
+### TOML Format
+
+**horus.toml**:
+```toml
+[hubs.camera]
+name = "camera"
+
+[hubs.sensor]
+name = "sensor"
+transport = "direct"
+host = "192.168.1.5"
+port = 9000
+
+[hubs.telemetry]
+name = "telemetry"
+endpoint = "telemetry@router"
 ```
 
 ## Configuration Search Path
 
 HORUS searches for configuration files in this order:
 
-1. `./horus.yaml` (current directory)
-2. `~/.horus/config.yaml` (user home)
-3. `/etc/horus/config.yaml` (system-wide)
+1. `./horus.toml` or `./horus.yaml` (current directory)
+2. `~/.horus/config.toml` or `~/.horus/config.yaml` (user home)
+3. `/etc/horus/config.toml` or `/etc/horus/config.yaml` (system-wide)
 
-**Priority**: Files earlier in the search path override later ones.
+Files earlier in the search path take priority.
 
-## Loading from Configuration
+## Loading Configuration
 
-### Topic from Config
-
-```rust
-use horus::prelude::*;
-
-// Load from default search path
-let telemetry: Topic<Status> = Topic::from_config("telemetry")?;
-
-// Load from specific file
-let camera: Topic<Image> = Topic::from_config_file("my_config.yaml", "camera")?;
-```
-
-### Topic from Config
+### HorusConfig API
 
 ```rust
 use horus::prelude::*;
 
-// Producer
-let output: Topic<SensorData> = Topic::from_config("sensors")?;
+// Auto-find and load from standard search paths
+let config = HorusConfig::find_and_load()?;
 
-// Consumer
-let input: Topic<SensorData> = Topic::from_config("sensors")?;
+// Or load from a specific file (auto-detects format by extension)
+let config = HorusConfig::from_file("my_config.yaml")?;
 
-// From specific file
-let motors: Topic<MotorCmd> = Topic::from_config_file(
-    "/etc/robot/config.toml",
-    "motors"
-)?;
+// Parse from string
+let config = HorusConfig::from_yaml(yaml_string)?;
+let config = HorusConfig::from_toml(toml_string)?;
 ```
+
+### Getting Hub Configuration
+
+```rust
+// Get a specific hub's config
+let camera_config = config.get_hub("camera")?;
+
+// Get the endpoint string
+let endpoint = camera_config.get_endpoint();
+println!("Camera endpoint: {}", endpoint);
+// For local: "camera"
+// For direct: "sensor@192.168.1.5:9000"
+```
+
+### Creating Topics from Config
+
+```rust
+use horus::prelude::*;
+
+// Create a topic with TopicConfig
+let topic_config = TopicConfig {
+    name: "sensors".to_string(),
+    capacity: 16,
+};
+let topic: Topic<SensorData> = Topic::from_config(topic_config)?;
+
+// Or create directly with Topic::new using the hub name
+let topic: Topic<SensorData> = Topic::new("sensors")?;
+```
+
+## EndpointConfig Fields
+
+Each hub entry in the configuration supports these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Topic name (required) |
+| `endpoint` | string | Full endpoint string (overrides other fields) |
+| `transport` | string | Transport type: `local`, `localhost`, `router`, `multicast`, `direct`, `zenoh` |
+| `host` | string | Host address (for direct/router transports) |
+| `port` | u16 | Port number |
+| `tls` | bool | Enable TLS (router transport only) |
+| `tls_cert` | string | Path to TLS certificate (PEM) |
+| `tls_key` | string | Path to TLS private key (PEM) |
+| `zenoh` | object | Zenoh-specific configuration |
+
+### Transport Types
+
+| Transport | Endpoint Format | Description |
+|-----------|----------------|-------------|
+| `local` (default) | `topic_name` | Local shared memory |
+| `localhost` | `topic@localhost:port` | Localhost connection |
+| `router` | `topic@router:port` | Router-based transport |
+| `multicast` | `topic@*` | Multicast discovery |
+| `direct` | `topic@host:port` | Direct UDP connection |
+| `zenoh` | `topic@zenoh` | Zenoh transport (ROS2 interop) |
+
+## Zenoh Configuration (Advanced)
+
+For multi-robot mesh networking and ROS2 interop, HORUS supports Zenoh transport configuration:
+
+```yaml
+hubs:
+  multi_robot:
+    name: swarm_pose
+    transport: zenoh
+    zenoh:
+      ros2_mode: false
+      namespace: swarm1
+      connect:
+        - tcp/192.168.1.100:7447
+      shared_memory: true
+      reliability: best_effort
+      priority: 5
+
+  ros2_bridge:
+    name: cmd_vel
+    transport: zenoh
+    zenoh:
+      ros2_mode: true
+      ros2_domain_id: 42
+      serialization: cdr
+      express: true
+```
+
+### Zenoh Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ros2_mode` | bool | Enable ROS2 compatibility mode |
+| `ros2_domain_id` | u32 | ROS2 domain ID (0-232) |
+| `connect` | list | Endpoints to connect to (e.g., `tcp/192.168.1.1:7447`) |
+| `listen` | list | Endpoints to listen on |
+| `namespace` | string | Namespace prefix for topics |
+| `shared_memory` | bool | Enable shared memory transport for local comm |
+| `serialization` | string | Format: `bincode` (default), `json`, `cdr` (ROS2) |
+| `reliability` | string | `best_effort` (default) or `reliable` |
+| `priority` | u8 | QoS priority (0-7, higher = more important) |
+| `express` | bool | Skip batching for low latency |
 
 ## Environment-Specific Configurations
 
-### Development Environment
+### Using Symlinks
 
-**horus_dev.yaml**:
-```yaml
-# Local shared memory for development
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry  # Local
-
-  camera:
-    name: camera
-    endpoint: camera  # Local
-
-  motors:
-    name: motors
-    endpoint: motors  # Local
-```
-
-### Production Environment
-
-**horus_prod.yaml**:
-```yaml
-# Network endpoints for production
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry@ground-station:8000
-
-  camera:
-    name: camera
-    endpoint: camera@edge-device.local:9000
-
-  motors:
-    name: motors
-    endpoint: motors  # Still local (critical path)
-```
-
-### Switching Environments
-
-**Method 1: Symlink**
 ```bash
 # Development
 ln -sf horus_dev.yaml horus.yaml
@@ -140,58 +189,61 @@ ln -sf horus_dev.yaml horus.yaml
 ln -sf horus_prod.yaml horus.yaml
 ```
 
-**Method 2: Environment Variable**
-```rust
-use horus::prelude::*;
+### Using Environment Variables
 
+```rust
 let config_file = std::env::var("HORUS_CONFIG")
     .unwrap_or_else(|_| "horus.yaml".to_string());
 
-let telemetry: Topic<Status> = Topic::from_config_file(&config_file, "telemetry")?;
+let config = HorusConfig::from_file(&config_file)?;
 ```
 
 ```bash
 # Development
-export HORUS_CONFIG=horus_dev.yaml
-horus run robot.rs
+HORUS_CONFIG=horus_dev.yaml horus run
 
 # Production
-export HORUS_CONFIG=horus_prod.yaml
-horus run --release robot.rs
+HORUS_CONFIG=horus_prod.yaml horus run --release
 ```
 
 ## Complete Example
 
-### Configuration File
+### Configuration Files
 
-**horus.yaml**:
+**horus_dev.yaml** (development):
 ```yaml
-# ======= ROBOT CONFIGURATION =======
-topics:
-  # Network telemetry to ground station
+hubs:
   telemetry:
     name: telemetry
-    endpoint: telemetry@192.168.1.100:8000
+    transport: local
 
-  # Network camera to processing server
   camera:
     name: camera
-    endpoint: camera@192.168.1.200:9000
+    transport: local
 
-  # Local motor control (critical path - must be local!)
   motors:
     name: motors
-    endpoint: motors
+    transport: local
+```
 
-  # Local IMU (critical path)
-  imu:
-    name: imu
-    endpoint: imu
+**horus_prod.yaml** (production):
+```yaml
+hubs:
+  telemetry:
+    name: telemetry
+    transport: direct
+    host: 192.168.1.100
+    port: 8000
 
-  # Network fleet coordination
-  fleet:
-    name: fleet
-    endpoint: fleet@router:7000
+  camera:
+    name: camera
+    transport: direct
+    host: 192.168.1.50
+    port: 9000
+
+  motors:
+    name: motors
+    transport: local  # Always local for safety
 ```
 
 ### Application Code
@@ -199,355 +251,67 @@ topics:
 ```rust
 use horus::prelude::*;
 
-struct Robot {
-    // Network: telemetry to ground station
-    telemetry: Topic<Status>,
+fn main() -> Result<()> {
+    // Load config from standard search path
+    let config = HorusConfig::find_and_load()?;
 
-    // Network: camera to processing server
-    camera: Topic<Image>,
+    // Get endpoint strings from config
+    let telem_endpoint = config.get_hub("telemetry")?.get_endpoint();
+    let motor_endpoint = config.get_hub("motors")?.get_endpoint();
 
-    // Local: critical control loop
-    imu: Topic<ImuData>,
-    motors: Topic<MotorCmd>,
+    println!("Telemetry endpoint: {}", telem_endpoint);
+    println!("Motors endpoint: {}", motor_endpoint);
 
-    // Network: fleet coordination
-    fleet: Topic<FleetMsg>,
-}
+    // Create topics using the configured names
+    let telemetry: Topic<Status> = Topic::new(&telem_endpoint)?;
+    let motors: Topic<MotorCmd> = Topic::new(&motor_endpoint)?;
 
-impl Robot {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            // All loaded from config - no hardcoded endpoints!
-            telemetry: Topic::from_config("telemetry")?,
-            camera: Topic::from_config("camera")?,
-            imu: Topic::from_config("imu")?,
-            motors: Topic::from_config("motors")?,
-            fleet: Topic::from_config("fleet")?,
-        })
-    }
-}
-```
-
-## Advanced Configuration
-
-### Per-Environment Overrides
-
-**horus.yaml** (base config):
-```yaml
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry@ground-station:8000
-```
-
-**horus_local.yaml** (local override):
-```yaml
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry  # Override to local for testing
-```
-
-```rust
-// Load with fallback
-let config_file = if cfg!(debug_assertions) {
-    "horus_local.yaml"
-} else {
-    "horus.yaml"
-};
-
-let telemetry: Topic<Status> = Topic::from_config_file(config_file, "telemetry")?;
-```
-
-### Robot-Specific Configs
-
-**robot1_config.yaml**:
-```yaml
-topics:
-  fleet:
-    name: fleet
-    endpoint: fleet@router:7000
-
-robot:
-  id: 1
-  name: scout-01
-  position: [0.0, 0.0, 0.0]
-```
-
-**robot2_config.yaml**:
-```yaml
-topics:
-  fleet:
-    name: fleet
-    endpoint: fleet@router:7000
-
-robot:
-  id: 2
-  name: scout-02
-  position: [10.0, 10.0, 0.0]
-```
-
-```bash
-# Deploy robot 1
-scp robot1_config.yaml robot1:/etc/horus/horus.yaml
-ssh robot1 'horus run --release robot.rs'
-
-# Deploy robot 2
-scp robot2_config.yaml robot2:/etc/horus/horus.yaml
-ssh robot2 'horus run --release robot.rs'
-```
-
-### Multi-Environment Testing
-
-**horus_test.yaml**:
-```yaml
-# Simulate network delays locally for testing
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry@localhost:8000
-
-  camera:
-    name: camera
-    endpoint: camera@localhost:9000
-```
-
-```bash
-# Run with test config
-export HORUS_CONFIG=horus_test.yaml
-horus run robot.rs
-```
-
-## Configuration Management Best Practices
-
-### 1. Version Control
-
-```bash
-# Track all config files
-git add horus*.yaml
-git commit -m "Add robot configuration files"
-
-# .gitignore sensitive production configs
-echo "horus_prod_secrets.yaml" >> .gitignore
-```
-
-### 2. Environment Templates
-
-**horus.template.yaml**:
-```yaml
-# Template configuration - copy and customize
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry@GROUND_STATION_IP:8000
-
-  camera:
-    name: camera
-    endpoint: camera@EDGE_DEVICE_IP:9000
-```
-
-```bash
-# Setup new deployment
-cp horus.template.yaml horus.yaml
-# Edit horus.yaml with actual IPs
-```
-
-### 3. Deployment Scripts
-
-**deploy.sh**:
-```bash
-#!/bin/bash
-# Deploy robot configuration
-
-ROBOT_IP=$1
-CONFIG_ENV=$2
-
-if [ -z "$ROBOT_IP" ] || [ -z "$CONFIG_ENV" ]; then
-    echo "Usage: ./deploy.sh <robot_ip> <dev|staging|prod>"
-    exit 1
-fi
-
-# Copy environment-specific config
-scp "horus_${CONFIG_ENV}.yaml" "robot@${ROBOT_IP}:/etc/horus/horus.yaml"
-
-# Deploy and run
-ssh "robot@${ROBOT_IP}" 'systemctl restart horus-robot'
-
-echo "Deployed $CONFIG_ENV config to $ROBOT_IP"
-```
-
-```bash
-# Deploy to staging
-./deploy.sh 192.168.1.50 staging
-
-# Deploy to production
-./deploy.sh 192.168.1.50 prod
-```
-
-### 4. Configuration Validation
-
-```rust
-use horus::prelude::*;
-
-fn validate_config() -> Result<()> {
-    // Try loading all configured topics
-    let _telemetry: Topic<Status> = Topic::from_config("telemetry")?;
-    let _camera: Topic<Image> = Topic::from_config("camera")?;
-    let _motors: Topic<MotorCmd> = Topic::from_config("motors")?;
-
-    println!("[OK] Configuration valid");
     Ok(())
 }
-
-fn main() {
-    if let Err(e) = validate_config() {
-        eprintln!("[ERROR] Configuration error: {}", e);
-        std::process::exit(1);
-    }
-
-    // Run application
-}
-```
-
-## Configuration for Different Scenarios
-
-### Scenario 1: Development (Local Only)
-
-**horus_dev.yaml**:
-```yaml
-topics:
-  telemetry:
-    endpoint: telemetry
-
-  camera:
-    endpoint: camera
-
-  motors:
-    endpoint: motors
-```
-
-### Scenario 2: Lab Testing (Local Network)
-
-**horus_lab.yaml**:
-```yaml
-topics:
-  telemetry:
-    endpoint: telemetry@192.168.1.100:8000
-
-  camera:
-    endpoint: camera@192.168.1.50:9000
-
-  motors:
-    endpoint: motors  # Keep critical path local
-```
-
-### Scenario 3: Field Deployment (Production)
-
-**horus_field.yaml**:
-```yaml
-topics:
-  telemetry:
-    endpoint: telemetry@ground-station.local:8000
-
-  camera:
-    endpoint: camera@edge.local:9000
-
-  motors:
-    endpoint: motors  # Always local for safety
-```
-
-### Scenario 4: Multi-Robot Fleet
-
-**horus_fleet.yaml**:
-```yaml
-# Central router for fleet coordination
-topics:
-  fleet_positions:
-    endpoint: positions@router.local:7000
-
-  fleet_commands:
-    endpoint: commands@router.local:7001
-
-  # Local control for each robot
-  motors:
-    endpoint: motors
-
-  imu:
-    endpoint: imu
 ```
 
 ## Troubleshooting
 
 ### Config File Not Found
 
-**Error**: `Failed to load configuration: file not found`
+**Error**: `No config file found in standard locations`
 
 **Solution**:
 ```bash
 # Check current directory
-ls -la horus.yaml
+ls -la horus.yaml horus.toml 2>/dev/null
 
 # Check user config
-ls -la ~/.horus/config.yaml
+ls -la ~/.horus/config.yaml ~/.horus/config.toml 2>/dev/null
 
 # Check system config
-ls -la /etc/horus/config.yaml
-
-# Create config
-cp horus.template.yaml horus.yaml
+ls -la /etc/horus/config.yaml /etc/horus/config.toml 2>/dev/null
 ```
 
-### Topic Not Found in Config
+### Hub Not Found in Config
 
-**Error**: `Topic 'telemetry' not found in configuration`
+**Error**: `Hub 'telemetry' not found in config`
 
-**Solution**:
-```bash
-# Verify topic name matches config
-grep -A2 "telemetry:" horus.yaml
-
-# Check YAML syntax
-yamllint horus.yaml
-```
-
-### Invalid Endpoint Syntax
-
-**Error**: `Invalid endpoint: telemetry@invalid:port`
-
-**Solution**:
+**Solution**: Ensure the hub name matches your config:
 ```yaml
-# Correct endpoint formats
-endpoint: topic                      # Local
-endpoint: topic@192.168.1.100       # Network (default port)
-endpoint: topic@192.168.1.100:8000  # Network (custom port)
-endpoint: topic@hostname.local:9000  # Hostname
+hubs:
+  telemetry:    # <-- This is the hub name used in get_hub("telemetry")
+    name: telemetry
+    transport: local
 ```
 
 ## Summary
 
-**Benefits of Configuration Files**:
-- Environment-agnostic code
-- Easy deployment across dev/staging/prod
-- No hardcoded IP addresses
-- Centralized endpoint management
-- Version controllable
-
-**Best Practices**:
-- Use configuration files for all endpoints
-- Separate dev/staging/prod configs
-- Version control configuration templates
-- Validate configs before deployment
-- Keep critical paths local (motors, IMU)
-
-**File Locations**:
-1. `./horus.yaml` (project-specific)
-2. `~/.horus/config.yaml` (user-specific)
-3. `/etc/horus/config.yaml` (system-wide)
+| Feature | Details |
+|---------|---------|
+| **File Formats** | TOML and YAML |
+| **Search Path** | `./` → `~/.horus/` → `/etc/horus/` |
+| **Config Struct** | `HorusConfig` with `hubs` map |
+| **Hub Entry** | `EndpointConfig` with name, transport, host, port |
+| **Transport Types** | local, localhost, router, multicast, direct, zenoh |
+| **Zenoh Support** | ROS2 interop, mesh networking, cloud transport |
 
 ## Next Steps
 
-- [Network Communication](/concepts/network-communication) - Multi-machine systems guide
-- [Communication Transport](/concepts/communication-transport) - Local vs Network overview
+- [Communication Transport](/concepts/communication-transport) - Transport mechanism details
 - [Topic (MPMC)](/concepts/core-concepts-topic) - Topic MPMC pattern deep dive
-- [Topic (SPSC)](/concepts/core-concepts-topic) - Topic SPSC pattern deep dive
-- [Configuration Reference](/package-management/configuration) - Complete config file reference

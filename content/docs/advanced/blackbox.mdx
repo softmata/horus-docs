@@ -1,66 +1,111 @@
 ---
 title: "BlackBox Flight Recorder"
-description: "Event recording and crash analysis for post-mortem debugging and incident investigation"
+description: "Event recording and post-mortem debugging for HORUS applications"
 weight: 30
 ---
 
 # BlackBox Flight Recorder
 
-The BlackBox flight recorder provides continuous event logging in a circular buffer for post-mortem analysis. Like an aircraft flight recorder, it captures all significant events leading up to failures for debugging and incident investigation.
+The BlackBox flight recorder provides continuous event logging in a circular buffer for post-mortem analysis. Like an aircraft flight recorder, it captures all significant events leading up to failures.
 
 ## Overview
 
 The BlackBox system:
-- Records all significant scheduler and node events
-- Uses a circular buffer to limit memory usage
-- Supports write-ahead logging (WAL) for crash recovery
-- Generates detailed crash reports
-- Enables filtering by event type or time range
+- Records scheduler, node, and safety events in a circular buffer
+- Limits memory usage with configurable buffer size
+- Filters anomalies (errors, deadline misses, emergency stops)
+- Integrates directly with the Scheduler
 
 ## Enabling BlackBox
 
+### Via Scheduler Builder (Recommended)
+
 ```rust
 use horus::prelude::*;
-use std::path::PathBuf;
 
-// Create with 10MB buffer
-let mut blackbox = BlackBox::new(10);
-
-// Enable disk persistence with WAL
-let blackbox = BlackBox::new(10)
-    .with_persistence(PathBuf::from("/var/log/horus/blackbox.json"));
+// Enable with 16MB buffer
+let scheduler = Scheduler::new()
+    .with_blackbox(16);  // 16MB flight recorder
 ```
+
+### Via Deploy Preset
+
+The `deploy()` preset enables blackbox automatically with 16MB:
+
+```rust
+use horus::prelude::*;
+
+// Production preset: RT features + blackbox + profiling
+let scheduler = Scheduler::deploy();
+```
+
+### Via SchedulerConfig
+
+```rust
+use horus::prelude::*;
+
+// Using the builder method
+let config = SchedulerConfig::standard()
+    .with_black_box(true, 10);  // Enabled with 10MB buffer
+
+let scheduler = Scheduler::new().with_config(config);
+
+// Or set fields directly
+let mut config = SchedulerConfig::standard();
+config.monitoring.black_box_enabled = true;
+config.monitoring.black_box_size_mb = 10;
+
+let scheduler = Scheduler::new().with_config(config);
+```
+
+### Standalone
+
+```rust
+use horus::prelude::*;
+
+// Create a standalone blackbox (10MB buffer)
+let mut blackbox = BlackBox::new(10);
+```
+
+Passing `0` to `BlackBox::new()` disables recording (the default).
 
 ## Event Types
 
 The BlackBox records 11 event types covering all critical system operations:
 
-| Event | Description |
-|-------|-------------|
-| `SchedulerStart` | Scheduler initialization with config |
-| `SchedulerStop` | Scheduler shutdown with reason |
-| `NodeAdded` | New node registered |
-| `NodeTick` | Node execution completed (with duration) |
-| `NodeError` | Node execution failed |
-| `DeadlineMiss` | Node missed its deadline |
-| `WCETViolation` | Node exceeded WCET budget |
-| `CircuitBreakerChange` | Circuit breaker state transition |
-| `LearningComplete` | Profiling learning phase finished |
-| `EmergencyStop` | Emergency stop triggered |
-| `Custom` | User-defined events |
+| Event | Fields | Description |
+|-------|--------|-------------|
+| `SchedulerStart` | `name`, `node_count`, `config` | Scheduler initialization |
+| `SchedulerStop` | `reason`, `total_ticks` | Scheduler shutdown |
+| `NodeAdded` | `name`, `priority` | New node registered |
+| `NodeTick` | `name`, `duration_us`, `success` | Node execution completed |
+| `NodeError` | `name`, `error` | Node execution failed |
+| `DeadlineMiss` | `name`, `deadline_us`, `actual_us` | Node missed its deadline |
+| `WCETViolation` | `name`, `budget_us`, `actual_us` | Node exceeded WCET budget |
+| `CircuitBreakerChange` | `name`, `new_state`, `failure_count` | Circuit breaker state transition |
+| `LearningComplete` | `duration_ms`, `tier_summary` | Profiling learning phase finished |
+| `EmergencyStop` | `reason` | Emergency stop triggered |
+| `Custom` | `category`, `message` | User-defined events |
 
 ## Recording Events
+
+When using the Scheduler, events are recorded **automatically**:
+- `SchedulerStart` on `run()` / `run_with_config()`
+- `NodeTick` for each node execution
+- `EmergencyStop` when triggered
+- `SchedulerStop` on shutdown
+
+You can also record events manually:
 
 ```rust
 use horus::prelude::*;
 
 let mut blackbox = BlackBox::new(10);
 
-// Record scheduler start
-blackbox.record(BlackBoxEvent::SchedulerStart {
-    name: "main_scheduler".to_string(),
-    node_count: 15,
-    config: "default".to_string(),
+// Record custom events
+blackbox.record(BlackBoxEvent::Custom {
+    category: "sensor".to_string(),
+    message: "IMU calibration started".to_string(),
 });
 
 // Advance tick counter (call each scheduler tick)
@@ -85,108 +130,71 @@ blackbox.record(BlackBoxEvent::DeadlineMiss {
     deadline_us: 1000,
     actual_us: 1500,
 });
-
-// Record custom events
-blackbox.record(BlackBoxEvent::Custom {
-    category: "sensor".to_string(),
-    message: "IMU calibration started".to_string(),
-});
 ```
 
 ## Querying Events
 
 ### Get All Events
 
-```rust,ignore
+```rust
 let events = blackbox.get_events();
 println!("Total events: {}", events.len());
-```
 
-### Get Recent Events
-
-```rust,ignore
-// Get events from last 100 ticks
-let recent = blackbox.get_recent(100);
-```
-
-### Filter by Event Type
-
-```rust,ignore
-// Get all deadline misses
-let deadline_misses = blackbox.get_by_type("DeadlineMiss");
-
-// Get all errors
-let errors = blackbox.get_by_type("NodeError");
-
-// Get circuit breaker changes
-let cb_changes = blackbox.get_by_type("CircuitBreakerChange");
-```
-
-### Get Anomalies
-
-Get all error-related events (errors, deadline misses, WCET violations, emergency stops):
-
-```rust,ignore
-let anomalies = blackbox.get_anomalies();
-for record in anomalies {
+for record in &events {
     println!("[tick {}] {:?}", record.tick, record.event);
 }
 ```
 
-## Persistence
+Each `BlackBoxRecord` contains:
+- `timestamp_us` — Microseconds since epoch
+- `tick` — Monotonic tick counter
+- `event` — The `BlackBoxEvent`
 
-### Write-Ahead Logging (WAL)
+### Get Anomalies
 
-The WAL file ensures events are persisted immediately for crash recovery:
+Filter for error-related events (errors, deadline misses, WCET violations, circuit breaker changes, emergency stops):
+
+```rust
+let anomalies = blackbox.get_anomalies();
+for record in &anomalies {
+    println!("[tick {}] {:?}", record.tick, record.event);
+}
+```
+
+### Buffer Info
+
+```rust
+println!("Buffer size: {}", blackbox.len());
+println!("Is empty: {}", blackbox.is_empty());
+
+// Clear all recorded events
+blackbox.clear();
+```
+
+## Accessing from Scheduler
+
+The Scheduler provides read and write access to its blackbox:
 
 ```rust
 use horus::prelude::*;
-use std::path::PathBuf;
 
-let blackbox = BlackBox::new(10)
-    .with_persistence(PathBuf::from("/var/log/horus/blackbox.json"));
+let mut scheduler = Scheduler::new()
+    .with_blackbox(16);
 
-// Events are automatically written to blackbox.wal as JSON lines
-// blackbox.json contains the full buffer on explicit save
-```
+// Read-only access
+if let Some(bb) = scheduler.blackbox() {
+    let events = bb.get_events();
+    let anomalies = bb.get_anomalies();
+    println!("Recorded {} events, {} anomalies", events.len(), anomalies.len());
+}
 
-### Save and Load
-
-```rust,ignore
-// Save current buffer to disk
-blackbox.save()?;
-
-// Load previous session's buffer
-blackbox.load()?;
-```
-
-## Crash Reports
-
-Generate a comprehensive crash report for incident analysis:
-
-```rust,ignore
-let report = blackbox.generate_crash_report();
-println!("{}", report);
-```
-
-Sample output:
-
-```
-=== HORUS BLACK BOX CRASH REPORT ===
-
-Total events: 1523
-Last tick: 45678
-
-=== ANOMALIES (12) ===
-[tick 45670] DeadlineMiss { name: "vision_node", deadline_us: 5000, actual_us: 7200 }
-[tick 45672] WCETViolation { name: "planner", budget_us: 1000, actual_us: 1850 }
-[tick 45675] CircuitBreakerChange { name: "motor_ctrl", new_state: "Open", failure_count: 5 }
-[tick 45678] EmergencyStop { reason: "Too many deadline misses: 10" }
-
-=== LAST 100 EVENTS ===
-[tick 45678] EmergencyStop { reason: "Too many deadline misses: 10" }
-[tick 45678] NodeTick { name: "safety_monitor", duration_us: 50, success: true }
-...
+// Mutable access (for recording custom events)
+if let Some(bb) = scheduler.blackbox_mut() {
+    bb.record(BlackBoxEvent::Custom {
+        category: "deploy".to_string(),
+        message: "Firmware update started".to_string(),
+    });
+}
 ```
 
 ## Thread-Safe Usage
@@ -211,76 +219,73 @@ std::thread::spawn(move || {
 });
 ```
 
-## Integration with Scheduler
-
-The scheduler can be configured with BlackBox monitoring:
-
-```rust,ignore
-use horus::prelude::*;
-
-// Using builder method
-let config = SchedulerConfig::standard()
-    .with_black_box(true, 10);  // Enabled with 10MB buffer
-
-let mut scheduler = Scheduler::new().with_config(config);
-
-// Or configure directly
-let mut config = SchedulerConfig::standard();
-config.monitoring.black_box_enabled = true;
-config.monitoring.black_box_size_mb = 10;
-
-let mut scheduler = Scheduler::new().with_config(config);
-```
-
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_size_mb` | 0 (disabled) | Maximum buffer size in MB |
-| Buffer capacity | ~5000/MB | Estimated records per MB |
-| WAL flush | Immediate | Events flushed to WAL immediately |
+| Buffer size | 0 (disabled) | Set via `BlackBox::new(mb)` or `with_blackbox(mb)` |
+| Records per MB | ~5,000 | Estimated at ~200 bytes per record |
+| Max pre-allocated | 100,000 records | Initial capacity cap |
+| Min buffer | 1,000 records | Minimum regardless of size |
 
-## Best Practices
+### Preset Sizes
 
-### 1. Enable in Production
+| Use Case | Recommended Size |
+|----------|-----------------|
+| Development | 1-5 MB |
+| Production | 10-50 MB |
+| Long-running systems | 50-100 MB |
+
+The `deploy()` preset uses 16MB. The `safety_critical()` preset uses 1024MB.
+
+## Post-Mortem Debugging
+
+After a failure, use the blackbox to investigate what happened:
 
 ```rust
 use horus::prelude::*;
-use std::path::PathBuf;
 
-// Production: Enable with persistence
-let blackbox = BlackBox::new(50)
-    .with_persistence(PathBuf::from("/var/log/horus/blackbox.json"));
-```
+let mut scheduler = Scheduler::new()
+    .with_blackbox(16);
 
-### 2. Regular Saves
+// ... run application ...
 
-```rust,ignore
-// Save periodically (e.g., every minute)
-if last_save.elapsed() > Duration::from_secs(60) {
-    blackbox.save()?;
-    last_save = Instant::now();
+// After a failure, inspect the blackbox
+if let Some(bb) = scheduler.blackbox() {
+    let anomalies = bb.get_anomalies();
+    println!("=== ANOMALIES ({}) ===", anomalies.len());
+    for record in &anomalies {
+        println!("[tick {}] {:?}", record.tick, record.event);
+    }
+
+    // Look at all events around the failure
+    let all_events = bb.get_events();
+    println!("\n=== LAST {} EVENTS ===", all_events.len());
+    for record in all_events.iter().rev().take(20) {
+        println!("[tick {}] {:?}", record.tick, record.event);
+    }
 }
 ```
 
-### 3. Size Appropriately
+## Circular Buffer Behavior
 
-- Development: 1-5 MB
-- Production: 10-50 MB
-- Long-running systems: 50-100 MB
+The blackbox uses a circular buffer — when full, the oldest events are discarded:
 
-### 4. Monitor Anomalies
-
-```rust,ignore
-// Check for anomalies periodically
-let anomalies = blackbox.get_anomalies();
-if anomalies.len() > previous_count {
-    alert_operator(&anomalies[previous_count..]);
-}
 ```
+Buffer capacity: 50,000 records (10MB)
+
+Event 1 → [1, _, _, _, _]     New events fill the buffer
+Event 2 → [1, 2, _, _, _]
+...
+Event N → [1, 2, ..., N-1, N]  Buffer full
+Event N+1 → [2, 3, ..., N, N+1]  Oldest dropped
+```
+
+This ensures bounded memory usage while keeping the most recent events for debugging.
 
 ## See Also
 
 - [Safety Monitor](/advanced/safety-monitor) - Real-time safety monitoring
 - [Circuit Breaker](/advanced/circuit-breaker) - Fault tolerance patterns
+- [Deterministic Execution](/advanced/deterministic-execution) - Scheduler configuration
 - [Troubleshooting](/troubleshooting) - Common issues and solutions

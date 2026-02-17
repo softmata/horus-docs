@@ -27,9 +27,9 @@ Test node behavior without running the scheduler.
 
 Test nodes communicating through the Topic.
 
-### 3. Mocking Hubs
+### 3. Testing Business Logic in Isolation
 
-Isolate nodes by mocking their dependencies.
+Extract and test business logic without Topic dependencies.
 
 ## Unit Testing a Single Node
 
@@ -329,11 +329,11 @@ mod tests {
 ### Run Integration Tests
 
 ```bash
-horus test test_pubsub_communication -- --test-threads=1
+horus test test_pubsub_communication --test-threads 1
 ```
 
-**Why `--test-threads=1`?**
-- Prevents tests from running in parallel
+**Why `--test-threads 1`?**
+- Prevents tests from running in parallel (this is the default for `horus test`)
 - Avoids shared memory conflicts between tests
 - Ensures deterministic behavior
 
@@ -347,11 +347,11 @@ test tests::test_multiple_messages ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-## Mocking Hubs for Isolated Tests
+## Testing Business Logic in Isolation
 
-Test nodes without real Topic connections.
+Test node logic without real Topic connections.
 
-### Example: Mock Topic for Testing
+### Example: Extracting Testable Logic
 
 ```rust
 use horus::prelude::*;
@@ -436,15 +436,16 @@ pub fn process_temperature(&self, temp: f32) -> f32 {
 // Test this directly without Topic
 #[test]
 fn test_logic() {
+    let node = TemperatureProcessor::new().unwrap();
     assert_eq!(node.process_temperature(0.0), 32.0);
 }
 ```
 
-**2. Test Tick with Real Hubs:**
+**2. Test Tick with Real Topics:**
 ```rust
-// Use real Topics in tests (they're lightweight)
+// Topics are lightweight — use real ones in tests
 #[test]
-fn test_with_real_hub() {
+fn test_with_real_topic() {
     let mut node = MyNode::new().unwrap();
     node.tick();
     // Verify behavior
@@ -610,7 +611,7 @@ mod tests {
 ### Run All Tests
 
 ```bash
-horus test -- --test-threads=1
+horus test --test-threads 1
 ```
 
 **Output:**
@@ -665,10 +666,10 @@ sub_node.tick();
 
 ### 4. Run Tests Sequentially
 
-Prevent shared memory conflicts:
+`horus test` defaults to single-threaded execution to prevent shared memory conflicts. If you use `--parallel`, ensure each test uses unique topic names:
 
 ```bash
-horus test -- --test-threads=1
+horus test    # Already single-threaded by default
 ```
 
 ### 5. Test Edge Cases
@@ -692,20 +693,39 @@ fn test_invalid_data() {
 ### Basic Commands
 
 ```bash
-# Run all tests
+# Run all tests (defaults to single-threaded for shared memory safety)
 horus test
 
-# Run tests sequentially (recommended for HORUS)
-horus test -- --test-threads=1
-
-# Run specific test
+# Run specific test by name filter
 horus test test_sensor_initialization
 
-# Run tests with output
-horus test -- --nocapture
-
-# Run tests matching pattern
+# Run tests matching a pattern
 horus test sensor
+
+# Show test output (println!, hlog!, etc.)
+horus test --nocapture
+
+# Run with multiple threads (override default single-threaded mode)
+horus test --parallel
+horus test --test-threads 4
+
+# Run in release mode (optimized build)
+horus test --release
+
+# Skip the build step (use existing build artifacts)
+horus test --no-build
+
+# Skip shared memory cleanup after tests
+horus test --no-cleanup
+
+# Verbose output
+horus test -v
+
+# Run integration tests (tests marked #[ignore])
+horus test --integration
+
+# Enable simulation drivers (no hardware required)
+horus test --sim
 ```
 
 ### Test Organization
@@ -725,10 +745,92 @@ mod tests {
     mod integration_tests {
         use super::*;
 
+        // Mark integration tests with #[ignore] — run with `horus test --integration`
         #[test]
-        fn test_pipeline() { /* ... */ }
+        #[ignore]
+        fn test_full_pipeline() { /* ... */ }
     }
 }
+```
+
+## Time-Limited Test Runs
+
+Use `scheduler.run_for()` to run tests for a fixed duration:
+
+```rust
+#[test]
+fn test_system_runs_for_one_second() {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(SensorNode::new().unwrap()).order(0).done();
+    scheduler.add(ControlNode::new().unwrap()).order(1).done();
+
+    // Run for exactly 1 second, then shutdown gracefully
+    scheduler.run_for(std::time::Duration::from_secs(1)).unwrap();
+}
+```
+
+## Record/Replay Testing
+
+HORUS supports recording node execution and replaying it later for deterministic debugging. This is useful for reproducing bugs and regression testing.
+
+### Recording a Session
+
+Record all node inputs/outputs during a run:
+
+```bash
+# Record while running
+horus run --record
+```
+
+Recordings are saved to `~/.horus/recordings/<session>/` in binary format (`.horus` files). Each node gets its own recording file:
+
+```
+~/.horus/recordings/my_session/
+├── sensor_node@abc123.horus       # Node recording
+├── control_node@def456.horus      # Node recording
+└── scheduler@main789.horus        # Scheduler execution order
+```
+
+### Replaying in Tests
+
+Use `scheduler.add_replay()` to replay a recorded node:
+
+```rust
+use std::path::PathBuf;
+
+#[test]
+fn test_replay_crash_scenario() {
+    let mut scheduler = Scheduler::new();
+
+    // Replay the motor node from a crash recording
+    scheduler.add_replay(
+        PathBuf::from("~/.horus/recordings/crash/motor_node@abc123.horus"),
+        1,  // priority
+    ).unwrap();
+
+    // Add a live node to test against the recorded data
+    scheduler.add(DiagnosticNode::new().unwrap()).order(2).done();
+
+    scheduler.run_for(std::time::Duration::from_secs(5)).unwrap();
+}
+```
+
+### Replay Modes
+
+| Mode | Description |
+|------|-------------|
+| **Full replay** | Replay all nodes from a scheduler recording |
+| **Mixed replay** | Replay some nodes while others run live |
+| **Range replay** | Replay only a specific tick range |
+
+### Managing Recordings
+
+```bash
+# List recording sessions
+ls ~/.horus/recordings/
+
+# Recordings auto-cap at 100MB per node
+# Delete old recordings to free space
 ```
 
 ## Troubleshooting Tests
@@ -739,7 +841,8 @@ mod tests {
 
 **Fix:**
 ```bash
-horus test -- --test-threads=1
+# horus test defaults to single-threaded, but if you used --parallel:
+horus test --test-threads 1
 ```
 
 ### Issue: "Topic not found" Errors
@@ -764,6 +867,7 @@ thread::sleep(Duration::from_millis(10));
 ## Next Steps
 
 - **[Examples](/rust/examples/basic-examples)** - See complete tested applications
-- **[Core Concepts - Nodes](/concepts/core-concepts-nodes)** - Understand node lifecycle
+- **[Core Concepts](/concepts/core)** - Understand node lifecycle
 - **[Monitor](/development/monitor)** - Debug with visual monitoring
-- **[Troubleshooting](/troubleshooting)** - Fix common runtime issues
+- **[CLI Reference](/development/cli-reference#horus-test)** - Full `horus test` command reference
+- **[Deterministic Execution](/advanced/deterministic-execution)** - Deterministic scheduling for reproducible tests

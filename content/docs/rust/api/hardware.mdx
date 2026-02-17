@@ -1,602 +1,519 @@
 ---
-title: Hardware Discovery API
-description: API reference for HORUS hardware discovery system
+title: Hardware API
+description: Driver traits, plugin system, and hardware configuration
 ---
 
-# Hardware Discovery API
+# Hardware API
 
-The `horus::prelude` includes comprehensive hardware discovery types for detecting and identifying connected robotics hardware.
+HORUS provides a driver and plugin system for interfacing with robotics hardware. Drivers are simple structs with direct methods — no abstract ceremony required.
 
-## Core Types
+```rust
+use horus::prelude::*;
+```
 
-### HardwareDiscovery
+---
 
-Main entry point for hardware discovery.
+## Driver Traits
+
+### Driver
+
+Base trait for all hardware drivers. Provides lifecycle management and identification.
+
+```rust
+pub trait Driver: Send + 'static {
+    fn init(&mut self) -> Result<()>;
+    fn shutdown(&mut self) -> Result<()>;
+    fn is_available(&self) -> bool;
+    fn status(&self) -> DriverStatus;
+    fn id(&self) -> &str;
+    fn name(&self) -> &str;
+}
+```
+
+### Sensor
+
+Extension trait for drivers that produce data.
+
+```rust
+pub trait Sensor: Driver {
+    type Output: Send + 'static;
+
+    fn read(&mut self) -> Result<Self::Output>;
+    fn has_data(&self) -> bool;
+    fn sample_rate(&self) -> Option<f32> { None }  // Optional
+}
+```
+
+### Actuator
+
+Extension trait for drivers that accept commands.
+
+```rust
+pub trait Actuator: Driver {
+    type Command: Send + 'static;
+
+    fn write(&mut self, command: Self::Command) -> Result<()>;
+    fn stop(&mut self) -> Result<()>;
+    fn is_ready(&self) -> bool;  // Default: is_available() && status is Ready/Running
+}
+```
+
+### Example: Simple Driver
 
 ```rust
 use horus::prelude::*;
 
-let discovery = HardwareDiscovery::new()?;
-let report = discovery.scan_all();
+pub struct MyMotorDriver {
+    port: String,
+    status: DriverStatus,
+}
+
+impl Driver for MyMotorDriver {
+    fn init(&mut self) -> Result<()> {
+        // Open serial port, configure hardware
+        self.status = DriverStatus::Ready;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.status = DriverStatus::Shutdown;
+        Ok(())
+    }
+
+    fn is_available(&self) -> bool {
+        matches!(self.status, DriverStatus::Ready | DriverStatus::Running)
+    }
+
+    fn status(&self) -> DriverStatus { self.status.clone() }
+    fn id(&self) -> &str { "my-motor" }
+    fn name(&self) -> &str { "My Motor Driver" }
+}
+
+impl Actuator for MyMotorDriver {
+    type Command = MotorCommand;
+
+    fn write(&mut self, command: MotorCommand) -> Result<()> {
+        // Send command to hardware
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.write(MotorCommand::stop(0))
+    }
+}
+```
+
+---
+
+## DriverStatus
+
+Driver lifecycle states.
+
+```rust
+pub enum DriverStatus {
+    Uninitialized,   // Not yet initialized
+    Ready,           // Ready to operate
+    Running,         // Actively running/streaming
+    Error(String),   // Encountered an error
+    Shutdown,        // Has been shut down
+}
+```
+
+## DriverCategory
+
+Classification for drivers.
+
+```rust
+pub enum DriverCategory {
+    Sensor,      // LiDAR, cameras, IMU, GPS, etc.
+    Actuator,    // Motors, servos, grippers, etc.
+    Bus,         // I2C, SPI, CAN, Serial, etc.
+    Input,       // Joystick, keyboard, etc.
+    Simulation,  // Simulation backends
+}
+```
+
+---
+
+## Driver Configuration
+
+### SingleDriverConfig
+
+Configuration for a single driver instance. Supports YAML and TOML formats.
+
+```rust
+pub struct SingleDriverConfig {
+    pub backend: String,              // Driver backend identifier
+    pub enabled: bool,                // Enable/disable (default: true)
+    pub port: Option<String>,         // Serial port path
+    pub baud_rate: Option<u32>,       // Serial baud rate
+    pub i2c_bus: Option<u8>,          // I2C bus number
+    pub i2c_address: Option<u8>,      // I2C device address
+    pub device: Option<String>,       // Device path (cameras, etc.)
+    pub width: Option<u32>,           // Width (cameras)
+    pub height: Option<u32>,          // Height (cameras)
+    pub fps: Option<f32>,             // Frame/sample rate
+    pub options: HashMap<String, Value>, // Additional driver-specific options
+}
+```
+
+#### Constructors
+
+```rust
+// Simulation backend (default)
+let config = SingleDriverConfig::simulation();
+
+// Serial device
+let config = SingleDriverConfig::serial("rplidar", "/dev/ttyUSB0", 115200);
+
+// I2C device
+let config = SingleDriverConfig::i2c("mpu6050", 1, 0x68);
 ```
 
 #### Methods
 
 | Method | Description |
 |--------|-------------|
-| `new() -> Result\<Self\>` | Create new discovery instance |
-| `platform() -> Platform` | Get detected platform |
-| `database() -> &DeviceDatabase` | Access device identification database |
-| `scan_all() -> DiscoveryReport` | Scan all hardware categories |
-| `scan_with_options(&DiscoveryOptions) -> DiscoveryReport` | Scan with custom options |
+| `simulation()` | Create simulation config |
+| `serial(backend, port, baud_rate)` | Create serial config |
+| `i2c(backend, bus, address)` | Create I2C config |
+| `is_simulation()` | Check if simulation backend |
 
----
+### DriversConfig
 
-### DiscoveryOptions
+Multi-driver configuration loaded from YAML or TOML files.
 
-Configure what and how to scan.
+```yaml
+# drivers.yaml
+drivers:
+  lidar:
+    backend: rplidar
+    port: /dev/ttyUSB0
+    baud_rate: 115200
 
-```rust
-let options = DiscoveryOptions::default()
-    .with_categories(CategoryFilter::only(&[
-        DeviceCategory::Camera,
-        DeviceCategory::Lidar,
-    ]))
-    .with_timeout(Duration::from_secs(5))
-    .with_i2c_probe(true);
+  camera:
+    backend: v4l2
+    device: /dev/video0
+    width: 640
+    height: 480
+
+  imu:
+    backend: simulation
 ```
 
-#### Builder Methods
+```toml
+# drivers.toml
+[drivers.lidar]
+backend = "rplidar"
+port = "/dev/ttyUSB0"
+baud_rate = 115200
+
+[drivers.imu]
+backend = "mpu6050"
+i2c_bus = 1
+i2c_address = 104
+```
+
+#### Loading Configuration
+
+```rust
+use horus::prelude::*;
+
+// Load from file (auto-detects YAML/TOML)
+let config = DriversConfig::from_file("drivers.yaml")?;
+
+// Parse from string
+let config = DriversConfig::from_yaml(yaml_str)?;
+let config = DriversConfig::from_toml(toml_str)?;
+
+// Access drivers
+let lidar_cfg = config.get_driver("lidar")?;
+let imu_cfg = config.get_driver_or_default("imu");  // Falls back to simulation
+
+// List and filter
+let all_names = config.list_drivers();
+let enabled = config.enabled_drivers();  // Only enabled drivers
+
+// Save
+config.save("drivers.yaml")?;
+```
+
+#### Methods
 
 | Method | Description |
 |--------|-------------|
-| `with_categories(CategoryFilter)` | Filter device categories |
-| `with_timeout(Duration)` | Set scan timeout |
-| `with_i2c_probe(bool)` | Enable/disable I2C probing |
-| `with_parallel(bool)` | Enable parallel scanning |
+| `from_file(path)` | Load from file (auto-detect format) |
+| `from_yaml(str)` | Parse YAML string |
+| `from_toml(str)` | Parse TOML string |
+| `get_driver(name)` | Get driver config (returns `Result`) |
+| `get_driver_or_default(name)` | Get driver or default simulation config |
+| `list_drivers()` | List all configured driver names |
+| `has_driver(name)` | Check if driver is configured |
+| `enabled_drivers()` | Get all enabled drivers |
+| `save(path)` | Save config to file |
 
 ---
 
-### DiscoveryReport
+## Plugin System
 
-Results from a hardware scan.
+The plugin system enables modular driver loading — compile-time (static), runtime (dynamic), or both (hybrid).
+
+### DriverPlugin Trait
+
+Core trait all driver plugins must implement.
 
 ```rust
-let report = discovery.scan_all();
-println!("Found {} USB devices", report.usb_devices.len());
-println!("{}", report.summary());
+pub trait DriverPlugin: Send + Sync {
+    /// Plugin metadata
+    fn manifest(&self) -> PluginManifest;
+
+    /// Scan for hardware this plugin can drive
+    fn probe(&self, backend_id: &str) -> Vec<ProbeResult>;
+
+    /// Create a driver instance
+    fn create(
+        &self,
+        backend_id: &str,
+        config: &SingleDriverConfig,
+    ) -> Result<Box<dyn Any + Send + Sync>>;
+
+    /// Health status
+    fn health(&self) -> PluginHealth;
+
+    /// List available backend IDs (derived from manifest)
+    fn available_backends(&self) -> Vec<String>;
+
+    /// Called on plugin load (optional)
+    fn on_load(&self) -> Result<()> { Ok(()) }
+
+    /// Called on plugin unload (optional)
+    fn on_unload(&self) { }
+}
 ```
 
-#### Fields
+### PluginManifest
+
+Metadata describing a plugin.
+
+```rust
+pub struct PluginManifest {
+    pub id: String,                    // Unique ID (e.g., "horus-imu-mpu6050")
+    pub name: String,                  // Human-readable name
+    pub version: String,               // Semver string
+    pub category: DriverCategory,      // Sensor, Actuator, Bus, etc.
+    pub description: String,           // Brief description
+    pub author: Option<String>,        // Author/maintainer
+    pub license: Option<String>,       // SPDX license
+    pub repository: Option<String>,    // Source repository URL
+    pub backends: Vec<BackendInfo>,    // Available backends
+    pub system_deps: Vec<SystemDependency>, // System requirements
+    pub horus_version: String,         // Required HORUS version range
+    pub platforms: Vec<String>,        // Supported platforms
+    pub features: Vec<PluginFeature>,  // Optional feature flags
+}
+```
+
+### ProbeResult
+
+Hardware detection result.
+
+```rust
+// Hardware found
+let result = ProbeResult::detected("mpu6050", "/dev/i2c-1")
+    .with_metadata("address", "0x68")
+    .with_message("MPU6050 found at 0x68");
+
+// Not found
+let result = ProbeResult::not_detected("bno055");
+
+// Partial confidence
+let result = ProbeResult::with_confidence("mpu6050", 0.8, Some("/dev/i2c-1".into()));
+```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `platform` | `Platform` | Detected platform |
-| `usb_devices` | `Vec\<UsbDevice\>` | USB devices found |
-| `serial_ports` | `Vec\<SerialPort\>` | Serial ports found |
-| `i2c_buses` | `Vec\<I2cBus\>` | I2C buses and devices (Linux) |
-| `spi_buses` | `Vec\<SpiBus\>` | SPI buses (Linux) |
-| `can_interfaces` | `Vec\<CanInterface\>` | CAN interfaces (Linux) |
-| `gpio_chips` | `Vec\<GpioChip\>` | GPIO chips (Linux) |
-| `pwm_chips` | `Vec\<PwmChip\>` | PWM chips (Linux) |
-| `cameras` | `Vec\<Camera\>` | Video capture devices (Linux) |
-| `bluetooth_adapters` | `Vec\<BluetoothAdapter\>` | Bluetooth adapters (Linux) |
-| `network_interfaces` | `Vec\<NetworkInterface\>` | Network interfaces (Linux) |
-| `audio_cards` | `Vec\<AudioCard\>` | Audio cards (Linux) |
+| `backend_id` | `String` | Backend that detected hardware |
+| `detected` | `bool` | Whether hardware was found |
+| `confidence` | `f32` | Detection confidence (0.0-1.0) |
+| `device_path` | `Option<String>` | Device path or identifier |
+| `metadata` | `HashMap<String, String>` | Additional detection info |
+| `message` | `Option<String>` | Human-readable status |
 
-#### Methods
+### PluginHealth
 
-| Method | Description |
-|--------|-------------|
-| `summary() -> DiscoverySummary` | Get summary statistics |
-| `total_devices() -> usize` | Total device count |
-| `to_json() -> String` | Serialize to JSON |
-
----
-
-### DiscoverySummary
-
-Summary statistics from a scan.
+Health monitoring for plugins.
 
 ```rust
-let summary = report.summary();
-println!("USB: {}", summary.usb_count);
-println!("I2C: {} devices on {} buses", summary.i2c_device_count, summary.i2c_bus_count);
+// Report healthy
+let health = PluginHealth::healthy("my-plugin");
+
+// Report unhealthy
+let health = PluginHealth::unhealthy("my-plugin", "Device disconnected");
 ```
 
-#### Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `usb_count` | `usize` | USB device count |
-| `serial_count` | `usize` | Serial port count |
-| `i2c_bus_count` | `usize` | I2C bus count |
-| `i2c_device_count` | `usize` | I2C device count |
-| `spi_bus_count` | `usize` | SPI bus count |
-| `can_interface_count` | `usize` | CAN interface count |
-| `gpio_chip_count` | `usize` | GPIO chip count |
-| `gpio_line_count` | `usize` | GPIO line count |
-| `camera_count` | `usize` | Camera count |
-| `network_count` | `usize` | Network interface count |
-| `audio_count` | `usize` | Audio card count |
-
 ---
 
-### DiscoveredDevice
+## DriverLoader
 
-Unified device representation.
+High-level driver management with three loading modes.
+
+### Driver Modes
+
+| Mode | Description |
+|------|-------------|
+| `DriverMode::Static` | Drivers compiled into binary (default, zero overhead) |
+| `DriverMode::Dynamic` | Drivers loaded at runtime via `dlopen` |
+| `DriverMode::Hybrid` | Core drivers static, specialized drivers dynamic |
+
+### Configuration
+
+```yaml
+# horus.yaml
+driver_mode: hybrid
+
+plugins:
+  search_paths:
+    - ~/.horus/drivers
+    - /usr/local/lib/horus/drivers
+
+  static:
+    - imu
+    - motor
+
+  dynamic:
+    - camera-fancy
+    - lidar-velodyne
+```
+
+### Usage
 
 ```rust
-pub struct DiscoveredDevice {
-    pub name: String,
-    pub category: DeviceCategory,
-    pub path: Option<PathBuf>,
-    pub vendor_id: Option<u16>,
-    pub product_id: Option<u16>,
-    pub serial_number: Option<String>,
-    pub driver: Option<String>,
+use horus::prelude::*;
+use horus::plugin::{DriverLoader, DriverLoaderConfig, DriverMode};
+
+// Create loader
+let config = DriverLoaderConfig {
+    mode: DriverMode::Hybrid,
+    search_paths: vec!["~/.horus/drivers".into()],
+    static_drivers: vec!["imu".to_string()],
+    dynamic_drivers: vec!["camera".to_string()],
+    auto_discover: true,
+};
+
+let mut loader = DriverLoader::new(config);
+
+// Register static plugins
+loader.register_static(Box::new(MyImuPlugin));
+
+// Initialize (discovers dynamic plugins)
+loader.initialize()?;
+
+// List available drivers
+for id in loader.available_drivers() {
+    println!("Available: {}", id);
 }
+
+// Create a driver
+let imu_config = SingleDriverConfig::i2c("mpu6050", 1, 0x68);
+let driver = loader.create_driver("horus-imu", "mpu6050", &imu_config)?;
+
+// Auto-detect and create
+let driver = loader.auto_create_driver("horus-imu", &imu_config)?;
+
+// Probe for hardware
+let results = loader.probe("horus-imu")?;
+
+// Health check
+let health = loader.health();
 ```
 
----
+### Dynamic Plugin Export
 
-### CategoryFilter
-
-Filter for device categories.
+For runtime-loaded plugins, export the entry point:
 
 ```rust
-// Only specific categories
-let filter = CategoryFilter::only(&[DeviceCategory::Camera, DeviceCategory::Lidar]);
-
-// All except certain categories
-let filter = CategoryFilter::except(&[DeviceCategory::Audio, DeviceCategory::Bluetooth]);
-
-// All categories (default)
-let filter = CategoryFilter::all();
-```
-
----
-
-## Platform Types
-
-### Platform
-
-Detected platform type.
-
-```rust
-pub enum Platform {
-    RaspberryPi3,
-    RaspberryPi4,
-    RaspberryPi5,
-    JetsonNano,
-    JetsonXavier,
-    JetsonOrin,
-    BeagleBoneBlack,
-    BeagleBoneAI,
-    IntelNuc,
-    GenericLinux,
-    Unknown,
-}
-```
-
-#### Methods
-
-| Method | Description |
-|--------|-------------|
-| `name() -> &str` | Human-readable name |
-| `is_raspberry_pi() -> bool` | Check if Raspberry Pi |
-| `is_jetson() -> bool` | Check if NVIDIA Jetson |
-| `is_beaglebone() -> bool` | Check if BeagleBone |
-
----
-
-### PlatformCapabilities
-
-Platform hardware capabilities.
-
-```rust
-pub struct PlatformCapabilities {
-    pub has_gpio: bool,
-    pub has_i2c: bool,
-    pub has_spi: bool,
-    pub has_can: bool,
-    pub has_pwm: bool,
-    pub has_uart: bool,
-    pub cpu_cores: u8,
-    pub cpu_freq_mhz: Option<u32>,
-    pub memory_mb: Option<u32>,
-    pub gpu: Option<GpuType>,
+#[no_mangle]
+pub extern "C" fn horus_driver_entry() -> Box<dyn DriverPlugin> {
+    Box::new(MyPlugin)
 }
 ```
 
 ---
 
-### GpuType
+## Implementing a Plugin
 
-GPU type enumeration.
-
-```rust
-pub enum GpuType {
-    VideoCore4,      // Raspberry Pi 3
-    VideoCore6,      // Raspberry Pi 4
-    VideoCore7,      // Raspberry Pi 5
-    NvidiaTegra,     // Jetson Nano
-    NvidiaXavier,    // Jetson Xavier
-    NvidiaOrin,      // Jetson Orin
-    IntelIntegrated,
-    AmdIntegrated,
-    Unknown,
-}
-```
-
----
-
-## Device Database
-
-### DeviceDatabase
-
-USB VID/PID device identification database.
+Complete example of a sensor driver plugin:
 
 ```rust
-let db = DeviceDatabase::new();
-let info = db.lookup_usb(0x10C4, 0xEA60); // Silicon Labs CP210x
-
-if let Some(info) = info {
-    println!("Device: {} ({:?})", info.name, info.category);
-}
-```
-
-#### Methods
-
-| Method | Description |
-|--------|-------------|
-| `new() -> Self` | Create with built-in database |
-| `lookup_usb(vid, pid) -> Option<&DeviceInfo>` | Lookup by VID/PID |
-| `lookup_i2c(address) -> Option<&DeviceInfo>` | Lookup I2C by address |
-| `get_vendor(vid) -> Option<&str>` | Get vendor name |
-| `devices_by_category(cat) -> Vec<&DeviceInfo>` | Get all devices in category |
-
----
-
-### DeviceCategory
-
-Device classification.
-
-```rust
-pub enum DeviceCategory {
-    Microcontroller,
-    SerialAdapter,
-    MotorController,
-    ServoController,
-    Lidar,
-    DepthCamera,
-    Camera,
-    Imu,
-    Gps,
-    CanAdapter,
-    Joystick,
-    Bluetooth,
-    Audio,
-    Network,
-    Power,
-    Display,
-    Storage,
-    Other,
-}
-```
-
-#### Methods
-
-| Method | Description |
-|--------|-------------|
-| `name() -> &str` | Human-readable name |
-
----
-
-### DeviceInfo
-
-Information about a known device.
-
-```rust
-pub struct DeviceInfo {
-    pub name: String,
-    pub vendor: String,
-    pub category: DeviceCategory,
-    pub driver: Option<String>,
-    pub notes: Option<String>,
-}
-```
-
----
-
-### DriverMatch
-
-Driver recommendation for a device.
-
-```rust
-pub struct DriverMatch {
-    pub driver_name: String,
-    pub confidence: MatchConfidence,
-    pub feature_flag: Option<String>,
-}
-```
-
----
-
-### MatchConfidence
-
-Confidence level for driver match.
-
-```rust
-pub enum MatchConfidence {
-    Exact,     // Exact VID/PID match
-    High,      // Same vendor, similar device
-    Medium,    // Generic driver
-    Low,       // Best guess
-}
-```
-
----
-
-## USB Types
-
-### UsbDevice
-
-USB device information.
-
-```rust
-pub struct UsbDevice {
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub vendor: Option<String>,
-    pub product: Option<String>,
-    pub serial_number: Option<String>,
-    pub bus_number: u8,
-    pub device_address: u8,
-    pub device_class: u8,
-    pub device_subclass: u8,
-    pub serial_port: Option<String>,  // e.g., "/dev/ttyUSB0"
-}
-```
-
----
-
-### UsbDiscovery
-
-USB device scanner.
-
-```rust
-let mut usb = UsbDiscovery::new();
-let devices = usb.enumerate_devices();
-```
-
----
-
-## Serial Types
-
-### SerialPort
-
-Serial port information.
-
-```rust
-pub struct SerialPort {
-    pub path: PathBuf,
-    pub port_type: SerialPortType,
-    pub vendor_id: Option<u16>,
-    pub product_id: Option<u16>,
-    pub product: Option<String>,
-    pub serial_number: Option<String>,
-}
-```
-
----
-
-### SerialPortType
-
-Serial port type.
-
-```rust
-pub enum SerialPortType {
-    UsbSerial,      // USB-to-serial adapter
-    PciSerial,      // PCI serial card
-    PlatformUart,   // Built-in UART (e.g., /dev/ttyAMA0)
-    Bluetooth,      // Bluetooth serial
-    Unknown,
-}
-```
-
----
-
-## Linux-Specific Types
-
-*Available when `target_os = "linux"`*
-
-### I2C Types
-
-```rust
-pub struct I2cBus {
-    pub bus_number: u8,
-    pub path: PathBuf,
-    pub devices: Vec<I2cDevice>,
-}
-
-pub struct I2cDevice {
-    pub address: u8,
-    pub name: Option<String>,
-    pub driver: Option<String>,
-}
-```
-
-### SPI Types
-
-```rust
-pub struct SpiBus {
-    pub bus_number: u8,
-    pub chip_selects: Vec<SpiChipSelect>,
-}
-
-pub struct SpiChipSelect {
-    pub chip_select: u8,
-    pub device_path: PathBuf,
-}
-```
-
-### CAN Types
-
-```rust
-pub struct CanInterface {
-    pub name: String,
-    pub interface_type: CanInterfaceType,
-    pub state: CanState,
-    pub bitrate: Option<u32>,
-}
-
-pub enum CanInterfaceType {
-    SocketCan,
-    Slcan,
-    Virtual,
-}
-
-pub enum CanState {
-    Up,
-    Down,
-    Error,
-}
-```
-
-### GPIO Types
-
-```rust
-pub struct GpioChip {
-    pub name: String,
-    pub label: String,
-    pub num_lines: u32,
-    pub path: PathBuf,
-    pub lines: Vec<GpioLine>,
-}
-
-pub struct GpioLine {
-    pub offset: u32,
-    pub name: String,
-    pub consumer: Option<String>,
-    pub direction: Option<String>,
-}
-```
-
-### PWM Types
-
-```rust
-pub struct PwmChip {
-    pub chip_number: u8,
-    pub num_channels: u8,
-    pub path: PathBuf,
-    pub channels: Vec<PwmChannel>,
-}
-
-pub struct PwmChannel {
-    pub channel_number: u8,
-    pub enabled: bool,
-    pub period: Option<u64>,
-    pub duty_cycle: Option<u64>,
-    pub polarity: PwmPolarity,
-    pub frequency: Option<u32>,
-}
-
-pub enum PwmPolarity {
-    Normal,
-    Inversed,
-}
-```
-
-### Camera Types
-
-```rust
-pub struct Camera {
-    pub name: String,
-    pub device_path: PathBuf,
-    pub camera_type: CameraType,
-    pub driver: Option<String>,
-    pub formats: Vec<VideoFormat>,
-}
-
-pub enum CameraType {
-    Usb,
-    Csi,
-    Pci,
-    Virtual,
-}
-
-pub struct VideoFormat {
-    pub pixel_format: String,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-}
-```
-
-### Bluetooth Types
-
-```rust
-pub struct BluetoothAdapter {
-    pub name: String,
-    pub address: String,
-    pub adapter_type: BluetoothAdapterType,
-    pub state: BluetoothState,
-    pub devices: Vec<BluetoothDevice>,
-}
-
-pub struct BluetoothDevice {
-    pub name: String,
-    pub address: String,
-    pub device_class: BluetoothDeviceClass,
-    pub connected: bool,
-    pub paired: bool,
-}
-```
-
-### Network Types
-
-```rust
-pub struct NetworkInterface {
-    pub name: String,
-    pub interface_type: NetworkInterfaceType,
-    pub state: NetworkState,
-    pub mac_address: Option<String>,
-    pub ip_address: Option<String>,
-    pub wifi_info: Option<WifiInfo>,
-}
-
-pub struct WifiInfo {
-    pub ssid: String,
-    pub signal_strength: i32,
-    pub frequency: u32,
-}
-```
-
-### Audio Types
-
-```rust
-pub struct AudioCard {
-    pub card_number: u8,
-    pub card_id: String,
-    pub card_name: String,
-    pub device_type: AudioDeviceType,
-    pub driver: Option<String>,
-    pub devices: Vec<AudioDevice>,
-}
-
-pub struct AudioDevice {
-    pub card_number: u8,
-    pub device_number: u8,
-    pub device_name: String,
-    pub direction: AudioDirection,
-    pub device_path: String,
-}
-
-pub enum AudioDirection {
-    Playback,
-    Capture,
-    Duplex,
+use horus::prelude::*;
+use std::any::Any;
+use std::collections::HashMap;
+
+pub struct Mpu6050Plugin;
+
+impl DriverPlugin for Mpu6050Plugin {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: "horus-imu-mpu6050".into(),
+            name: "MPU6050 IMU Driver".into(),
+            version: "1.0.0".into(),
+            category: DriverCategory::Sensor,
+            description: "Driver for MPU6050 6-axis IMU".into(),
+            author: Some("HORUS Team".into()),
+            license: Some("MIT OR Apache-2.0".into()),
+            repository: None,
+            backends: vec![BackendInfo {
+                id: "mpu6050".into(),
+                name: "MPU6050".into(),
+                description: "MPU6050 via I2C".into(),
+                hardware_ids: vec!["i2c:0x68".into(), "i2c:0x69".into()],
+            }],
+            system_deps: vec![SystemDependency {
+                name: "i2c-dev".into(),
+                kind: "kernel-module".into(),
+                required: true,
+                check_cmd: Some("lsmod | grep -q i2c_dev".into()),
+            }],
+            horus_version: ">=0.5.0".into(),
+            platforms: vec!["linux".into()],
+            features: vec![],
+            extra: HashMap::new(),
+        }
+    }
+
+    fn probe(&self, backend_id: &str) -> Vec<ProbeResult> {
+        if backend_id.is_empty() || backend_id == "mpu6050" {
+            // Scan I2C for MPU6050
+            if check_i2c_device(1, 0x68) {
+                vec![ProbeResult::detected("mpu6050", "/dev/i2c-1")
+                    .with_metadata("address", "0x68")]
+            } else {
+                vec![ProbeResult::not_detected("mpu6050")]
+            }
+        } else {
+            vec![ProbeResult::not_detected(backend_id)]
+        }
+    }
+
+    fn create(
+        &self,
+        backend_id: &str,
+        config: &SingleDriverConfig,
+    ) -> Result<Box<dyn Any + Send + Sync>> {
+        match backend_id {
+            "mpu6050" => {
+                let bus = config.i2c_bus.unwrap_or(1);
+                let addr = config.i2c_address.unwrap_or(0x68);
+                let driver = Mpu6050Driver::new(bus, addr)?;
+                Ok(Box::new(driver))
+            }
+            _ => Err(HorusError::driver(format!("Unknown backend: {}", backend_id))),
+        }
+    }
+
+    fn health(&self) -> PluginHealth {
+        PluginHealth::healthy("horus-imu-mpu6050")
+    }
 }
 ```
 
@@ -604,6 +521,6 @@ pub enum AudioDirection {
 
 ## See Also
 
-- [Hardware Discovery Guide](/development/hardware-discovery) - Usage guide and examples
-- [I/O Messages](/rust/api/io-messages) - Communication protocol messages
+
 - [Sensor Messages](/rust/api/sensor-messages) - Sensor data types
+- [Control Messages](/rust/api/control-messages) - Motor and servo commands

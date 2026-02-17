@@ -87,7 +87,9 @@ node = horus.Node(
     tick=my_function,          # Function called repeatedly
     rate=30,                   # Hz (default: 30)
     init=setup_fn,             # Optional: called once at start
-    shutdown=cleanup_fn        # Optional: called once at end
+    shutdown=cleanup_fn,       # Optional: called once at end
+    on_error=error_fn,         # Optional: called on tick errors
+    default_capacity=1024      # Optional: topic buffer capacity
 )
 ```
 
@@ -95,10 +97,12 @@ node = horus.Node(
 - `name` (str, optional): Node name (auto-generated if omitted)
 - `pubs` (str | list[str], optional): Topics to publish to
 - `subs` (str | list[str], optional): Topics to subscribe from
-- `tick` (callable): Function called each cycle
+- `tick` (callable): Function called each cycle, receives `(node)` as argument
 - `rate` (int, optional): Execution rate in Hz (default: 30)
-- `init` (callable, optional): Setup function
-- `shutdown` (callable, optional): Cleanup function
+- `init` (callable, optional): Setup function, called once at start
+- `shutdown` (callable, optional): Cleanup function, called once at end
+- `on_error` (callable, optional): Error handler, called if tick raises an exception
+- `default_capacity` (int, optional): Buffer capacity for auto-created topics (default: 1024)
 
 ### Alternative: Class-Based Inheritance
 
@@ -152,10 +156,24 @@ def my_tick(node):
 ```
 
 **Node Methods**:
-- `node.send(topic, data)` - Publish message
-- `node.get(topic)` - Get one message (returns None if empty)
-- `node.get_all(topic)` - Get all messages as list
-- `node.has_msg(topic)` - Check if messages available
+
+| Method | Description |
+|--------|-------------|
+| `node.send(topic, data)` | Publish a message to a topic |
+| `node.get(topic)` | Get one message (returns `None` if empty) |
+| `node.get_all(topic)` | Get all available messages as a list |
+| `node.has_msg(topic)` | Check if messages are available |
+| `node.get_timestamp(topic)` | Peek at the timestamp of the next message without consuming it |
+| `node.get_message_age(topic)` | Get the age of the next message in seconds |
+| `node.is_stale(topic, max_age)` | Check if the next message is older than `max_age` seconds |
+| `node.get_with_timestamp(topic)` | Get message and its timestamp as a `(msg, timestamp)` tuple |
+| `node.log_info(msg)` | Log an informational message |
+| `node.log_warning(msg)` | Log a warning message |
+| `node.log_error(msg)` | Log an error message |
+| `node.log_debug(msg)` | Log a debug message |
+| `node.request_stop()` | Request the scheduler to stop execution |
+| `node.publishers` | Property: list of publisher topic names |
+| `node.subscribers` | Property: list of subscriber topic names |
 
 ### Running Nodes
 
@@ -332,17 +350,82 @@ horus.run(node, duration=5)
 
 HORUS Python includes advanced features that match or exceed ROS2 capabilities while maintaining simplicity.
 
-### Priority-Based Execution
+### Scheduler
 
-Lower priority numbers execute first, ensuring correct data flow:
+The Scheduler orchestrates node execution with priority ordering, per-node rate control, and real-time features.
+
+**Creating a Scheduler:**
 
 ```python
+# Default scheduler
 scheduler = horus.Scheduler()
-scheduler.add(sensor, order=0)     # Executes FIRST
-scheduler.add(controller, order=1) # Executes SECOND
-scheduler.add(actuator, order=2)   # Executes THIRD
-scheduler.run()
+
+# From configuration
+config = horus.SchedulerConfig.builder().rate_hz(1000.0).build()
+scheduler = horus.Scheduler(config)
+
+# Presets for common use cases
+scheduler = horus.Scheduler.preset_safety_critical()     # Sequential, 1kHz, WCET enforcement
+scheduler = horus.Scheduler.preset_high_performance()    # Parallel, 10kHz
+scheduler = horus.Scheduler.preset_deterministic()       # Sequential, reproducible
+scheduler = horus.Scheduler.preset_hard_realtime()       # Parallel, 1kHz, <5μs jitter
+scheduler = horus.Scheduler.deploy()                     # Production with RT priority + BlackBox
 ```
+
+**Adding Nodes (kwargs API):**
+
+```python
+scheduler.add(sensor, order=0, rate_hz=100.0)
+scheduler.add(controller, order=1, rt=True, deadline_ms=5.0)
+scheduler.add(logger, order=2, rate_hz=10.0, logging=True)
+scheduler.add(monitor, order=3, tier="normal", failure_policy="skip")
+```
+
+**Adding Nodes (fluent builder API):**
+
+```python
+scheduler.node(sensor).order(0).rate_hz(1000.0).done()
+scheduler.node(motor).order(1).rt().deadline_ms(5.0).done()
+scheduler.node(logger).order(100).no_logging().done()
+```
+
+**`add()` Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `node` | `Node` | required | Node instance |
+| `order` | `int` | `100` | Execution order (lower = earlier) |
+| `rate_hz` | `float` | node's rate | Per-node tick rate in Hz |
+| `rt` | `bool` | `False` | Mark as real-time node |
+| `deadline_ms` | `float` | `None` | Soft deadline in milliseconds |
+| `logging` | `bool` | `True` | Enable logging |
+| `tier` | `str` | `None` | `"ultra_fast"`, `"fast"`, or `"normal"` |
+| `failure_policy` | `str` | `None` | `"fatal"`, `"restart"`, `"skip"`, or `"ignore"` |
+
+**Running and Monitoring:**
+
+| Method | Description |
+|--------|-------------|
+| `scheduler.run(duration=None)` | Run the scheduler. Pass `duration` in seconds, or `None` to run until Ctrl+C. |
+| `scheduler.stop()` | Stop the scheduler |
+| `scheduler.get_node_stats(name)` | Get stats dict for a node (`total_ticks`, `errors_count`, etc.) |
+| `scheduler.set_node_rate(name, rate_hz)` | Change a node's tick rate at runtime |
+| `scheduler.get_all_nodes()` | List all nodes with their configuration |
+| `scheduler.get_node_count()` | Number of registered nodes |
+| `scheduler.has_node(name)` | Check if a node is registered |
+| `scheduler.get_node_names()` | List of registered node names |
+| `scheduler.status()` | Scheduler status string |
+| `scheduler.capabilities()` | Dict of scheduler capabilities |
+
+**`horus.run()` Convenience Function:**
+
+```python
+# Quick helper — creates a Scheduler, auto-assigns execution order, and runs
+horus.run(sensor, controller, logger, duration=10)
+horus.run(node, logging=False)  # Disable logging
+```
+
+`horus.run()` uses smart priority assignment: subscriber-only nodes run first, then nodes with both pubs/subs, then publisher-only nodes.
 
 ### Automatic Timestamps
 
@@ -523,224 +606,106 @@ router_topic = Topic(CmdVel, endpoint="cmdvel@router")
 
 ### Topic Methods
 
-**Core Operations:**
-
 | Method | Description |
 |--------|-------------|
-| `topic.send(msg)` | Send a single message |
-| `topic.recv()` | Receive one message (returns None if empty) |
-| `topic.name()` | Get the topic name |
-| `topic.transport_type()` | Get transport type ("shm", "udp", "router") |
+| `topic.send(msg, node=None)` | Send a message. Pass optional `node` for automatic IPC logging. Returns `True`. |
+| `topic.recv(node=None)` | Receive one message. Returns the message or `None` if empty. |
+| `topic.name` | Property: the topic name string |
+| `topic.backend_type` | Property: the active backend name (e.g., `"DirectChannel"`, `"SpscShm"`) |
+| `topic.is_network_topic` | Property: `True` if this topic uses network transport |
+| `topic.endpoint` | Property: the endpoint string, or `None` for local topics |
+| `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `is_network`, `backend` |
+| `topic.is_generic()` | Returns `True` if this is a generic (string-name) topic |
 
-**Batch Operations (High-Performance):**
-
-| Method | Description |
-|--------|-------------|
-| `topic.send_many(msgs)` | Send multiple messages at once, returns count sent |
-| `topic.recv_many(n)` | Receive up to n messages in batch |
-| `topic.drain()` | Receive all available messages (up to 1000) |
-| `topic.view()` | Zero-copy raw bytes (GenericMessage only) |
-
-**Batch Example:**
+**Example:**
 
 ```python
 from horus import Topic, CmdVel
 
-# === Send multiple messages at once ===
 topic = Topic(CmdVel)
-commands = [
-    CmdVel(linear=1.0, angular=0.0),
-    CmdVel(linear=1.5, angular=0.2),
-    CmdVel(linear=0.0, angular=0.5),
-]
-sent = topic.send_many(commands)
-print(f"Sent {sent}/{len(commands)} messages")
 
-# === Receive up to N messages ===
-messages = topic.recv_many(10)  # Get up to 10 messages
-for msg in messages:
+# Send and receive typed messages
+topic.send(CmdVel(linear=1.0, angular=0.5))
+msg = topic.recv()
+if msg:
     print(f"linear={msg.linear}, angular={msg.angular}")
 
-# === Drain all available messages ===
-all_msgs = topic.drain()  # Get everything pending
-print(f"Drained {len(all_msgs)} messages")
+# Check topic properties
+print(f"Name: {topic.name}")           # "cmd_vel"
+print(f"Backend: {topic.backend_type}") # e.g. "MpmcShm"
+print(f"Stats: {topic.stats()}")
 ```
 
-**Zero-Copy Raw Access (Generic Topics Only):**
+### Generic Topics
+
+When you create a Topic with a **string name** (instead of a typed class), you get a generic topic that accepts any JSON-serializable data:
 
 ```python
-from horus import Topic
-import msgpack  # pip install msgpack
+from horus import Topic, CmdVel
 
-# For custom/large data where you control serialization
-topic = Topic("sensor_data")  # Generic (untyped) topic
-
-# view() returns raw MessagePack bytes without JSON overhead
-if raw := topic.view():
-    # Parse with your own logic (msgpack, struct, numpy, etc.)
-    data = msgpack.unpackb(raw)
-    print(f"Raw data: {data}")
-
-# Note: view() raises TypeError for typed topics (CmdVel, etc.)
-# because they're already optimized for direct field access
-```
-
-**Performance Tips:**
-- Use `send_many()` when you have multiple messages queued (1 GIL release vs N)
-- Use `drain()` when processing bursts of data
-- Use `view()` for custom serialization of large blobs (avoids JSON round-trip)
-- Batch operations release the GIL once for all messages, not per-message
-
-### Generic Topic Methods
-
-When you create a Topic with a **string topic** (instead of a typed class), you get a generic topic that accepts any serializable data:
-
-```python
-from horus import Topic
-
-# Generic topic (string topic = dynamic typing)
-topic = Topic("my.topic")
+# Generic topic (string name = dynamic typing)
+topic = Topic("my_topic")
 
 # Typed topic (class = static typing, better performance)
 typed_topic = Topic(CmdVel)
 ```
 
-**Generic Topic Methods:**
-
-| Method | Description |
-|--------|-------------|
-| `send(obj)` | Send any JSON-serializable object (dict, list, str, int, float) |
-| `recv()` | Receive and deserialize to Python object |
-| `send_bytes(data)` | Send raw bytes (up to 4KB) |
-| `view()` | Receive raw bytes without deserialization |
-| `send_numpy(arr)` | Send NumPy array as bytes |
-| `send_with_metadata(data, meta)` | Send bytes with string metadata |
-| `recv_with_metadata()` | Receive bytes and metadata tuple |
-| `is_generic` | Property: True if this is a generic topic |
-
-**Example: JSON-Serializable Objects**
+Generic topics use the same `send()` and `recv()` methods as typed topics, but accept any JSON-serializable Python object. Data is serialized via MessagePack internally.
 
 ```python
 from horus import Topic
 
-pub = Topic("sensor.data")
-sub = Topic("sensor.data")
+topic = Topic("sensor_data")
 
 # Send dict, list, or any JSON-serializable data
-pub.send({"temperature": 25.5, "humidity": 60.0})
-pub.send([1.0, 2.0, 3.0, 4.0])
-pub.send("status: OK")
+topic.send({"temperature": 25.5, "humidity": 60.0})
+topic.send([1.0, 2.0, 3.0, 4.0])
+topic.send("status: OK")
 
 # Receive (returns Python object)
-msg = sub.recv()  # {"temperature": 25.5, "humidity": 60.0}
+msg = topic.recv()  # {"temperature": 25.5, "humidity": 60.0}
+
+# Check if generic
+print(topic.is_generic())  # True
 ```
 
-**Example: Raw Bytes**
+**Typed vs Generic Performance:**
 
-```python
-from horus import Topic
+| Topic Type | Serialization | Use Case |
+|------------|---------------|----------|
+| Typed (`Topic(CmdVel)`) | Direct field extraction (no serde) | Production, cross-language, high-frequency |
+| Generic (`Topic("name")`) | Python → JSON → MessagePack | Dynamic schemas, prototyping, Python-only |
 
-pub = Topic("binary.data")
-sub = Topic("binary.data")
+### Backend Hints
 
-# Send raw bytes (custom binary protocol)
-pub.send_bytes(b'\x01\x02\x03\x04')
-
-# Receive raw bytes (no deserialization)
-raw = sub.view()  # b'\x01\x02\x03\x04'
-```
-
-**Example: NumPy Arrays**
-
-```python
-from horus import Topic
-import numpy as np
-
-pub = Topic("numpy.data")
-sub = Topic("numpy.data")
-
-# Send NumPy array
-arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-pub.send_numpy(arr)
-
-# Receive and reconstruct
-raw = sub.view()
-received = np.frombuffer(raw, dtype=np.float32)
-```
-
-**Example: Bytes with Metadata**
-
-```python
-from horus import Topic
-import json
-
-pub = Topic("tagged.data")
-sub = Topic("tagged.data")
-
-# Send with type hint metadata
-data = json.dumps({"x": 1.0, "y": 2.0}).encode()
-pub.send_with_metadata(data, "json")
-
-# Receive with metadata
-payload, metadata = sub.recv_with_metadata()
-if metadata == "json":
-    obj = json.loads(payload)
-```
-
-**Performance Comparison:**
-
-| Method | Latency | Use Case |
-|--------|---------|----------|
-| Typed (`Topic(CmdVel)`) | ~3μs | Production, high-frequency |
-| `send()` / `recv()` | ~50μs | Dynamic schemas, prototyping |
-| `send_bytes()` / `view()` | ~10μs | Custom binary protocols |
-| `send_numpy()` | ~15μs | Array data |
-
-### Topic SPSC (Point-to-Point)
-
-Topic SPSC provides high-performance point-to-point (SPSC) communication - ~30% faster than Topic MPMC for single producer/consumer patterns.
-
-**Key Architecture**: Topic SPSC uses a **single-slot design** (not a ring buffer):
-- Always stores exactly **one message** (the latest value)
-- New messages **overwrite** old unread messages
-- Perfect for **sensors** where only the latest reading matters
-- `send()` **never blocks** - it always succeeds immediately
+Topic automatically selects the optimal backend, but you can override it with the `backend` parameter for fine-grained control:
 
 ```python
 from horus import Topic, CmdVel
 
-# === MACHINE 1 (Producer) ===
-# Connects to consumer at 192.168.1.20:9000
-output = Topic(CmdVel, endpoint="sensors@192.168.1.20:9000")
-output.send(CmdVel(linear=1.0, angular=0.5))
+# Auto-detected (default) — HORUS picks the best backend
+topic = Topic(CmdVel)
 
-# === MACHINE 2 (Consumer) ===
-# Listens on port 9000
-input_link = Topic(CmdVel, endpoint="sensors@0.0.0.0:9000")
-if msg := input_link.recv():
-    print(f"Received: {msg}")
+# Explicit backend selection
+fast = Topic(CmdVel, backend="direct")      # ~3ns, same-thread callbacks
+spsc = Topic(CmdVel, backend="spsc")        # ~18ns, single producer/consumer
+mpmc = Topic(CmdVel, backend="mpmc")        # ~36ns, multiple producers/consumers
+shm  = Topic(CmdVel, backend="mpmc_shm")   # ~167ns, cross-process MPMC
 ```
 
-**Topic SPSC Methods:**
+**Available Backends:**
 
-| Method | Description |
-|--------|-------------|
-| `Topic(type, endpoint=endpoint)` | Create producer (connects to consumer) |
-| `Topic(type, endpoint=endpoint)` | Create consumer (listens for producer) |
-| `link.send(msg)` | Send a message |
-| `link.recv()` | Receive a message (returns None if empty) |
-| `link.topic()` | Get the topic name |
-
-**Local Topic (Shared Memory):**
-
-```python
-# No "@" in endpoint = local shared memory
-producer = Topic(CmdVel, endpoint="motor_commands")
-consumer = Topic(CmdVel, endpoint="motor_commands")
-
-producer.send(CmdVel(linear=1.0, angular=0.0))
-msg = consumer.recv()  # ~~85ns latency
-```
+| Backend | Latency | Description |
+|---------|---------|-------------|
+| `"direct"` | ~3ns | DirectChannel — same-thread callbacks |
+| `"spsc"` | ~18ns | SPSC intra-process — single producer/consumer |
+| `"mpsc"` | ~26ns | MPSC intra-process — multiple producers |
+| `"spmc"` | varies | SPMC intra-process — multiple consumers |
+| `"mpmc"` | ~36ns | MPMC intra-process — multiple producers/consumers |
+| `"spsc_shm"` | ~85ns | SPSC shared memory — cross-process |
+| `"mpsc_shm"` | varies | MPSC shared memory — cross-process |
+| `"spmc_shm"` | varies | SPMC shared memory — cross-process |
+| `"mpmc_shm"` | ~167ns | MPMC shared memory — cross-process |
 
 ### Router Client (WAN/NAT Traversal)
 
@@ -795,11 +760,11 @@ server.start()
 
 | Transport | Latency | Use Case |
 |-----------|---------|----------|
-| Topic MPMC (local) | ~500ns | Same-machine pub/sub |
-| Topic SPSC (local) | ~~85ns | Same-machine point-to-point (30% faster) |
-| Topic MPMC (network) | &lt;50μs | Multi-machine pub/sub on LAN |
-| Topic SPSC (network) | 5-15μs | Multi-machine point-to-point (3-10x faster than Topic MPMC) |
-| Router | 10-50ms | WAN, NAT traversal, cloud deployments |
+| Local (`Topic(CmdVel)`) | ~85-167ns | Same-machine communication (auto-detected backend) |
+| Local SPSC (`backend="spsc_shm"`) | ~85ns | Same-machine, single producer/consumer |
+| Local MPMC (`backend="mpmc_shm"`) | ~167ns | Same-machine, multiple producers/consumers |
+| Network (`endpoint="topic@host:port"`) | &lt;50μs | Multi-machine on LAN (direct UDP) |
+| Router (`endpoint="topic@router"`) | 10-50ms | WAN, NAT traversal, cloud deployments |
 
 ### Multi-Machine Example
 
@@ -1050,27 +1015,13 @@ if node.get_message_age("cmd_vel") > 0.1:
 ### 4. Batch Processing
 
 ```python
-# === Node API (for tick functions) ===
+# Use node.get_all() to process all available messages at once
 def batch_processor(node):
-    # Process all available messages at once
     messages = node.get_all("input")
     if messages:
         results = [process(msg) for msg in messages]
         for result in results:
             node.send("output", result)
-
-# === Topic API (direct usage) ===
-from horus import Topic, CmdVel
-
-topic = Topic(CmdVel)
-
-# Receive in batches (1 GIL release for N messages)
-messages = topic.recv_many(100)  # Up to 100 messages
-all_msgs = topic.drain()          # All available messages
-
-# Send in batches (1 GIL release for N messages)
-commands = [CmdVel(linear=v, angular=0) for v in range(10)]
-sent = topic.send_many(commands)  # Returns count sent
 ```
 
 ### 5. Keep tick() Fast
@@ -1202,7 +1153,7 @@ cmd_topic.send(CmdVel(linear=1.0, angular=0.5))
 // Rust node receives
 use horus::prelude::*;
 
-let topic: Topic<CmdVel> = Topic::new("cmdvel")?;
+let topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 if let Some(cmd) = topic.recv() {
     println!("Got: linear={}, angular={}", cmd.linear, cmd.angular);
 }

@@ -26,15 +26,16 @@ horus new my-project
 
 ### Python
 
-> **-Production-Ready**: Full-featured Python API with advanced capabilities
+> **Production-Ready**: Full-featured Python API with advanced capabilities
 
 **Best for:** Rapid prototyping, AI/ML integration, data processing, visualization
 
-Python bindings provide a simple, Pythonic API for HORUS with production-grade features:
+Python bindings (via PyO3) provide a simple, Pythonic API for HORUS with production-grade features:
 - **Per-node rate control** - Different rates for different nodes (100Hz sensor, 10Hz logger)
 - **Automatic timestamps** - Built-in message timing and staleness detection
-- **Typed messages** - Optional type-safe messages from Rust (CmdVel, ImuMsg)
-- **Multiprocess support** - Process isolation and multi-language systems
+- **Typed messages** - Type-safe messages shared with Rust (CmdVel, Pose2D, Imu, Odometry, LaserScan)
+- **Generic messages** - Send any Python type (dicts, lists, etc.) between Python nodes
+- **Multiprocess support** - Process isolation via shared memory
 
 Perfect for integrating with NumPy, PyTorch, TensorFlow, and other Python libraries.
 
@@ -48,94 +49,128 @@ horus new my-project
 
 ## Cross-Language Communication
 
-**All languages can communicate** through HORUS's shared memory system.
+Python and Rust nodes communicate through HORUS's shared memory system. For cross-language communication, both sides **must use the same typed message types**.
 
-### Simple Types (Numbers, Strings)
+### Typed Topics for Cross-Language Communication
 
-```python
-# Python publisher
-import horus
-node = horus.Node(name="sensor", pubs="temperature")
-node.send("temperature", 25.5)
-```
-
-```rust
-// Rust subscriber (in another process)
-let topic: Topic<f32> = Topic::new("temperature")?;
-if let Some(temp) = topic.recv() {
-    println!("Temperature: {}", temp);
-}
-```
-
-### Structured Messages - Type-Safe Topics for Cross-Language Communication
-
-**Important**: For cross-language communication with structured data, use typed Topics. Pass a message type to the Topic constructor to enable automatic serialization that Rust can understand.
-
-#### Python ↔ Rust with Typed Topics
+Pass a message type class to the Python `Topic()` constructor to create a typed topic that Rust can read:
 
 ```python
 # Python publisher (pose_publisher.py)
 from horus import Topic, Pose2D
 
-# Create typed topic - pass message type to constructor
+# Create typed topic - the type determines the topic name and serialization
 topic = Topic(Pose2D)
 
-while True:
-    # Create and send Pose2D message
-    pose = Pose2D(x=1.0, y=2.0, theta=0.5)
-    topic.send(pose)
-    time.sleep(0.1)
+# Send a Pose2D message (shared memory, readable by Rust)
+pose = Pose2D(x=1.0, y=2.0, theta=0.5)
+topic.send(pose)
 ```
 
 ```rust
 // Rust subscriber (in another process)
 use horus::prelude::*;
 
-let topic: Topic<Pose2D> = Topic::new("pose2d")?;
+let topic: Topic<Pose2D> = Topic::new("pose")?;
 if let Some(pose) = topic.recv() {
     println!("Received: x={}, y={}, theta={}", pose.x, pose.y, pose.theta);
 }
 ```
 
-#### Supported Message Types
+### Supported Typed Message Types
 
-Pass these types to `Topic()` for cross-language communication:
+These types work for Python-Rust cross-language communication:
 
-| Message Type | Description | Use Case |
-|-------------|-------------|----------|
-| `Pose2D` | 2D position (x, y, theta) | Robot localization |
-| `CmdVel` | Velocity command (linear, angular) | Motion control |
+| Message Type | Python Constructor | Default Topic Name | Use Case |
+|-------------|-------------------|-------------------|----------|
+| `CmdVel` | `CmdVel(linear, angular)` | `cmd_vel` | Velocity commands |
+| `Pose2D` | `Pose2D(x, y, theta)` | `pose` | 2D position |
+| `Imu` | `Imu(accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z)` | `imu` | IMU sensor data |
+| `Odometry` | `Odometry(x, y, theta, linear_velocity, angular_velocity)` | `odom` | Odometry data |
+| `LaserScan` | `LaserScan(angle_min, angle_max, ..., ranges=[...])` | `scan` | LiDAR scans |
 
-**Usage Pattern:**
+All message types include an optional `timestamp_ns` field for nanosecond timestamps.
+
+**Usage examples:**
 
 ```python
-from horus import Topic, Pose2D, CmdVel
+from horus import Topic, CmdVel, Imu, LaserScan
 
-# Create typed topics - pass message type to constructor
-pose_topic = Topic(Pose2D)
-pose_topic.send(Pose2D(x=1.0, y=2.0, theta=0.5))
-
+# Velocity commands
 cmd_topic = Topic(CmdVel)
-cmd_topic.send(CmdVel(linear=1.0, angular=0.5))
+cmd_topic.send(CmdVel(linear=1.5, angular=0.3))
+
+# IMU data
+imu_topic = Topic(Imu)
+imu_topic.send(Imu(
+    accel_x=0.0, accel_y=0.0, accel_z=9.81,
+    gyro_x=0.0, gyro_y=0.0, gyro_z=0.1
+))
+
+# Receive (returns typed Python object or None)
+if cmd := cmd_topic.recv():
+    print(f"linear={cmd.linear}, angular={cmd.angular}")
 ```
 
-#### Generic Topics (Python-Only or String Topics)
+### Generic Topics (Python-to-Python Only)
 
-For Python-to-Python communication or custom topics, pass a string:
+For Python-to-Python communication, pass a string name to create a generic topic that can send any Python type:
 
 ```python
 from horus import Topic
 
-# Generic Topic - pass topic name as string
-topic = Topic("my_topic")
-topic.send({"any": "python", "object": [1, 2, 3]})  # Dicts, lists, any Python type
+# Generic topic - pass topic name as string
+topic = Topic("my_data")
+topic.send({"sensor": "lidar", "ranges": [1.0, 1.1, 1.2]})
+topic.send([1, 2, 3])
+topic.send("hello")
 
-# Note: Generic topics use JSON serialization for simple types
+# Receive
+if msg := topic.recv():
+    print(msg)  # Python dict, list, string, etc.
 ```
 
+Generic topics use JSON/MessagePack serialization internally. **Rust nodes cannot read generic topics** — use typed messages for cross-language communication.
+
 **When to use which:**
-- **Typed Topics** (`Topic(CmdVel)`, `Topic(Pose2D)`) - When communicating with Rust nodes
-- **Generic Topic** (`Topic("topic")`) - For Python-only systems or custom data
+- **Typed Topics** (`Topic(CmdVel)`, `Topic(Pose2D)`) — Cross-language Rust+Python or Python-only
+- **Generic Topics** (`Topic("topic_name")`) — Python-only systems with custom data
+
+## Python Node API
+
+The Python `Node` class provides a simple callback-based API:
+
+```python
+from horus import Node, Scheduler, CmdVel, Pose2D
+
+def controller(node):
+    if node.has_msg("pose"):
+        pose = node.get("pose")
+        # Compute velocity command from pose
+        cmd = CmdVel(linear=1.0, angular=0.5)
+        node.send("cmd_vel", cmd)
+
+node = Node(
+    name="controller",
+    subs={"pose": {"type": Pose2D}},
+    pubs={"cmd_vel": {"type": CmdVel}},
+    tick=controller,
+    rate=30
+)
+
+scheduler = Scheduler()
+scheduler.add(node, order=0)
+scheduler.run()
+```
+
+**Key Node methods:**
+- `node.send(topic, data)` — Send data to a topic
+- `node.get(topic)` — Get next message (returns `None` if no messages)
+- `node.has_msg(topic)` — Check if messages are available
+- `node.get_all(topic)` — Get all available messages
+- `node.get_message_age(topic)` — Get age of next message in seconds
+- `node.is_stale(topic, max_age)` — Check if message is too old
+- `node.request_stop()` — Stop the scheduler
 
 ## Choosing a Language
 
@@ -153,10 +188,10 @@ topic.send({"any": "python", "object": [1, 2, 3]})  # Dicts, lists, any Python t
 You can build systems with nodes in different languages:
 
 **Example: Robot with mixed languages**
-- **Motor controller** (Rust) - 1kHz control loop
-- **Vision processing** (Python) - PyTorch object detection
-- **Hardware driver** (Rust) - Sensor integration
-- **Monitor** (Rust) - Real-time visualization
+- **Motor controller** (Rust) — 1kHz control loop
+- **Vision processing** (Python) — PyTorch object detection
+- **Hardware driver** (Rust) — Sensor integration
+- **Monitor** (Rust) — Real-time visualization
 
 All communicate through HORUS shared memory with **sub-microsecond latency**.
 
@@ -180,31 +215,43 @@ horus run lidar_driver.rs planner.py motor_control.rs
 
 **Note:** For Rust files, `horus run` creates a temporary Cargo project in `.horus/` with proper dependencies, builds it with `cargo build`, and executes the resulting binary.
 
-**Example - Complete Mixed System:**
+### Example: Complete Mixed System
 
+**Python sensor node** (`sensor.py`):
 ```python
-# sensor.py - Python sensor node
-import horus
-from horus import Topic, LaserScan
+from horus import Node, Scheduler, LaserScan
 
-# Create Topic once outside tick function
-topic = Topic("lidar")
+scan_topic = None
+
+def init(node):
+    global scan_topic
+    from horus import Topic
+    scan_topic = Topic(LaserScan)
 
 def tick(node):
-    scan = LaserScan()
-    scan.ranges = read_lidar()  # Your hardware driver
-    topic.send(scan)
+    scan = LaserScan(
+        angle_min=-1.57,
+        angle_max=1.57,
+        angle_increment=0.01,
+        range_min=0.1,
+        range_max=10.0,
+        ranges=[1.0, 1.1, 1.2, 0.9]
+    )
+    scan_topic.send(scan)
 
-node = horus.Node(name="lidar_sensor", tick=tick, rate=10)
-horus.run(node)
+node = Node(name="lidar_sensor", tick=tick, init=init, rate=10)
+
+scheduler = Scheduler()
+scheduler.add(node, order=0)
+scheduler.run()
 ```
 
+**Rust planner node** (`planner.rs`):
 ```rust
-// planner.rs - Rust planning node
 use horus::prelude::*;
 
 fn main() -> Result<()> {
-    let scan_topic: Topic<LaserScan> = Topic::new("lidar")?;
+    let scan_topic: Topic<LaserScan> = Topic::new("scan")?;
     let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 
     loop {
@@ -224,18 +271,34 @@ horus run sensor.py planner.rs
 ```
 
 **Benefits:**
-- **No manual compilation** - `horus run` handles it
-- **Automatic dependency management** - HORUS libraries linked correctly
-- **Process isolation** - One crash doesn't kill the whole system
-- **True parallelism** - Each process can use separate CPU cores
-- **Hot reload** - Change a file, stop/restart just that node
+- **No manual compilation** — `horus run` handles it
+- **Automatic dependency management** — HORUS libraries linked correctly
+- **Process isolation** — One crash doesn't kill the whole system
+- **True parallelism** — Each process can use separate CPU cores
+
+## API Parity
+
+| Feature | Rust | Python |
+|---------|------|--------|
+| **Topic send/recv** | `topic.send(msg)` / `topic.recv()` | `topic.send(msg)` / `topic.recv()` |
+| **Typed messages** | `Topic<CmdVel>` | `Topic(CmdVel)` |
+| **Generic messages** | `Topic<GenericMessage>` | `Topic("name")` |
+| **Node lifecycle** | `init()`, `tick()`, `shutdown()` | `init()`, `tick()`, `shutdown()` callbacks |
+| **Scheduler** | `Scheduler::new()` | `Scheduler()` |
+| **Node priority** | `.order(n)` | `order=n` |
+| **Rate control** | `Scheduler` rate | `rate=Hz` per node |
+| **Backend hints** | `TopicConfig::with_backend()` | `backend="spsc"` kwarg |
+| **Message types** | Full horus_library | CmdVel, Pose2D, Imu, Odometry, LaserScan + horus.library |
+| **HFrame transforms** | `HFrame::new()` | `HFrame()` |
+| **Tensor system** | Native | `TensorPool` / `TensorHandle` |
+| **Logging** | `hlog!(info, ...)` | `node.log_info(...)` |
 
 ## Next Steps
 
 **Choose your language:**
-- [Python Bindings](/python/api/python-bindings) - Full guide with examples
-- [Quick Start](/getting-started/quick-start) - Get started with Rust
+- [Python Bindings](/python/api/python-bindings) — Full guide with examples
+- [Quick Start](/getting-started/quick-start) — Get started with Rust
 
 **Build something:**
-- [Examples](/rust/examples/basic-examples) - See multi-language systems in action
-- [CLI Reference](/development/cli-reference) - `horus new` command options
+- [Examples](/rust/examples/basic-examples) — See multi-language systems in action
+- [CLI Reference](/development/cli-reference) — `horus new` command options

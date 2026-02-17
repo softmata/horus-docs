@@ -15,7 +15,7 @@ When your HORUS application isn't working:
 1. **Check the Monitor**: Run `horus monitor` to see active nodes, topics, and message flow
 2. **Examine Logs**: Look for error messages in your terminal output
 3. **Verify Topics**: Ensure publisher and subscriber use exact same topic names
-4. **Check Shared Memory**: Look in `/dev/shm/` for stale HORUS memory regions
+4. **Check Shared Memory**: Look in `/dev/shm/horus/` for stale HORUS memory regions
 5. **Test Individually**: Run nodes one at a time to isolate the problem
 
 ---
@@ -33,13 +33,13 @@ thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value'
 **Common Causes**:
 
 1. **Stale Shared Memory from Previous Run**
-   - HORUS uses `/dev/shm/horus_*` for communication
+   - HORUS uses `/dev/shm/horus/` directory for communication
    - If your app crashes, these files persist
 
    **Fix**: Clean shared memory:
    ```bash
    # Remove all HORUS shared memory
-   rm -f /dev/shm/horus_*
+   rm -rf /dev/shm/horus/
    ```
 
 2. **Permission Issues**
@@ -47,15 +47,15 @@ thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value'
 
    **Fix**: Check permissions:
    ```bash
-   ls -la /dev/shm/ | grep horus
+   ls -la /dev/shm/horus/topics/
    # Should show your user as owner
 
    # If not, remove with sudo
-   sudo rm -f /dev/shm/horus_*
+   sudo rm -rf /dev/shm/horus/
    ```
 
 3. **Conflicting Topic Names**
-   - Two Hubs with same name but different types
+   - Two Topics with same name but different types
 
    **Fix**: Use unique topic names:
    ```rust
@@ -77,23 +77,23 @@ thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value'
 thread 'main' panicked at 'Failed to create publisher 'camera': No such file or directory'
 ```
 
-**Cause**: You're using **slashes (`/`)** in your topic name instead of **dots (`.`)**.
+**Cause**: You're using **slashes (`/`)** in your topic name. While slashes work on Linux (parent directories are created automatically), they fail on **macOS** where shared memory uses `shm_open()` which doesn't support embedded slashes.
 
-HORUS topic names become file names in `/dev/shm`. When you use a slash, it's interpreted as a directory path that doesn't exist:
+HORUS topic names map to files under `/dev/shm/horus/topics/` on Linux:
 
 ```
-Topic: "sensors/camera"  →  /dev/shm/horus_default_sensors/camera  (FAILS!)
-Topic: "sensors.camera"  →  /dev/shm/horus_default_sensors.camera  (Works!)
+Topic: "sensors.camera"  →  /dev/shm/horus/topics/horus_sensors.camera  (cross-platform)
+Topic: "sensors/camera"  →  Works on Linux only, fails on macOS
 ```
 
-**Fix**: Replace all slashes with dots in topic names:
+**Fix**: Use dots instead of slashes for cross-platform compatibility:
 
 ```rust
-// WRONG - causes "No such file or directory"
+// NOT RECOMMENDED - fails on macOS
 let topic: Topic<f32> = Topic::new("sensors/camera")?;
 let topic: Topic<Twist> = Topic::new("robot/cmd_vel")?;
 
-// CORRECT - use dots
+// RECOMMENDED - works on all platforms
 let topic: Topic<f32> = Topic::new("sensors.camera")?;
 let topic: Topic<Twist> = Topic::new("robot.cmd_vel")?;
 ```
@@ -243,13 +243,13 @@ let topic: Topic<Twist> = Topic::new("robot.cmd_vel")?;
 
 ## Message Size Issues
 
-### Error: "Message too large" or allocation failure
+### Messages Silently Dropped Due to Size
 
-**Symptom**: Compilation error or runtime panic when creating large messages.
+**Symptom**: Publisher sends messages but subscriber never receives them. No error output.
 
-**Cause**: Message exceeds shared memory limits (typically a few MB).
+**Cause**: For non-POD (serialized) messages, the serialized data exceeds the slot size (default 8KB). The `send()` method is lossy — it retries briefly then drops the message, incrementing an internal failure counter.
 
-**Fix**: Use fixed-size arrays instead of Vec:
+**Fix**: Keep messages small or use fixed-size POD types:
 
 ```rust
 // BAD: Variable size
@@ -285,8 +285,8 @@ pub struct MessageChunk {
 
 ```yaml
 dependencies:
-  horus: "0.1"
-  horus_library: "0.1"  # For standard messages
+  - horus
+  - horus_library  # For standard messages (CmdVel, Twist, etc.)
 ```
 
 Import the prelude:
@@ -320,7 +320,7 @@ The HORUS monitor is your best debugging tool. It shows real-time information ab
 horus monitor
 ```
 
-Then open your browser to `http://localhost:7777` (or the displayed URL).
+Then open your browser to `http://localhost:3000` (or the displayed URL).
 
 ### Monitor Features
 
@@ -378,29 +378,26 @@ fn tick(&mut self) {
 }
 ```
 
-**Enable debug logs**:
-```bash
-RUST_LOG=debug horus run main.rs
+**Add debug logging to your nodes**:
+```rust
+fn tick(&mut self) {
+    hlog!(debug, "Processing sensor data: {}", self.value);
+}
 ```
 
-### Interpreting Timestamps
+### Log Format
 
-Logs include nanosecond timestamps:
+Console output uses ANSI-colored formatting:
 
 ```
-[1234567890123456789] [INFO] [SensorNode] Sensor initialized
-│                     │      │           │
-│                     │      │           └─ Node name
-│                     │      └─ Log level
-│                     └─ Timestamp (nanoseconds since epoch)
+[INFO] [SensorNode] Sensor initialized
+│      │            │
+│      │            └─ Message
+│      └─ Node name
+└─ Log level (INFO, WARN, ERROR, DEBUG)
 ```
 
-Calculate time between events:
-```
-Event 1: 1234567890123456789
-Event 2: 1234567890623456789
-Diff:                500000000 (500ms)
-```
+Timestamps are included in the shared memory log buffer (visible in the monitor), formatted as `HH:MM:SS.mmm`.
 
 ---
 
@@ -431,7 +428,7 @@ fn tick(&mut self) {
 impl Node for MyNode {
     fn init(&mut self) -> Result<()> {
         if self.sensor.is_broken() {
-            return Err("Sensor initialization failed".into());
+            return Err(Error::node("MyNode", "Sensor initialization failed"));
         }
         Ok(())
     }
@@ -474,16 +471,17 @@ fn tick(&mut self) {
 
 If you're still having issues:
 
-1. **Check GitHub Issues**: https://github.com/anthropics/horus/issues
+1. **Check GitHub Issues**: https://github.com/softmata/horus/issues
    - Search for similar problems
    - Create a new issue with:
      - Full error message
      - Minimal code example
      - OS and platform
 
-2. **Enable Verbose Logging**:
-   ```bash
-   RUST_LOG=trace horus run main.rs
+2. **Add Debug Logging**:
+   ```rust
+   // Add hlog!(debug, ...) in your nodes to trace execution
+   hlog!(debug, "Node state: {:?}", self.state);
    ```
 
 3. **Test with Minimal Example**:
@@ -497,10 +495,10 @@ If you're still having issues:
    df -h /dev/shm
 
    # Check HORUS files
-   ls -lh /dev/shm/horus_*
+   ls -lh /dev/shm/horus/topics/
 
    # Clean if needed
-   rm -f /dev/shm/horus_*
+   rm -rf /dev/shm/horus/
    ```
 
 ---

@@ -1,486 +1,31 @@
 ---
 title: "Network Backends"
-description: "High-performance network transports: QUIC, io_uring, compression, and batching"
+description: "Network communication with Zenoh transport for multi-robot and cloud connectivity"
 weight: 40
 ---
 
 # Network Backends
 
-HORUS provides advanced network backends for high-performance distributed communication. These backends offer significant improvements over basic UDP/TCP for robotics applications.
+<Callout type="warn" title="Planned Feature">
 
-## Available Backends
+Zenoh network transport is **planned but not yet implemented**. The configuration API (`ZenohEndpointConfig`, YAML topic config) exists and parses correctly, but no actual network transport backend is wired up yet. HORUS currently operates as a **local shared memory IPC framework only**. This page documents the configuration scaffolding that is in place for the upcoming network transport layer.
 
-| Backend | Latency | Throughput | Use Case |
-|---------|---------|------------|----------|
-| **BatchUDP** | ~10µs | 200K+ pkt/s | Local network |
-| **io_uring** | 3-5µs | High | Linux low-latency |
-| **QUIC** | ~1ms | High | WAN, reliable |
-| **Zenoh** | ~100µs | High | ROS2 interop, mesh |
+</Callout>
 
-## QUIC Transport
+HORUS uses shared memory for local communication (<1μs latency). Zenoh network transport configuration is scaffolded for future multi-robot, cloud, and ROS2 interoperability.
 
-QUIC provides reliable, encrypted transport with superior performance over TCP:
+## Communication Architecture
 
-### Features
+| Transport | Latency | Use Case |
+|-----------|---------|----------|
+| **Shared Memory** | ~85ns | Same-machine IPC (default) |
+| **Zenoh** | ~100μs | Multi-robot, cloud, ROS2 interop |
 
-- **0-RTT connection resumption**: No handshake latency for repeat connections
-- **No head-of-line blocking**: Independent streams
-- **Built-in TLS 1.3**: Encrypted by default
-- **Connection migration**: Handles IP changes
-- **Better congestion control**: Modern algorithms
+Most HORUS applications only need shared memory. Zenoh is for when nodes run on different machines or you need to bridge with ROS2.
 
-### Enabling QUIC
+## Zenoh Transport
 
-```toml
-[dependencies]
-horus_core = { version = "0.1", features = ["quic"] }
-```
-
-### Configuration
-
-```rust
-use horus::communication::network::{QuicConfig, QuicTransport};
-
-// Default configuration
-let config = QuicConfig::default();
-
-// Low latency configuration
-let config = QuicConfig::low_latency();
-
-// High throughput configuration
-let config = QuicConfig::high_throughput();
-```
-
-### Configuration Options
-
-| Parameter | Default | Low Latency | High Throughput |
-|-----------|---------|-------------|-----------------|
-| `max_idle_timeout` | 30s | 60s | 120s |
-| `keep_alive_interval` | 5s | 2s | 10s |
-| `max_concurrent_bidi_streams` | 100 | 256 | 1000 |
-| `enable_0rtt` | true | true | true |
-| `initial_rtt` | 10ms | 5ms | 20ms |
-| `max_udp_payload_size` | 1472 | 1472 | 65527 |
-
-### Client Usage
-
-```rust
-use horus::communication::network::{QuicConfig, QuicTransport};
-use std::net::SocketAddr;
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-
-    // Create client
-    let transport = QuicTransport::new_client(
-        bind_addr,
-        QuicConfig::low_latency()
-    ).await?;
-
-    // Send data (unidirectional)
-    let server_addr: SocketAddr = "192.168.1.100:9000".parse().unwrap();
-    transport.send(server_addr, b"sensor data").await?;
-
-    // Send and receive response (bidirectional)
-    let response = transport.send_recv(server_addr, b"request").await?;
-
-    Ok(())
-}
-```
-
-### Server Usage
-
-```rust
-use horus::communication::network::{QuicConfig, QuicTransport, get_or_create_cert};
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    // Generate self-signed certificate for development
-    let (certs, key) = get_or_create_cert()?;
-
-    let bind_addr: SocketAddr = "0.0.0.0:9000".parse().unwrap();
-
-    // Create server
-    let transport = QuicTransport::new_server(
-        bind_addr,
-        certs,
-        key,
-        QuicConfig::default()
-    ).await?;
-
-    // Accept connections
-    loop {
-        let (conn, addr) = transport.accept().await?;
-        println!("Connection from {}", addr);
-
-        // Handle incoming data
-        let (data, _) = transport.accept_uni(&conn).await?;
-        println!("Received: {:?}", data);
-    }
-}
-```
-
-### Statistics
-
-```rust
-let stats = transport.stats();
-
-println!("Connections established: {}", stats.connections_established.load(Ordering::Relaxed));
-println!("Streams opened: {}", stats.streams_opened.load(Ordering::Relaxed));
-println!("Bytes sent: {}", stats.bytes_sent.load(Ordering::Relaxed));
-println!("0-RTT accepted: {}", stats.zero_rtt_accepted.load(Ordering::Relaxed));
-```
-
-## io_uring Backend
-
-True zero-copy networking using Linux io_uring for ultra-low latency:
-
-### Features
-
-- **3-5µs latency**: Matches Zenoh-pico performance
-- **Zero-copy**: Registered buffers avoid copies
-- **SQPOLL mode**: Kernel-side polling without syscalls
-- **Single core 100Gb**: Can saturate high-speed NICs
-
-### Requirements
-
-- Linux 5.6+ (5.19+ for SQPOLL without root)
-- `io-uring-net` feature
-- Root or CAP_SYS_NICE for SQPOLL
-
-### Enabling io_uring
-
-```toml
-[dependencies]
-horus_core = { version = "0.1", features = ["io-uring-net"] }
-```
-
-### Configuration
-
-```rust
-use horus::communication::network::{RealIoUringConfig, RealIoUringBackend};
-
-// Default configuration
-let config = RealIoUringConfig::default();
-
-// High performance (requires root/CAP_SYS_NICE)
-let config = RealIoUringConfig::high_performance();
-
-// Low latency
-let config = RealIoUringConfig::low_latency();
-```
-
-### Configuration Options
-
-| Parameter | Default | High Perf | Low Latency |
-|-----------|---------|-----------|-------------|
-| `sq_entries` | 256 | 1024 | 128 |
-| `sqpoll` | false | true | false |
-| `sqpoll_idle_ms` | 2000 | 10000 | 0 |
-| `num_buffers` | 64 | 256 | 32 |
-| `buffer_size` | 65536 | 65536 | 8192 |
-| `coop_taskrun` | true | true | true |
-| `single_issuer` | true | true | true |
-
-### Basic Usage
-
-```rust
-use horus::communication::network::{RealIoUringBackend, RealIoUringConfig, is_real_io_uring_available};
-
-// Check availability
-if !is_real_io_uring_available() {
-    eprintln!("io_uring not available on this system");
-    return;
-}
-
-let bind_addr: SocketAddr = "0.0.0.0:9000".parse().unwrap();
-let remote_addr: SocketAddr = "192.168.1.100:9000".parse().unwrap();
-
-// Create backend
-let mut backend = RealIoUringBackend::new(
-    bind_addr,
-    Some(remote_addr),  // Connected mode
-    RealIoUringConfig::default()
-)?;
-
-// Synchronous send
-let bytes_sent = backend.send_sync(b"sensor data")?;
-
-// Synchronous receive
-let data = backend.recv_sync()?;
-```
-
-### Async Operations
-
-```rust
-// Submit send (returns immediately)
-let user_data = backend.submit_send(b"data")?;
-
-// Submit receive
-let recv_ud = backend.submit_recv()?;
-
-// Submit to kernel (required for non-SQPOLL)
-backend.submit()?;
-
-// Wait for completions
-backend.submit_and_wait(1)?;
-
-// Process completions
-for completion in backend.process_completions() {
-    match completion {
-        CompletionResult::SendComplete { bytes_sent, .. } => {
-            println!("Sent {} bytes", bytes_sent);
-        }
-        CompletionResult::RecvComplete { data, .. } => {
-            println!("Received {} bytes", data.len());
-        }
-        CompletionResult::Error { error, .. } => {
-            eprintln!("Error: {}", error);
-        }
-    }
-}
-```
-
-### SQPOLL Mode
-
-For maximum performance with kernel-side polling:
-
-```rust
-// Check if SQPOLL is available
-if is_sqpoll_available() {
-    let config = RealIoUringConfig::high_performance();
-    let backend = RealIoUringBackend::new(bind_addr, None, config)?;
-
-    // No submit() calls needed - kernel polls automatically
-    backend.submit_send(b"data")?;
-    // Kernel will send without syscall
-}
-```
-
-## Compression
-
-Transparent compression for large messages:
-
-### Algorithms
-
-| Algorithm | Speed | Ratio | Use Case |
-|-----------|-------|-------|----------|
-| **LZ4** | Fast | Moderate | Real-time data |
-| **Zstd** | Slower | Better | Large payloads |
-| **Auto** | Varies | Varies | General purpose |
-
-### Configuration
-
-```rust
-use horus::communication::network::{CompressionConfig, CompressionAlgo, Compressor};
-
-// LZ4 for real-time
-let config = CompressionConfig::lz4();
-
-// Zstd for better ratio
-let config = CompressionConfig::zstd();
-
-// Zstd with custom level (1-19)
-let config = CompressionConfig::zstd_level(6);
-
-// Auto-select based on size
-let config = CompressionConfig::auto();
-
-// Custom configuration
-let config = CompressionConfig {
-    algorithm: CompressionAlgo::Zstd,
-    min_size: 1024,      // Don't compress < 1KB
-    level: 3,            // Compression level
-    min_ratio: 0.8,      // Need 20% savings
-};
-```
-
-### Usage
-
-```rust
-let compressor = Compressor::new(CompressionConfig::lz4());
-
-// Compress data
-let compressed = compressor.compress(&large_data);
-
-if compressed.is_compressed {
-    println!("Compressed {} -> {} bytes",
-        compressed.original_size,
-        compressed.data.len()
-    );
-}
-
-// Decompress
-let decompressed = compressor.decompress(
-    &compressed.data,
-    compressed.algorithm,
-    compressed.original_size
-)?;
-```
-
-### Network Packets
-
-```rust
-use horus::communication::network::CompressedPacket;
-
-// Create packet from compressed data
-let packet = CompressedPacket::from_compressed(compressed);
-
-// Send over network (serialize packet)
-let bytes = bincode::serialize(&packet)?;
-send_udp(&bytes)?;
-
-// Receive and decompress
-let packet: CompressedPacket = bincode::deserialize(&received)?;
-let data = packet.decompress(&compressor)?;
-```
-
-## Message Batching
-
-Batch multiple messages for efficiency:
-
-```rust
-use horus::communication::network::{MessageBatcher, BatchConfig};
-
-// Create batcher with configuration
-let config = BatchConfig::default();  // 100 messages, 60KB, 5ms timeout
-let mut batcher = MessageBatcher::new("sensor_data", config);
-
-// Low latency config (smaller batches, shorter timeout)
-let config = BatchConfig::low_latency();  // 10 messages, 500µs timeout
-let mut batcher = MessageBatcher::new("control_cmd", config);
-
-// High throughput config (larger batches, longer timeout)
-let config = BatchConfig::high_throughput();  // 500 messages, 20ms timeout
-let mut batcher = MessageBatcher::new("telemetry", config);
-
-// Add messages - returns Some(batch) when batch is full
-let payload = bincode::serialize(&sensor_data)?;
-if let Some(batch) = batcher.add(payload) {
-    // Batch is full, send it
-    let bytes = batch.encode()?;
-    send_udp(&bytes)?;
-}
-
-// Check timeout - call periodically to flush incomplete batches
-if let Some(batch) = batcher.check_timeout() {
-    let bytes = batch.encode()?;
-    send_udp(&bytes)?;
-}
-
-// Force flush current batch
-if let Some(batch) = batcher.flush() {
-    let bytes = batch.encode()?;
-    send_udp(&bytes)?;
-}
-```
-
-## Congestion Control
-
-Adaptive congestion control for network stability:
-
-```rust
-use horus::communication::network::{CongestionController, CongestionConfig, CongestionResult, DropPolicy};
-
-// Default config (error on buffer full)
-let config = CongestionConfig::default();
-let mut controller = CongestionController::new(config);
-
-// Drop oldest messages when congested
-let config = CongestionConfig::drop_oldest();
-let mut controller = CongestionController::new(config);
-
-// Rate limiting (messages per second)
-let config = CongestionConfig::rate_limited(1000);  // 1000 msg/sec
-let mut controller = CongestionController::new(config);
-
-// Blocking mode (waits for space)
-let config = CongestionConfig::blocking();
-let mut controller = CongestionController::new(config);
-
-// Try to send a message
-let payload = bincode::serialize(&sensor_data)?;
-let priority = 5;  // Higher = more important
-match controller.try_send(payload, priority) {
-    CongestionResult::Accepted => {
-        // Message queued for sending
-    }
-    CongestionResult::Dropped(reason) => {
-        // Message was dropped due to congestion
-        eprintln!("Dropped: {:?}", reason);
-    }
-    CongestionResult::RetryAfter(duration) => {
-        // Rate limited, retry after duration
-        std::thread::sleep(duration);
-    }
-}
-
-// Pop next message to send
-if let Some(payload) = controller.pop() {
-    send_udp(&payload)?;
-}
-
-// Check buffer utilization
-println!("Buffer {}% full", controller.utilization());
-```
-
-## Best Practices
-
-### 1. Choose the Right Backend
-
-```rust
-// Local high-frequency sensors → io_uring
-if is_real_io_uring_available() && is_local {
-    use_io_uring();
-}
-
-// WAN or reliability needed → QUIC
-if is_wan || needs_reliability {
-    use_quic();
-}
-
-// Default → BatchUDP
-use_batch_udp();
-```
-
-### 2. Enable Compression for Large Data
-
-```rust
-// Only compress if beneficial
-let config = CompressionConfig {
-    min_size: 512,      // Skip small messages
-    min_ratio: 0.9,     // Need 10% savings
-    algorithm: CompressionAlgo::Auto,
-    ..Default::default()
-};
-```
-
-### 3. Batch Small Messages
-
-```rust
-// For high-frequency small messages
-let config = BatchConfig {
-    max_messages: 100,           // Up to 100 messages
-    max_bytes: 60000,            // ~MTU minus headers
-    flush_timeout: Duration::from_millis(1),  // 1ms max latency
-    enabled: true,
-};
-let mut batcher = MessageBatcher::new("sensor_topic", config);
-```
-
-## Zenoh Transport (ROS2 Bridge)
-
-Zenoh provides mesh networking, cloud connectivity, and full ROS2 DDS compatibility:
-
-### Features
-
-- **Multi-robot mesh**: Automatic peer discovery and routing
-- **ROS2 DDS bridge**: Full compatibility with ROS2 nodes
-- **Cloud connectivity**: Connect robots to cloud services
-- **QoS policies**: Deadline, lifespan, liveliness, history, durability
-- **Services & Actions**: Complete ROS2 service and action support
-- **Parameter server**: Full ROS2 parameter protocol
+Zenoh provides peer-to-peer mesh networking with optional cloud connectivity. HORUS integrates Zenoh through the `ZenohEndpointConfig` for Topic transport.
 
 ### Enabling Zenoh
 
@@ -489,180 +34,196 @@ Zenoh provides mesh networking, cloud connectivity, and full ROS2 DDS compatibil
 horus_core = { version = "0.1", features = ["zenoh-transport"] }
 ```
 
-### Basic Configuration
+### Configuration
+
+Zenoh endpoints are configured through `ZenohEndpointConfig`:
 
 ```rust
-use horus::communication::network::ZenohConfig;
-
-// HORUS mode (default)
-let config = ZenohConfig::new()
-    .with_namespace("robot1");
-
-// ROS2 compatible mode
-let config = ZenohConfig::ros2(0);  // Domain ID 0
-
-// Connect to cloud
-let config = ZenohConfig::cloud("tcp/cloud.example.com:7447");
-
-// Multi-robot mesh
-let config = ZenohConfig::mesh("fleet1")
-    .connect_to("tcp/192.168.1.10:7447")
-    .connect_to("tcp/192.168.1.11:7447");
-```
-
-### QoS Presets
-
-```rust
-use horus::communication::network::{ZenohQos, Reliability, HistoryPolicy, Durability};
-
-// Sensor data: best-effort, small history, deadline/lifespan constraints
-let sensor_qos = ZenohQos::sensor_data();
-
-// Parameters: reliable, transient-local durability
-let param_qos = ZenohQos::parameters();
-
-// Services: reliable, keep all messages
-let service_qos = ZenohQos::services();
-
-// Actions: reliable, bounded history
-let action_qos = ZenohQos::actions();
-
-// Custom QoS
-let custom_qos = ZenohQos::default()
-    .with_reliability(Reliability::Reliable)
-    .with_history(HistoryPolicy::KeepLast(10))
-    .with_durability(Durability::TransientLocal)
-    .with_deadline(Duration::from_millis(100))
-    .with_lifespan(Duration::from_secs(5));
-```
-
-### ROS2 Services
-
-Full ROS2 service protocol (request/response):
-
-```rust
-use horus::communication::network::{Ros2ServiceConfig, Ros2ServiceClient, Ros2ServiceServer};
-
-// Create service client
-let config = Ros2ServiceConfig::new("/robot", "trigger_action");
-let client = Ros2ServiceClient::new(zenoh_session, config)?;
-
-// Call service
-let request = TriggerRequest::default();
-let response = client.call(request, Duration::from_secs(5)).await?;
-
-// Create service server
-let server = Ros2ServiceServer::new(zenoh_session, config, |req| {
-    TriggerResponse { success: true, message: "Done".into() }
-})?;
-```
-
-### ROS2 Actions
-
-Full ROS2 action protocol (5 topics: send_goal, cancel_goal, get_result, status, feedback):
-
-```rust
-use horus::communication::network::{Ros2ActionClient, Ros2ActionServer, Ros2ActionConfig, GoalStatus};
-
-// Create action client
-let config = Ros2ActionConfig::new("/robot", "navigate_to_pose");
-let client = Ros2ActionClient::new(zenoh_session, config)?;
-
-// Send goal
-let goal = NavigateGoal { x: 1.0, y: 2.0, theta: 0.0 };
-let handle = client.send_goal(goal).await?;
-
-// Monitor feedback
-while let Some(feedback) = handle.get_feedback().await {
-    println!("Progress: {:.1}%", feedback.percent_complete);
+pub struct ZenohEndpointConfig {
+    /// Enable ROS2 compatibility mode (uses rt/{topic} naming)
+    pub ros2_mode: bool,
+    /// ROS2 domain ID (0-232), only used when ros2_mode is true
+    pub ros2_domain_id: u32,
+    /// Endpoints to connect to (routers or peers)
+    /// Format: "tcp/192.168.1.1:7447" or "udp/192.168.1.1:7447"
+    pub connect: Vec<String>,
+    /// Endpoints to listen on
+    /// Format: "tcp/0.0.0.0:7447"
+    pub listen: Vec<String>,
+    /// Namespace prefix for topics (default: "horus")
+    pub namespace: Option<String>,
+    /// Enable shared memory transport for local communication
+    pub shared_memory: bool,
+    /// Serialization format: "bincode" (default), "json", "cdr" (ROS2)
+    pub serialization: Option<String>,
+    /// QoS reliability: "best_effort" (default) or "reliable"
+    pub reliability: Option<String>,
+    /// QoS priority (0-7, higher = more important)
+    pub priority: Option<u8>,
+    /// Express mode (skip batching for low latency)
+    pub express: bool,
 }
-
-// Get result
-let result = handle.get_result().await?;
-println!("Navigation complete: {:?}", result);
-
-// Create action server
-let server = Ros2ActionServer::new(zenoh_session, config,
-    |goal| async { Ok(GoalStatus::Accepted) },  // Goal callback
-    |_| async { Ok(true) },                      // Cancel callback
-    |goal| async {                               // Execute callback
-        // Do navigation...
-        NavigateResult { success: true }
-    }
-)?;
 ```
 
-### ROS2 Parameter Server
+### YAML Configuration
 
-Full ROS2 parameter protocol (list/get/set/describe/events):
+Configure topics with Zenoh transport in your `horus.yaml`:
 
-```rust
-use horus::communication::network::{
-    LocalParameterStore, Parameter, ParameterValue, ParameterDescriptor, ParameterType,
-    Ros2ParameterClient, Ros2ParameterServer,
-};
+```yaml
+topics:
+  - name: cmd_vel
+    transport: zenoh
+    zenoh:
+      connect:
+        - "tcp/192.168.1.100:7447"
+      namespace: robot1
+      reliability: reliable
+      priority: 5
+      express: true
 
-// Create local parameter store
-let store = LocalParameterStore::new("/robot_controller");
-
-// Declare parameters with descriptors
-store.declare_parameter(
-    "max_velocity",
-    ParameterValue::from_double(1.5),
-    Some(ParameterDescriptor::new("max_velocity", ParameterType::Double)
-        .with_description("Maximum velocity in m/s")
-        .with_float_range(0.0, 10.0, 0.1))
-)?;
-
-// Set parameter with validation
-let result = store.set_parameter(Parameter::double("max_velocity", 2.0))?;
-if !result.successful {
-    println!("Failed: {}", result.reason);
-}
-
-// Register change callback
-store.add_change_callback(|param, event_type| {
-    println!("Parameter {} changed: {:?}", param.name, event_type);
-});
-
-// Create parameter client for ROS2 interop
-let client = Ros2ParameterClient::new(zenoh_session, "/remote_node")?;
-let params = client.get_parameters(&["max_velocity", "use_sim_time"]).await?;
-
-// Create parameter server for ROS2 nodes to query
-let server = Ros2ParameterServer::new(zenoh_session, store)?;
+  - name: sensor_data
+    transport: zenoh
+    zenoh:
+      ros2_mode: true
+      ros2_domain_id: 0
+      serialization: cdr
 ```
 
-### Topic Naming
+### Topic Transport Types (Planned)
 
-HORUS automatically maps topics to ROS2 DDS conventions:
+The `EndpointConfig` defines these transport types for future use:
+
+| Transport | Description | Config Syntax |
+|-----------|-------------|---------------|
+| `local` | Shared memory (same machine) | Default (currently the only working transport) |
+| `localhost` | UDP loopback | `transport: localhost` |
+| `router` | Via HORUS router | `transport: router` |
+| `multicast` | UDP multicast | `transport: multicast` |
+| `direct` | Direct UDP | `transport: direct` with `host`/`port` |
+| `zenoh` | Zenoh transport | `transport: zenoh` with `zenoh:` section |
+
+<Callout type="info">
+Currently only `local` (shared memory) transport is implemented. `Topic::new("name")` always creates a local shared memory topic. The `@` endpoint syntax shown in `EndpointConfig` is for configuration purposes only and is not parsed by `Topic::new()`.
+</Callout>
+
+### ROS2 Interoperability
+
+When `ros2_mode` is enabled, HORUS automatically maps topic names to ROS2 DDS conventions:
 
 | HORUS Topic | Zenoh Key Expression | ROS2 Topic |
 |-------------|---------------------|------------|
 | `/cmd_vel` | `rt/cmd_vel` | `/cmd_vel` |
 | `/robot/odom` | `rt/robot/odom` | `/robot/odom` |
-| Service `/trigger` | `rq/trigger`, `rp/trigger` | `/trigger` |
-| Action `/navigate` | `rq/navigate/_action/*` | `/navigate` |
 
-### ROS2 Interoperability Completeness
+Set `serialization: "cdr"` for wire-compatible ROS2 message encoding.
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| **Topics** | Complete | Pub/sub with CDR serialization |
-| **Services** | Complete | Request/response protocol |
-| **Actions** | Complete | All 5 topic types |
-| **Parameters** | Complete | Full protocol + local store |
-| **QoS: Reliability** | Complete | BestEffort, Reliable |
-| **QoS: History** | Complete | KeepLast(n), KeepAll |
-| **QoS: Durability** | Complete | Volatile, TransientLocal |
-| **QoS: Deadline** | Complete | Expected message period |
-| **QoS: Lifespan** | Complete | Message validity duration |
-| **QoS: Liveliness** | Complete | Automatic, ManualByParticipant, ManualByTopic |
-| **Discovery** | Complete | Automatic peer discovery |
-| **Namespaces** | Complete | Full namespace support |
+### Multi-Robot Setup
+
+Connect multiple robots through Zenoh peers:
+
+```yaml
+# Robot 1
+topics:
+  - name: robot1/odom
+    transport: zenoh
+    zenoh:
+      listen:
+        - "tcp/0.0.0.0:7447"
+      namespace: fleet
+
+# Robot 2
+topics:
+  - name: robot2/odom
+    transport: zenoh
+    zenoh:
+      connect:
+        - "tcp/192.168.1.10:7447"
+      namespace: fleet
+```
+
+### Cloud Connectivity
+
+Connect to a Zenoh router for cloud/remote access:
+
+```yaml
+topics:
+  - name: telemetry
+    transport: zenoh
+    zenoh:
+      connect:
+        - "tcp/cloud.example.com:7447"
+      reliability: reliable
+```
+
+## Shared Memory (Default)
+
+For same-machine communication, HORUS uses shared memory by default:
+
+```rust,ignore
+use horus::prelude::*;
+
+// Default: shared memory transport (~85ns latency)
+let topic = Topic::<SensorData>::new("sensor_data")?;
+```
+
+Shared memory topics are stored in `/dev/shm/horus/` and provide sub-microsecond latency with zero-copy semantics.
+
+### Performance Characteristics
+
+| Metric | Shared Memory | Zenoh (Local) | Zenoh (Network) |
+|--------|--------------|---------------|-----------------|
+| Latency | ~85ns | ~100μs | Network dependent |
+| Throughput | Millions msg/s | High | Network dependent |
+| Zero-copy | Yes | No | No |
+| Cross-machine | No | Yes | Yes |
+
+## Best Practices
+
+### 1. Use Shared Memory for Local Communication
+
+```yaml
+# Don't use Zenoh for same-machine nodes
+topics:
+  - name: sensor_data
+    # No transport specified = shared memory (fastest)
+```
+
+### 2. Use Zenoh Only When Needed
+
+```yaml
+# Multi-robot or cross-machine communication
+topics:
+  - name: fleet_status
+    transport: zenoh
+    zenoh:
+      connect: ["tcp/192.168.1.100:7447"]
+```
+
+### 3. Enable Express Mode for Low Latency
+
+```yaml
+topics:
+  - name: control_cmd
+    transport: zenoh
+    zenoh:
+      express: true  # Skip batching
+      priority: 7    # Highest priority
+```
+
+### 4. Use CDR Serialization for ROS2
+
+```yaml
+topics:
+  - name: cmd_vel
+    transport: zenoh
+    zenoh:
+      ros2_mode: true
+      ros2_domain_id: 0
+      serialization: cdr  # ROS2 wire format
+```
 
 ## See Also
 
-- [Network Communication](/concepts/network-communication) - Basic networking
-- [Shared Memory](/concepts/core-concepts-shared-memory) - Local communication
-- [GPU Tensor Sharing](/advanced/gpu-tensor-sharing) - GPU memory transfer
+- [Network Communication](/concepts/network-communication) - Basic networking concepts
+- [Shared Memory](/concepts/core-concepts-shared-memory) - Local communication details
+- [ROS2 Bridge](/development/ros2-bridge) - ROS2 migration guide

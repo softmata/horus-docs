@@ -6,7 +6,7 @@ order: 5
 
 # Zero-Overhead IPC Architecture
 
-HORUS uses a **zero-overhead IPC architecture** that separates introspection from the hot path. This design ensures that `send()` and `recv()` have minimal latency regardless of whether monitoring tools are attached.
+HORUS uses a **zero-overhead IPC architecture** that separates introspection from the hot path. This design ensures that `send()` and `recv()` operate at bare-metal latency (~3-167ns) regardless of whether monitoring tools are attached.
 
 ## Key Takeaways
 
@@ -29,11 +29,11 @@ flowchart TB
             direction LR
             subgraph HOT["<b>HOT PATH</b><br/>Zero Overhead"]
                 H1["topic.send(msg)<br/>topic.recv()"]
-                H2["• No timing<br/>• No logging<br/>• No syscalls<br/>• <b>~50-600ns</b>"]
+                H2["• No timing<br/>• No logging<br/>• No syscalls<br/>• <b>~3-167ns</b>"]
             end
             subgraph INTRO["<b>INTROSPECTION</b><br/>Opt-in"]
-                I1["Topic::new(name)?.with_logging()<br/>then send() / recv()"]
-                I2["✓ Timing measured<br/>✓ Logs to buffer<br/>✓ Metrics updated<br/>• <b>~200-1000ns</b>"]
+                I1["Topic::new(name)?.with_logging()"]
+                I2["✓ Timing measured<br/>✓ Summary logged<br/>✓ Metrics updated<br/>• <b>+200-500ns overhead</b>"]
             end
         end
         subgraph EXT["<b>EXTERNAL INTROSPECTION</b> (Passive)"]
@@ -72,7 +72,7 @@ topic.send(42.0);
 - No logging or tracing
 - No syscalls beyond the atomic operations
 - Infallible — ring buffer overwrites oldest message when full
-- **Latency: 50-600ns** depending on backend
+- **Latency: ~3-167ns** depending on backend
 
 #### `recv() -> Option<T>`
 
@@ -89,7 +89,7 @@ if let Some(value) = topic.recv() {
 - Non-blocking (returns `None` if no message)
 - No timing measurement
 - No logging
-- **Latency: 50-600ns** depending on backend
+- **Latency: ~3-167ns** depending on backend
 
 ### Introspection Mode (Opt-in via `with_logging()`)
 
@@ -98,7 +98,7 @@ Enable logging and metrics at topic creation time using `with_logging()`. Once e
 ```rust
 use horus::prelude::*;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, LogSummary)]
 struct SensorData {
     temperature: f32,
     pressure: f32,
@@ -116,14 +116,23 @@ if let Some(data) = topic.recv() {
 }
 ```
 
-**What `with_logging()` does on every `send()` / `recv()`:**
-1. Records `Instant::now()` before the operation
-2. Performs the IPC operation
-3. Calculates elapsed time
-4. Writes to introspection log buffer
-5. Updates topic metrics
+The `with_logging()` method requires `T: LogSummary`. Use `#[derive(LogSummary)]` for automatic `Debug`-based summaries, or implement the trait manually for custom formatting (useful for large types like images where you want to log only metadata).
+
+**What `with_logging()` adds to `send()`:**
+1. Calls `msg.log_summary()` to produce a compact string
+2. Records `Instant::now()` before the IPC operation
+3. Performs the IPC send
+4. Calculates elapsed IPC time
+5. Publishes a `LogEntry` (timestamp, node name, tick number, topic, summary, IPC latency)
+
+**What `with_logging()` adds to `recv()`:**
+1. Records `Instant::now()` before the IPC operation
+2. Performs the IPC receive
+3. If a message was received, calls `msg.log_summary()` and publishes a `LogEntry`
 
 **Latency:** +200-500ns overhead per operation
+
+**How it stays zero-overhead when disabled:** The default path uses `unlikely()` branch prediction hints and `#[cold]` / `#[inline(never)]` annotations on the logging path, ensuring the branch predictor treats the non-logging path as the fast path. The overhead when logging is disabled is less than 1 CPU cycle.
 
 ## External Introspection
 
@@ -131,29 +140,19 @@ HORUS provides external tools that monitor Topics without affecting publishers:
 
 ### `horus monitor`
 
-The TUI monitor reads shared memory metadata directly:
+Launches a monitoring dashboard. Defaults to a web interface; use `-t` for a terminal UI:
 
 ```bash
-horus monitor
-```
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  HORUS Monitor                                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│  Topic           │ Rate   │ Publishers │ Subscribers │ Size       │
-│  ──────────────────────────────────────────────────────────────────│
-│  sensors/lidar   │ 40 Hz  │ 1          │ 2           │ 1.5 KB     │
-│  robot/cmd_vel   │ 100 Hz │ 1          │ 1           │ 16 B       │
-│  camera/image    │ 30 Hz  │ 1          │ 3           │ 921 KB     │
-└─────────────────────────────────────────────────────────────────────┘
+horus monitor          # Web dashboard on localhost:3000
+horus monitor -t       # Terminal UI (TUI) mode
+horus monitor --port 8080  # Web dashboard on custom port
 ```
 
 **How it works:**
 - Scans `/dev/shm/horus/topics/` directory
 - Reads file metadata (size, mtime, accessing PIDs)
 - Calculates message rate from timestamps
-- **Zero impact on publishers** - reads existing shared memory
+- **Zero impact on publishers** — reads existing shared memory
 
 ### `horus topic echo <name>`
 
@@ -161,6 +160,8 @@ Subscribes to a topic and prints messages:
 
 ```bash
 horus topic echo sensors
+horus topic echo sensors -n 10      # Echo 10 messages then stop
+horus topic echo sensors -r 5       # Limit to 5 Hz display rate
 ```
 
 **How it works:**
@@ -174,34 +175,42 @@ Measures message publication rate:
 
 ```bash
 horus topic hz cmd_vel
+horus topic hz cmd_vel -w 20   # Averaging window of 20 samples
 # Output: average rate: 100.02 Hz
+```
+
+### Additional Topic Commands
+
+```bash
+horus topic list              # List all active topics
+horus topic list --json       # JSON output
+horus topic info <name>       # Detailed info about a topic
+horus topic pub <name> <msg>  # Publish a test message
 ```
 
 ## Backend Performance
 
-### Latency by Backend
+HORUS auto-detects the optimal backend from 10 modes based on topology (same-thread, same-process, cross-process), participant pattern (1P1C, 1P-MC, MP-1C, MPMC), and type characteristics (POD vs non-POD).
 
-| Backend | Latency | Use Case |
-|---------|---------|----------|
-| **DirectChannel** | ~3-5ns | Same-thread pipelines |
-| **SpscIntra** | ~25ns | Same-process, 1:1 |
-| **MpmcIntra** | ~80ns | Same-process, N:M |
-| **SpscShm** | ~85ns | Cross-process, 1:1 |
-| **MpmcShm** | ~167ns | Cross-process, N:M (default) |
-| **PodShm** | ~50ns | Cross-process, POD types |
+### Intra-Process Backends (Heap-Backed)
 
-### Absolute Latency Guarantees
+| Backend | Latency | Pattern | Use Case |
+|---------|---------|---------|----------|
+| **DirectChannel** | ~3ns | Same-thread, 1P1C | Internal pipelines |
+| **SpscIntra** | ~18ns | Same-process, 1P1C | Fast 1:1 channels |
+| **SpmcIntra** | ~24ns | Same-process, 1P-MC | One publisher, many consumers |
+| **MpscIntra** | ~26ns | Same-process, MP-1C | Many publishers, one consumer |
+| **MpmcIntra** | ~36ns | Same-process, MPMC | General same-process pub/sub |
 
-HORUS CI enforces these maximum latencies:
+### Cross-Process Backends (Shared Memory)
 
-| Backend | Maximum | Typical |
-|---------|---------|---------|
-| **MpmcShm** | 600ns | ~167ns |
-| **SpscShm** | 200ns | ~85ns |
-| **MpmcIntra** | 100ns | ~80ns |
-| **SpscIntra** | 50ns | ~25ns |
-
-If benchmarks exceed these thresholds, CI fails.
+| Backend | Latency | Pattern | Use Case |
+|---------|---------|---------|----------|
+| **PodShm** | ~50ns | Cross-process, POD types | Fastest cross-process for simple types |
+| **MpscShm** | ~65ns | Cross-process, MP-1C | Many publishers, one consumer |
+| **SpmcShm** | ~70ns | Cross-process, 1P-MC | One publisher, many consumers |
+| **SpscShm** | ~85ns | Cross-process, 1P1C | Simple cross-process 1:1 |
+| **MpmcShm** | ~167ns | Cross-process, MPMC | General cross-process (default) |
 
 ## When to Use Each API
 
@@ -234,22 +243,13 @@ impl Node for MotorController {
 
 ```rust
 // Health status - introspection useful, low frequency
-impl HealthMonitor {
-    fn new() -> HorusResult<Self> {
-        Ok(Self {
-            // Configure logging once at creation
-            status_pub: Topic::new("health/status")?.with_logging(),
-        })
-    }
-}
+// The status type must implement LogSummary for with_logging()
+let status_pub: Topic<HealthStatus> = Topic::new("health/status")?.with_logging();
 
-impl Node for HealthMonitor {
-    fn tick(&mut self) {
-        let status = self.collect_health();
-        // Logging happens automatically - only 1 Hz so overhead is fine
-        self.status_pub.send(status);
-    }
-}
+// In your node's tick:
+let status = self.collect_health();
+// Logging happens automatically — only 1 Hz so overhead is negligible
+self.status_pub.send(status);
 ```
 
 ### Use External Tools

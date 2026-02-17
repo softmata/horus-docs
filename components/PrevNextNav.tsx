@@ -38,7 +38,6 @@ const allPages: DocLink[] = [
   { title: "Configuration", href: "/concepts/communication-configuration" },
   { title: "Scheduler", href: "/concepts/core-concepts-scheduler" },
   { title: "node! Macro", href: "/concepts/node-macro" },
-  { title: "message! Macro", href: "/concepts/message-macro" },
   { title: "Message Types", href: "/concepts/message-types" },
   { title: "Real-Time Nodes", href: "/concepts/realtime-nodes" },
   { title: "HFrame Transforms", href: "/concepts/hframe" },
@@ -58,7 +57,7 @@ const allPages: DocLink[] = [
   { title: "Diagnostics Messages", href: "/rust/api/diagnostics-messages" },
   { title: "Force Messages", href: "/rust/api/force-messages" },
   { title: "Geometry Messages", href: "/rust/api/geometry-messages" },
-  { title: "I/O Messages", href: "/rust/api/io-messages" },
+
   { title: "ML Messages", href: "/rust/api/ml-messages" },
   { title: "Navigation Messages", href: "/rust/api/navigation-messages" },
   { title: "Perception Messages", href: "/rust/api/perception-messages" },

@@ -1,697 +1,420 @@
 ---
 title: Network Communication
-description: Building distributed multi-machine systems with HORUS
+description: Node discovery and multi-machine patterns with HORUS
 order: 22
 ---
 
 # Network Communication
 
-HORUS supports network communication for building distributed systems across multiple machines. Topic work transparently over the network with only a syntax change.
+HORUS currently uses **local shared memory** for all topic data transport, providing ultra-low latency IPC on the same machine. For multi-machine awareness, HORUS includes **mDNS/DNS-SD** service discovery (behind the `mdns` feature flag) that enables zero-configuration node discovery on the local network.
 
-## Quick Start
+## Current Architecture
 
-### Topic Network Example
+### Topic Transport: Local Shared Memory Only
+
+All topics use shared memory regardless of configuration:
 
 ```rust
-// === MACHINE 1 (Producer @ 192.168.1.10) ===
 use horus::prelude::*;
 
-// Connect to consumer at 192.168.1.20:9000
-let output: Topic<SensorData> = Topic::new("sensors@192.168.1.20:9000")?;
-output.send(data);
+// All topics use local shared memory
+let sensors: Topic<SensorData> = Topic::new("sensors")?;
+let motors: Topic<MotorCmd> = Topic::new("motors")?;
+```
 
-// === MACHINE 2 (Consumer @ 192.168.1.20) ===
+Topics provide ~85ns (SPSC) to ~167ns (MPMC) latency for nodes on the same machine. See [Communication Transport](/concepts/communication-transport) for details on the automatic backend selection.
+
+### Network Discovery: mDNS/DNS-SD
+
+HORUS includes mDNS support for discovering other HORUS nodes on the local network. This is useful for monitoring, debugging, and building awareness of what's running across machines — though topic data transport remains local shared memory.
+
+mDNS is behind the `mdns` feature flag:
+
+```toml
+[dependencies]
+horus = { version = "0.1", features = ["mdns"] }
+```
+
+## mDNS Node Discovery
+
+### One-Shot Discovery
+
+Scan the local network for HORUS nodes:
+
+```rust
 use horus::prelude::*;
 
-// Listen for producer on port 9000
-let input: Topic<SensorData> = Topic::new("sensors@0.0.0.0:9000")?;
-if let Some(data) = input.recv() {
-    process(data);
+// Discover all HORUS nodes on the network
+let nodes = discover()?;
+for node in &nodes {
+    println!("Found: {} at {}:{}", node.name, node.ip, node.port);
+    println!("  Topics: {:?}", node.topics);
 }
 ```
 
-### Topic Network Example
+### Discovery with Options
+
+Filter and customize discovery:
 
 ```rust
-// === MACHINE 1 (Publisher @ 192.168.1.10) ===
 use horus::prelude::*;
 
-// Publish to network
-let pub_topic: Topic<Status> = Topic::new("status@192.168.1.20")?;
-pub_topic.send(status);
+let options = DiscoveryOptions {
+    timeout: Duration::from_secs(5),          // Scan for 5 seconds
+    filter_topic: Some("lidar".to_string()),  // Only nodes with "lidar" topic
+    filter_name: None,
+    include_cached: false,
+};
 
-// === MACHINE 2 (Subscriber @ 192.168.1.20) ===
+let nodes = discover_with_options(options)?;
+```
+
+### Full Discovery Result
+
+Get metadata along with discovered nodes:
+
+```rust
+let result = discover_full()?;
+println!("Found {} nodes in {}ms", result.count, result.scan_duration_ms);
+println!("Scan timestamp: {}", result.timestamp);
+
+for node in &result.nodes {
+    println!("  {} ({}:{})", node.name, node.ip, node.port);
+}
+```
+
+### Find Specific Nodes
+
+```rust
+// Find a node by name
+if let Some(node) = find_node("arm-controller")? {
+    println!("Found arm controller at {}", node.ip);
+}
+
+// Find all nodes publishing a specific topic
+let lidar_nodes = find_nodes_with_topic("lidar.scan")?;
+```
+
+## Continuous Monitoring
+
+Watch for nodes joining and leaving the network in real-time:
+
+```rust
 use horus::prelude::*;
 
-// Subscribe from network
-let sub_topic: Topic<Status> = Topic::new("status@192.168.1.20")?;
-if let Some(status) = sub_topic.recv() {
-    process(status);
-}
-```
+let watcher = watch()?;
 
-### Python Examples
-
-The same endpoint syntax works in Python:
-
-**Topic (Python):**
-```python
-from horus import Topic, SensorData
-
-# === MACHINE 1 (Producer) ===
-output = Topic(SensorData, endpoint="sensors@192.168.1.20:9000")
-output.send(data)
-
-# === MACHINE 2 (Consumer) ===
-input_link = Topic(SensorData, endpoint="sensors@0.0.0.0:9000")
-if msg := input_link.recv():
-    process(msg)
-```
-
-**Topic (Python):**
-```python
-from horus import Topic, Status
-
-# Network topic with endpoint parameter
-topic = Topic(Status, endpoint="status@192.168.1.20:8000")
-topic.send(status)
-
-# Receive
-if msg := topic.recv():
-    process(msg)
-```
-
-**Router (Python):**
-```python
-from horus import Topic, RouterClient, CmdVel
-
-# Method 1: Implicit router endpoint
-router_topic = Topic(CmdVel, endpoint="cmdvel@router")
-
-# Method 2: Explicit RouterClient
-router = RouterClient("192.168.1.100", 7777)
-topic = Topic(CmdVel, endpoint=router.endpoint("cmdvel"))
-```
-
-See [Python Bindings - Network Communication](/python/api/python-bindings#network-communication) for full Python documentation.
-
-## Endpoint Syntax
-
-HORUS uses a simple `topic@address` syntax to specify network endpoints:
-
-### Topic Endpoints (TCP)
-
-**Producer (connects to consumer)**:
-```rust
-Topic::new("topic@192.168.1.20:9000")?     // Connect to specific IP:port
-Topic::new("topic@hostname:9000")?         // Connect to hostname
-Topic::new("topic@drone.local:9000")?      // mDNS/Avahi hostname
-```
-
-**Consumer (listens for producer)**:
-```rust
-Topic::new("topic@0.0.0.0:9000")?          // Listen on port 9000 (all interfaces)
-Topic::new("topic@192.168.1.20:9000")?     // Listen on specific interface
-```
-
-### Topic Endpoints (UDP)
-
-```rust
-Topic::new("topic@192.168.1.20")?                // Direct UDP (default port)
-Topic::new("topic@192.168.1.20:8000")?           // Direct UDP (custom port)
-Topic::new("topic@localhost")?                    // Unix socket (localhost optimization)
-Topic::new("topic@router")?                       // Router backend (WAN/NAT traversal)
-```
-
-### Local Endpoints (Shared Memory)
-
-```rust
-// No '@' symbol = local shared memory
-Topic::new("topic")?
-Topic::new("topic")?
-Topic::new("topic")?
-```
-
-## Network Backends
-
-### Topic (SPSC): DirectBackend (TCP)
-
-**Technology**: TCP with `TCP_NODELAY`
-**Latency**: 5-15µs
-**Pattern**: Point-to-point (1 producer → 1 consumer)
-
-**Architecture**:
-- Async Tokio I/O (event-driven, non-blocking)
-- Lock-free crossbeam channels (send/recv queues)
-- Buffer pooling (zero-allocation sends)
-- Binary serialization (bincode)
-
-**When to use**:
-- Point-to-point communication between exactly 2 machines
-- Control loops where 5-15µs latency is acceptable
-- Latest-value semantics (sensor data, state updates)
-- Guaranteed delivery and ordering (TCP reliability)
-
-**Example**:
-```rust
-// Robot sends IMU data to ground station
-// Robot (192.168.1.50)
-let imu_output: Topic<ImuData> = Topic::new("imu@192.168.1.100:9000")?;
-
-// Ground station (192.168.1.100)
-let imu_input: Topic<ImuData> = Topic::new("imu@0.0.0.0:9000")?;
-```
-
-### Topic (MPMC): UdpDirectBackend (UDP)
-
-**Technology**: UDP with packet fragmentation
-**Latency**: &lt;50µs
-**Pattern**: Many-to-many pub/sub
-
-**Architecture**:
-- UDP sockets (connectionless)
-- Mutex-protected receive queues
-- Packet fragmentation for large messages
-- Polling with 100µs sleep
-
-**When to use**:
-- Broadcasting to multiple subscribers over network
-- Pub/sub patterns (many publishers, many subscribers)
-- Occasional packet loss acceptable
-- Lower overhead than TCP
-
-**Example**:
-```rust
-// Multiple robots publish position, central server aggregates
-// Robot 1
-let pos_pub: Topic<Position> = Topic::new("positions@192.168.1.100")?;
-
-// Robot 2
-let pos_pub: Topic<Position> = Topic::new("positions@192.168.1.100")?;
-
-// Central server
-let positions: Topic<Position> = Topic::new("positions@0.0.0.0:8000")?;
-```
-
-## Performance Characteristics
-
-### Latency Comparison
-
-| Transport | Topic (SPSC) | Topic (MPMC) | Speedup |
-|-----------|-------------|------------|---------|
-| **Local SHM** | ~85ns | ~167ns | Baseline |
-| **Network** | 5-15µs | &lt;50µs | **Topic SPSC 3-10x faster** |
-
-**Why Topic SPSC is faster on network**:
-1. **Lock-free channels** (no mutex contention) vs mutex-protected queues
-2. **Event-driven I/O** (async Tokio) vs polling with 100µs sleep
-3. **TCP_NODELAY** (sends immediately) vs UDP overhead
-4. **Buffer pooling** (zero allocations) vs standard allocations
-
-### Message Size Impact
-
-| Message Size | SPSC Latency | MPMC Latency |
-|--------------|-------------|-------------|
-| 16 bytes | 5µs | 10µs |
-| 256 bytes | 8µs | 15µs |
-| 1KB | 12µs | 25µs |
-| 10KB | 50µs | 100µs |
-| 100KB | 500µs | 1ms |
-
-**Note**: Network latency dominated by RTT for small messages, bandwidth for large messages.
-
-### Frequency Guidelines
-
-**Topic Network** (5-15us latency):
-- 1kHz (1ms period): Possible with headroom
-- 500Hz (2ms period): Comfortable
-- 100Hz (10ms period): Plenty of headroom
-
-**Topic Network** (&lt;50us latency):
-- 100Hz (10ms period): Comfortable
-- 50Hz (20ms period): Safe
-- 30Hz (33ms period): Typical for camera streams
-
-## Multi-Machine Topologies
-
-### 1. Robot Fleet Coordination
-
-```rust
-// === ROBOT 1 (192.168.1.10) ===
-struct Robot1 {
-    // Publish own position
-    position_pub: Topic<Position>,
-
-    // Subscribe to fleet positions
-    fleet_positions: Topic<Position>,
-
-    // Local control loop (ultra-fast)
-    imu_link: Topic<ImuData>,
-    motors_link: Topic<MotorCmd>,
-}
-
-impl Robot1 {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            position_pub: Topic::new("fleet.positions@router")?,
-            fleet_positions: Topic::new("fleet.positions@router")?,
-            imu_link: Topic::new("imu")?,      // Local
-            motors_link: Topic::new("motors")?, // Local
-        })
-    }
-}
-
-// === ROBOT 2 (192.168.1.20) ===
-// Same structure, different IP
-```
-
-### 2. Edge Computing Pipeline
-
-```rust
-// === EDGE DEVICE (192.168.1.50) - Raspberry Pi ===
-struct EdgeSensor {
-    // Capture camera locally
-    camera: Topic<RawImage>,
-
-    // Send to processing server
-    image_output: Topic<RawImage>,
-}
-
-impl EdgeSensor {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            camera: Topic::new("camera")?,  // Local
-            image_output: Topic::new("images@192.168.1.100:9000")?, // Network
-        })
-    }
-}
-
-// === PROCESSING SERVER (192.168.1.100) - Powerful GPU ===
-struct ProcessingServer {
-    // Receive from edge device
-    image_input: Topic<RawImage>,
-
-    // Process and send results back
-    detections_output: Topic<Detections>,
-}
-
-impl ProcessingServer {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            image_input: Topic::new("images@0.0.0.0:9000")?,          // Network listen
-            detections_output: Topic::new("detect@192.168.1.50:9001")?, // Send back
-        })
+// Iterate over discovery events
+for event in watcher {
+    match event {
+        DiscoveryEvent::NodeJoined(node) => {
+            println!("+ Node joined: {} at {}", node.name, node.ip);
+        }
+        DiscoveryEvent::NodeLeft(name) => {
+            println!("- Node left: {}", name);
+        }
+        DiscoveryEvent::NodeUpdated(node) => {
+            println!("~ Node updated: {}", node.name);
+        }
+        DiscoveryEvent::Error(err) => {
+            eprintln!("Discovery error: {}", err);
+        }
     }
 }
 ```
 
-### 3. Distributed Sensing Network
+### Custom Scan Interval
 
 ```rust
-// === SENSOR NODE 1 (192.168.1.51) ===
-let temp1: Topic<Temperature> = Topic::new("temps@192.168.1.100")?;
-
-// === SENSOR NODE 2 (192.168.1.52) ===
-let temp2: Topic<Temperature> = Topic::new("temps@192.168.1.100")?;
-
-// === SENSOR NODE 3 (192.168.1.53) ===
-let temp3: Topic<Temperature> = Topic::new("temps@192.168.1.100")?;
-
-// === AGGREGATOR (192.168.1.100) ===
-let temps: Topic<Temperature> = Topic::new("temps@0.0.0.0:8000")?;
-// Receives from all sensor nodes
+// Scan every 500ms instead of default 1 second
+let watcher = watch_with_interval(Duration::from_millis(500))?;
 ```
 
-### 4. Drone with Ground Control Station
+### Non-Blocking Events
 
 ```rust
-// === DRONE (192.168.1.50) ===
-struct Drone {
-    // Local: Critical flight control (ultra-fast)
+let watcher = watch()?;
+
+loop {
+    // Non-blocking check
+    if let Some(event) = watcher.try_recv() {
+        handle_event(event);
+    }
+
+    // Or with timeout
+    if let Some(event) = watcher.recv_timeout(Duration::from_millis(100)) {
+        handle_event(event);
+    }
+
+    do_other_work();
+}
+```
+
+## Service Registration
+
+### Registering a Node
+
+Make your node discoverable on the network:
+
+```rust
+use horus::prelude::*;
+
+// Register with name and port
+let reg = MdnsNodeRegistration::new("arm-controller", 9870)?;
+reg.register(&["joint_states", "joint_commands"])?;
+
+// Node is now discoverable as "arm-controller.local"
+// Other nodes can find it via discover() or find_node()
+```
+
+### Builder Pattern
+
+```rust
+let reg = MdnsNodeRegistration::builder("arm-controller")
+    .port(9871)
+    .auto_register(false)
+    .extra_property("robot_type", "arm")
+    .build()?;
+
+// Register later with specific topics
+reg.register(&["joint_states", "cmd_vel"])?;
+```
+
+### Dynamic Topic Updates
+
+```rust
+// Initially register with some topics
+reg.register(&["joint_states"])?;
+
+// Later, add more topics
+reg.update_topics(&["joint_states", "joint_commands", "gripper"])?;
+```
+
+### Clean Shutdown
+
+```rust
+// Explicit unregistration
+reg.unregister()?;
+
+// Or automatic on Drop — the registration is cleaned up when
+// the MdnsNodeRegistration goes out of scope
+```
+
+### Global Registration Manager
+
+For applications with multiple nodes, use the centralized manager:
+
+```rust
+let manager = GlobalMdnsManager::new();
+
+// Register multiple nodes
+manager.register_node("lidar-node", 9870, &["lidar.scan"])?;
+manager.register_node("camera-node", 9871, &["camera.rgb"])?;
+
+// Look up a registration
+if let Some(reg) = manager.get("lidar-node") {
+    println!("Lidar registered on port {}", reg.port());
+}
+
+// Unregister all on shutdown
+manager.unregister_all()?;
+```
+
+## HorusMdns Low-Level API
+
+For advanced use cases, access the mDNS daemon directly:
+
+```rust
+use horus_core::communication::network::mdns::{HorusMdns, ServiceInfo};
+
+let mdns = HorusMdns::new()?;
+
+// Register as a discoverable service
+mdns.register_service("my-robot", 9870, &["lidar", "camera"])?;
+
+// Resolve a .local hostname to an IP address
+let ip = mdns.resolve_hostname("other-robot")?;
+println!("other-robot is at {}", ip);
+
+// Browse all HORUS services on the network
+let services = mdns.browse_services()?;
+for service in services {
+    println!("Found: {} at {}:{}", service.hostname, service.address, service.port);
+    println!("  Topics: {:?}", service.topics);
+}
+
+// Clean shutdown
+mdns.shutdown()?;
+```
+
+### Hostname Resolution
+
+Resolve `.local` hostnames without knowing IP addresses:
+
+```rust
+// Resolve with default timeout (100ms)
+let ip = mdns.resolve_hostname("drone-1")?;
+
+// Resolve with custom timeout
+let ip = mdns.resolve_hostname_with_timeout("drone-1", Duration::from_secs(5))?;
+
+// Standalone convenience function (creates temporary HorusMdns)
+let ip = resolve_mdns_hostname("drone-1")?;
+```
+
+Results are cached for 5 minutes to avoid repeated network queries.
+
+## Endpoint Configuration System
+
+HORUS includes a configuration system that defines endpoint transport types. While the configuration plumbing is in place, the actual network data transport for topics is not yet implemented — topics always use local shared memory.
+
+```yaml
+# horus.yaml — endpoint configuration (for future network transport)
+hubs:
+  telemetry:
+    name: telemetry
+    transport: local         # Currently the only functional transport
+
+  camera:
+    name: camera
+    transport: direct        # Config plumbing exists, but topic transport is local
+    host: 192.168.1.50
+    port: 9000
+```
+
+```rust
+use horus::prelude::*;
+
+// Load endpoint configuration
+let config = HorusConfig::find_and_load()?;
+
+// Get configured endpoint strings
+let endpoint = config.get_hub("telemetry")?.get_endpoint();
+println!("Configured endpoint: {}", endpoint);
+
+// Create topic (always uses local shared memory regardless of config)
+let telemetry: Topic<Status> = Topic::new("telemetry")?;
+```
+
+See [Communication Configuration](/concepts/communication-configuration) for full configuration details including Zenoh settings.
+
+## Multi-Machine Patterns
+
+While topic transport is local, you can build multi-machine systems using mDNS for discovery alongside external data transport.
+
+### Pattern: Discovery + External Bridge
+
+```rust
+use horus::prelude::*;
+
+struct MonitoringNode {
+    // Local topics for on-machine communication
+    sensor_data: Topic<SensorData>,
+
+    // mDNS for network awareness
+    registration: MdnsNodeRegistration,
+}
+
+impl MonitoringNode {
+    fn new() -> Result<Self> {
+        // Register this node on the network
+        let reg = MdnsNodeRegistration::new("sensor-node", 9870)?;
+        reg.register(&["sensor_data"])?;
+
+        Ok(Self {
+            sensor_data: Topic::new("sensor_data")?,
+            registration: reg,
+        })
+    }
+}
+
+// On another machine: discover and monitor
+fn monitor_fleet() -> Result<()> {
+    let nodes = discover()?;
+    println!("Fleet status:");
+    for node in &nodes {
+        println!("  {} at {} — topics: {:?}", node.name, node.ip, node.topics);
+    }
+    Ok(())
+}
+```
+
+### Pattern: Local Control + Network Telemetry
+
+Keep critical control loops on local shared memory and use mDNS for fleet awareness:
+
+```rust
+struct Robot {
+    // Critical control: local shared memory (~85ns)
     imu: Topic<ImuData>,
     motors: Topic<MotorCmd>,
 
-    // Network: Telemetry to GCS
-    telemetry: Topic<DroneStatus>,
-
-    // Network: Commands from GCS
-    commands: Topic<Command>,
+    // Network awareness: mDNS registration
+    registration: MdnsNodeRegistration,
 }
 
-impl Drone {
+impl Robot {
     fn new() -> Result<Self> {
-        Ok(Self {
-            imu: Topic::new("imu")?,          // Local: ~85ns
-            motors: Topic::new("motors")?,     // Local: ~85ns
-            telemetry: Topic::new("telem@192.168.1.100")?,   // Network: &lt;50µs
-            commands: Topic::new("cmd@0.0.0.0:8001")?,       // Network listen
-        })
-    }
-}
+        let reg = MdnsNodeRegistration::new("robot-1", 9870)?;
+        reg.register(&["imu", "motors", "status"])?;
 
-// === GROUND CONTROL STATION (192.168.1.100) ===
-struct GroundStation {
-    telemetry_sub: Topic<DroneStatus>,
-    command_pub: Topic<Command>,
-}
-
-impl GroundStation {
-    fn new() -> Result<Self> {
         Ok(Self {
-            telemetry_sub: Topic::new("telem@0.0.0.0:8000")?,  // Listen for drone
-            command_pub: Topic::new("cmd@192.168.1.50:8001")?, // Send to drone
+            imu: Topic::new("imu")?,
+            motors: Topic::new("motors")?,
+            registration: reg,
         })
     }
 }
 ```
 
-## Network Configuration
+## Network Tips
 
-### Using Configuration Files
+### Disable WiFi Power Saving
 
-Instead of hardcoding IP addresses, use configuration files:
-
-**horus.yaml** (production):
-```yaml
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry@192.168.1.100:8000
-
-  camera:
-    name: camera
-    endpoint: camera@192.168.1.50:9000
-```
-
-**horus_dev.yaml** (development):
-```yaml
-topics:
-  telemetry:
-    name: telemetry
-    endpoint: telemetry  # Local for testing
-
-  camera:
-    name: camera
-    endpoint: camera  # Local for testing
-```
-
-**Code** (same for dev and prod):
-```rust
-// Automatically loads from horus.yaml or horus_dev.yaml
-let telemetry: Topic<Status> = Topic::from_config("telemetry")?;
-let camera: Topic<Image> = Topic::from_config("camera")?;
-```
-
-See [Communication Configuration](/concepts/communication-configuration) for details.
-
-### Environment-Specific Endpoints
+For reliable mDNS discovery on WiFi:
 
 ```bash
-# Development (local)
-export HORUS_CONFIG=horus_dev.yaml
-horus run robot.rs
-
-# Production (network)
-export HORUS_CONFIG=horus.yaml
-horus run --release robot.rs
-```
-
-## Error Handling
-
-### Connection Failures
-
-```rust
-use horus::prelude::*;
-
-let link: Topic<Data> = match Topic::new("data@192.168.1.100:9000") {
-    Ok(l) => l,
-    Err(e) => {
-        eprintln!("Failed to connect: {}", e);
-        // Retry or fallback to local mode
-        Topic::new("data")?
-    }
-};
-```
-
-### Timeouts and Heartbeats
-
-```rust
-struct NetworkNode {
-    data_link: Topic<SensorData>,
-    last_recv: std::time::Instant,
-}
-
-impl Node for NetworkNode {
-    fn tick(&mut self) {
-        if let Some(data) = self.data_link.recv() {
-            self.last_recv = std::time::Instant::now();
-            self.process(data);
-        } else {
-            // Check for timeout
-            if self.last_recv.elapsed() > std::time::Duration::from_secs(5) {
-                hlog!(error, "Network timeout - no data received for 5s");
-            }
-        }
-    }
-}
-```
-
-### Graceful Degradation
-
-```rust
-struct RobotWithFallback {
-    // Try network first
-    telemetry_network: Option<Topic<Status>>,
-
-    // Fallback to local logging
-    telemetry_local: Topic<Status>,
-}
-
-impl Node for RobotWithFallback {
-    fn tick(&mut self) {
-        let status = self.get_status();
-
-        // Try network first if available
-        if let Some(ref net) = self.telemetry_network {
-            net.send(status.clone());
-            return;
-        }
-
-        // Fallback to local logging
-        self.telemetry_local.send(status);
-    }
-}
-```
-
-## Network Performance Tuning
-
-### 1. TCP Buffer Sizes
-
-For high-throughput Topic connections:
-
-```bash
-# Increase TCP buffer sizes (Linux)
-sudo sysctl -w net.core.rmem_max=16777216
-sudo sysctl -w net.core.wmem_max=16777216
-sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
-sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
-```
-
-### 2. UDP Buffer Sizes
-
-For high-rate Topic pub/sub:
-
-```bash
-# Increase UDP buffer sizes
-sudo sysctl -w net.core.rmem_default=8388608
-sudo sysctl -w net.core.wmem_default=8388608
-```
-
-### 3. Disable WiFi Power Saving
-
-For reliable latency on WiFi:
-
-```bash
-# Disable WiFi power saving
 sudo iw dev wlan0 set power_save off
 ```
 
-### 4. QoS and Traffic Shaping
+### mDNS Troubleshooting
 
-Prioritize HORUS traffic:
-
+**No nodes discovered**:
 ```bash
-# Mark HORUS packets with DSCP (Differentiated Services Code Point)
-sudo iptables -t mangle -A OUTPUT -p tcp --dport 9000 -j DSCP --set-dscp 46
-sudo iptables -t mangle -A OUTPUT -p udp --dport 8000 -j DSCP --set-dscp 46
+# Check if avahi/mDNS is running
+systemctl status avahi-daemon
+
+# Test mDNS resolution
+avahi-resolve -n robot.local
+
+# Check multicast traffic
+sudo tcpdump -i eth0 port 5353
 ```
 
-## Firewall Configuration
+**Slow discovery**:
+- Increase the timeout in `DiscoveryOptions`
+- Check that multicast is not blocked by your network
+- Ensure `avahi-daemon` is running on Linux systems
 
-### Linux (ufw)
+### Service Type
 
-```bash
-# Allow HORUS ports
-sudo ufw allow 8000:9999/tcp  # Topic (TCP)
-sudo ufw allow 8000:9999/udp  # Topic MPMC (UDP)
-```
-
-### Linux (iptables)
-
-```bash
-# Allow inbound HORUS traffic
-sudo iptables -A INPUT -p tcp --dport 9000 -j ACCEPT
-sudo iptables -A INPUT -p udp --dport 8000 -j ACCEPT
-```
-
-## Security Considerations
-
-### Network Isolation
-
-- Run HORUS on isolated VLAN for robots
-- Use firewall rules to limit access
-- Disable internet access for safety-critical nodes
-
-### Future: TLS Support
-
-```toml
-# Future feature (not yet implemented)
-[topics.secure_telemetry]
-name = "telemetry"
-endpoint = "telemetry@192.168.1.100:8000"
-tls = true
-cert = "/path/to/cert.pem"
-key = "/path/to/key.pem"
-```
-
-## Troubleshooting
-
-### Connection Refused
-
-**Symptom**: `Failed to connect: connection refused`
-
-**Causes**:
-1. Consumer not running yet
-2. Firewall blocking port
-3. Wrong IP address or port
-
-**Solutions**:
-```bash
-# Check if consumer is listening
-ss -tulpn | grep :9000
-
-# Check firewall
-sudo ufw status
-sudo iptables -L
-
-# Test connectivity
-nc -zv 192.168.1.100 9000
-```
-
-### High Latency
-
-**Symptom**: Network latency >100µs (expected 5-50µs)
-
-**Causes**:
-1. WiFi congestion or power saving
-2. Network switch buffering
-3. CPU overload
-
-**Solutions**:
-```bash
-# Measure ping latency
-ping -i 0.001 192.168.1.100  # 1ms interval
-
-# Check network interface stats
-ip -s link show eth0
-
-# Disable WiFi power save
-sudo iw dev wlan0 set power_save off
-```
-
-### Packet Loss
-
-**Symptom**: Topic messages missing (UDP)
-
-**Causes**:
-1. Network congestion
-2. UDP buffers too small
-3. WiFi interference
-
-**Solutions**:
-```bash
-# Check packet loss
-ping -c 100 192.168.1.100
-
-# Increase UDP buffers
-sudo sysctl -w net.core.rmem_default=8388608
-
-# Check WiFi signal
-iwconfig wlan0
-```
-
-## Best Practices
-
-**Use Topic for critical paths**
-```rust
-// Critical control loop: Topic over network
-let motors: Topic<MotorCmd> = Topic::new("motors@robot:9000")?;
-```
-
-**Use Topic for broadcasting**
-```rust
-// Status to multiple subscribers: Topic
-let status: Topic<Status> = Topic::new("status@monitoring:8000")?;
-```
-
-**Keep critical loops local**
-```rust
-// Flight control stays on-board (local)
-let imu: Topic<ImuData> = Topic::new("imu")?;  // ~85ns, not network
-```
-
-**Use configuration files**
-```rust
-// Don't hardcode IPs
-let telem: Topic<Status> = Topic::from_config("telemetry")?;
-```
-
-**Send is infallible**
-```rust
-// send() always succeeds — oldest message overwritten when buffer is full
-telemetry.send(status);
-```
-
-**Avoid using network for 10kHz loops**
-```rust
-// This won't work - network latency too high
-// Use local shared memory instead
-```
+HORUS services are registered under `_horus._udp.local.` following DNS-SD conventions. The default port is 9870.
 
 ## Summary
 
-**Topic Network** (TCP, 5-15µs):
-- Point-to-point (1P1C)
-- 3-10x faster than Topic MPMC network
-- Reliable (TCP)
-- Use for: Critical paths, control loops, pipelines
-
-**Topic Network** (UDP, &lt;50µs):
-- Many-to-many (pub/sub)
-- Flexible, dynamic topologies
-- Connectionless (UDP)
-- Use for: Broadcasting, monitoring, coordination
-
-**Both support**:
-- Simple endpoint syntax (`topic@IP:port`)
-- Transparent fallback to local
-- Configuration file support
-- Same API as local shared memory
+| Feature | Status |
+|---------|--------|
+| **Topic Transport** | Local shared memory only (~85ns-167ns) |
+| **Node Discovery** | mDNS/DNS-SD (behind `mdns` feature flag) |
+| **Service Registration** | `MdnsNodeRegistration` with auto-deregister |
+| **Hostname Resolution** | `.local` via `resolve_mdns_hostname()` |
+| **Continuous Monitoring** | `watch()` with `DiscoveryEvent` stream |
+| **Endpoint Config** | Configuration plumbing in place for future network transport |
+| **Service Type** | `_horus._udp.local.` |
+| **Default Port** | 9870 |
 
 ## Next Steps
 
-- [Communication Transport](/concepts/communication-transport) - Local vs Network overview
-- [Communication Configuration](/concepts/communication-configuration) - Config files and management
-- [Topic (MPMC)](/concepts/core-concepts-topic) - Topic MPMC pattern deep dive
-- [Topic (SPSC)](/concepts/core-concepts-topic) - Topic SPSC pattern deep dive
-- [Performance](/performance/performance) - Optimization guide
+- [Communication Transport](/concepts/communication-transport) - Shared memory transport details
+- [Communication Configuration](/concepts/communication-configuration) - Endpoint configuration system
+- [Topic (MPMC)](/concepts/core-concepts-topic) - Topic pattern deep dive

@@ -40,7 +40,7 @@ Robotics systems are inherently modular. A robot has sensors, actuators, planner
 - **Isolation** - A failing camera driver doesn't crash your motion controller
 - **Composability** - Mix and match nodes to build different robots
 - **Testability** - Test each node independently before integration
-- **Hot-swapping** - Replace nodes at runtime without stopping the system
+- **Reusability** - Share nodes across projects via the package registry
 
 ### Node Lifecycle
 
@@ -49,7 +49,7 @@ Every node follows the same lifecycle, ensuring predictable behavior:
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
 flowchart LR
-    U["Created"] --> I["Initializing"]
+    U["Uninitialized"] --> I["Initializing"]
     I --> R["Running"]
     R --> P["Paused"]
     P --> R
@@ -57,19 +57,21 @@ flowchart LR
     S --> D["Stopped"]
     R -.-> E["Error"]
     E --> S
+    R -.-> C["Crashed"]
 `}
   caption="Node State Machine"
 />
 
 | State | What Happens |
 |-------|--------------|
-| **Created** | Node exists but hasn't started |
+| **Uninitialized** | Node exists but hasn't started |
 | **Initializing** | Setting up resources, connecting to hardware |
 | **Running** | Actively processing - `tick()` called each cycle |
 | **Paused** | Temporarily suspended, can resume instantly |
 | **Stopping** | Cleaning up, releasing resources |
 | **Stopped** | Fully shut down |
 | **Error** | Something went wrong, but recoverable |
+| **Crashed** | Unrecoverable failure |
 
 ### The Tick Model
 
@@ -95,84 +97,42 @@ This model enables:
 
 ---
 
-## Communication Patterns
+## Communication
 
-Nodes need to exchange data. HORUS provides two communication primitives, each optimized for different patterns.
+Nodes need to exchange data. HORUS provides a single **Topic** API that automatically selects the optimal backend based on how many nodes are communicating and whether they're in the same process.
 
-### Why Two Patterns?
+### Topic: One API, Auto-Detected Backends
 
-<MermaidDiagram
-  chart={`%%{init: {'flowchart': {'padding': 20}}}%%
-flowchart TB
-    subgraph TOPIC["Topic (Pub/Sub)"]
-        direction LR
-        P1["Publisher"] --> T["Topic"]
-        P2["Publisher"] --> T
-        T --> S1["Subscriber"]
-        T --> S2["Subscriber"]
-        T --> S3["Subscriber"]
-    end
-
-    subgraph SPSC["Topic SPSC (Point-to-Point)"]
-        direction LR
-        PR["Producer"] --> LK["Topic"] --> CO["Consumer"]
-    end
-`}
-  caption="Two Communication Patterns for Different Needs"
-/>
-
-| Pattern | Use When | Example |
-|---------|----------|---------|
-| **Topic** | Multiple readers need the same data | Camera images → multiple vision algorithms |
-| **Topic** | Strict ordering between two nodes | Sensor → filter → controller pipeline |
-
-### Topic (MPMC): Broadcast to Many
-
-Topic implements **publish-subscribe** messaging. Any node can publish to a topic, and any number of nodes can subscribe.
+You always use the same `Topic::new()` call. HORUS automatically detects the topology and selects from 10 backend modes:
 
 ```rust
-// Camera node publishes images
-let image_pub: Topic<Image> = Topic::new("camera.image")?;
-image_pub.send(frame);
+// Same API for all communication patterns
+let topic: Topic<Image> = Topic::new("camera.image")?;
+topic.send(frame);
 
-// Multiple subscribers receive the same image
-let image_sub: Topic<Image> = Topic::new("camera.image")?;
-if let Some(frame) = image_sub.recv() {
+// Another node subscribes — same API
+let topic: Topic<Image> = Topic::new("camera.image")?;
+if let Some(frame) = topic.recv() {
     // Process frame
 }
 ```
 
-**Topic MPMC characteristics:**
-- Many-to-many communication
-- Latest-value semantics (subscribers get most recent)
-- ~~167ns round-trip latency
-- Automatic network transport for distributed systems
+**Auto-detected backends:**
 
-### Topic (SPSC): Fast Pipeline
+| Backend | Topology | Latency |
+|---------|----------|---------|
+| DirectChannel | Same thread | ~3 ns |
+| SpscIntra | Same process, 1:1 | ~18 ns |
+| MpmcIntra | Same process, many:many | ~36 ns |
+| PodShm | Cross-process, POD types | ~50 ns |
+| SpscShm | Cross-process, 1:1 | ~85 ns |
+| MpmcShm | Cross-process, many:many | ~167 ns |
 
-Topic SPSC implements **point-to-point** channels. One producer, one consumer, guaranteed ordering.
-
-```rust
-// Producer side
-let link: Topic<SensorData> = Topic::new("sensor_pipeline")?;
-link.send(data);
-
-// Consumer side
-let link: Topic<SensorData> = Topic::new("sensor_pipeline")?;
-if let Some(data) = link.recv() {
-    // Process in order
-}
-```
-
-**Topic characteristics:**
-- One-to-one communication
-- FIFO ordering guaranteed
-- ~~85ns round-trip latency
-- Ideal for processing pipelines
+The backend is selected transparently — you don't need to specify which one to use.
 
 ### Cross-Process Communication
 
-Topic work transparently across process boundaries using shared memory:
+Topics work transparently across process boundaries using shared memory:
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
@@ -194,7 +154,7 @@ flowchart TB
   caption="Transparent Cross-Process Communication"
 />
 
-No serialization overhead for same-machine communication. Data is written once to shared memory and read directly by subscribers.
+POD types (plain data like `f32`, `CmdVel`) use zero-copy memory-mapped I/O — no serialization. Non-POD types (containing `String`, `Vec`, etc.) use fast bincode serialization. In both cases, data goes through shared memory with sub-microsecond latency.
 
 ---
 
@@ -283,7 +243,7 @@ TensorPool manages shared memory allocation:
 ```rust
 // Allocate space for a 1080p RGB image
 let pool = TensorPool::new(1, TensorPoolConfig::default())?;
-let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::U8)?;
+let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::U8, TensorDevice::Cpu)?;
 
 // Write data (only done once)
 let data = pool.data_slice_mut(&tensor);
@@ -334,9 +294,9 @@ flowchart LR
     MOT["<b>Motors</b><br/>Executes movement"]
 
     CAM -->|"Image<br/>(zero-copy)"| DET
-    DET -->|"Detections<br/>(Topic MPMC)"| NAV
-    NAV -->|"Velocity<br/>(Topic MPMC)"| CTRL
-    CTRL -->|"PWM<br/>(Topic SPSC)"| MOT
+    DET -->|"Detections<br/>(Topic)"| NAV
+    NAV -->|"Velocity<br/>(Topic)"| CTRL
+    CTRL -->|"PWM<br/>(Topic)"| MOT
 `}
   caption="Perception-Planning-Control Pipeline"
 />
@@ -346,9 +306,9 @@ flowchart LR
 | Camera → Detector | TensorPool | Large image, zero-copy |
 | Detector → Planner | Topic | Multiple planners might subscribe |
 | Planner → Controller | Topic | Monitoring tools can observe |
-| Controller → Motors | Topic | Strict ordering, lowest latency |
+| Controller → Motors | Topic | Direct pipeline connection |
 
-**Total pipeline latency:** Under 2 microseconds for message passing.
+**Total pipeline latency:** Under 1 microsecond for message passing (same-process backends).
 
 ---
 
@@ -356,11 +316,11 @@ flowchart LR
 
 | Metric | Value |
 |--------|-------|
-| Topic MPMC round-trip | ~~167ns |
-| Topic SPSC round-trip | ~~85ns |
+| Same-thread topic | ~3 ns |
+| Same-process topic (1:1) | ~18 ns |
+| Cross-process topic (MPMC) | ~167 ns |
 | Scheduler tick overhead | ~50-100ns |
 | TensorPool allocation | ~100ns |
-| Message serialization | ~50-200ns |
 
 ---
 

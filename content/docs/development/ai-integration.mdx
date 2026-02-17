@@ -1,642 +1,342 @@
 ---
 title: AI Integration
-description: Integrate computer vision and AI models into HORUS robotics applications
+description: Integrate AI and ML models into HORUS robotics applications
 order: 55
 ---
 
 # AI Integration
 
-Integrate computer vision and AI models into your HORUS applications using OpenCV, external Python scripts, or cloud APIs. HORUS's sub-microsecond communication is well-suited for combining real-time control with AI inference.
+HORUS's sub-microsecond IPC makes it well-suited for combining real-time control with AI inference. This guide covers patterns for integrating ML models into HORUS applications.
 
 ## Overview
 
-HORUS supports multiple AI integration patterns:
+HORUS supports AI integration through two main approaches:
 
-**Local Vision Processing** (Real-Time)
-- OpenCV computer vision (optional feature flag)
-- Edge detection, tracking, blob detection
-- Camera capture and processing
-- 5-50ms typical latency
+**Python ML Nodes** (Recommended for Prototyping)
+- Use any Python ML library (PyTorch, TensorFlow, ONNX, etc.)
+- Hardware nodes handle camera/sensor capture
+- Pub/sub connects ML pipeline to control nodes
+- 10-100ms typical inference latency
 
-**External AI Services** (Background Tasks)
-- Python ML models via subprocess or HTTP
-- Cloud APIs (OpenAI, Anthropic, etc.)
-- Custom inference servers
-- 50-5000ms typical latency
+**Rust Inference** (For Production)
+- ONNX Runtime via `ort` crate
+- Tract (pure Rust inference engine)
+- Custom inference with `horus_ai` tensor system
+- 1-50ms typical inference latency
 
-**Architecture Pattern:**
+### Architecture Pattern
+
 ```
-Camera Node ──Topic──> Vision Node ──Topic──> Control Node
-   (Fast)            (AI/CV)             (Real-time)
-   ~16ms             ~20-50ms            ~1ms
+Sensor Node ──Topic──> ML Node ──Topic──> Control Node
+  (Fast)              (AI/CV)           (Real-time)
+  ~1ms                ~10-50ms          ~1μs
 ```
+
+The key insight: keep AI inference in dedicated nodes. HORUS topics decouple the fast control loop from slower ML processing, so a slow inference step doesn't block motor commands.
 
 ---
 
-## OpenCV Computer Vision
+## horus_ai: Tensor System
 
-HORUS includes optional OpenCV integration for camera capture and real-time vision processing.
-
-### Enabling OpenCV
-
-**Option 1: Command-line flag (recommended)**
-
-```bash
-horus run --enable opencv
-```
-
-**Option 2: Explicit in horus.yaml**
-
-```yaml
-enable:
-  - opencv
-```
-
-Then run:
-```bash
-horus run
-```
-
-**Option 3: Manual Cargo.toml (for cargo projects)**
+HORUS includes the `horus_ai` crate, a tensor system with DLPack interoperability for zero-copy tensor sharing between frameworks.
 
 ```toml
 [dependencies]
-horus_library = { version = "0.1", features = ["opencv-backend"] }
+horus_ai = "0.1"
 ```
 
-### Using the Camera Node
+The `horus_ai` crate provides:
+- **Tensor types** for ML data representation
+- **DLPack interop** for zero-copy sharing with PyTorch, TensorFlow, JAX, etc.
+- **Device abstraction** (CPU/GPU)
+- **ML utilities** for common operations
 
-The built-in `CameraNode` supports OpenCV:
-
-```rust
-use horus::prelude::*; // Provides {Scheduler, CameraNode, Result}
-
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
-
-    // Camera node with OpenCV backend
-    let mut camera = CameraNode::new()?;
-    camera.set_device_id(0);  // Default camera
-    camera.set_resolution(640, 480);
-    camera.set_fps(30.0);
-    camera.set_topic("camera.raw");
-
-    scheduler.add(camera).order(0).done();
-    scheduler.run()?;
-    Ok(())
-}
-```
-
-### Custom OpenCV Processing
-
-```rust
-use horus::prelude::*;
-use opencv::{
-    prelude::*,
-    core::{Mat, Vector},
-    imgproc,
-    videoio::{VideoCapture, CAP_ANY}
-};
-
-#[derive(Clone, Debug)]
-pub struct ImageFrame {
-    pub stamp_nanos: u64,
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>,
-}
-
-pub struct VisionProcessorNode {
-    camera_sub: Topic<ImageFrame>,
-    detections_pub: Topic<String>,
-}
-
-impl VisionProcessorNode {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            detections_pub: Topic::new("vision.detections")?,
-        })
-    }
-
-    fn process_frame(&self, frame_data: &[u8], width: u32, height: u32) -> Option<String> {
-        // Convert to OpenCV Mat
-        let mut mat = Mat::from_slice(frame_data).ok()?;
-        let mat = mat.reshape(3, height as i32).ok()?;
-
-        // Convert to grayscale
-        let mut gray = Mat::default();
-        imgproc::cvt_color(&mat, &mut gray, imgproc::COLOR_BGR2GRAY, 0).ok()?;
-
-        // Simple edge detection
-        let mut edges = Mat::default();
-        imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false).ok()?;
-
-        // Count edge pixels (simple object detection metric)
-        let edge_count = imgproc::count_non_zero(&edges).ok()?;
-
-        Some(format!("edges_detected:{}", edge_count))
-    }
-}
-
-impl Node for VisionProcessorNode {
-    fn name(&self) -> &'static str { "VisionProcessorNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            if let Some(result) = self.process_frame(&frame.data, frame.width, frame.height) {
-                self.detections_pub.send(result);
-            }
-        }
-    }
-}
-```
+This is useful when you need to pass tensor data between HORUS nodes and external ML frameworks without copying.
 
 ---
 
-## AI Model Inference
+## Python ML Integration
 
-HORUS can integrate with various AI model formats and inference engines commonly used in robotics.
+The fastest way to add AI to a HORUS application is through Python nodes. Python has the richest ML ecosystem, and HORUS's Python bindings give you full access to the pub/sub system.
 
-### ONNX Runtime (Recommended)
+### Camera + ML Pipeline
 
-ONNX Runtime provides cross-platform inference for models from PyTorch, TensorFlow, scikit-learn, and more.
+```python
+from horus import Node, Scheduler, CameraNode
+import numpy as np
 
-**Add dependencies:**
+# Camera capture (auto-detects hardware, falls back to simulation)
+cam = CameraNode(device=0, width=640, height=480, prefix="cam")
+
+# ML processing node
+def ml_tick(node):
+    if node.has_msg("cam.frame"):
+        frame = node.get("cam.frame")
+        # Run your ML model here
+        # e.g., model.predict(frame), torch inference, etc.
+        result = process_frame(frame)
+        node.send("detections", result)
+
+ml_node = Node(
+    name="ml_processor",
+    subs=["cam.frame"],
+    pubs=["detections"],
+    tick=ml_tick,
+    rate=10  # Process at 10 FPS
+)
+
+# Control node reacts to detections
+def control_tick(node):
+    if node.has_msg("detections"):
+        detections = node.get("detections")
+        # React to ML output
+        if detections.get("obstacle_detected"):
+            node.send("cmd_vel", {"linear": 0.0, "angular": 0.5})
+        else:
+            node.send("cmd_vel", {"linear": 1.0, "angular": 0.0})
+
+controller = Node(
+    name="controller",
+    subs=["detections"],
+    pubs=["cmd_vel"],
+    tick=control_tick,
+    rate=30
+)
+
+scheduler = Scheduler()
+scheduler.add(cam, order=0)
+scheduler.add(ml_node, order=1)
+scheduler.add(controller, order=2)
+scheduler.run()
+```
+
+### PyTorch Example
+
+```python
+from horus import Node, run
+import torch
+
+# Load model once at startup
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+model.eval()
+
+def detect_tick(node):
+    if node.has_msg("cam.frame"):
+        frame = node.get("cam.frame")
+        results = model(frame)
+        detections = results.pandas().xyxy[0].to_dict('records')
+        node.send("detections", detections)
+
+node = Node(
+    name="yolo_detector",
+    subs=["cam.frame"],
+    pubs=["detections"],
+    tick=detect_tick,
+    rate=10
+)
+
+run(node)
+```
+
+### ONNX Runtime (Python)
+
+```python
+from horus import Node, run
+import onnxruntime as ort
+import numpy as np
+
+session = ort.InferenceSession("model.onnx")
+input_name = session.get_inputs()[0].name
+
+def inference_tick(node):
+    if node.has_msg("cam.frame"):
+        frame = node.get("cam.frame")
+        # Preprocess
+        input_data = np.array(frame).astype(np.float32)
+        input_data = np.expand_dims(input_data, axis=0)
+        # Run inference
+        outputs = session.run(None, {input_name: input_data})
+        node.send("ml.output", outputs[0].tolist())
+
+node = Node(
+    name="onnx_inference",
+    subs=["cam.frame"],
+    pubs=["ml.output"],
+    tick=inference_tick,
+    rate=15
+)
+
+run(node)
+```
+
+### ML Utilities
+
+HORUS provides Python ML utilities for common patterns:
+
+```python
+from horus.ml_utils import ONNXInferenceNode, PerformanceMonitor
+
+# Pre-built ONNX inference node
+class MyDetector(ONNXInferenceNode):
+    def __init__(self):
+        super().__init__(
+            model_path="models/detector.onnx",
+            input_topic="cam.frame",
+            output_topic="detections"
+        )
+
+    def preprocess(self, frame):
+        # Resize, normalize, etc.
+        return processed_frame
+
+    def postprocess(self, output):
+        # Parse model output into detections
+        return detections
+
+# Performance monitoring
+monitor = PerformanceMonitor(window_size=100)
+monitor.record(12.5)  # Record inference time in ms
+stats = monitor.get_stats()
+print(f"Avg: {stats['avg_ms']:.1f}ms, P95: {stats['p95_ms']:.1f}ms, FPS: {stats['fps']:.0f}")
+```
+
+See [ML Utilities](/python/library/ml-utilities) for the full API.
+
+---
+
+## Rust Inference
+
+For production deployments where you need maximum performance, integrate ML inference directly in Rust.
+
+### ONNX Runtime (ort crate)
+
+The `ort` crate provides Rust bindings for ONNX Runtime:
+
 ```toml
 [dependencies]
-ort = "2.0"  # ONNX Runtime bindings
+horus_core = "0.1"
+horus_library = "0.1"
+ort = "2.0"
 ndarray = "0.15"
-image = "0.24"
 ```
 
-**YOLOv8 Object Detection Example:**
 ```rust
 use horus::prelude::*;
 use ort::{GraphOptimizationLevel, Session};
-use ndarray::{Array, IxDyn};
-use image::{DynamicImage, imageops::FilterType};
+use ndarray::Array;
 
-#[derive(Clone, Debug)]
-pub struct Detection {
-    pub class_id: usize,
-    pub confidence: f32,
-    pub bbox: [f32; 4],  // x, y, w, h
-}
-
-pub struct YOLOv8Node {
-    camera_sub: Topic<ImageFrame>,
-    detections_pub: Topic<Vec<Detection>>,
+struct InferenceNode {
     session: Session,
+    input_name: String,
 }
 
-impl YOLOv8Node {
-    pub fn new(model_path: &str) -> Result<Self> {
-        // Load ONNX model
-        let session = Session::builder()
-            .map_err(|e| Error::Config(format!("ONNX error: {}", e)))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| Error::Config(format!("ONNX error: {}", e)))?
-            .commit_from_file(model_path)
-            .map_err(|e| Error::Config(format!("Failed to load model: {}", e)))?;
+impl InferenceNode {
+    fn new(model_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .commit_from_file(model_path)?;
 
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            detections_pub: Topic::new("vision.detections")?,
-            session,
-        })
+        let input_name = session.inputs[0].name.clone();
+
+        Ok(Self { session, input_name })
     }
 
-    fn preprocess_image(&self, img_data: &[u8], width: u32, height: u32) -> Option<Array<f32, IxDyn>> {
-        // Resize to 640x640, convert RGB to CHW format, normalize to 0-1
-        // See: https://docs.rs/image and https://docs.rs/ndarray for details
-        todo!("Implement using image and ndarray crates")
-    }
-
-    fn run_inference(&self, input: Array<f32, IxDyn>) -> Option<Vec<Detection>> {
-        // Run ONNX model and parse YOLOv8 output format [batch, 84, 8400]
-        // Filter by confidence threshold, extract bounding boxes and classes
-        // See: https://docs.rs/ort for ONNX Runtime usage
-        todo!("Implement YOLOv8 output parsing")
-    }
-}
-
-impl Node for YOLOv8Node {
-    fn name(&self) -> &'static str { "YOLOv8Node" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            if let Some(input) = self.preprocess_image(&frame.data, frame.width, frame.height) {
-                if let Some(detections) = self.run_inference(input) {
-                    self.detections_pub.send(detections);
-                }
-            }
-        }
+    fn infer(&self, input: &[f32]) -> Option<Vec<f32>> {
+        let input_array = Array::from_shape_vec((1, input.len()), input.to_vec()).ok()?;
+        let outputs = self.session.run(
+            ort::inputs![&self.input_name => input_array.view()].ok()?
+        ).ok()?;
+        let output = outputs[0].try_extract_tensor::<f32>().ok()?;
+        Some(output.view().iter().copied().collect())
     }
 }
 ```
 
-**Download YOLOv8 ONNX:**
-```bash
-# Export from Ultralytics
-pip install ultralytics
-python -c "from ultralytics import YOLO; model = YOLO('yolov8n.pt'); model.export(format='onnx')"
-```
+### Tract (Pure Rust)
 
-### TensorFlow Lite (Edge Devices)
+Tract runs ONNX models with zero external dependencies:
 
-For embedded systems and edge devices:
-
-**Add dependencies:**
 ```toml
 [dependencies]
-tflite = "0.9"
-```
-
-**MobileNet Classification:**
-```rust
-use horus::prelude::*;
-use tflite::{FlatBufferModel, InterpreterBuilder, ops::builtin::BuiltinOpResolver};
-
-pub struct TFLiteClassifierNode {
-    camera_sub: Topic<ImageFrame>,
-    class_pub: Topic<String>,
-    interpreter: tflite::Interpreter,
-    labels: Vec<String>,
-}
-
-impl TFLiteClassifierNode {
-    pub fn new(model_path: &str, labels_path: &str) -> Result<Self> {
-        // Load TFLite model
-        let model = FlatBufferModel::build_from_file(model_path)
-            .map_err(|e| Error::Config(format!("TFLite error: {}", e)))?;
-
-        let resolver = BuiltinOpResolver::default();
-        let builder = InterpreterBuilder::new(model, resolver)
-            .map_err(|e| Error::Config(format!("Builder error: {}", e)))?;
-
-        let mut interpreter = builder.build()
-            .map_err(|e| Error::Config(format!("Interpreter error: {}", e)))?;
-
-        interpreter.allocate_tensors()
-            .map_err(|e| Error::Config(format!("Allocation error: {}", e)))?;
-
-        // Load class labels
-        let labels = std::fs::read_to_string(labels_path)
-            .map_err(|e| Error::Config(format!("Labels error: {}", e)))?
-            .lines()
-            .map(String::from)
-            .collect();
-
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            class_pub: Topic::new("vision.classification")?,
-            interpreter,
-            labels,
-        })
-    }
-
-    fn classify(&mut self, img_data: &[u8]) -> Option<String> {
-        // Preprocess and set input tensor
-        let input_tensor = self.interpreter.input(0)?;
-        // ... preprocessing code ...
-
-        // Run inference
-        self.interpreter.invoke().ok()?;
-
-        // Get output
-        let output_tensor = self.interpreter.output(0)?;
-        let scores = output_tensor.data::<f32>();
-
-        // Find top class
-        let (max_idx, max_score) = scores
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())?;
-
-        Some(format!("{}: {:.2}%", self.labels[max_idx], max_score * 100.0))
-    }
-}
-
-impl Node for TFLiteClassifierNode {
-    fn name(&self) -> &'static str { "TFLiteClassifierNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            if let Some(result) = self.classify(&frame.data) {
-                self.class_pub.send(result);
-            }
-        }
-    }
-}
-```
-
-### Tract (Pure Rust Inference)
-
-Tract is a pure-Rust ONNX/TensorFlow inference engine - no external dependencies!
-
-**Add dependencies:**
-```toml
-[dependencies]
+horus_core = "0.1"
+horus_library = "0.1"
 tract-onnx = "0.21"
 ```
 
-**Example:**
 ```rust
-use horus::prelude::*;
 use tract_onnx::prelude::*;
 
-pub struct TractInferenceNode {
-    camera_sub: Topic<ImageFrame>,
-    output_pub: Topic<String>,
-    model: SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+fn load_model(path: &str) -> TractResult<SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>> {
+    tract_onnx::onnx()
+        .model_for_path(path)?
+        .into_optimized()?
+        .into_runnable()
 }
 
-impl TractInferenceNode {
-    pub fn new(model_path: &str) -> Result<Self> {
-        // Load ONNX model with Tract
-        let model = tract_onnx::onnx()
-            .model_for_path(model_path)
-            .map_err(|e| Error::Config(format!("Tract error: {}", e)))?
-            .into_optimized()
-            .map_err(|e| Error::Config(format!("Optimization error: {}", e)))?
-            .into_runnable()
-            .map_err(|e| Error::Config(format!("Runnable error: {}", e)))?;
-
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            output_pub: Topic::new("vision.output")?,
-            model,
-        })
-    }
-
-    fn run_inference(&self, input_data: &[f32]) -> Option<String> {
-        let input = tract_ndarray::arr1(input_data).into_dyn();
-        let result = self.model.run(tvec!(input.into())).ok()?;
-
-        // Process output
-        let output = result[0].to_array_view::<f32>().ok()?;
-        Some(format!("Inference result: {:?}", output))
-    }
-}
-
-impl Node for TractInferenceNode {
-    fn name(&self) -> &'static str { "TractInferenceNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            // Convert frame to input format
-            let input_data: Vec<f32> = frame.data.iter().map(|&x| x as f32 / 255.0).collect();
-
-            if let Some(result) = self.run_inference(&input_data) {
-                self.output_pub.send(result);
-            }
-        }
-    }
+fn run_inference(model: &SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>, input: &[f32]) -> Option<Vec<f32>> {
+    let input_tensor = tract_ndarray::arr1(input).into_dyn();
+    let result = model.run(tvec!(input_tensor.into())).ok()?;
+    let output = result[0].to_array_view::<f32>().ok()?;
+    Some(output.iter().copied().collect())
 }
 ```
 
 ### Model Format Comparison
 
-| Format | Use Case | Rust Support | Edge Devices |
-|--------|----------|--------------|--------------|
-| **ONNX** | General (PyTorch, TF) | `ort` crate |  |
-| **TFLite** | Mobile/Edge | `tflite` crate |  |
-| **Tract** | Pure Rust | Native |  |
-| **CoreML** | Apple Silicon | Via Python |  |
-| **TensorRT** | NVIDIA GPUs | Via C++ |  |
-
-### Popular Models for Robotics
-
-**Object Detection:**
-- YOLOv8 (ONNX) - Real-time detection
-- MobileNet SSD (TFLite) - Edge devices
-- EfficientDet (ONNX) - High accuracy
-
-**Semantic Segmentation:**
-- DeepLabV3 (ONNX) - Scene understanding
-- U-Net (ONNX) - Medical/precision tasks
-
-**Pose Estimation:**
-- MediaPipe (TFLite) - Human pose
-- OpenPose (ONNX) - Multi-person
-
-**Depth Estimation:**
-- MiDaS (ONNX) - Monocular depth
-- DPT (ONNX) - Dense prediction
-
-**Download pre-trained models:**
-```bash
-# Hugging Face
-huggingface-cli download ultralytics/yolov8n --include "*.onnx"
-
-# TensorFlow Hub
-wget https://tfhub.dev/tensorflow/lite-model/ssd_mobilenet_v1/1/metadata/1?lite-format=tflite
-
-# ONNX Model Zoo
-wget https://github.com/onnx/models/raw/main/vision/object_detection_segmentation/yolov4/model/yolov4.onnx
-```
+| Format | Crate | Use Case | External Deps |
+|--------|-------|----------|---------------|
+| **ONNX** | `ort` | General (PyTorch, TF exports) | ONNX Runtime C lib |
+| **ONNX** | `tract-onnx` | Pure Rust inference | None |
+| **TFLite** | `tflite` | Edge/mobile models | TFLite C lib |
+| **Custom** | `horus_ai` | Tensor/DLPack interop | None |
 
 ---
 
-## Large Language Models (LLMs)
+## Cloud API Integration
 
-Integrate LLMs for natural language commands, task planning, and vision-language reasoning in robotics.
+For complex reasoning tasks (task planning, scene understanding, natural language), call cloud APIs from HORUS nodes.
 
-### Local LLM Inference
+### Python (Recommended)
 
-Run LLMs locally using Rust bindings for llama.cpp or Candle.
+```python
+from horus import Node, run
+import requests
+import os
 
-#### llama-cpp-rs (Recommended)
+API_KEY = os.environ["OPENAI_API_KEY"]
 
-**Add dependencies:**
-```toml
-[dependencies]
-llama_cpp_rs = "0.4"
-```
-
-**LLM Command Interpreter Node:**
-```rust
-use horus::prelude::*;
-use llama_cpp_rs::{LlamaModel, LlamaParams, LlamaContext};
-
-pub struct LLMCommandNode {
-    text_sub: Topic<String>,  // Natural language commands
-    cmd_pub: Topic<String>,   // Structured robot commands
-    context: LlamaContext,
-}
-
-impl LLMCommandNode {
-    pub fn new(model_path: &str) -> Result<Self> {
-        // Load LLaMA model (Llama 2, Mistral, Phi, etc.)
-        let params = LlamaParams::default();
-        let model = LlamaModel::load_from_file(model_path, params)
-            .map_err(|e| Error::Config(format!("Failed to load LLM: {}", e)))?;
-
-        let context = model.create_context(LlamaParams::default())
-            .map_err(|e| Error::Config(format!("Context error: {}", e)))?;
-
-        Ok(Self {
-            text_sub: Topic::new("speech.text")?,
-            cmd_pub: Topic::new("robot.commands")?,
-            context,
-        })
-    }
-
-    fn generate_command(&mut self, user_input: &str) -> Option<String> {
-        let prompt = format!(
-            "You are a robot command interpreter. Convert natural language to JSON commands.\n\
-            User: {}\n\
-            Command (JSON): ",
-            user_input
-        );
-
-        // Generate response
-        let output = self.context.predict(
-            prompt,
-            64,  // max tokens
-            true,  // echo prompt
-            |token| {
-                // Token callback
-                print!("{}", token);
-                true
+def planner_tick(node):
+    if node.has_msg("user.goal"):
+        goal = node.get("user.goal")
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": "Generate robot action plans as JSON."},
+                    {"role": "user", "content": goal}
+                ],
+                "max_tokens": 500
             }
-        ).ok()?;
+        )
+        plan = response.json()["choices"][0]["message"]["content"]
+        node.send("robot.plan", plan)
 
-        // Extract JSON command
-        Some(output.trim().to_string())
-    }
-}
+node = Node(
+    name="planner",
+    subs=["user.goal"],
+    pubs=["robot.plan"],
+    tick=planner_tick,
+    rate=1  # Check for goals once per second
+)
 
-impl Node for LLMCommandNode {
-    fn name(&self) -> &'static str { "LLMCommandNode" }
-
-    fn tick(&mut self) {
-        if let Some(text) = self.text_sub.recv() {
-            if let Some(command) = self.generate_command(&text) {
-                self.cmd_pub.send(command);
-            }
-        }
-    }
-}
+run(node)
 ```
 
-**Example usage:**
-```bash
-# Download a model (Llama 2, Mistral, Phi-2, etc.)
-wget https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf
+### Rust (reqwest)
 
-# Run with HORUS
-horus run robot_with_llm.rs
-```
-
-**Supported models:**
-- Llama 2 (7B, 13B, 70B)
-- Mistral 7B
-- Phi-2 (2.7B - fast on CPU!)
-- Mixtral 8x7B
-- CodeLlama
-- Any GGUF format model
-
-#### Candle (Pure Rust)
-
-Candle is HuggingFace's pure Rust ML framework:
-
-**Add dependencies:**
-```toml
-[dependencies]
-candle-core = "0.3"
-candle-nn = "0.3"
-candle-transformers = "0.3"
-tokenizers = "0.15"
-```
-
-**Candle LLM Node:**
 ```rust
-use horus::prelude::*;
-use candle_core::{Device, Tensor};
-use candle_transformers::models::llama::{Llama, Config};
-use tokenizers::Tokenizer;
-
-pub struct CandleLLMNode {
-    text_sub: Topic<String>,
-    response_pub: Topic<String>,
-    model: Llama,
-    tokenizer: Tokenizer,
-    device: Device,
-}
-
-impl CandleLLMNode {
-    pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self> {
-        let device = Device::cuda_if_available(0)
-            .map_err(|e| Error::Config(format!("Device error: {}", e)))?;
-
-        let config = Config::default();
-        let model = Llama::load(model_path, &config, &device)
-            .map_err(|e| Error::Config(format!("Model load error: {}", e)))?;
-
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| Error::Config(format!("Tokenizer error: {}", e)))?;
-
-        Ok(Self {
-            text_sub: Topic::new("user.input")?,
-            response_pub: Topic::new("llm.response")?,
-            model,
-            tokenizer,
-            device,
-        })
-    }
-
-    fn generate(&self, prompt: &str, max_tokens: usize) -> Option<String> {
-        // Tokenize input
-        let encoding = self.tokenizer.encode(prompt, true).ok()?;
-        let tokens = encoding.get_ids();
-
-        let input_tensor = Tensor::new(tokens, &self.device).ok()?
-            .unsqueeze(0).ok()?;
-
-        // Generate response
-        let output = self.model.forward(&input_tensor, 0).ok()?;
-
-        // Decode tokens
-        let output_tokens: Vec<u32> = output
-            .to_vec1::<u32>()
-            .ok()?;
-
-        self.tokenizer.decode(&output_tokens, true).ok()
-    }
-}
-
-impl Node for CandleLLMNode {
-    fn name(&self) -> &'static str { "CandleLLMNode" }
-
-    fn tick(&mut self) {
-        if let Some(input) = self.text_sub.recv() {
-            if let Some(response) = self.generate(&input, 100) {
-                self.response_pub.send(response);
-            }
-        }
-    }
-}
-```
-
-### Cloud LLM APIs
-
-Use cloud LLMs for complex reasoning and vision-language tasks.
-
-#### OpenAI GPT-4
-
-**Add dependencies:**
-```toml
-[dependencies]
-reqwest = { version = "0.11", features = ["blocking", "json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-```
-
-**GPT-4 Task Planning Node:**
-```rust
-use horus::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -644,11 +344,10 @@ use serde::{Deserialize, Serialize};
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
-    temperature: f32,
     max_tokens: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
     content: String,
@@ -664,713 +363,25 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-pub struct GPT4PlannerNode {
-    goal_sub: Topic<String>,
-    plan_pub: Topic<String>,
-    client: Client,
-    api_key: String,
-    conversation: Vec<ChatMessage>,
-}
-
-impl GPT4PlannerNode {
-    pub fn new(api_key: String) -> Result<Self> {
-        let system_prompt = ChatMessage {
-            role: "system".to_string(),
-            content: "You are a robot task planner. Generate step-by-step plans in JSON format.".to_string(),
-        };
-
-        Ok(Self {
-            goal_sub: Topic::new("user.goal")?,
-            plan_pub: Topic::new("robot.plan")?,
-            client: Client::new(),
-            api_key,
-            conversation: vec![system_prompt],
-        })
-    }
-
-    fn generate_plan(&mut self, goal: &str) -> Option<String> {
-        // Add user message
-        self.conversation.push(ChatMessage {
+fn call_llm(client: &Client, api_key: &str, prompt: &str) -> Option<String> {
+    let request = ChatRequest {
+        model: "gpt-4".to_string(),
+        messages: vec![ChatMessage {
             role: "user".to_string(),
-            content: goal.to_string(),
-        });
-
-        let request = ChatRequest {
-            model: "gpt-4-turbo-preview".to_string(),
-            messages: self.conversation.clone(),
-            temperature: 0.7,
-            max_tokens: 500,
-        };
-
-        let response = self.client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
-            .send()
-            .ok()?;
-
-        let chat_response: ChatResponse = response.json().ok()?;
-        let assistant_message = chat_response.choices[0].message.clone();
-
-        // Add to conversation history
-        self.conversation.push(assistant_message.clone());
-
-        Some(assistant_message.content)
-    }
-}
-
-impl Node for GPT4PlannerNode {
-    fn name(&self) -> &'static str { "GPT4PlannerNode" }
-
-    fn tick(&mut self) {
-        if let Some(goal) = self.goal_sub.recv() {
-            if let Some(plan) = self.generate_plan(&goal) {
-                self.plan_pub.send(plan);
-            }
-        }
-    }
-}
-```
-
-#### Anthropic Claude
-
-**Claude for Robot Reasoning:**
-```rust
-use horus::prelude::*;
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize)]
-struct ClaudeRequest {
-    model: String,
-    max_tokens: u32,
-    messages: Vec<ClaudeMessage>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ClaudeMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ClaudeResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Deserialize)]
-struct ContentBlock {
-    text: String,
-}
-
-pub struct ClaudeReasoningNode {
-    sensor_sub: Topic<String>,  // Sensor readings as JSON
-    decision_pub: Topic<String>,
-    client: Client,
-    api_key: String,
-}
-
-impl ClaudeReasoningNode {
-    pub fn new(api_key: String) -> Result<Self> {
-        Ok(Self {
-            sensor_sub: Topic::new("sensors.summary")?,
-            decision_pub: Topic::new("robot.decision")?,
-            client: Client::new(),
-            api_key,
-        })
-    }
-
-    fn reason(&self, sensor_data: &str) -> Option<String> {
-        let request = ClaudeRequest {
-            model: "claude-3-opus-20240229".to_string(),
-            max_tokens: 1024,
-            messages: vec![ClaudeMessage {
-                role: "user".to_string(),
-                content: format!(
-                    "Given these robot sensor readings: {}\n\
-                    What should the robot do next? Respond with a JSON action.",
-                    sensor_data
-                ),
-            }],
-        };
-
-        let response = self.client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request)
-            .send()
-            .ok()?;
-
-        let claude_response: ClaudeResponse = response.json().ok()?;
-        Some(claude_response.content[0].text.clone())
-    }
-}
-
-impl Node for ClaudeReasoningNode {
-    fn name(&self) -> &'static str { "ClaudeReasoningNode" }
-
-    fn tick(&mut self) {
-        if let Some(sensors) = self.sensor_sub.recv() {
-            if let Some(decision) = self.reason(&sensors) {
-                self.decision_pub.send(decision);
-            }
-        }
-    }
-}
-```
-
-### Vision-Language Models (VLMs)
-
-Combine vision and language for advanced robot perception.
-
-#### GPT-4 Vision for Scene Understanding
-
-```rust
-use horus::prelude::*;
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use base64::{Engine as _, engine::general_purpose};
-
-#[derive(Serialize)]
-struct VisionMessage {
-    role: String,
-    content: Vec<VisionContent>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum VisionContent {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Serialize)]
-struct ImageUrl {
-    url: String,
-    detail: String,
-}
-
-pub struct SceneUnderstandingNode {
-    camera_sub: Topic<ImageFrame>,
-    description_pub: Topic<String>,
-    client: Client,
-    api_key: String,
-}
-
-impl SceneUnderstandingNode {
-    pub fn new(api_key: String) -> Result<Self> {
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            description_pub: Topic::new("scene.description")?,
-            client: Client::new(),
-            api_key,
-        })
-    }
-
-    fn understand_scene(&self, image_data: &[u8]) -> Option<String> {
-        // Convert to base64
-        let base64_image = general_purpose::STANDARD.encode(image_data);
-
-        // Construct vision API request with base64 image
-        let response = client.post("https://api.openai.com/gpt-4-vision")
-            .json(&json!({
-                "model": "gpt-4-vision-preview",
-                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", base64_image)}}]}]
-            }))
-            .send()
-            .ok()?;
-
-        let result: serde_json::Value = response.json().ok()?;
-        Some(result["choices"][0]["message"]["content"].as_str()?.to_string())
-    }
-}
-
-impl Node for SceneUnderstandingNode {
-    fn name(&self) -> &'static str { "SceneUnderstandingNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            // Process every 30th frame to reduce API calls
-            if frame.stamp_nanos % 30 == 0 {
-                if let Some(description) = self.understand_scene(&frame.data) {
-                    self.description_pub.send(description);
-                }
-            }
-        }
-    }
-}
-```
-
-### Complete Example: Voice-Controlled Robot
-
-```rust
-use horus::prelude::*;
-
-// Combine speech recognition + LLM + robot control
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
-
-    // 1. Speech-to-text (via external service or Whisper)
-    let speech_node = SpeechRecognitionNode::new()?;
-
-    // 2. LLM converts natural language to commands
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .expect("Set OPENAI_API_KEY environment variable");
-    let llm_node = GPT4PlannerNode::new(api_key)?;
-
-    // 3. Command parser extracts motor commands
-    let parser_node = CommandParserNode::new()?;
-
-    // 4. Motor control (user-defined node)
-    let drive_node = DriveNode::new()?;
-
-    // Add nodes
-    scheduler.add(speech_node).order(0).done();
-    scheduler.add(llm_node).order(1).done();
-    scheduler.add(parser_node).order(2).done();
-    scheduler.add(drive_node).order(3).done();
-
-    // User says: "Move forward slowly"
-    //  GPT-4: {"action": "move", "linear": 0.3, "angular": 0.0}
-    //  Robot moves forward at 0.3 m/s
-
-    scheduler.run()?;
-    Ok(())
-}
-
-pub struct CommandParserNode {
-    llm_sub: Topic<String>,
-    cmd_pub: Topic<(f32, f32)>,
-}
-
-impl CommandParserNode {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            llm_sub: Topic::new("robot.plan")?,
-            cmd_pub: Topic::new("motor.cmd")?,
-        })
-    }
-}
-
-impl Node for CommandParserNode {
-    fn name(&self) -> &'static str { "CommandParserNode" }
-
-    fn tick(&mut self) {
-        if let Some(json_str) = self.llm_sub.recv() {
-            // Parse JSON from LLM
-            if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                let linear = cmd["linear"].as_f64().unwrap_or(0.0) as f32;
-                let angular = cmd["angular"].as_f64().unwrap_or(0.0) as f32;
-
-                self.cmd_pub.send((linear, angular));
-            }
-        }
-    }
-}
-```
-
-### LLM Performance & Best Practices
-
-**Latency Comparison:**
-```
-Local LLMs (llama.cpp):
-  - Phi-2 (2.7B):     ~100-500ms per response (CPU)
-  - Mistral 7B:       ~500-2000ms (CPU), ~50-200ms (GPU)
-  - Llama 2 13B:      ~1-4s (CPU), ~100-400ms (GPU)
-
-Cloud APIs:
-  - GPT-4:            ~1-5s per request
-  - Claude:           ~1-3s per request
-  - GPT-4 Vision:     ~2-6s per request
-```
-
-**Optimization Tips:**
-
-1. **Cache common responses:**
-```rust
-use std::collections::HashMap;
-
-struct CachedLLMNode {
-    cache: HashMap<String, String>,
-    // ... llm fields
-}
-
-impl CachedLLMNode {
-    fn get_response(&mut self, input: &str) -> String {
-        if let Some(cached) = self.cache.get(input) {
-            return cached.clone();
-        }
-
-        let response = self.generate(input);
-        self.cache.insert(input.to_string(), response.clone());
-        response
-    }
-}
-```
-
-2. **Throttle requests:**
-```rust
-if frame_count % 30 == 0 {  // Only every 30 frames
-    run_llm_inference();
-}
-```
-
-3. **Use smaller models locally:**
-- Phi-2 (2.7B) is excellent for CPU inference
-- Mistral 7B for better quality with GPU
-- GPT-4 only for complex reasoning
-
-4. **Async processing:**
-```rust
-use tokio::spawn;
-
-spawn(async move {
-    let response = llm.generate(prompt).await;
-    response_topic.send(response);
-});
-```
-
-### Model Recommendations
-
-| Task | Local (CPU) | Local (GPU) | Cloud |
-|------|-------------|-------------|-------|
-| **Commands** | Phi-2 | Mistral 7B | GPT-3.5 |
-| **Planning** | Mistral 7B | Llama 2 13B | GPT-4 |
-| **Vision+Text** | LLaVA | LLaVA 13B | GPT-4V |
-| **Code Gen** | CodeLlama 7B | CodeLlama 13B | GPT-4 |
-
----
-
-## Python ML Integration
-
-Run Python ML models alongside your HORUS application using subprocess or HTTP.
-
-### Pattern 1: Python Script via Subprocess
-
-**Python inference script** (`object_detector.py`):
-```python
-#!/usr/bin/env python3
-import sys
-import json
-
-# Your ML model here (YOLOv8, TensorFlow, PyTorch, etc.)
-def detect_objects(image_path):
-    # Mock detection for example
-    return [
-        {"class": "person", "confidence": 0.95, "bbox": [100, 100, 200, 300]},
-        {"class": "car", "confidence": 0.87, "bbox": [300, 150, 500, 400]}
-    ]
-
-if __name__ == "__main__":
-    image_path = sys.argv[1]
-    detections = detect_objects(image_path)
-    print(json.dumps(detections))
-```
-
-**HORUS node** calling Python:
-```rust
-use horus::prelude::*;
-use std::process::Command;
-use std::fs;
-
-pub struct PythonMLNode {
-    camera_sub: Topic<ImageFrame>,
-    detections_pub: Topic<String>,
-    frame_count: u64,
-}
-
-impl PythonMLNode {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            detections_pub: Topic::new("ml.detections")?,
-            frame_count: 0,
-        })
-    }
-
-    fn run_inference(&self, image_data: &[u8]) -> Option<String> {
-        // Save image temporarily
-        let temp_path = format!("/tmp/frame_{}.jpg", self.frame_count);
-        fs::write(&temp_path, image_data).ok()?;
-
-        // Run Python script
-        let output = Command::new("python3")
-            .arg("object_detector.py")
-            .arg(&temp_path)
-            .output()
-            .ok()?;
-
-        // Parse JSON output
-        String::from_utf8(output.stdout).ok()
-    }
-}
-
-impl Node for PythonMLNode {
-    fn name(&self) -> &'static str { "PythonMLNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            // Run inference every 10th frame (throttle to reduce load)
-            if self.frame_count % 10 == 0 {
-                if let Some(detections) = self.run_inference(&frame.data) {
-                    self.detections_pub.send(detections);
-                }
-            }
-            self.frame_count += 1;
-        }
-    }
-}
-```
-
-### Pattern 2: HTTP Inference Server
-
-**Python FastAPI server** (`inference_server.py`):
-```python
-from fastapi import FastAPI, File, UploadFile
-import uvicorn
-
-app = FastAPI()
-
-@app.post("/detect")
-async def detect_objects(file: UploadFile = File(...)):
-    # Your ML inference here
-    detections = [{"class": "person", "confidence": 0.95}]
-    return {"detections": detections}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
-**HORUS HTTP client node:**
-```rust
-use horus::prelude::*;
-use reqwest::blocking::Client;
-
-pub struct HTTPInferenceNode {
-    camera_sub: Topic<ImageFrame>,
-    detections_pub: Topic<String>,
-    client: Client,
-}
-
-impl HTTPInferenceNode {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            detections_pub: Topic::new("ml.detections")?,
-            client: Client::new(),
-        })
-    }
-
-    fn run_inference(&self, image_data: &[u8]) -> Option<String> {
-        let response = self.client
-            .post("http://localhost:8000/detect")
-            .body(image_data.to_vec())
-            .send()
-            .ok()?;
-
-        response.text().ok()
-    }
-}
-
-impl Node for HTTPInferenceNode {
-    fn name(&self) -> &'static str { "HTTPInferenceNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            if let Some(detections) = self.run_inference(&frame.data) {
-                self.detections_pub.send(detections);
-            }
-        }
-    }
-}
-```
-
----
-
-## Cloud AI APIs
-
-Integrate cloud AI services like OpenAI Vision, Anthropic Claude, or Google Cloud Vision.
-
-### OpenAI Vision Example
-
-**Add dependencies:**
-```toml
-[dependencies]
-reqwest = { version = "0.11", features = ["blocking", "json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-base64 = "0.21"
-```
-
-**Vision API node:**
-```rust
-use horus::prelude::*;
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use base64::{Engine as _, engine::general_purpose};
-
-#[derive(Serialize)]
-struct VisionRequest {
-    model: String,
-    messages: Vec<Message>,
-    max_tokens: u32,
-}
-
-#[derive(Serialize)]
-struct Message {
-    role: String,
-    content: Vec<Content>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum Content {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Serialize)]
-struct ImageUrl {
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct VisionResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    content: String,
-}
-
-pub struct OpenAIVisionNode {
-    camera_sub: Topic<ImageFrame>,
-    description_pub: Topic<String>,
-    client: Client,
-    api_key: String,
-}
-
-impl OpenAIVisionNode {
-    pub fn new(api_key: String) -> Result<Self> {
-        Ok(Self {
-            camera_sub: Topic::new("camera.raw")?,
-            description_pub: Topic::new("vision.description")?,
-            client: Client::new(),
-            api_key,
-        })
-    }
-
-    fn analyze_image(&self, image_data: &[u8]) -> Option<String> {
-        // Convert to base64
-        let base64_image = general_purpose::STANDARD.encode(image_data);
-
-        // Construct vision API request with base64 image
-        let response = client.post("https://api.openai.com/gpt-4-vision")
-            .json(&json!({
-                "model": "gpt-4-vision-preview",
-                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", base64_image)}}]}]
-            }))
-            .send()
-            .ok()?;
-
-        let vision_response: VisionResponse = response.json().ok()?;
-        Some(vision_response.choices[0].message.content.clone())
-    }
-}
-
-impl Node for OpenAIVisionNode {
-    fn name(&self) -> &'static str { "OpenAIVisionNode" }
-
-    fn tick(&mut self) {
-        if let Some(frame) = self.camera_sub.recv() {
-            // Only analyze every 30th frame to avoid API costs
-            if frame.stamp_nanos % 30 == 0 {
-                if let Some(description) = self.analyze_image(&frame.data) {
-                    self.description_pub.send(description);
-                }
-            }
-        }
-    }
-}
-```
-
----
-
-## Complete Example: Vision-Guided Robot
-
-Combine camera, OpenCV processing, and control:
-
-```rust
-use horus::prelude::*; // Provides {Topic, CameraNode, Result}
-
-// Simple vision-based follower
-pub struct ObjectFollowerNode {
-    vision_sub: Topic<String>,
-    cmd_pub: Topic<(f32, f32)>,
-}
-
-impl ObjectFollowerNode {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            vision_sub: Topic::new("vision.detections")?,
-            cmd_pub: Topic::new("motor.cmd")?,
-        })
-    }
-}
-
-impl Node for ObjectFollowerNode {
-    fn name(&self) -> &'static str { "ObjectFollowerNode" }
-
-    fn tick(&mut self) {
-        if let Some(detection) = self.vision_sub.recv() {
-            // Parse edge count from detection string
-            if let Some(count_str) = detection.strip_prefix("edges_detected:") {
-                if let Ok(edge_count) = count_str.parse::<i32>() {
-                    // Simple behavior: move forward if edges detected, stop if not
-                    let (linear, angular) = if edge_count > 1000 {
-                        (0.5, 0.0)  // Move forward
-                    } else {
-                        (0.0, 0.3)  // Turn to search
-                    };
-
-                    self.cmd_pub.send((linear, angular));
-                }
-            }
-        }
-    }
-}
-
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
-
-    // Camera capture (if opencv-backend feature enabled)
-    let mut camera = CameraNode::new()?;
-    camera.set_topic("camera.raw");
-
-    // Vision processing
-    let vision = VisionProcessorNode::new()?;
-
-    // Decision making
-    let follower = ObjectFollowerNode::new()?;
-
-    // Motor control
-    let drive = DriveNode::new()?;
-
-    // Add in priority order
-    scheduler.add(camera).order(0).done();     // Highest priority
-    scheduler.add(vision).order(1).done();     // Process images
-    scheduler.add(follower).order(2).done();   // Make decisions
-    scheduler.add(drive).order(3).done();      // Control motors
-
-    scheduler.run()?;
-    Ok(())
+            content: prompt.to_string(),
+        }],
+        max_tokens: 500,
+    };
+
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&request)
+        .send()
+        .ok()?;
+
+    let chat_response: ChatResponse = response.json().ok()?;
+    Some(chat_response.choices[0].message.content.clone())
 }
 ```
 
@@ -1381,71 +392,98 @@ fn main() -> Result<()> {
 ### Latency Budget
 
 Typical robotics control loop at 100Hz (10ms cycle):
-```
-Camera:      ~16ms  (30 FPS)
-Vision:      ~5-50ms (OpenCV/ML inference)
-Decision:    ~1μs   (HORUS Topic communication)
-Control:     ~1μs   (HORUS Topic communication)
-Motors:      ~1ms   (Hardware actuator delay)
-```
 
-### Optimization Tips
-
-1. **Throttle AI Processing**: Process every Nth frame
-```rust
-if frame_count % 10 == 0 {
-    run_expensive_inference();
-}
+```
+Sensor capture:  ~1-16ms  (hardware dependent)
+ML inference:    ~5-50ms  (model dependent)
+Topic transfer:  ~85ns    (HORUS shared memory)
+Control logic:   ~1μs     (HORUS node tick)
+Motor command:   ~1ms     (hardware actuator)
 ```
 
-2. **Async Processing**: Run ML in separate thread
-```rust
-use std::sync::mpsc;
-let (tx, rx) = mpsc::channel();
+ML inference is typically the bottleneck. Strategies to manage this:
 
-// In tick():
-tx.send(frame_data).ok();
+### Throttle Inference
 
-// Separate thread:
-while let Ok(data) = rx.recv() {
-    let result = expensive_ml(data);
-    result_topic.send(result);
-}
+Process every Nth frame instead of every frame:
+
+```python
+frame_count = 0
+
+def ml_tick(node):
+    global frame_count
+    if node.has_msg("cam.frame"):
+        frame_count += 1
+        if frame_count % 5 == 0:  # Every 5th frame
+            frame = node.get("cam.frame")
+            result = model.predict(frame)
+            node.send("detections", result)
 ```
 
-3. **Use GPU**: OpenCV and ML libraries support CUDA/Metal
-```rust
-// OpenCV can use GPU acceleration automatically
-opencv::core::set_use_optimized(true);
+### Async Processing
+
+Run ML in a background thread so the control loop isn't blocked:
+
+```python
+from horus import AsyncNode, AsyncTopic
+import asyncio
+
+class AsyncMLNode(AsyncNode):
+    async def setup(self):
+        self.input = AsyncTopic("cam.frame", dict)
+        self.output = AsyncTopic("detections", dict)
+
+    async def tick(self):
+        frame = await self.input.try_recv()
+        if frame:
+            # Run in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, model.predict, frame)
+            await self.output.send(result)
 ```
+
+### Use Appropriate Models
+
+| Task | CPU Model | GPU Model | Cloud API |
+|------|-----------|-----------|-----------|
+| **Object Detection** | YOLOv8n (ONNX) | YOLOv8x | GPT-4 Vision |
+| **Classification** | MobileNet (TFLite) | EfficientNet | Cloud Vision |
+| **Pose Estimation** | MediaPipe | OpenPose | - |
+| **Task Planning** | Phi-3 Mini | Llama 3 | GPT-4 / Claude |
+| **Depth Estimation** | MiDaS Small | MiDaS Large | - |
 
 ---
 
 ## Best Practices
 
-**Separate Concerns**: Keep AI inference in dedicated nodes
-- Camera node  Vision node  Decision node  Control node
+1. **Separate concerns**: Keep AI inference in dedicated nodes. Don't mix ML code with control logic.
 
-**Handle Failures Gracefully**: AI can fail, robots shouldn't crash
-```rust
-if let Some(result) = try_inference(&data) {
-    control_pub.send(result);
-} else {
-    // Fallback behavior
-    control_pub.send(default_safe_command());
-}
-```
+2. **Handle failures gracefully**: AI inference can fail. Always have a safe fallback:
+   ```python
+   def control_tick(node):
+       if node.has_msg("detections"):
+           detections = node.get("detections")
+           react_to(detections)
+       else:
+           # Safe default when no detections available
+           node.send("cmd_vel", {"linear": 0.0, "angular": 0.0})
+   ```
 
-**Monitor Performance**: Use HORUS monitor
-```bash
-horus monitor  # Watch node timing and message flow
-```
+3. **Monitor performance**: Use `horus monitor` to watch node timing and message flow:
+   ```bash
+   horus monitor  # See which nodes are slow
+   ```
+
+4. **Start with Python**: Prototype in Python first, then move performance-critical inference to Rust if needed.
+
+5. **Cache results**: For cloud APIs, cache common responses to reduce latency and cost.
 
 ---
 
-## Next Steps
+## See Also
 
-- **[Camera Node Reference](/development/library-reference)** - Built-in camera capture
-- **[Message Types](/concepts/message-types)** - Define custom AI result types
-- **[Examples](/rust/examples/basic-examples)** - See complete vision projects
-- **[Performance](/performance/performance)** - Optimize your pipeline
+- [ML Utilities](/python/library/ml-utilities) - Python ML inference helpers
+- [Hardware Nodes](/python/library/python-hardware-nodes) - Camera and sensor capture
+- [Async Nodes](/python/api/async-nodes) - Non-blocking inference patterns
+- [Python Examples](/python/examples) - Complete example applications
+- [Message Library](/python/library/python-message-library) - Available message types
