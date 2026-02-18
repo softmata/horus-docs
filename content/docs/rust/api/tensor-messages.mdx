@@ -10,10 +10,10 @@ Zero-copy tensor sharing between nodes for ML/AI workloads.
 
 ## HorusTensor
 
-A ~200 byte descriptor pointing to data in shared memory:
+A 232-byte Pod descriptor pointing to data in shared memory:
 
 ```rust
-use horus::prelude::*; // Provides tensor::{HorusTensor, TensorDtype, TensorDevice};
+use horus::prelude::*; // Provides HorusTensor, TensorDtype, Device from horus_types
 
 // Send tensor descriptor through Topic
 let topic: Topic<HorusTensor> = Topic::new("camera.frames")?;
@@ -21,42 +21,188 @@ let topic: Topic<HorusTensor> = Topic::new("camera.frames")?;
 if let Some(tensor) = topic.recv() {
     println!("Shape: {:?}", tensor.shape());
     println!("Dtype: {:?}", tensor.dtype);
-    println!("Device: {}", tensor.device);
+    println!("Device: {}", tensor.device());
 }
 ```
+
+All tensor types live in the `horus_types` crate — a leaf crate with zero HORUS dependencies. This is the single source of truth for `HorusTensor`, `TensorDtype`, and `Device`.
 
 ## TensorDtype
 
 | Dtype | Size | Use Case |
 |-------|------|----------|
 | F32 | 4 | ML training/inference |
+| F64 | 8 | High-precision computation |
 | F16 | 2 | Memory-efficient inference |
 | BF16 | 2 | Training on modern GPUs |
 | U8 | 1 | Images |
+| U16 | 2 | Depth sensors (mm) |
+| U32 | 4 | Large indices |
+| U64 | 8 | Counters, timestamps |
 | I8 | 1 | Quantized inference |
+| I16 | 2 | Audio, sensor data |
+| I32 | 4 | General integer |
+| I64 | 8 | Large signed values |
+| Bool | 1 | Masks |
 
-## TensorDevice
+Helper methods:
 
 ```rust
-TensorDevice::Cpu     // Shared memory
-TensorDevice::Cuda0   // GPU 0
-TensorDevice::Cuda1   // GPU 1
+let dtype = TensorDtype::F32;
+assert_eq!(dtype.element_size(), 4);
+assert!(dtype.is_float());
+assert!(!dtype.is_signed_int());
+println!("{}", dtype);  // "f32"
+
+// DLPack interop
+let dl = dtype.to_dlpack();
+let back = TensorDtype::from_dlpack(dl.0, dl.1).unwrap();
+
+// Parse from string
+let parsed = TensorDtype::parse("float32").unwrap();
 ```
 
-## With TensorPool
+## Device
+
+The `Device` struct replaces the old `TensorDevice` enum. It's a Pod-safe `repr(C)` struct supporting **unlimited GPU indices**:
 
 ```rust
-use horus::prelude::*; // Provides {TensorPool, TensorPoolConfig, TensorDtype, TensorDevice}
+Device::cpu()      // CPU / shared memory
+Device::cuda(0)    // GPU 0
+Device::cuda(1)    // GPU 1
+Device::cuda(7)    // GPU 7 — no limit!
+
+// Parse from string
+let dev = Device::parse("cuda:2").unwrap();
+let cpu = Device::parse("cpu").unwrap();
+
+// Check device type
+assert!(Device::cpu().is_cpu());
+assert!(Device::cuda(0).is_cuda());
+println!("{}", Device::cuda(1));  // "cuda:1"
+```
+
+## Auto-Managed Tensor Pools
+
+`Topic<HorusTensor>` automatically manages a shared-memory `TensorPool` per topic. Users call `alloc_tensor()`, `send_handle()`, and `recv_handle()` instead of managing pools manually:
+
+```rust
+use horus::prelude::*;
+
+let topic: Topic<HorusTensor> = Topic::new("camera/rgb")?;
+
+// Allocate a 1080p RGB image from the topic's auto-managed pool
+let handle = topic.alloc_tensor(&[1080, 1920, 3], TensorDtype::U8, Device::cpu())?;
+
+// Write pixel data
+let pixels = handle.data_slice_mut();
+// ... fill pixels ...
+
+// Send — only the 232-byte descriptor flows through the ring buffer.
+// The actual tensor data stays in shared memory — true zero-copy.
+topic.send_handle(&handle);
+```
+
+On the receiver side:
+
+```rust
+let topic: Topic<HorusTensor> = Topic::new("camera/rgb")?;
+
+if let Some(recv_handle) = topic.recv_handle() {
+    let data = recv_handle.data_slice();  // Zero-copy access to shared memory
+    println!("Shape: {:?}", recv_handle.shape());
+    println!("Dtype: {:?}", recv_handle.dtype());
+}
+// TensorHandle is RAII — refcount decremented automatically on drop
+```
+
+The pool is created lazily on first use and shared across all `Topic<HorusTensor>` instances with the same name — even across processes. Pool IDs are derived deterministically from the topic name.
+
+## With Manual TensorPool
+
+For advanced use cases, you can manage pools directly:
+
+```rust
+use horus::prelude::*;
 
 let pool = TensorPool::new(1, TensorPoolConfig::default())?;
-let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::U8, TensorDevice::Cpu)?;
+let handle = TensorHandle::alloc(
+    Arc::new(pool),
+    &[1080, 1920, 3],
+    TensorDtype::U8,
+    Device::cpu(),
+)?;
 
 // Write data
-pool.data_slice_mut(&tensor)[0] = 255;
+handle.data_slice_mut()[0] = 255;
 
 // Share via Topic
-topic.send(tensor);
+topic.send(*handle.tensor());
 ```
+
+## Tensor Domain Types
+
+For common robotics data, HORUS provides zero-overhead Pod wrappers around `HorusTensor` with domain-specific accessors. These use the same zero-copy shared memory path as `HorusTensor` — only the 232-byte descriptor is sent.
+
+### TensorImage
+
+Camera images with shape `[height, width, channels]`:
+
+```rust
+use horus::prelude::*;
+
+let topic: Topic<HorusTensor> = Topic::new("camera/rgb")?;
+
+if let Some(handle) = topic.recv_handle() {
+    let img = TensorImage::from_tensor(*handle.tensor());
+    println!("{}x{}, {} channels", img.width(), img.height(), img.channels());
+    println!("Encoding: {:?}", img.inferred_encoding()); // Rgb8, Mono8, etc.
+    println!("Pixels: {}", img.pixel_count());
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `height()` | Image height (shape dim 0) |
+| `width()` | Image width (shape dim 1) |
+| `channels()` | Channel count (shape dim 2, default 1) |
+| `dtype()` | Data type of pixel components |
+| `inferred_encoding()` | Infers ImageEncoding from dtype + channels |
+| `pixel_count()` | Total pixels (height * width) |
+| `nbytes()` | Total bytes of image data |
+| `is_cpu()` / `is_cuda()` | Device location |
+
+### TensorPointCloud
+
+Point clouds with shape `[N, K]` where K = fields per point:
+
+```rust
+let cloud = TensorPointCloud::from_tensor(tensor);
+println!("{} points, {} fields", cloud.point_count(), cloud.fields_per_point());
+println!("XYZ: {}, Has color: {}", cloud.is_xyz(), cloud.has_color());
+```
+
+| Fields per Point | Format |
+|-----------------|--------|
+| 3 | XYZ |
+| 4 | XYZI (XYZ + intensity) |
+| 6 | XYZRGB (XYZ + RGB) |
+
+### TensorDepthImage
+
+Depth images with shape `[height, width]`:
+
+```rust
+let depth = TensorDepthImage::from_tensor(tensor);
+println!("{}x{}", depth.width(), depth.height());
+if depth.is_meters() { println!("F32, depth in meters"); }
+if depth.is_millimeters() { println!("U16, depth in millimeters"); }
+```
+
+| Dtype | Unit |
+|-------|------|
+| F32 | Depth in meters (ML pipelines) |
+| U16 | Depth in millimeters (RealSense, etc.) |
 
 ## Python Interop
 
@@ -66,3 +212,8 @@ tensor = topic.recv_tensor(node)
 arr = np.asarray(tensor)  # Zero-copy via __array_interface__
 ```
 
+## See Also
+
+- [TensorPool API](/rust/api/tensor-pool) — Pool management and configuration
+- [GPU Tensor Sharing](/advanced/gpu-tensor-sharing) — CUDA IPC guide
+- [Message Types](/concepts/message-types) — All HORUS message types
