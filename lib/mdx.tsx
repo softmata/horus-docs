@@ -6,7 +6,7 @@
  *
  * Common pitfalls:
  * - Using `<` in text (e.g., "<1%" should be "&lt;1%")
- * - Generic types without backticks (e.g., "Hub<T>" should be "`Hub<T>`")
+ * - Generic types without backticks (e.g., "Topic<T>" should be "`Topic<T>`")
  * - Headings starting with numbers (auto-fixed below but still discouraged)
  */
 

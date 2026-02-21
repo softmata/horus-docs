@@ -1,229 +1,125 @@
 ---
 title: "Network Backends"
-description: "Network communication with Zenoh transport for multi-robot and cloud connectivity"
+description: "Communication backends in HORUS — automatic local IPC with planned network transport"
 weight: 40
 ---
 
-# Network Backends
+# Communication Backends
 
-<Callout type="warn" title="Planned Feature">
+HORUS automatically selects the optimal communication backend based on topology — no configuration needed. All current backends are **local** (same-machine), using shared memory or in-process channels.
 
-Zenoh network transport is **planned but not yet implemented**. The configuration API (`ZenohEndpointConfig`, YAML topic config) exists and parses correctly, but no actual network transport backend is wired up yet. HORUS currently operates as a **local shared memory IPC framework only**. This page documents the configuration scaffolding that is in place for the upcoming network transport layer.
+<Callout type="warn" title="Network Transport Not Yet Available">
+
+HORUS currently operates as a **local shared memory IPC framework only**. Network transport (Zenoh, UDP, etc.) is planned but no network backend code exists yet. All topics created with `Topic::new("name")` use local shared memory or in-process channels. This page documents the existing backends and the planned network direction.
 
 </Callout>
 
-HORUS uses shared memory for local communication (<1μs latency). Zenoh network transport configuration is scaffolded for future multi-robot, cloud, and ROS2 interoperability.
+## Automatic Backend Selection
 
-## Communication Architecture
-
-| Transport | Latency | Use Case |
-|-----------|---------|----------|
-| **Shared Memory** | ~85ns | Same-machine IPC (default) |
-| **Zenoh** | ~100μs | Multi-robot, cloud, ROS2 interop |
-
-Most HORUS applications only need shared memory. Zenoh is for when nodes run on different machines or you need to bridge with ROS2.
-
-## Zenoh Transport
-
-Zenoh provides peer-to-peer mesh networking with optional cloud connectivity. HORUS integrates Zenoh through the `ZenohEndpointConfig` for Topic transport.
-
-### Enabling Zenoh
-
-```toml
-[dependencies]
-horus_core = { version = "0.1", features = ["zenoh-transport"] }
-```
-
-### Configuration
-
-Zenoh endpoints are configured through `ZenohEndpointConfig`:
-
-```rust
-pub struct ZenohEndpointConfig {
-    /// Enable ROS2 compatibility mode (uses rt/{topic} naming)
-    pub ros2_mode: bool,
-    /// ROS2 domain ID (0-232), only used when ros2_mode is true
-    pub ros2_domain_id: u32,
-    /// Endpoints to connect to (routers or peers)
-    /// Format: "tcp/192.168.1.1:7447" or "udp/192.168.1.1:7447"
-    pub connect: Vec<String>,
-    /// Endpoints to listen on
-    /// Format: "tcp/0.0.0.0:7447"
-    pub listen: Vec<String>,
-    /// Namespace prefix for topics (default: "horus")
-    pub namespace: Option<String>,
-    /// Enable shared memory transport for local communication
-    pub shared_memory: bool,
-    /// Serialization format: "bincode" (default), "json", "cdr" (ROS2)
-    pub serialization: Option<String>,
-    /// QoS reliability: "best_effort" (default) or "reliable"
-    pub reliability: Option<String>,
-    /// QoS priority (0-7, higher = more important)
-    pub priority: Option<u8>,
-    /// Express mode (skip batching for low latency)
-    pub express: bool,
-}
-```
-
-### YAML Configuration
-
-Configure topics with Zenoh transport in your `horus.yaml`:
-
-```yaml
-topics:
-  - name: cmd_vel
-    transport: zenoh
-    zenoh:
-      connect:
-        - "tcp/192.168.1.100:7447"
-      namespace: robot1
-      reliability: reliable
-      priority: 5
-      express: true
-
-  - name: sensor_data
-    transport: zenoh
-    zenoh:
-      ros2_mode: true
-      ros2_domain_id: 0
-      serialization: cdr
-```
-
-### Topic Transport Types (Planned)
-
-The `EndpointConfig` defines these transport types for future use:
-
-| Transport | Description | Config Syntax |
-|-----------|-------------|---------------|
-| `local` | Shared memory (same machine) | Default (currently the only working transport) |
-| `localhost` | UDP loopback | `transport: localhost` |
-| `router` | Via HORUS router | `transport: router` |
-| `multicast` | UDP multicast | `transport: multicast` |
-| `direct` | Direct UDP | `transport: direct` with `host`/`port` |
-| `zenoh` | Zenoh transport | `transport: zenoh` with `zenoh:` section |
-
-<Callout type="info">
-Currently only `local` (shared memory) transport is implemented. `Topic::new("name")` always creates a local shared memory topic. The `@` endpoint syntax shown in `EndpointConfig` is for configuration purposes only and is not parsed by `Topic::new()`.
-</Callout>
-
-### ROS2 Interoperability
-
-When `ros2_mode` is enabled, HORUS automatically maps topic names to ROS2 DDS conventions:
-
-| HORUS Topic | Zenoh Key Expression | ROS2 Topic |
-|-------------|---------------------|------------|
-| `/cmd_vel` | `rt/cmd_vel` | `/cmd_vel` |
-| `/robot/odom` | `rt/robot/odom` | `/robot/odom` |
-
-Set `serialization: "cdr"` for wire-compatible ROS2 message encoding.
-
-### Multi-Robot Setup
-
-Connect multiple robots through Zenoh peers:
-
-```yaml
-# Robot 1
-topics:
-  - name: robot1/odom
-    transport: zenoh
-    zenoh:
-      listen:
-        - "tcp/0.0.0.0:7447"
-      namespace: fleet
-
-# Robot 2
-topics:
-  - name: robot2/odom
-    transport: zenoh
-    zenoh:
-      connect:
-        - "tcp/192.168.1.10:7447"
-      namespace: fleet
-```
-
-### Cloud Connectivity
-
-Connect to a Zenoh router for cloud/remote access:
-
-```yaml
-topics:
-  - name: telemetry
-    transport: zenoh
-    zenoh:
-      connect:
-        - "tcp/cloud.example.com:7447"
-      reliability: reliable
-```
-
-## Shared Memory (Default)
-
-For same-machine communication, HORUS uses shared memory by default:
+When you call `Topic::new("name")`, HORUS automatically detects the optimal backend based on the number of publishers, subscribers, and whether they're in the same process:
 
 ```rust,ignore
 use horus::prelude::*;
 
-// Default: shared memory transport (~85ns latency)
-let topic = Topic::<SensorData>::new("sensor_data")?;
+// Just create a topic — backend is auto-selected
+let topic = Topic::<CmdVel>::new("motors.cmd_vel")?;
+topic.send(CmdVel { linear: 1.0, angular: 0.0 });
 ```
 
-Shared memory topics are stored in `/dev/shm/horus/` and provide sub-microsecond latency with zero-copy semantics.
+No configuration needed. The backend upgrades and downgrades dynamically as participants join and leave.
 
-### Performance Characteristics
+## Backend Modes
 
-| Metric | Shared Memory | Zenoh (Local) | Zenoh (Network) |
-|--------|--------------|---------------|-----------------|
-| Latency | ~85ns | ~100μs | Network dependent |
-| Throughput | Millions msg/s | High | Network dependent |
-| Zero-copy | Yes | No | No |
-| Cross-machine | No | Yes | Yes |
+HORUS has 10 backend modes across two categories:
 
-## Best Practices
+### Intra-Process Backends (Same Process)
 
-### 1. Use Shared Memory for Local Communication
+| Backend | Pattern | Latency | Description |
+|---------|---------|---------|-------------|
+| `DirectChannel` | 1P-1C | ~3ns | Same-thread direct channel |
+| `SpscIntra` | 1P-1C | ~18ns | Single-producer single-consumer |
+| `SpmcIntra` | 1P-MC | ~24ns | Single-producer multi-consumer |
+| `MpscIntra` | MP-1C | ~26ns | Multi-producer single-consumer |
+| `MpmcIntra` | MP-MC | ~36ns | Multi-producer multi-consumer |
 
-```yaml
-# Don't use Zenoh for same-machine nodes
-topics:
-  - name: sensor_data
-    # No transport specified = shared memory (fastest)
+### Cross-Process Backends (Shared Memory)
+
+| Backend | Pattern | Latency | Description |
+|---------|---------|---------|-------------|
+| `PodShm` | 1P-1C | ~50ns | POD types via shared memory |
+| `MpscShm` | MP-1C | ~65ns | Multi-producer single-consumer SHM |
+| `SpmcShm` | 1P-MC | ~70ns | Single-producer multi-consumer SHM |
+| `SpscShm` | 1P-1C | ~85ns | Single-producer single-consumer SHM |
+| `MpmcShm` | MP-MC | ~167ns | Multi-producer multi-consumer SHM |
+
+The backend is selected based on:
+- **Process locality**: Same thread → same process → cross-process
+- **Topology**: Number of publishers and consumers
+- **Data type**: POD types get the fastest path
+
+## Shared Memory Layout
+
+On Linux, shared memory files are stored in `/dev/shm/horus/`:
+
+```
+/dev/shm/horus/
+├── nodes/          # Node presence files ({node_name}.json)
+├── params/         # Runtime parameters ({param_name})
+├── control/        # Node control commands ({node_name}.cmd)
+└── {topic_name}    # Topic ring buffers
 ```
 
-### 2. Use Zenoh Only When Needed
+On macOS, the base path is `/tmp/horus/` (no `/dev/shm`). On Windows, `%TEMP%\horus`.
 
-```yaml
-# Multi-robot or cross-machine communication
-topics:
-  - name: fleet_status
-    transport: zenoh
-    zenoh:
-      connect: ["tcp/192.168.1.100:7447"]
+## Backend Migration
+
+HORUS dynamically migrates between backends as topology changes:
+
+```
+Single publisher + single subscriber (same process)
+  → SpscIntra (~18ns)
+
+Second subscriber joins (same process)
+  → SpmcIntra (~24ns)
+
+Subscriber in different process joins
+  → SpmcShm (~70ns)
+
+All subscribers disconnect except one in-process
+  → SpscIntra (~18ns)
 ```
 
-### 3. Enable Express Mode for Low Latency
+Migration is transparent — `send()` and `recv()` calls are unaffected.
 
-```yaml
-topics:
-  - name: control_cmd
-    transport: zenoh
-    zenoh:
-      express: true  # Skip batching
-      priority: 7    # Highest priority
-```
+## Performance Characteristics
 
-### 4. Use CDR Serialization for ROS2
+| Metric | In-Process | Shared Memory |
+|--------|-----------|---------------|
+| Latency | 3-36ns | 50-167ns |
+| Throughput | Millions msg/s | Millions msg/s |
+| Zero-copy | Yes | Yes (via mmap) |
+| Cross-machine | No | No |
 
-```yaml
-topics:
-  - name: cmd_vel
-    transport: zenoh
-    zenoh:
-      ros2_mode: true
-      ros2_domain_id: 0
-      serialization: cdr  # ROS2 wire format
-```
+## Planned: Network Transport (Zenoh)
+
+Future versions of HORUS will add Zenoh-based network transport for:
+
+- **Multi-robot communication** across machines
+- **Cloud connectivity** for telemetry and remote monitoring
+- **ROS2 interoperability** via Zenoh DDS bridge
+
+The planned architecture adds network backends alongside the existing local backends:
+
+| Transport | Latency | Use Case |
+|-----------|---------|----------|
+| In-process | 3-36ns | Same-process nodes |
+| Shared Memory | 50-167ns | Same-machine IPC |
+| Zenoh (planned) | ~100μs+ | Multi-robot, cloud, ROS2 |
+
+When network transport is implemented, `Topic::new()` will continue to auto-select the optimal backend. Network transport will only be used when topics are explicitly configured for remote communication.
 
 ## See Also
 
-- [Network Communication](/concepts/network-communication) - Basic networking concepts
-- [Shared Memory](/concepts/core-concepts-shared-memory) - Local communication details
-- [ROS2 Bridge](/development/ros2-bridge) - ROS2 migration guide
+- [Shared Memory](/concepts/core-concepts-shared-memory) - Detailed shared memory architecture
+- [Zero-Overhead IPC](/concepts/zero-overhead-ipc) - How HORUS achieves sub-microsecond latency
+- [Topic API](/rust/api/topic-api) - Topic creation and usage

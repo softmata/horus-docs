@@ -39,16 +39,16 @@ All performance features use **graceful degradation** - your code runs everywher
 
 ### Cache-Optimized Structures
 
-**64-byte alignment**: Matches CPU cache line size
+**64-byte alignment**: Ring buffer headers are cache-line aligned to prevent false sharing
 
 ```rust
-#[repr(align(64))]  // Cache-line aligned
-pub struct Topic<T> {
-    // Prevents false sharing between cores
+#[repr(C, align(64))]  // Cache-line aligned
+pub struct RingBufferHeader {
+    // Producer (head) and consumer (tail) on SEPARATE cache lines
 }
 ```
 
-**Padding prevention**: False sharing eliminated with explicit padding
+**Padding prevention**: False sharing eliminated with explicit padding between producer and consumer fields
 
 **Atomic operations**: Lock-free operations with appropriate memory ordering
 
@@ -134,7 +134,7 @@ SIMD acceleration works across platforms with automatic fallback:
 
 | Platform | SIMD Support | Fallback |
 |----------|--------------|----------|
-| **x86_64 (Linux/Windows/macOS)** | AVX2/AVX512 | SSE4.2 → memcpy |
+| **x86_64 (Linux/Windows/macOS)** | AVX2 | Standard memcpy |
 | **ARM64 (macOS M1/M2, Linux)** | NEON (future) | Standard memcpy |
 | **Other architectures** | None | Standard memcpy |
 
@@ -146,22 +146,20 @@ On x86_64, the framework uses `std::arch::x86_64` intrinsics for:
 
 | Operation | SIMD Instruction | Speedup |
 |-----------|------------------|---------|
-| Memory copy (16-64B) | AVX2 `_mm256_*` | 2-4x |
-| Memory copy (64B+) | AVX512 `_mm512_*` | 3-5x |
+| Memory copy (4KB+) | AVX2 `_mm256_*` | 2-4x |
 | Cache prefetch | `_mm_prefetch` | Reduces latency |
 | Non-temporal stores | `_mm256_stream_*` | Bypasses cache for large writes |
 
 ### Automatic Feature Detection
 
-SIMD features are detected at compile time based on target CPU:
+SIMD features are detected at **runtime** using `is_x86_feature_detected!()`:
 
 ```bash
-# Check available SIMD features
+# Check available SIMD features on your CPU
 rustc --print cfg | grep target_feature
 
 # Common features on modern CPUs:
 # target_feature="avx2"
-# target_feature="avx512f" (newer CPUs)
 # target_feature="sse4.2"
 ```
 
@@ -170,25 +168,25 @@ rustc --print cfg | grep target_feature
 For maximum performance, compile with native CPU features:
 
 ```bash
-# Build for your specific CPU
+# Build for your specific CPU (enables all supported features)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# Or specify features explicitly
-RUSTFLAGS="-C target-feature=+avx2,+avx512f" cargo build --release
+# Or specify AVX2 explicitly
+RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 ```
 
 ### When SIMD Applies
 
 SIMD acceleration automatically applies to:
 
-- **Topic send/recv**: Small message copying (16B-1KB)
-- **Topic operations**: Ring buffer management
-- **Message serialization**: Fixed-size struct copying
-- **Shared memory operations**: Page-aligned transfers
+- **Topic send/recv**: Message copying for messages >= 4KB (`SIMD_COPY_THRESHOLD`)
+- **Shared memory operations**: Large buffer transfers using non-temporal streaming stores
+
+For messages smaller than 4KB, standard `ptr::copy_nonoverlapping` is used (setup overhead exceeds SIMD benefit for small copies).
 
 ### SIMD Impact on Latency
 
-Benchmarks on Intel Core i9-13900K (AVX512 enabled):
+Benchmarks on Intel Core i9-13900K (AVX2 enabled):
 
 | Message Size | Without SIMD | With SIMD | Improvement |
 |--------------|--------------|-----------|-------------|
@@ -196,12 +194,13 @@ Benchmarks on Intel Core i9-13900K (AVX512 enabled):
 | 304B (IMU) | ~280ns | ~160ns | 1.75x |
 | 1.5KB (LaserScan) | ~800ns | ~400ns | 2x |
 
+> **Note**: SIMD acceleration applies to messages >= 4KB (`SIMD_COPY_THRESHOLD`). Smaller messages use standard `ptr::copy_nonoverlapping`. The latency improvements above are from the overall Topic pipeline, including cache-line alignment and lock-free algorithms.
+
 ### Fallback Behavior
 
-On CPUs without AVX2/AVX512, HORUS automatically falls back to:
+On CPUs without AVX2, HORUS automatically falls back to:
 
-1. SSE4.2 operations (if available)
-2. Standard `memcpy` (always available)
+1. Standard `memcpy` / `ptr::copy_nonoverlapping` (always available)
 
 Performance remains good, but peak throughput is reduced.
 
@@ -211,10 +210,10 @@ Performance remains good, but peak throughput is reduced.
 // At runtime, check CPU features
 #[cfg(target_arch = "x86_64")]
 {
-    if is_x86_feature_detected!("avx512f") {
-        println!("AVX-512 acceleration enabled");
-    } else if is_x86_feature_detected!("avx2") {
+    if is_x86_feature_detected!("avx2") {
         println!("AVX2 acceleration enabled");
+    } else {
+        println!("Using standard memcpy fallback");
     }
 }
 ```
@@ -407,7 +406,8 @@ The default scheduler runs at 60 Hz (16ms per tick). Use `SchedulerConfig` to ch
 let scheduler = Scheduler::new();
 
 // Custom: 1kHz
-let config = SchedulerConfig::builder().rate_hz(1000.0).build();
+let mut config = SchedulerConfig::standard();
+config.timing.global_rate_hz = 1000.0;
 let scheduler = Scheduler::new().with_config(config);
 
 // Preset: 10kHz for high-performance
@@ -544,23 +544,24 @@ let cloud: Topic<PointCloud> = Topic::new("cloud")?;    // 120KB per slot
 
 HORUS automatically tracks node performance metrics. Use `horus monitor` to view real-time performance data including tick duration, messages sent, and CPU usage.
 
-**Available metrics**:
+**Available metrics** (on `NodeMetrics` / `SchedulerNodeMetrics`):
 - `total_ticks`: Total number of ticks
 - `avg_tick_duration_ms`: Average tick time in milliseconds
 - `max_tick_duration_ms`: Worst-case tick time in milliseconds
 - `messages_sent`: Messages published
-- `cpu_usage_percent`: CPU utilization (f64)
+- `messages_received`: Messages received
+- `errors_count`: Total error count
+- `uptime_seconds`: Node uptime in seconds
 
 ### IPC Latency Logging
 
-HORUS automatically logs IPC timing:
+HORUS automatically tracks IPC timing for each topic operation. The `horus monitor` web interface displays per-log-entry metrics:
 
 ```
-[12:34:56.789] [IPC: 296ns | Tick: 12µs] PublisherNode --PUB--> 'cmd_vel' = 1.5
+Tick: 12μs | IPC: 296ns
 ```
 
-**IPC**: Time to write to shared memory
-**Tick**: Total node execution time
+Each `LogEntry` includes `tick_us` (node tick time in microseconds) and `ipc_ns` (IPC write time in nanoseconds).
 
 ### Manual Profiling
 

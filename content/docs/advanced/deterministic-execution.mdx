@@ -85,11 +85,12 @@ let scheduler = Scheduler::new()
 ```
 
 **Adds:**
-- Watchdog timers
+- Watchdog timers (100ms timeout)
 - WCET enforcement
 - Deadline monitoring
 - Memory locking (mlockall)
 - Real-time scheduling class (SCHED_FIFO)
+- Safety monitor with zero tolerance for deadline misses
 
 ### Level 4: Full Deterministic Mode
 
@@ -104,134 +105,61 @@ let scheduler = Scheduler::new()
 
 **Adds:**
 - Virtual time (deterministic clock instead of wall clock)
-- Seeded RNG (all randomness derived from seed)
-- Execution tracing (record/replay exact node sequences)
-- Static execution order
+- Seeded RNG (all randomness derived from seed 42)
+- Execution tracing via the built-in recording system
+- BlackBox flight recorder (100MB)
+- Static execution order (no per-node rates)
 
-## DeterministicConfig
+The deterministic config is managed internally by the scheduler — you configure it through `SchedulerConfig` and the scheduler creates the virtual clock and trace infrastructure automatically.
 
-The `DeterministicConfig` controls virtual time and tracing:
+## WCET Monitoring
+
+HORUS tracks Worst-Case Execution Time through the real-time node system. When a node's tick exceeds its WCET budget, a `WCETViolation` is recorded:
+
+```rust,ignore
+use horus::prelude::*;
+
+// Set WCET budget when adding an RT node
+let mut scheduler = Scheduler::new()
+    .with_config(SchedulerConfig::safety_critical());
+
+scheduler.add(motor_controller)
+    .order(0)
+    .rt()
+    .wcet_us(500)      // 500μs max execution time
+    .deadline_us(1000)  // 1ms deadline
+    .done();
+
+scheduler.run()?;
+```
+
+When a WCET budget is exceeded, the node's `on_wcet_violation` callback is invoked with a `WCETViolation` containing:
 
 ```rust
-pub struct DeterministicConfig {
-    /// Seed for deterministic RNG (default: 42)
-    pub seed: u64,
-    /// Use virtual time instead of wall clock (default: true)
-    pub virtual_time: bool,
-    /// Fixed tick duration in nanoseconds (default: 1_000_000 = 1ms)
-    pub tick_duration_ns: u64,
-    /// Record execution trace for comparison (default: true)
-    pub record_trace: bool,
+pub struct WCETViolation {
+    pub node_name: String,
+    pub budget: Duration,
+    pub actual: Duration,
+    pub overrun: Duration,
 }
 ```
 
-```rust,ignore
-// Default config
-let config = DeterministicConfig::default();
-// seed: 42, virtual_time: true, tick_duration_ns: 1_000_000, record_trace: true
-
-// Custom config with tracing
-let config = DeterministicConfig::with_trace(123); // Custom seed
-```
-
-## Deterministic Clock
-
-The `DeterministicClock` provides reproducible time that advances in fixed steps:
+RT nodes track violations through `RtStats`:
 
 ```rust,ignore
-use horus::prelude::*;
-
-let config = DeterministicConfig::default();
-let clock = DeterministicClock::new(&config);
-
-// Virtual time starts at 0
-assert_eq!(clock.now_ns(), 0);
-assert_eq!(clock.tick(), 0);
-
-// Advance one tick (adds tick_duration_ns)
-clock.advance_tick();
-assert_eq!(clock.tick(), 1);
-assert_eq!(clock.now_ns(), 1_000_000); // 1ms
-
-// Deterministic random numbers (same seed = same sequence)
-let r1 = clock.random_u64();
-let r2 = clock.random_u64();
-
-// Reset to initial state
-clock.reset();
-assert_eq!(clock.tick(), 0);
-```
-
-Two clocks with the same seed produce identical random sequences — useful for verifying determinism.
-
-## Execution Tracing
-
-Record and compare execution traces to detect non-determinism:
-
-```rust,ignore
-use horus::prelude::*;
-
-let config = DeterministicConfig::with_trace(42);
-
-// Run 1
-let mut trace1 = ExecutionTrace::new(config.clone());
-// ... trace entries added by scheduler during execution ...
-
-// Run 2
-let mut trace2 = ExecutionTrace::new(config);
-// ... trace entries added by scheduler during execution ...
-
-// Compare the two runs
-match trace1.compare(&trace2) {
-    None => println!("Runs are identical!"),
-    Some(divergence) => {
-        println!("Diverged at tick {}: {}", divergence.tick, divergence.message);
-    }
+// Inside an RtNode implementation
+fn tick_rt(&mut self) -> Result<()> {
+    // ... your time-critical logic ...
+    Ok(())
 }
 
-// Save/load traces for later comparison
-trace1.save(Path::new("trace_run1.json"))?;
-let loaded = ExecutionTrace::load(Path::new("trace_run1.json"))?;
-```
-
-Each trace entry records:
-- Tick number and node index
-- Entry type (TickStart, TickEnd, Input, Output, StateChange, Error, Custom)
-- Timestamp and duration
-- Input/output hashes for comparison
-
-## WCET Timing Analysis
-
-The `TimingBounds` system tracks execution timing for WCET (Worst-Case Execution Time) verification:
-
-```rust,ignore
-use horus::prelude::*;
-
-let mut bounds = TimingBounds::new(1000); // 1ms WCET budget
-
-// Record per-node execution times
-bounds.record_node_execution("sensor", tick, 200_000);  // 200μs - OK
-bounds.record_node_execution("control", tick, 1_500_000); // 1.5ms - VIOLATION!
-
-// Check compliance
-match bounds.check_compliance() {
-    Ok(()) => println!("All executions within WCET"),
-    Err(e) => println!("WCET violation: {}", e),
-}
-
-// Inspect violations
-for v in &bounds.violations {
-    println!("[tick {}] {}: expected <{}μs, actual {}ns (severity: {:?})",
-        v.tick, v.node_name, v.expected_us, v.actual_ns, v.severity);
+fn on_wcet_violation(&mut self, violation: &WCETViolation) {
+    eprintln!(
+        "WCET violation in {}: budget={:?}, actual={:?}, overrun={:?}",
+        violation.node_name, violation.budget, violation.actual, violation.overrun
+    );
 }
 ```
-
-Violation severities:
-| Severity | Threshold |
-|----------|-----------|
-| `Minor` | <10% over WCET |
-| `Major` | 10-50% over WCET |
-| `Critical` | >50% over WCET |
 
 ## Deterministic vs Non-Deterministic
 

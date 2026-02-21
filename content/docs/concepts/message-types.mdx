@@ -160,7 +160,9 @@ impl LogSummary for MyLargeMessage {
 
 LogSummary is implemented for:
 - Primitive types: `f32`, `f64`, `i32`, `i64`, `u32`, `u64`, `usize`, `bool`, `String`
-- Messages: `CmdVel`, `Image`, `CompressedImage`, `CameraInfo`, `RegionOfInterest`, `StereoInfo`, `NavSatFix`, `PointCloud`, `DepthImage`, `PwmCommand`, `StepperCommand`, `GenericMessage`
+- Messages: `CmdVel`, `CompressedImage`, `CameraInfo`, `RegionOfInterest`, `StereoInfo`, `NavSatFix`, `PwmCommand`, `StepperCommand`, `GenericMessage`
+- Descriptors: `ImageDescriptor`, `PointCloudDescriptor`, `DepthImageDescriptor`, `HorusTensor`
+- Any type that derives `#[derive(LogSummary)]` (uses `Debug` formatting)
 
 ---
 
@@ -542,23 +544,34 @@ Image and camera data types.
 
 ### Image
 
-Raw image data (variable-size, not POD — uses serialization):
+RAII image type with zero-copy shared memory backing. Pixel data lives in a `TensorPool` — only a 288-byte descriptor flows through the ring buffer.
 
 ```rust
 use horus::prelude::*;
 
-let image = Image::new(640, 480, ImageEncoding::Rgb8);
-assert!(image.is_valid());
+// Note: args are (height, width, encoding)
+let mut img = Image::new(480, 640, ImageEncoding::Rgb8)?;
+img.set_pixel(100, 200, &[255, 0, 0]);  // Set pixel at (x=100, y=200)
+let pixels: &[u8] = img.data();         // Zero-copy access
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `width` / `height` | `u32` | Image dimensions |
-| `encoding` | `ImageEncoding` | Pixel format (Mono8, Rgb8, Bgr8, Rgba8, Depth16, etc.) |
-| `step` | `u32` | Row stride in bytes |
-| `data` | `Vec<u8>` | Pixel data |
-| `frame_id` | `[u8; 32]` | Camera frame |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+**Accessor methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `width()` | `u32` | Image width in pixels |
+| `height()` | `u32` | Image height in pixels |
+| `encoding()` | `ImageEncoding` | Pixel format |
+| `channels()` | `u32` | Number of channels |
+| `step()` | `u32` | Row stride in bytes |
+| `data()` / `data_mut()` | `&[u8]` / `&mut [u8]` | Zero-copy pixel data |
+| `pixel(x, y)` | `Option<&[u8]>` | Get a single pixel |
+| `set_pixel(x, y, val)` | `&mut Self` | Set a single pixel |
+| `copy_from(buf)` | `&mut Self` | Copy pixel data from buffer |
+| `fill(val)` | `&mut Self` | Fill entire image |
+| `roi(x, y, w, h)` | `Option<Vec<u8>>` | Extract region of interest |
+| `frame_id()` | `&str` | Camera frame |
+| `timestamp_ns()` | `u64` | Nanoseconds since epoch |
 
 **Supported encodings:** Mono8, Mono16, Rgb8, Bgr8, Rgba8, Bgra8, Yuv422, Mono32F, Rgb32F, BayerRggb8, Depth16
 
@@ -616,7 +629,7 @@ Zero-copy camera image with shape `[height, width, channels]`:
 ```rust
 use horus::prelude::*;
 
-let topic: Topic<HorusTensor> = Topic::new("camera/rgb")?;
+let topic: Topic<HorusTensor> = Topic::new("camera.rgb")?;
 let handle = topic.alloc_tensor(&[1080, 1920, 3], TensorDtype::U8, Device::cpu())?;
 // ... fill pixels via handle.data_slice_mut() ...
 topic.send_handle(&handle);
@@ -656,10 +669,12 @@ if depth.is_millimeters() { /* U16 dtype, depth in mm */ }
 | | Tensor Types | Standard Types |
 |---|---|---|
 | **Types** | `TensorImage`, `TensorPointCloud`, `TensorDepthImage` | `Image`, `PointCloud`, `DepthImage` |
-| **IPC** | ~50ns (zero-copy Pod) | ~167ns (serde serialization) |
-| **Data location** | Shared memory pool | Inline in message |
-| **Best for** | High-throughput pipelines, ML inference | General use, rich API |
-| **API** | Shape-based accessors | Field-level pixel/point access |
+| **IPC** | ~50ns (zero-copy Pod descriptor) | ~50ns (zero-copy Pod descriptor) |
+| **Data location** | Shared memory pool | Shared memory pool |
+| **Best for** | Raw tensor access, ML inference | Rich API with pixel/point methods |
+| **API** | Shape-based accessors (`from_tensor()`) | Field-level (`pixel()`, `get_depth()`, `point_at()`) |
+
+Both approaches use zero-copy shared memory. The difference is the API surface: tensor types provide raw shape/dtype access, while standard types provide domain-specific convenience methods.
 
 ---
 
@@ -698,25 +713,32 @@ Object detection results. All are POD types.
 
 ### PointCloud
 
-Variable-size point cloud (not POD — uses serialization):
+RAII point cloud type with zero-copy shared memory backing. Point data lives in a `TensorPool` — only a descriptor flows through the ring buffer.
 
 ```rust
 use horus::prelude::*;
 
-let cloud = PointCloud::xyz(1000);      // 1000 XYZ points
-let cloud = PointCloud::xyzrgb(1000);   // 1000 XYZRGB points
+// Create XYZ cloud: (num_points, fields_per_point, dtype)
+let cloud = PointCloud::new(1000, 3, TensorDtype::F32)?;  // 1000 XYZ points
+let cloud = PointCloud::new(1000, 6, TensorDtype::F32)?;  // 1000 XYZRGB points
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `width` / `height` | `u32` | Point cloud dimensions |
-| `fields` | `[PointField; 16]` | Field descriptors |
-| `field_count` | `u8` | Number of fields |
-| `is_dense` | `bool` | Whether all points are finite |
-| `point_step` / `row_step` | `u32` | Byte strides |
-| `data` | `Vec<u8>` | Raw point data |
-| `frame_id` | `[u8; 32]` | Reference frame |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+**Accessor methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `point_count()` | `u64` | Number of points |
+| `fields_per_point()` | `u32` | Floats per point (3=XYZ, 4=XYZI, 6=XYZRGB) |
+| `dtype()` | `TensorDtype` | Data type of components |
+| `is_xyz()` | `bool` | Whether this is a plain XYZ cloud |
+| `has_intensity()` | `bool` | Whether cloud has intensity |
+| `has_color()` | `bool` | Whether cloud has color |
+| `data()` / `data_mut()` | `&[u8]` / `&mut [u8]` | Zero-copy point data |
+| `point_at(idx)` | `Option<&[u8]>` | Get the i-th point as bytes |
+| `extract_xyz()` | `Option<Vec<[f32; 3]>>` | Extract all XYZ coordinates |
+| `copy_from(buf)` | `&mut Self` | Copy point data from buffer |
+| `frame_id()` | `&str` | Reference frame |
+| `timestamp_ns()` | `u64` | Nanoseconds since epoch |
 
 ### Fixed-Size Point Types (POD)
 
@@ -727,22 +749,34 @@ For zero-copy point cloud processing:
 | `PointXYZ` | `x`, `y`, `z` (`f32`) | 3D point |
 | `PointXYZRGB` | `x`, `y`, `z` (`f32`), `r`, `g`, `b`, `a` (`u8`) | Colored point |
 | `PointXYZI` | `x`, `y`, `z`, `intensity` (`f32`) | Point with intensity |
-| `PointCloudHeader` | `num_points`, `point_type`, `point_stride`, `timestamp_ns`, `frame_id` | Fixed-size cloud descriptor |
 
 ### DepthImage
 
-Depth image data (variable-size, not POD):
+RAII depth image type with zero-copy shared memory backing. Supports both F32 (meters) and U16 (millimeters) formats.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `width` / `height` | `u32` | Image dimensions |
-| `depths` | `Vec<u16>` | Depth values |
-| `min_depth` / `max_depth` | `u16` | Depth range |
-| `depth_scale` | `f32` | Scale factor |
-| `frame_id` | `[u8; 32]` | Reference frame |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+```rust
+use horus::prelude::*;
 
-Methods: `get_depth()`, `set_depth()`, `is_valid_depth()`, `to_point_cloud()`, `depth_statistics()`
+let mut depth = DepthImage::new(480, 640, TensorDtype::F32)?;  // F32 meters
+depth.set_depth(100, 200, 1.5);  // Set depth at (x=100, y=200)
+```
+
+**Accessor methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `width()` / `height()` | `u32` | Image dimensions |
+| `dtype()` | `TensorDtype` | Data type (F32 or U16) |
+| `is_meters()` | `bool` | Whether F32 depth in meters |
+| `is_millimeters()` | `bool` | Whether U16 depth in mm |
+| `depth_scale()` | `f32` | Depth scale factor |
+| `data()` / `data_mut()` | `&[u8]` / `&mut [u8]` | Zero-copy depth data |
+| `get_depth(x, y)` | `Option<f32>` | Get depth at pixel (meters) |
+| `set_depth(x, y, val)` | `&mut Self` | Set depth at pixel |
+| `get_depth_u16(x, y)` | `Option<u16>` | Get raw U16 depth |
+| `depth_statistics()` | `(f32, f32, f32)` | (min, max, mean) in meters |
+| `frame_id()` | `&str` | Reference frame |
+| `timestamp_ns()` | `u64` | Nanoseconds since epoch |
 
 ---
 
@@ -757,7 +791,7 @@ Navigation goal and result (both POD):
 ```rust
 use horus::prelude::*;
 
-let goal = Goal::new(Pose2D::new(5.0, 3.0, 0.0));
+let goal = Goal::new(Pose2D::new(5.0, 3.0, 0.0), 0.1, 0.05);  // pose, position_tol, angle_tol
 let goal = goal.with_timeout(30.0).with_priority(1);
 
 if goal.is_reached(&current_pose) {
@@ -803,12 +837,14 @@ Compact planned path (POD, fixed-size):
 2D occupancy map (variable-size, not POD — uses serialization):
 
 ```rust
-let grid = OccupancyGrid::new(0.05, 200, 200);  // 5cm resolution, 200x200
-let (gx, gy) = grid.world_to_grid(1.0, 2.0);
-grid.set_occupancy(gx, gy, 100);  // Mark occupied
+let mut grid = OccupancyGrid::new(200, 200, 0.05, Pose2D::origin());  // 200x200, 5cm resolution
+if let Some((gx, gy)) = grid.world_to_grid(1.0, 2.0) {
+    grid.set_occupancy(gx, gy, 100);  // Mark occupied (grid coords)
+}
 
-if grid.is_free(gx, gy) { /* navigable */ }
-if grid.is_occupied(gx, gy) { /* blocked */ }
+// is_free/is_occupied take world coordinates directly
+if grid.is_free(1.0, 2.0) { /* navigable */ }
+if grid.is_occupied(1.0, 2.0) { /* blocked */ }
 ```
 
 Values: -1 = unknown, 0 = free, 100 = occupied.
@@ -818,9 +854,8 @@ Values: -1 = unknown, 0 = free, 100 = occupied.
 Cost map for path planning (variable-size, not POD):
 
 ```rust
-let costmap = CostMap::from_occupancy_grid(&grid);
-costmap.inflate_obstacles();
-let cost = costmap.get_cost(gx, gy);
+let costmap = CostMap::from_occupancy_grid(grid, 0.55);  // 55cm inflation radius
+let cost = costmap.cost(1.0, 2.0);  // Get cost at world coordinates
 ```
 
 ### VelocityObstacle / VelocityObstacles
@@ -927,20 +962,6 @@ Force sensing and haptic feedback. All are POD types.
 
 ---
 
-## Coordination Messages
-
-Multi-robot coordination. All are POD types.
-
-| Message | Description |
-|---------|-------------|
-| `RobotState` | Individual robot state (pose, velocity, status, battery, capabilities) |
-| `FleetStatus` | Fleet-wide status (up to 64 robots) |
-| `TaskAssignment` | Task allocation with priority, deadline, and required capabilities |
-| `FormationControl` | Formation control parameters (type, spacing, leader) |
-| `AuctionBid` | Task auction bid with bid value, estimated time, and capability score |
-
----
-
 ## Input Messages
 
 Human input devices. All are POD types.
@@ -949,19 +970,6 @@ Human input devices. All are POD types.
 |---------|-------------|
 | `JoystickInput` | Gamepad/joystick state (buttons, axes, hats) |
 | `KeyboardInput` | Keyboard key events with modifier flags |
-
----
-
-## Timing Messages
-
-Time synchronization and scheduling. All are POD types.
-
-| Message | Description |
-|---------|-------------|
-| `TimeSync` | Clock synchronization (offset, drift, accuracy) |
-| `ScheduledEvent` | Timed event with priority, repeat interval, and status |
-| `Timeline` | Event timeline (up to 64 scheduled events) |
-| `ClockStats` | Clock statistics (offset, drift, sync quality) |
 
 ---
 
@@ -1062,7 +1070,7 @@ struct LidarNode {
 }
 
 impl Node for LidarNode {
-    fn name(&self) -> &'static str { "LidarNode" }
+    fn name(&self) -> &str { "LidarNode" }
     fn tick(&mut self) {
         let mut scan = LaserScan::new();
         scan.ranges[0] = 5.2;
@@ -1079,7 +1087,7 @@ struct ObstacleDetector {
 }
 
 impl Node for ObstacleDetector {
-    fn name(&self) -> &'static str { "ObstacleDetector" }
+    fn name(&self) -> &str { "ObstacleDetector" }
     fn tick(&mut self) {
         if let Some(scan) = self.scan_sub.recv() {
             if let Some(min_range) = scan.min_range() {

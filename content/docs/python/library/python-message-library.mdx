@@ -243,7 +243,6 @@ The available Python message types are **binary-compatible with Rust** via share
 | `Image` | `horus_library::messages::vision::Image` | Planned |
 | `PointCloud` | `horus_library::messages::perception::PointCloud` | Planned |
 | `Goal` | `horus_library::messages::navigation::Goal` | Planned |
-| `RobotState` | `horus_library::messages::coordination::RobotState` | Planned |
 
 **Example - Python to Rust:**
 
@@ -444,10 +443,13 @@ Individual motor control.
 from horus import MotorCommand
 
 cmd = MotorCommand()
-cmd.velocity = 100.0      # RPM or rad/s depending on mode
-cmd.position = 0.0        # Target position (radians)
-cmd.torque = 0.0          # Torque limit (Nm)
-cmd.mode = 0              # 0=velocity, 1=position, 2=torque
+cmd.motor_id = 0            # Motor index (u8)
+cmd.mode = 0                # Control mode (u8)
+cmd.target = 1.0            # Target value (f64, units depend on mode)
+cmd.max_velocity = 10.0     # Velocity limit (f64)
+cmd.max_acceleration = 5.0  # Acceleration limit (f64)
+cmd.feed_forward = 0.0      # Feed-forward term (f64)
+cmd.enable = 1              # Enable motor (u8, 0=off, 1=on)
 ```
 
 ---
@@ -476,8 +478,10 @@ Servo motor control.
 from horus import ServoCommand
 
 cmd = ServoCommand()
-cmd.angle = 90.0          # Target angle (degrees)
-cmd.speed = 100           # Movement speed (0-100%)
+cmd.servo_id = 0          # Servo index (u8)
+cmd.position = 1.57       # Target position in radians (f32)
+cmd.speed = 1.0           # Movement speed (f32)
+cmd.enable = 1            # Enable servo (u8, 0=off, 1=on)
 ```
 
 ---
@@ -504,26 +508,30 @@ pid.kd = 0.05  # Derivative gain
 
 ### Image
 
-Raw image data.
+Pool-backed image with zero-copy transport. Image is an RAII type that allocates from a global tensor pool — you don't set fields directly.
 
 ```python
 # Planned horus.library API:
 from horus import Image, ImageEncoding
 
-img = Image()
-img.width = 640
-img.height = 480
-img.encoding = ImageEncoding.RGB8
-img.data = bytes(640 * 480 * 3)  # Raw pixel data
+# Create image (allocates from pool)
+img = Image(height=480, width=640, encoding=ImageEncoding.RGB8)
 
-# Access encoding constants
+# Copy pixel data in
+img.copy_from(pixel_bytes)
+
+# Access data
+data = img.data()       # bytes view of pixel data
+h = img.height()
+w = img.width()
+enc = img.encoding()
+
+# Encoding constants
 ImageEncoding.RGB8      # 8-bit RGB
 ImageEncoding.BGR8      # 8-bit BGR
 ImageEncoding.RGBA8     # 8-bit RGBA
 ImageEncoding.MONO8     # 8-bit grayscale
 ImageEncoding.MONO16    # 16-bit grayscale
-ImageEncoding.DEPTH16   # 16-bit depth
-ImageEncoding.DEPTH32F  # 32-bit float depth
 ```
 
 ---
@@ -554,48 +562,42 @@ from horus import CameraInfo
 info = CameraInfo()
 info.width = 640
 info.height = 480
-info.fx = 525.0   # Focal length X
-info.fy = 525.0   # Focal length Y
-info.cx = 320.0   # Principal point X
-info.cy = 240.0   # Principal point Y
+info.distortion_model = "plumb_bob"         # Distortion model name
+info.distortion_coefficients = [0.0] * 8    # Up to 8 distortion coefficients
+info.camera_matrix = [                      # 3x3 intrinsic matrix (row-major)
+    525.0, 0.0, 320.0,
+    0.0, 525.0, 240.0,
+    0.0, 0.0, 1.0,
+]
+info.rectification_matrix = [1,0,0, 0,1,0, 0,0,1]  # 3x3 rectification
+info.projection_matrix = [                  # 3x4 projection matrix (row-major)
+    525.0, 0.0, 320.0, 0.0,
+    0.0, 525.0, 240.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+]
 ```
 
 ---
 
 ### Detection
 
-Object detection result.
+Object detection result with 2D bounding box.
 
 ```python
 # Planned horus.library API:
 from horus import Detection
 
 det = Detection()
-det.class_id = 0           # Class index
-det.class_name = "person"  # Class label
-det.confidence = 0.95      # Detection confidence (0-1)
-det.x = 100                # Bounding box X
-det.y = 50                 # Bounding box Y
-det.width = 200            # Bounding box width
-det.height = 400           # Bounding box height
-```
+det.class_id = 0           # Class index (u32)
+det.class_name = "person"  # Class label (up to 32 chars)
+det.confidence = 0.95      # Detection confidence 0-1 (f32)
+det.instance_id = 1        # Instance ID for tracking (u32)
 
----
-
-### DetectionArray
-
-Multiple detections.
-
-```python
-# Planned horus.library API:
-from horus import DetectionArray, Detection
-
-detections = DetectionArray()
-detections.detections = [
-    Detection(),  # Add detection objects
-]
-detections.source_width = 640
-detections.source_height = 480
+# Bounding box (BoundingBox2D)
+det.bbox.x = 100.0         # Top-left X in pixels (f32)
+det.bbox.y = 50.0          # Top-left Y in pixels (f32)
+det.bbox.width = 200.0     # Width in pixels (f32)
+det.bbox.height = 400.0    # Height in pixels (f32)
 ```
 
 ---
@@ -687,43 +689,47 @@ costmap.data = bytes(100 * 100)  # Cost values 0-255
 
 ### PointCloud
 
-3D point cloud data.
+Pool-backed 3D point cloud with zero-copy transport. PointCloud is an RAII type that allocates from a global tensor pool.
 
 ```python
 # Planned horus.library API:
-from horus import PointCloud, PointField, PointFieldType
+from horus import PointCloud
 
-cloud = PointCloud()
-cloud.width = 1000        # Number of points
-cloud.height = 1          # 1 for unorganized, >1 for organized
-cloud.point_step = 12     # Bytes per point
-cloud.row_step = 12000    # Bytes per row
+# Create point cloud (allocates from pool)
+cloud = PointCloud(num_points=1000)
 
-# Define point format (XYZ float32)
-cloud.fields = [
-    PointField(name="x", offset=0, datatype=PointFieldType.FLOAT32, count=1),
-    PointField(name="y", offset=4, datatype=PointFieldType.FLOAT32, count=1),
-    PointField(name="z", offset=8, datatype=PointFieldType.FLOAT32, count=1),
-]
+# Copy point data in (XYZ float32 by default)
+cloud.copy_from(point_data_bytes)
 
-cloud.data = point_data_bytes  # Raw point data
+# Access data
+data = cloud.data()          # bytes view of point data
+n = cloud.num_points()
+dense = cloud.is_dense()
 ```
 
 ---
 
 ### DepthImage
 
-Depth image data.
+Pool-backed depth image with zero-copy transport. DepthImage is an RAII type that allocates from a global tensor pool.
 
 ```python
 # Planned horus.library API:
 from horus import DepthImage
 
-depth = DepthImage()
-depth.width = 640
-depth.height = 480
-depth.encoding = "32FC1"  # 32-bit float, 1 channel
-depth.data = depth_bytes  # Raw depth data
+# Create depth image (allocates from pool)
+depth = DepthImage(height=480, width=640)
+
+# Copy depth data in
+depth.copy_from(depth_bytes)
+
+# Access data and parameters
+data = depth.data()           # bytes view of depth values
+h = depth.height()
+w = depth.width()
+scale = depth.depth_scale()   # Scale factor (f32)
+min_d = depth.min_depth()     # Minimum depth value (u16)
+max_d = depth.max_depth()     # Maximum depth value (u16)
 ```
 
 ---
@@ -797,118 +803,6 @@ cmd.torque = [0.0, 0.0, 0.0]    # Desired torque [tx, ty, tz]
 
 ---
 
-## Coordination Messages
-
-> **Planned** — These types exist in Rust (`horus_library::messages::coordination`). Python wrappers via `horus.library` coming soon.
-
-### RobotState
-
-Robot status for fleet coordination.
-
-```python
-# Planned horus.library API:
-from horus import RobotState, RobotType
-
-state = RobotState()
-state.robot_id = "robot_01"
-state.robot_type = RobotType.Mobile
-state.x = 5.0
-state.y = 3.0
-state.theta = 0.0
-state.battery_level = 85.0
-state.is_active = True
-
-# Robot types
-RobotType.Mobile       # General purpose mobile robot
-RobotType.Manipulator  # Robot arm/manipulator
-RobotType.Aerial       # Aerial drone (UAV)
-RobotType.Marine       # Marine/underwater vehicle
-```
-
----
-
-### FleetStatus
-
-Fleet-wide status.
-
-```python
-# Planned horus.library API:
-from horus import FleetStatus, RobotState
-
-fleet = FleetStatus()
-fleet.fleet_id = "warehouse_fleet"
-fleet.robots = [
-    RobotState(),  # Add robot states
-]
-fleet.active_count = 5
-fleet.total_count = 8
-```
-
----
-
-### TaskAssignment
-
-Task assignment for multi-robot systems.
-
-```python
-# Planned horus.library API:
-from horus import TaskAssignment, TaskType, TaskStatus
-
-task = TaskAssignment()
-task.task_id = "task_001"
-task.robot_id = "robot_01"
-task.task_type = TaskType.Navigation
-task.status = TaskStatus.InProgress
-task.priority = 5
-task.goal_x = 10.0
-task.goal_y = 5.0
-
-# Task types
-TaskType.Navigation    # Navigate to location
-TaskType.Manipulation  # Pick and place
-TaskType.Transport     # Transport cargo
-TaskType.Inspection    # Inspect area/object
-TaskType.Cleaning      # Cleaning operation
-TaskType.Surveillance  # Monitoring
-TaskType.Emergency     # Emergency response
-
-# Task status
-TaskStatus.Assigned    # Assigned but not started
-TaskStatus.InProgress  # In progress
-TaskStatus.Completed   # Successfully done
-TaskStatus.Failed      # Failed
-TaskStatus.Cancelled   # Cancelled
-TaskStatus.Paused      # Suspended
-TaskStatus.Aborted     # Emergency abort
-```
-
----
-
-### FormationControl
-
-Multi-robot formation control.
-
-```python
-# Planned horus.library API:
-from horus import FormationControl, FormationType
-
-formation = FormationControl()
-formation.formation_type = FormationType.Line
-formation.spacing = 2.0           # Distance between robots
-formation.leader_id = "robot_01"
-
-# Formation types
-FormationType.Line           # Single file line
-FormationType.Column         # Side-by-side column
-FormationType.Wedge          # V-shaped wedge
-FormationType.Circle         # Circular formation
-FormationType.Grid           # Grid formation
-FormationType.Diamond        # Diamond formation
-FormationType.LeaderFollower # Leader-follower
-```
-
----
-
 ## Complete Message Reference
 
 **Available now** (via Rust bindings):
@@ -926,11 +820,10 @@ FormationType.LeaderFollower # Leader-follower
 | **Geometry** | Twist, Transform, Point3, Vector3, Quaternion |
 | **Control** | MotorCommand, DifferentialDriveCommand, ServoCommand, PidConfig |
 | **Sensor** | BatteryState, NavSatFix, Range |
-| **Vision** | Image, CompressedImage, CameraInfo, Detection, DetectionArray |
+| **Vision** | Image, CompressedImage, CameraInfo, Detection |
 | **Navigation** | Goal, Path, OccupancyGrid, CostMap |
 | **Perception** | PointCloud, DepthImage, BoundingBox3D |
 | **Force/Tactile** | WrenchStamped, TactileArray, ForceCommand |
-| **Coordination** | RobotState, FleetStatus, TaskAssignment, FormationControl |
 
 ---
 

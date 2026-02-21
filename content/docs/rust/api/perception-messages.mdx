@@ -6,99 +6,85 @@ weight: 50
 
 # Perception Messages
 
-HORUS provides message types for 3D perception tasks. These include two categories:
+HORUS provides message types for 3D perception tasks. These include:
 
-- **Serde-based types**: `PointCloud`, `DepthImage`, `PlaneDetection` — flexible, support variable-size data
+- **Pool-backed RAII types**: `PointCloud`, `DepthImage` — zero-copy shared memory backed, managed via global tensor pool
+- **Serde types**: `PointField`, `PlaneDetection` — flexible, support serialization
 - **Pod (zero-copy) types**: `PointXYZ`, `Landmark`, `TrackedObject`, `SegmentationMask` — fixed-size, suitable for shared memory transport with zero serialization overhead
 
 ## PointCloud
 
-Flexible 3D point cloud message with configurable fields (similar to ROS PointCloud2).
+Pool-backed RAII point cloud type with zero-copy shared memory transport. PointCloud allocates from a global tensor pool.
 
 ```rust
 use horus::prelude::*;
+use horus_types::TensorDtype;
 
-// Create XYZ point cloud from points
-let points = vec![
-    Point3::new(1.0, 2.0, 3.0),
-    Point3::new(4.0, 5.0, 6.0),
-];
-let cloud = PointCloud::xyz(&points);
+// Create XYZ point cloud (10000 points, 3 floats per point)
+let mut cloud = PointCloud::new(10000, 3, TensorDtype::F32)?;
 
-// Create XYZRGB point cloud with colors
-let colored_points = vec![
-    (Point3::new(1.0, 2.0, 3.0), [255, 0, 0]),   // Red point
-    (Point3::new(4.0, 5.0, 6.0), [0, 255, 0]),   // Green point
-];
-let cloud = PointCloud::xyzrgb(&colored_points);
+// Copy point data
+let point_data: Vec<u8> = vec![0; 10000 * 3 * 4]; // 10000 points * 3 floats * 4 bytes
+cloud.copy_from(&point_data);
 
-// Access point count and validate
+// Set metadata (method chaining)
+cloud.set_frame_id("lidar_front").set_timestamp_ns(1234567890);
+
+// Access properties
 println!("Points: {}", cloud.point_count());
-println!("Valid: {}", cloud.is_valid());
+println!("Fields per point: {}", cloud.fields_per_point());
+println!("Is XYZ: {}", cloud.is_xyz());
 
-// Extract XYZ coordinates back
+// Zero-copy data access
+let data: &[u8] = cloud.data();
+
+// Extract XYZ coordinates as Vec<[f32; 3]>
 if let Some(points) = cloud.extract_xyz() {
-    for point in points {
-        println!("({:.2}, {:.2}, {:.2})", point.x, point.y, point.z);
+    for p in &points[..3] {
+        println!("({:.2}, {:.2}, {:.2})", p[0], p[1], p[2]);
     }
 }
 
-// Set frame ID
-let cloud = cloud.with_frame_id("lidar_front");
+// Access individual point
+if let Some(point_bytes) = cloud.point_at(0) {
+    println!("Point 0: {} bytes", point_bytes.len());
+}
 ```
 
-**Fields:**
+**PointCloud methods:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `width` | `u32` | Point cloud width (columns) |
-| `height` | `u32` | Point cloud height (rows, 1 for unorganized) |
-| `fields` | `[PointField; 16]` | Field descriptors (x, y, z, rgb, etc.) |
-| `field_count` | `u8` | Number of valid fields |
-| `is_dense` | `bool` | True if no invalid points |
-| `point_step` | `u32` | Bytes per point |
-| `row_step` | `u32` | Bytes per row |
-| `data` | `Vec<u8>` | Raw point data |
-| `frame_id` | `[u8; 32]` | Coordinate frame |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
-
-**Methods:**
+PointCloud is an RAII type — fields are private, accessed through methods. Mutation methods return `&mut Self` for chaining.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `new()` | `PointCloud` | Create empty point cloud |
-| `xyz(points)` | `PointCloud` | Create XYZ cloud from `&[Point3]` |
-| `xyzrgb(points)` | `PointCloud` | Create XYZRGB cloud from `&[(Point3, [u8; 3])]` |
-| `add_field(field)` | `Result<(), &str>` | Add a field (max 16) |
-| `point_count()` | `u64` | Total number of points |
-| `is_valid()` | `bool` | Check data consistency |
-| `extract_xyz()` | `Option<Vec<Point3>>` | Extract XYZ coordinates |
-| `with_frame_id(id)` | `PointCloud` | Set frame ID (builder) |
+| `new(num_points, fields_per_point, dtype)` | `HorusResult<PointCloud>` | Create point cloud (allocates from global pool) |
+| `data()` | `&[u8]` | Zero-copy access to raw point data |
+| `data_mut()` | `&mut [u8]` | Mutable access to point data |
+| `copy_from(src)` | `&mut Self` | Copy data into point cloud |
+| `point_at(idx)` | `Option<&[u8]>` | Get bytes for the i-th point |
+| `extract_xyz()` | `Option<Vec<[f32; 3]>>` | Extract XYZ as float arrays (F32 only) |
+| `point_count()` | `u64` | Number of points |
+| `fields_per_point()` | `u32` | Floats per point (3=XYZ, 4=XYZI, 6=XYZRGB) |
+| `dtype()` | `TensorDtype` | Data type of point components |
+| `is_xyz()` | `bool` | Whether this is a plain XYZ cloud |
+| `has_intensity()` | `bool` | Whether cloud has intensity field |
+| `set_frame_id(id)` | `&mut Self` | Set sensor frame identifier |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds |
 
 ### PointField
 
-Describes a field within the point cloud data:
+Describes a field within point cloud data (serde type, used for custom point formats):
 
 ```rust
 use horus::prelude::*;
+use horus_types::TensorDtype;
 
 // Create custom field
-let intensity = PointField::new("intensity", 12, PointFieldType::Float32, 1);
+let intensity = PointField::new("intensity", 12, TensorDtype::F32, 1);
 println!("Field: {}, size: {} bytes", intensity.name_str(), intensity.field_size());
 ```
 
-**PointFieldType values:**
-
-| Type | Rust | Size |
-|------|------|------|
-| `Int8` | `i8` | 1 byte |
-| `UInt8` | `u8` | 1 byte |
-| `Int16` | `i16` | 2 bytes |
-| `UInt16` | `u16` | 2 bytes |
-| `Int32` | `i32` | 4 bytes |
-| `UInt32` | `u32` | 4 bytes |
-| `Float32` | `f32` | 4 bytes (default) |
-| `Float64` | `f64` | 8 bytes |
+**PointField** uses `TensorDtype` (from `horus_types`) for its `datatype` field. See [TensorDtype values](/rust/api/ml-messages#tensordata) for the full list.
 
 ## Pod Point Types (Zero-Copy)
 
@@ -200,62 +186,60 @@ println!("Data size: {} bytes", header.data_size());
 
 ## DepthImage
 
-Depth image from depth cameras (RealSense, Kinect, etc.).
+Pool-backed RAII depth image with zero-copy shared memory transport. Supports both F32 (meters) and U16 (millimeters) formats.
 
 ```rust
 use horus::prelude::*;
+use horus_types::TensorDtype;
 
-// Create depth image
-let width = 640;
-let height = 480;
-let depths = vec![0u16; (width * height) as usize];
+// Create F32 depth image (meters)
+let mut depth = DepthImage::new(480, 640, TensorDtype::F32)?;
 
-let mut depth_image = DepthImage::new(width, height, depths);
-depth_image.min_depth = 200;   // 20cm minimum
-depth_image.max_depth = 10000; // 10m maximum
-depth_image.depth_scale = 1.0; // 1mm per unit
+// Or U16 depth image (millimeters)
+let mut depth_u16 = DepthImage::new(480, 640, TensorDtype::U16)?;
 
-// Access depth at pixel
-if let Some(depth) = depth_image.get_depth(320, 240) {
-    if depth_image.is_valid_depth(depth) {
-        println!("Depth at center: {}mm", depth);
-    }
+// Set metadata (method chaining)
+depth.set_frame_id("depth_camera").set_timestamp_ns(1234567890);
+
+// Access depth at pixel (always returns meters as f32)
+if let Some(d) = depth.get_depth(320, 240) {
+    println!("Depth at center: {:.3}m", d);
 }
 
-// Set depth at pixel
-depth_image.set_depth(100, 100, 1500); // 1.5m
+// Set depth at pixel (value in meters)
+depth.set_depth(100, 100, 1.5);
 
-// Convert to point cloud using camera intrinsics
-let point_cloud = depth_image.to_point_cloud(525.0, 525.0, 320.0, 240.0);
+// Get raw U16 value for millimeter-format images
+if let Some(mm) = depth_u16.get_depth_u16(320, 240) {
+    println!("Raw depth: {}mm", mm);
+}
 
-// Get statistics
-let (min, max, mean) = depth_image.depth_statistics();
-println!("Depth range: {:.0}-{:.0}mm, mean: {:.0}mm", min, max, mean);
+// Get statistics (min, max, mean in meters)
+let (min, max, mean) = depth.depth_statistics();
+println!("Depth range: {:.2}-{:.2}m, mean: {:.2}m", min, max, mean);
+
+// Zero-copy data access
+let data: &[u8] = depth.data();
+println!("Image: {}x{}, {} bytes", depth.width(), depth.height(), data.len());
 ```
 
-**Fields:**
+**DepthImage methods:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `width` | `u32` | Image width in pixels |
-| `height` | `u32` | Image height in pixels |
-| `depths` | `Vec<u16>` | Depth values (0 = invalid) |
-| `min_depth` | `u16` | Minimum reliable depth (default: 200 = 20cm) |
-| `max_depth` | `u16` | Maximum reliable depth (default: 10000 = 10m) |
-| `depth_scale` | `f32` | mm per unit (default: 1.0) |
-| `frame_id` | `[u8; 32]` | Camera frame ID |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
-
-**Methods:**
+DepthImage is an RAII type — fields are private, accessed through methods. Mutation methods return `&mut Self` for chaining.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `new(width, height, depths)` | `DepthImage` | Create depth image |
-| `get_depth(x, y)` | `Option<u16>` | Get depth at pixel |
-| `set_depth(x, y, depth)` | `bool` | Set depth at pixel |
-| `is_valid_depth(depth)` | `bool` | Check if depth is within valid range |
-| `to_point_cloud(fx, fy, cx, cy)` | `PointCloud` | Convert to 3D point cloud |
-| `depth_statistics()` | `(f32, f32, f32)` | Get (min, max, mean) of valid depths |
+| `new(height, width, dtype)` | `HorusResult<DepthImage>` | Create depth image (F32 or U16) |
+| `data()` | `&[u8]` | Zero-copy access to raw depth data |
+| `data_mut()` | `&mut [u8]` | Mutable access to depth data |
+| `get_depth(x, y)` | `Option<f32>` | Get depth in meters at pixel |
+| `set_depth(x, y, value)` | `&mut Self` | Set depth in meters at pixel |
+| `get_depth_u16(x, y)` | `Option<u16>` | Get raw U16 value (millimeter format only) |
+| `depth_statistics()` | `(f32, f32, f32)` | Get (min, max, mean) of valid depths in meters |
+| `width()` | `u32` | Image width in pixels |
+| `height()` | `u32` | Image height in pixels |
+| `set_frame_id(id)` | `&mut Self` | Set camera frame identifier |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds |
 
 ## PlaneDetection
 
@@ -507,24 +491,32 @@ if mask.is_panoptic() {
 
 ```rust
 use horus::prelude::*;
+use horus_types::TensorDtype;
 
 struct PerceptionNode {
     depth_sub: Topic<DepthImage>,
     cloud_pub: Topic<PointCloud>,
-    fx: f64,
-    fy: f64,
-    cx: f64,
-    cy: f64,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
 }
 
 impl Node for PerceptionNode {
-    fn name(&self) -> &'static str { "PerceptionNode" }
+    fn name(&self) -> &str { "PerceptionNode" }
 
     fn tick(&mut self) {
         if let Some(depth) = self.depth_sub.recv() {
-            // Convert depth to point cloud
-            let cloud = depth.to_point_cloud(self.fx, self.fy, self.cx, self.cy);
-            self.cloud_pub.send(cloud);
+            // Read depth values and build point cloud
+            let w = depth.width();
+            let h = depth.height();
+            let num_points = (w * h) as u32;
+
+            if let Ok(mut cloud) = PointCloud::new(num_points, 3, TensorDtype::F32) {
+                // Depth-to-pointcloud conversion would fill cloud data here
+                // using camera intrinsics (fx, fy, cx, cy)
+                self.cloud_pub.send(cloud);
+            }
         }
     }
 }

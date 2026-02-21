@@ -65,6 +65,7 @@ const sections: SidebarSection[] = [
       { title: "Message Types", href: "/concepts/message-types", order: 7 },
       { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 9 },
       { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
+      { title: "Zero-Overhead IPC", href: "/concepts/zero-overhead-ipc", order: 11 },
       { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
     ],
   },
@@ -90,8 +91,7 @@ const sections: SidebarSection[] = [
             children: [
               { title: "Overview", href: "/rust/api/messages", order: 0 },
               { title: "Control", href: "/rust/api/control-messages", order: 1 },
-              { title: "Coordination", href: "/rust/api/coordination-messages", order: 2 },
-              { title: "Diagnostics", href: "/rust/api/diagnostics-messages", order: 3 },
+              { title: "Diagnostics", href: "/rust/api/diagnostics-messages", order: 2 },
               { title: "Force", href: "/rust/api/force-messages", order: 4 },
               { title: "Geometry", href: "/rust/api/geometry-messages", order: 5 },
 
@@ -99,8 +99,7 @@ const sections: SidebarSection[] = [
               { title: "Navigation", href: "/rust/api/navigation-messages", order: 8 },
               { title: "Perception", href: "/rust/api/perception-messages", order: 9 },
               { title: "Sensor", href: "/rust/api/sensor-messages", order: 10 },
-              { title: "Timing", href: "/rust/api/timing-messages", order: 11 },
-              { title: "Vision", href: "/rust/api/vision-messages", order: 12 },
+              { title: "Vision", href: "/rust/api/vision-messages", order: 10 },
             ]
           },
         ]
@@ -173,12 +172,9 @@ const sections: SidebarSection[] = [
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
       { title: "Circuit Breaker", href: "/advanced/circuit-breaker", order: 9 },
       { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },
-      { title: "Checkpoint System", href: "/advanced/checkpoint", order: 11 },
-      { title: "Model Registry", href: "/advanced/model-registry", order: 12 },
-      { title: "Record & Replay", href: "/advanced/record-replay", order: 13 },
-      { title: "Redundancy", href: "/advanced/redundancy", order: 14 },
-      { title: "Telemetry", href: "/advanced/telemetry", order: 15 },
-      { title: "Real-Time Configuration", href: "/advanced/rt-config", order: 16 },
+      { title: "Model Registry", href: "/advanced/model-registry", order: 11 },
+      { title: "Record & Replay", href: "/advanced/record-replay", order: 12 },
+      { title: "Real-Time Configuration", href: "/advanced/rt-config", order: 13 },
     ],
   },
   {

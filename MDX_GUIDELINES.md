@@ -26,15 +26,15 @@
 
 **WRONG**:
 ```markdown
-### Error: "Failed to create Hub<T>"
+### Error: "Failed to create Topic<T>"
 ```
 
 **CORRECT**:
 ```markdown
-### Error: "Failed to create `Hub<T>`"
+### Error: "Failed to create `Topic<T>`"
 ```
 
-**Why**: MDX interprets `Hub<T>` as a JSX component. Always wrap generic types in backticks.
+**Why**: MDX interprets `Topic<T>` as a JSX component. Always wrap generic types in backticks.
 
 ### 3. Comparison Operators in Text
 
@@ -89,7 +89,7 @@ Inside code blocks, you can use `<` and `>` normally:
 
 ```markdown
 \`\`\`rust
-let hub: Hub<f32> = Hub::new("topic")?;
+let topic: Topic<f32> = Topic::new("sensor")?;
 if value < 100 {
     // This is fine inside code blocks
 }
@@ -101,7 +101,7 @@ if value < 100 {
 Inside backticks, you can use `<` and `>`:
 
 ```markdown
-Use `Hub<T>` for pub-sub messaging.
+Use `Topic<T>` for IPC messaging.
 Values `<100` are considered low.
 ```
 
@@ -117,7 +117,7 @@ Values `<100` are considered low.
 ## Quick Checklist Before Committing
 
 - [ ] Search file for `<[0-9]` patterns outside code blocks
-- [ ] Search file for `<[A-Z]` patterns (like `Hub<T>`) outside backticks
+- [ ] Search file for `<[A-Z]` patterns (like `Topic<T>`) outside backticks
 - [ ] Check that all comparison operators use HTML entities
 - [ ] Verify headings don't start with raw numbers
 - [ ] Build locally: `npm run build` should show no MDX errors
@@ -141,8 +141,8 @@ If you see "Error loading doc" messages, you likely have an MDX syntax issue.
 **Fix**: Change to `&lt;1`
 
 ### "Unexpected character before name, expected a letter"
-**Cause**: Using generic types without backticks (e.g., `Hub<T>`)
-**Fix**: Wrap in backticks: `` `Hub<T>` ``
+**Cause**: Using generic types without backticks (e.g., `Topic<T>`)
+**Fix**: Wrap in backticks: `` `Topic<T>` ``
 
 ## Files to Check
 

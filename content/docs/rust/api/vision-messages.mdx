@@ -10,32 +10,40 @@ HORUS provides message types for cameras, images, camera calibration, and visual
 
 ## Image
 
-Raw image data message.
+Pool-backed RAII image type with zero-copy shared memory transport. Image allocates from a global tensor pool — you don't manage memory directly.
 
 ```rust
 use horus::prelude::*;
 
-// Create RGB image
-let pixels = vec![255, 0, 0, 0, 255, 0, 0, 0, 255]; // 3 RGB pixels
-let image = Image::new(3, 1, ImageEncoding::Rgb8, pixels)
-    .with_frame_id("camera_front");
+// Create an RGB image (height, width, encoding) — allocates from global pool
+let mut image = Image::new(480, 640, ImageEncoding::Rgb8)?;
 
-// Validate image
-if image.is_valid() {
-    println!("Image: {}x{}, {:?}", image.width, image.height, image.encoding);
-    println!("Data size: {} bytes", image.data.len());
-    println!("Expected size: {} bytes", image.expected_size());
-}
+// Copy pixel data into the image
+let pixels: Vec<u8> = vec![128; 480 * 640 * 3];
+image.copy_from(&pixels);
 
-// Access individual pixel
-if let Some(pixel) = image.get_pixel(0, 0) {
+// Set metadata (method chaining)
+image.set_frame_id("camera_front").set_timestamp_ns(1234567890);
+
+// Access image properties
+println!("Image: {}x{}, {:?}", image.width(), image.height(), image.encoding());
+println!("Data size: {} bytes", image.data().len());
+
+// Access individual pixel (x, y)
+if let Some(pixel) = image.pixel(0, 0) {
     println!("Pixel[0,0]: R={}, G={}, B={}", pixel[0], pixel[1], pixel[2]);
 }
 
-// Create region of interest (crop)
-if let Some(roi_image) = image.roi(0, 0, 2, 1) {
-    println!("ROI: {}x{}", roi_image.width, roi_image.height);
+// Set a pixel value
+image.set_pixel(0, 0, &[255, 0, 0]);
+
+// Extract region of interest (returns raw bytes, not Image)
+if let Some(roi_data) = image.roi(0, 0, 100, 100) {
+    println!("ROI data: {} bytes", roi_data.len());
 }
+
+// Fill entire image with a color
+image.fill(&[0, 0, 0]); // Black
 ```
 
 **ImageEncoding values:**
@@ -61,28 +69,25 @@ if let Some(roi_image) = image.roi(0, 0, 2, 1) {
 | `bytes_per_pixel()` | `u32` | Bytes per pixel for this encoding |
 | `is_color()` | `bool` | Whether encoding has color information |
 
-**Image fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `width` | `u32` | Image width in pixels |
-| `height` | `u32` | Image height in pixels |
-| `encoding` | `ImageEncoding` | Pixel encoding format |
-| `step` | `u32` | Bytes per row (may include padding) |
-| `data` | `Vec<u8>` | Row-major image data |
-| `frame_id` | `[u8; 32]` | Camera identifier |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
-
 **Image methods:**
+
+Image is an RAII type — fields are private, accessed through methods. Mutation methods return `&mut Self` for chaining.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `new(width, height, encoding, data)` | `Image` | Create image (auto-sets step and timestamp) |
-| `with_frame_id(id)` | `Image` | Set frame ID from string (builder) |
-| `is_valid()` | `bool` | Validate dimensions and data consistency |
-| `expected_size()` | `usize` | Expected data size in bytes (`step * height`) |
-| `get_pixel(x, y)` | `Option<&[u8]>` | Get pixel bytes at coordinates |
-| `roi(x, y, width, height)` | `Option<Image>` | Extract a cropped region |
+| `new(height, width, encoding)` | `HorusResult<Image>` | Create image (allocates from global pool) |
+| `width()` | `u32` | Image width in pixels |
+| `height()` | `u32` | Image height in pixels |
+| `encoding()` | `ImageEncoding` | Pixel encoding format |
+| `data()` | `&[u8]` | Zero-copy access to pixel data |
+| `data_mut()` | `&mut [u8]` | Mutable access to pixel data |
+| `copy_from(src)` | `&mut Self` | Copy pixel data into image |
+| `pixel(x, y)` | `Option<&[u8]>` | Get pixel bytes at coordinates |
+| `set_pixel(x, y, value)` | `&mut Self` | Set pixel value at coordinates |
+| `fill(value)` | `&mut Self` | Fill entire image with a value |
+| `roi(x, y, w, h)` | `Option<Vec<u8>>` | Extract raw bytes for a region |
+| `set_frame_id(id)` | `&mut Self` | Set camera frame identifier |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds |
 
 ## CompressedImage
 
@@ -333,7 +338,7 @@ use horus::prelude::*;
 let det = Detection::new("person", 0.95, 100.0, 50.0, 200.0, 300.0);
 
 println!("Detected: {} ({:.1}% confidence)",
-    det.get_class_name(),
+    det.class_name(),
     det.confidence * 100.0);
 
 println!("BBox: ({}, {}) {}x{}",
@@ -366,7 +371,7 @@ let det = Detection::with_class_id(1, 0.88, bbox);
 | `new(class_name, confidence, x, y, width, height)` | `Detection` | Create with name and bbox coordinates |
 | `with_class_id(class_id, confidence, bbox)` | `Detection` | Create with numeric class ID |
 | `set_class_name(name)` | `()` | Set class name (truncates to 31 chars) |
-| `get_class_name()` | `&str` | Get class name as string |
+| `class_name()` | `&str` | Get class name as string |
 | `is_confident(threshold)` | `bool` | Check if confidence >= threshold |
 
 ## Detection3D
@@ -388,7 +393,7 @@ let det = Detection3D::new("car", 0.92, bbox)
     .with_velocity(10.0, 5.0, 0.0);  // m/s
 
 println!("Detected: {} at ({}, {}, {})",
-    det.get_class_name(),
+    det.class_name(),
     det.bbox.cx, det.bbox.cy, det.bbox.cz);
 println!("Volume: {:.1} m³", det.bbox.volume());
 ```
@@ -425,7 +430,7 @@ struct VisionNode {
 }
 
 impl Node for VisionNode {
-    fn name(&self) -> &'static str { "VisionNode" }
+    fn name(&self) -> &str { "VisionNode" }
 
     fn tick(&mut self) {
         // Update camera calibration

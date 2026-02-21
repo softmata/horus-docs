@@ -107,7 +107,7 @@ We welcome contributions! To contribute to the documentation:
 
 Common mistakes to avoid:
 - Using `<` directly in text (e.g., `<1%` should be `&lt;1%`)
-- Writing generic types without backticks (e.g., `Hub<T>` should be `` `Hub<T>` ``)
+- Writing generic types without backticks (e.g., `Topic<T>` should be `` `Topic<T>` ``)
 - Starting headings with numbers
 
 General guidelines:
