@@ -34,17 +34,29 @@ interface SearchModalProps {
 let searchIndex: any = null;
 let docsCache: SearchDoc[] = [];
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function highlightText(text: string, query: string): string {
-  if (!query.trim() || !text) return text;
+  if (!query.trim() || !text) return escapeHtml(text);
 
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
-  if (terms.length === 0) return text;
+  if (terms.length === 0) return escapeHtml(text);
+
+  // HTML-escape first to prevent XSS, then apply highlights
+  const escaped = escapeHtml(text);
 
   // Create regex pattern for all terms
-  const pattern = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const pattern = terms.map(t => escapeHtml(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   const regex = new RegExp(`(${pattern})`, 'gi');
 
-  return text.replace(regex, '<mark class="bg-[var(--accent)]/30 text-[var(--accent)] px-0.5 rounded">$1</mark>');
+  return escaped.replace(regex, '<mark class="bg-[var(--accent)]/30 text-[var(--accent)] px-0.5 rounded">$1</mark>');
 }
 
 function getContentSnippet(content: string, query: string, maxLength = 150): string {
