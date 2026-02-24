@@ -15,12 +15,14 @@ Circuit breakers protect against:
 - Resource exhaustion from repeated retry attempts
 - System-wide slowdowns from blocked calls
 
+The Scheduler manages circuit breakers automatically — you enable them via a preset and the scheduler handles state transitions, timeouts, and recovery.
+
 ## States
 
 | State | Description | Behavior |
 |-------|-------------|----------|
 | **Closed** | Normal operation | All requests allowed |
-| **Open** | Too many failures | All requests rejected |
+| **Open** | Too many failures | Node temporarily disabled |
 | **Half-Open** | Testing recovery | Limited requests allowed |
 
 <MermaidDiagram
@@ -35,296 +37,112 @@ stateDiagram-v2
   caption="Circuit breaker state transitions"
 />
 
-## Basic Usage
-
-```rust,ignore
-use horus::prelude::*;
-
-// Create circuit breaker
-// - Opens after 5 failures
-// - Closes after 3 successes in half-open
-// - Waits 5000ms before trying half-open
-let circuit = CircuitBreaker::new(5, 3, 5000);
-
-// Check if request should be allowed
-if circuit.should_allow() {
-    match execute_node() {
-        Ok(_) => circuit.record_success(),
-        Err(_) => circuit.record_failure(),
-    }
-} else {
-    // Circuit is open - skip execution
-    println!("Circuit open, skipping node");
-}
-```
-
-## Configuration
-
-```rust
-use horus::prelude::*;
-
-// Conservative settings (for critical nodes)
-let critical = CircuitBreaker::new(
-    3,     // Open after 3 failures
-    5,     // Need 5 successes to close
-    10000, // 10 second timeout
-);
-
-// Aggressive settings (for non-critical nodes)
-let non_critical = CircuitBreaker::new(
-    10,    // Open after 10 failures
-    2,     // Need 2 successes to close
-    2000,  // 2 second timeout
-);
-
-// Default settings
-let default = CircuitBreaker::default();
-// failure_threshold: 5
-// success_threshold: 3
-// timeout: 5000ms
-```
-
-## State Transitions
+## How It Works
 
 ### Closed → Open
 
-When failures reach the threshold:
+When a node's failures reach the threshold, the circuit opens and the node is temporarily disabled:
 
-```rust,ignore
-let circuit = CircuitBreaker::new(3, 2, 5000);
-
-circuit.record_failure(); // failure_count = 1
-circuit.record_failure(); // failure_count = 2
-circuit.record_failure(); // failure_count = 3 -> OPEN
-
-assert_eq!(circuit.get_state(), CircuitState::Open);
-assert!(!circuit.should_allow());
+```
+Node fails repeatedly:
+  failure_count = 1 → Closed (keep trying)
+  failure_count = 2 → Closed (keep trying)
+  failure_count = 3 → Open (stop calling node)
 ```
 
 ### Open → Half-Open
 
-After timeout elapses:
+After the timeout elapses, the scheduler allows a single trial execution:
 
-```rust,ignore
-// Circuit is open
-assert_eq!(circuit.get_state(), CircuitState::Open);
-
-// Wait for timeout
-std::thread::sleep(Duration::from_millis(5000));
-
-// Next call triggers half-open
-if circuit.should_allow() {
-    // State is now Half-Open
-    assert_eq!(circuit.get_state(), CircuitState::HalfOpen);
-}
+```
+Circuit open → wait timeout → Half-Open (try one call)
 ```
 
 ### Half-Open → Closed
 
-After success threshold:
+If the trial succeeds enough times, the circuit closes and the node resumes normal operation:
 
-```rust,ignore
-// In Half-Open state
-circuit.record_success(); // success_count = 1
-circuit.record_success(); // success_count = 2 -> CLOSED
-
-assert_eq!(circuit.get_state(), CircuitState::Closed);
+```
+Half-Open:
+  success_count = 1 → Half-Open (keep testing)
+  success_count = 2 → Half-Open (keep testing)
+  success_count = 3 → Closed (fully recovered)
 ```
 
-### Half-Open → Open
+## Enabling Circuit Breakers
 
-On any failure:
+Use a Scheduler preset that includes circuit breakers:
+
+```rust
+use horus::prelude::*;
+
+// All of these enable circuit breakers:
+let scheduler = Scheduler::new();              // 5 failures, 5s timeout
+let scheduler = Scheduler::deploy();           // 5 failures, 5s timeout
+let scheduler = Scheduler::high_performance(); // 3 failures, 100ms timeout
+let scheduler = Scheduler::hard_realtime();    // 3 failures, default timeout
+```
+
+## Per-Node Failure Policies
+
+Configure different failure handling per node using the node builder:
 
 ```rust,ignore
-// In Half-Open state
-circuit.record_failure(); // Immediately reopens
+use horus::prelude::*;
 
-assert_eq!(circuit.get_state(), CircuitState::Open);
+let mut scheduler = Scheduler::deploy();
+
+// Critical node: stop immediately on failure
+scheduler.add(motor_controller)
+    .order(0)
+    .failure_policy(FailurePolicy::Fatal)
+    .done();
+
+// Sensor node: restart up to 5 times with 100ms delay
+scheduler.add(sensor_reader)
+    .order(1)
+    .failure_policy(FailurePolicy::Restart { max_restarts: 5, delay_ms: 100 })
+    .done();
+
+// Logging node: ignore failures entirely
+scheduler.add(data_logger)
+    .order(5)
+    .failure_policy(FailurePolicy::Ignore)
+    .done();
 ```
+
+**Failure policies:**
+
+| Policy | Behavior |
+|--------|----------|
+| `FailurePolicy::Fatal` | Stop the scheduler immediately |
+| `FailurePolicy::Restart { max_restarts, delay_ms }` | Restart the node up to N times |
+| `FailurePolicy::Ignore` | Log the failure, continue running |
+
+When circuit breakers are enabled, nodes use their tier's default failure policy unless overridden.
 
 ## Monitoring
 
-### Get Statistics
+Circuit breaker state changes are automatically recorded in the [BlackBox](/advanced/blackbox) flight recorder. After a failure, inspect the blackbox to see state transitions:
 
 ```rust,ignore
-let stats = circuit.stats();
-
-println!("State: {:?}", stats.state);
-println!("Failure count: {}", stats.failure_count);
-println!("Success count: {}", stats.success_count);
-```
-
-### State Checking
-
-```rust,ignore
-use horus::prelude::*;
-
-match circuit.get_state() {
-    CircuitState::Closed => {
-        println!("Normal operation");
+if let Some(bb) = scheduler.blackbox() {
+    for record in &bb.anomalies() {
+        println!("[tick {}] {:?}", record.tick, record.event);
     }
-    CircuitState::Open => {
-        println!("Circuit open - failures detected");
-    }
-    CircuitState::HalfOpen => {
-        println!("Testing recovery");
-    }
-}
-```
-
-### Reset
-
-Force the circuit breaker back to closed state:
-
-```rust,ignore
-// Reset to closed, clearing all counters
-circuit.reset();
-assert_eq!(circuit.get_state(), CircuitState::Closed);
-```
-
-## Integration with Scheduler
-
-The scheduler automatically manages circuit breakers for nodes:
-
-```rust,ignore
-use horus::prelude::*;
-
-// Configure thresholds directly
-let mut config = SchedulerConfig::standard();
-config.fault.circuit_breaker_enabled = true;
-config.fault.max_failures = 5;
-config.fault.recovery_threshold = 3;
-config.fault.circuit_timeout_ms = 5000;
-
-let scheduler = Scheduler::new().with_config(config);
-
-// Note: standard() preset already has circuit_breaker_enabled = true
-// safety_critical() and deterministic() presets have it disabled
-```
-
-## Per-Node Configuration
-
-Configure circuit breakers per node for different reliability requirements:
-
-```rust,ignore
-use horus::prelude::*;
-
-// Critical control node - conservative settings
-let control_config = NodeConfig {
-    circuit_breaker: Some(CircuitBreaker::new(2, 5, 10000)),
-    ..Default::default()
-};
-
-// Logging node - aggressive settings
-let log_config = NodeConfig {
-    circuit_breaker: Some(CircuitBreaker::new(20, 1, 1000)),
-    ..Default::default()
-};
-```
-
-## Thread Safety
-
-The circuit breaker uses lock-free atomics for thread-safe operation:
-
-```rust,ignore
-use std::sync::Arc;
-use std::thread;
-
-let circuit = Arc::new(CircuitBreaker::default());
-
-let handles: Vec<_> = (0..4).map(|_| {
-    let c = Arc::clone(&circuit);
-    thread::spawn(move || {
-        for _ in 0..1000 {
-            if c.should_allow() {
-                // Safe concurrent access
-                c.record_success();
-            }
-        }
-    })
-}).collect();
-
-for h in handles {
-    h.join().unwrap();
 }
 ```
 
 ## Best Practices
 
-### 1. Tune Thresholds Per Node Type
+1. **Use presets**: `Scheduler::deploy()` or `Scheduler::high_performance()` enable circuit breakers with sensible defaults.
 
-```rust,ignore
-// Safety-critical: fail fast
-let safety_cb = CircuitBreaker::new(2, 5, 15000);
+2. **Set failure policies per node**: Critical nodes should use `FailurePolicy::Fatal`, non-critical nodes can use `Restart` or `Ignore`.
 
-// Sensor: tolerate intermittent failures
-let sensor_cb = CircuitBreaker::new(10, 2, 3000);
-
-// Logging: very tolerant
-let log_cb = CircuitBreaker::new(50, 1, 1000);
-```
-
-### 2. Monitor Circuit State
-
-```rust,ignore
-fn check_circuits(circuits: &HashMap<String, CircuitBreaker>) {
-    for (name, circuit) in circuits {
-        if circuit.get_state() == CircuitState::Open {
-            log::warn!("Circuit open for node: {}", name);
-            alert_operator(name);
-        }
-    }
-}
-```
-
-### 3. Handle Open Circuit Gracefully
-
-```rust,ignore
-if circuit.should_allow() {
-    let result = execute_node();
-    match result {
-        Ok(v) => {
-            circuit.record_success();
-            Ok(v)
-        }
-        Err(e) => {
-            circuit.record_failure();
-            Err(e)
-        }
-    }
-} else {
-    // Return cached value or default
-    Ok(cached_value.clone())
-}
-```
-
-### 4. Log State Changes
-
-```rust,ignore
-let prev_state = circuit.get_state();
-
-// ... after operation ...
-
-let new_state = circuit.get_state();
-if new_state != prev_state {
-    log::info!(
-        "Circuit breaker state change: {:?} -> {:?}",
-        prev_state, new_state
-    );
-}
-```
-
-## Common Configurations
-
-| Use Case | Failure Threshold | Success Threshold | Timeout |
-|----------|-------------------|-------------------|---------|
-| Safety-critical | 2-3 | 5-10 | 10-30s |
-| Control loop | 5 | 3 | 5s |
-| Sensor | 10 | 2 | 2-3s |
-| Logging | 20+ | 1 | 1s |
-| Network I/O | 5 | 3 | 10s |
+3. **Test failure scenarios**: Verify your system behaves correctly when nodes are temporarily disabled by the circuit breaker.
 
 ## See Also
 
-- [BlackBox Flight Recorder](/advanced/blackbox) - Event logging
-- [Safety Monitor](/advanced/safety-monitor) - Real-time safety
+- [BlackBox Flight Recorder](/advanced/blackbox) - Event logging including circuit breaker changes
+- [Safety Monitor](/advanced/safety-monitor) - Real-time safety monitoring
+- [Scheduler Configuration](/advanced/scheduler-configuration) - Presets and node configuration

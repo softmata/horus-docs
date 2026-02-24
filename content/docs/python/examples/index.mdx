@@ -14,10 +14,11 @@ Complete Python examples demonstrating HORUS capabilities.
 |---------|-------------|--------------|
 | [Basic Node](#basic-node) | Simple sensor-to-motor node | Node, `get()`, `send()` |
 | [Typed Topics](#typed-pub-sub) | Direct pub/sub with typed messages | Topic, CmdVel, LaserScan |
-| [Async Node](#async-node) | Non-blocking I/O with async/await | AsyncNode, AsyncTopic |
-| [ML Inference](#ml-inference) | ONNX model inference pipeline | ONNXInferenceNode, PerformanceMonitor |
-| [Cross-Language](#cross-language-communication) | Python-Rust communication | Network topics, endpoint |
+| [Async Node](#async-node) | Non-blocking I/O with async/await | `AsyncNode`, `AsyncTopic` |
+| [ML Inference](#ml-inference) | ONNX model inference pipeline | `ONNXInferenceNode`, `PerformanceMonitor` |
+| [Cross-Language](#cross-language-communication) | Python-Rust communication | Typed topics, shared memory |
 | [Multi-Node System](#multi-node-system) | Scheduler with multiple nodes | Scheduler, run() |
+| [Sensor Processing](#sensor-processing-pipeline) | LaserScan obstacle avoidance | Topic, LaserScan, CmdVel |
 
 ---
 
@@ -79,11 +80,11 @@ from horus import Topic, CmdVel
 # Same-thread callbacks (~3ns)
 fast_topic = Topic(CmdVel, backend="direct")
 
+# Single producer/consumer intra-process (~18ns)
+spsc_topic = Topic(CmdVel, backend="spsc")
+
 # Cross-process shared memory (~167ns)
 shm_topic = Topic(CmdVel, backend="mpmc_shm")
-
-# Network transport (cross-machine)
-net_topic = Topic(CmdVel, endpoint="cmd_vel@192.168.1.100:9000")
 ```
 
 ---
@@ -97,6 +98,9 @@ import horus
 
 class WeatherFetcher(horus.AsyncNode):
     """Fetch data from HTTP API without blocking"""
+
+    def __init__(self):
+        super().__init__()
 
     async def setup(self):
         self.weather_pub = horus.AsyncTopic("weather", dict)
@@ -116,6 +120,9 @@ class WeatherFetcher(horus.AsyncNode):
 
 class WeatherLogger(horus.AsyncNode):
     """Log weather data to database"""
+
+    def __init__(self):
+        super().__init__()
 
     async def setup(self):
         self.weather_sub = horus.AsyncTopic("weather", dict)
@@ -203,14 +210,14 @@ monitor.print_stats()
 
 ## Cross-Language Communication
 
-Python and Rust nodes communicate via typed topics over the network:
+Python and Rust nodes communicate via typed topics through shared memory (same machine):
 
 ```python
 from horus import Topic, CmdVel
 import time
 
-# Create network topic (sends to Rust node on another machine)
-topic = Topic(CmdVel, endpoint="cmd_vel@192.168.1.5:9000")
+# Create typed topic — shared memory, readable by Rust
+topic = Topic(CmdVel)
 
 # Publish velocity commands
 while True:
@@ -218,11 +225,11 @@ while True:
     linear = 1.0 + 0.5 * (t % 10) / 10.0
     angular = 0.2 * ((t % 20) - 10) / 10.0
 
-    topic.send(CmdVel(linear, angular))
+    topic.send(CmdVel(linear=linear, angular=angular))
     time.sleep(0.1)
 ```
 
-**Rust subscriber on the other end:**
+**Rust subscriber (in another process on the same machine):**
 ```rust
 use horus::prelude::*;
 
@@ -292,45 +299,41 @@ run(node, duration=10)  # Run for 10 seconds
 
 ---
 
-## Hardware Node Examples
+## Sensor Processing Pipeline
 
-Using the built-in hardware nodes:
+Processing typed sensor data and publishing commands:
 
 ```python
-from horus import Node, Scheduler
-from horus import SerialNode, JoystickNode, CameraNode
+from horus import Node, Scheduler, Topic, LaserScan, CmdVel
 
-# Serial communication with Arduino
-serial = SerialNode(port="/dev/ttyUSB0", baudrate=115200, topic_prefix="arduino")
+scan_topic = None
+cmd_topic = None
 
-# Joystick input
-joy = JoystickNode(device_id=0, topic_prefix="joy")
+def init(node):
+    global scan_topic, cmd_topic
+    scan_topic = Topic(LaserScan)
+    cmd_topic = Topic(CmdVel)
 
-# Camera capture
-cam = CameraNode(device_id=0, width=640, height=480, topic_prefix="cam")
+def obstacle_avoidance(node):
+    scan = scan_topic.recv()
+    if scan and scan.ranges:
+        min_dist = min(r for r in scan.ranges if r > scan.range_min)
+        if min_dist < 0.5:
+            # Too close — turn away
+            cmd_topic.send(CmdVel(linear=0.0, angular=0.5))
+        else:
+            # Clear ahead — drive forward
+            cmd_topic.send(CmdVel(linear=1.0, angular=0.0))
 
-# Process joystick to motor commands
-def teleop_tick(node):
-    if node.has_msg("joy.state"):
-        state = node.get("joy.state")
-        # Map joystick axes to motor commands
-        linear = state.axes[1] if len(state.axes) > 1 else 0.0
-        angular = state.axes[0] if len(state.axes) > 0 else 0.0
-        node.send("arduino.tx", f"{linear:.2f},{angular:.2f}\n")
-
-teleop = Node(
-    name="teleop",
-    subs=["joy.state"],
-    pubs=["arduino.tx"],
-    tick=teleop_tick,
-    rate=20
+node = Node(
+    name="obstacle_avoider",
+    tick=obstacle_avoidance,
+    init=init,
+    rate=10
 )
 
 scheduler = Scheduler()
-scheduler.add(serial, order=0)
-scheduler.add(joy, order=1)
-scheduler.add(teleop, order=2)
-scheduler.add(cam, order=3)
+scheduler.add(node, order=0)
 scheduler.run()
 ```
 
@@ -339,7 +342,5 @@ scheduler.run()
 ## See Also
 
 - [Python Bindings](/python/api/python-bindings) - Core Python API
-- [Async Nodes](/python/api/async-nodes) - Async/await support
-- [ML Utilities](/python/library/ml-utilities) - ML inference helpers
-- [Hardware Nodes](/python/library/python-hardware-nodes) - Built-in hardware nodes
 - [Message Library](/python/library/python-message-library) - Available message types
+- [Multi-Language Support](/concepts/multi-language) - Python-Rust cross-language communication

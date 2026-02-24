@@ -6,247 +6,74 @@ weight: 30
 
 # BlackBox Flight Recorder
 
-The BlackBox flight recorder provides continuous event logging in a circular buffer for post-mortem analysis. Like an aircraft flight recorder, it captures all significant events leading up to failures.
+The BlackBox flight recorder provides continuous event logging for post-mortem analysis. Like an aircraft flight recorder, it captures all significant events leading up to failures in a circular buffer.
 
 ## Overview
 
-The BlackBox system:
-- Records scheduler, node, and safety events in a circular buffer
-- Limits memory usage with configurable buffer size
-- Filters anomalies (errors, deadline misses, emergency stops)
-- Integrates directly with the Scheduler
+The BlackBox:
+- Records scheduler, node, and safety events automatically
+- Uses a fixed-size circular buffer (oldest events discarded when full)
+- Captures anomalies (errors, deadline misses, emergency stops)
+- Requires no manual instrumentation — the Scheduler records events automatically
 
 ## Enabling BlackBox
 
-### Via Deploy Preset (Recommended)
-
-The `deploy()` preset enables blackbox automatically with 16MB:
+Use a Scheduler preset that includes the BlackBox:
 
 ```rust
 use horus::prelude::*;
 
-// Production preset: RT features + blackbox + profiling
+// deploy() — 16MB black box
 let scheduler = Scheduler::deploy();
+
+// safety_critical() — 1GB black box
+let scheduler = Scheduler::safety_critical();
+
+// hard_realtime() — 100MB black box
+let scheduler = Scheduler::hard_realtime();
+
+// deterministic() — 100MB black box
+let scheduler = Scheduler::deterministic();
 ```
 
-### Via SchedulerConfig
+## What Gets Recorded
 
-```rust
-use horus::prelude::*;
+The BlackBox automatically captures events during scheduler execution:
 
-// Set blackbox fields on SchedulerConfig
-let mut config = SchedulerConfig::standard();
-config.monitoring.black_box_enabled = true;
-config.monitoring.black_box_size_mb = 10;
-
-let scheduler = Scheduler::new().with_config(config);
-```
-
-### Standalone
-
-```rust
-use horus::prelude::*;
-
-// Create a standalone blackbox (10MB buffer)
-let mut blackbox = BlackBox::new(10);
-```
-
-Passing `0` to `BlackBox::new()` disables recording (the default).
-
-## Event Types
-
-The BlackBox records 11 event types covering all critical system operations:
-
-| Event | Fields | Description |
-|-------|--------|-------------|
-| `SchedulerStart` | `name`, `node_count`, `config` | Scheduler initialization |
-| `SchedulerStop` | `reason`, `total_ticks` | Scheduler shutdown |
-| `NodeAdded` | `name`, `priority` | New node registered |
-| `NodeTick` | `name`, `duration_us`, `success` | Node execution completed |
-| `NodeError` | `name`, `error` | Node execution failed |
-| `DeadlineMiss` | `name`, `deadline_us`, `actual_us` | Node missed its deadline |
-| `WCETViolation` | `name`, `budget_us`, `actual_us` | Node exceeded WCET budget |
-| `CircuitBreakerChange` | `name`, `new_state`, `failure_count` | Circuit breaker state transition |
-| `LearningComplete` | `duration_ms`, `tier_summary` | Profiling learning phase finished |
-| `EmergencyStop` | `reason` | Emergency stop triggered |
-| `Custom` | `category`, `message` | User-defined events |
-
-## Recording Events
-
-When using the Scheduler, events are recorded **automatically**:
-- `SchedulerStart` on `run()` / `run_with_config()`
-- `NodeTick` for each node execution
-- `EmergencyStop` when triggered
-- `SchedulerStop` on shutdown
-
-You can also record events manually:
-
-```rust
-use horus::prelude::*;
-
-let mut blackbox = BlackBox::new(10);
-
-// Record custom events
-blackbox.record(BlackBoxEvent::Custom {
-    category: "sensor".to_string(),
-    message: "IMU calibration started".to_string(),
-});
-
-// Advance tick counter (call each scheduler tick)
-blackbox.tick();
-
-// Record node execution
-blackbox.record(BlackBoxEvent::NodeTick {
-    name: "sensor_node".to_string(),
-    duration_us: 150,
-    success: true,
-});
-
-// Record errors
-blackbox.record(BlackBoxEvent::NodeError {
-    name: "motor_controller".to_string(),
-    error: "I2C timeout".to_string(),
-});
-
-// Record deadline misses
-blackbox.record(BlackBoxEvent::DeadlineMiss {
-    name: "critical_node".to_string(),
-    deadline_us: 1000,
-    actual_us: 1500,
-});
-```
-
-## Querying Events
-
-### Get All Events
-
-```rust
-let events = blackbox.events();
-println!("Total events: {}", events.len());
-
-for record in &events {
-    println!("[tick {}] {:?}", record.tick, record.event);
-}
-```
-
-Each `BlackBoxRecord` contains:
-- `timestamp_us` — Microseconds since epoch
-- `tick` — Monotonic tick counter
-- `event` — The `BlackBoxEvent`
-
-### Get Anomalies
-
-Filter for error-related events (errors, deadline misses, WCET violations, circuit breaker changes, emergency stops):
-
-```rust
-let anomalies = blackbox.anomalies();
-for record in &anomalies {
-    println!("[tick {}] {:?}", record.tick, record.event);
-}
-```
-
-### Buffer Info
-
-```rust
-println!("Buffer size: {}", blackbox.len());
-println!("Is empty: {}", blackbox.is_empty());
-
-// Clear all recorded events
-blackbox.clear();
-```
-
-## Accessing from Scheduler
-
-The Scheduler provides read and write access to its blackbox:
-
-```rust
-use horus::prelude::*;
-
-let mut config = SchedulerConfig::standard();
-config.monitoring.black_box_enabled = true;
-config.monitoring.black_box_size_mb = 16;
-
-let mut scheduler = Scheduler::new().with_config(config);
-
-// Read-only access
-if let Some(bb) = scheduler.blackbox() {
-    let events = bb.events();
-    let anomalies = bb.anomalies();
-    println!("Recorded {} events, {} anomalies", events.len(), anomalies.len());
-}
-
-// Mutable access (for recording custom events)
-if let Some(bb) = scheduler.blackbox_mut() {
-    bb.record(BlackBoxEvent::Custom {
-        category: "deploy".to_string(),
-        message: "Firmware update started".to_string(),
-    });
-}
-```
-
-## Thread-Safe Usage
-
-For multi-threaded applications, use the shared blackbox wrapper:
-
-```rust
-use horus::prelude::*;
-use std::sync::Arc;
-
-// Create thread-safe blackbox
-let blackbox: SharedBlackBox = create_shared_blackbox(10);
-
-// Use from multiple threads
-let bb_clone = Arc::clone(&blackbox);
-std::thread::spawn(move || {
-    let mut bb = bb_clone.lock().unwrap();
-    bb.record(BlackBoxEvent::Custom {
-        category: "thread".to_string(),
-        message: "Worker started".to_string(),
-    });
-});
-```
-
-## Configuration
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Buffer size | 0 (disabled) | Set via `BlackBox::new(mb)` or `config.monitoring.black_box_size_mb` |
-| Records per MB | ~5,000 | Estimated at ~200 bytes per record |
-| Max pre-allocated | 100,000 records | Initial capacity cap |
-| Min buffer | 1,000 records | Minimum regardless of size |
-
-### Preset Sizes
-
-| Use Case | Recommended Size |
-|----------|-----------------|
-| Development | 1-5 MB |
-| Production | 10-50 MB |
-| Long-running systems | 50-100 MB |
-
-The `deploy()` preset uses 16MB. The `safety_critical()` preset uses 1024MB.
+| Event | Description |
+|-------|-------------|
+| Scheduler start/stop | When the scheduler begins and ends |
+| Node execution | Each node tick with duration and success/failure |
+| Node errors | Failed node executions |
+| Deadline misses | Nodes that missed their timing deadline |
+| WCET violations | Nodes that exceeded their execution time budget |
+| Circuit breaker changes | Fault tolerance state transitions |
+| Emergency stops | Safety system activations |
+| Custom events | User-defined markers |
 
 ## Post-Mortem Debugging
 
-After a failure, use the blackbox to investigate what happened:
+After a failure, the BlackBox contains the sequence of events leading up to it. Use the Scheduler's blackbox access to inspect:
 
 ```rust
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::deploy();
 
-// ... run application ...
+// ... application runs ...
 
 // After a failure, inspect the blackbox
 if let Some(bb) = scheduler.blackbox() {
+    // Get all anomalies (errors, deadline misses, e-stops)
     let anomalies = bb.anomalies();
     println!("=== ANOMALIES ({}) ===", anomalies.len());
     for record in &anomalies {
         println!("[tick {}] {:?}", record.tick, record.event);
     }
 
-    // Look at all events around the failure
+    // Get all events (full history)
     let all_events = bb.events();
-    println!("\n=== LAST {} EVENTS ===", all_events.len());
+    println!("\n=== LAST 20 EVENTS ===");
     for record in all_events.iter().rev().take(20) {
         println!("[tick {}] {:?}", record.tick, record.event);
     }
@@ -255,7 +82,7 @@ if let Some(bb) = scheduler.blackbox() {
 
 ## Circular Buffer Behavior
 
-The blackbox uses a circular buffer — when full, the oldest events are discarded:
+The BlackBox uses a fixed-size circular buffer. When full, the oldest events are discarded:
 
 ```
 Buffer capacity: 50,000 records (10MB)
@@ -269,9 +96,16 @@ Event N+1 → [2, 3, ..., N, N+1]  Oldest dropped
 
 This ensures bounded memory usage while keeping the most recent events for debugging.
 
+## Recommended Buffer Sizes
+
+| Use Case | Preset | Buffer Size |
+|----------|--------|-------------|
+| Development | `deploy()` | 16 MB |
+| Long-running production | `hard_realtime()` | 100 MB |
+| Safety-critical | `safety_critical()` | 1 GB |
+
 ## See Also
 
 - [Safety Monitor](/advanced/safety-monitor) - Real-time safety monitoring
 - [Circuit Breaker](/advanced/circuit-breaker) - Fault tolerance patterns
-- [Deterministic Execution](/advanced/deterministic-execution) - Scheduler configuration
-- [Troubleshooting](/troubleshooting) - Common issues and solutions
+- [Record & Replay](/advanced/record-replay) - Full recording and playback
