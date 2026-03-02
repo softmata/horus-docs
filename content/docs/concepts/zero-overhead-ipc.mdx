@@ -12,7 +12,7 @@ HORUS uses a **zero-overhead IPC architecture** that separates introspection fro
 
 After reading this guide, you will understand:
 - Why introspection was separated from IPC operations
-- How `with_logging()` enables opt-in introspection at topic creation time
+- How the TUI monitor enables runtime debug logging per-topic (no code changes needed)
 - How external tools monitor Topics without affecting performance
 - Performance characteristics of each backend
 
@@ -31,9 +31,9 @@ flowchart TB
                 H1["topic.send(msg)<br/>topic.recv()"]
                 H2["• No timing<br/>• No logging<br/>• No syscalls<br/>• <b>~3-167ns</b>"]
             end
-            subgraph INTRO["<b>INTROSPECTION</b><br/>Opt-in"]
-                I1["Topic::new(name)?.with_logging()"]
-                I2["✓ Timing measured<br/>✓ Summary logged<br/>✓ Metrics updated<br/>• <b>+200-500ns overhead</b>"]
+            subgraph INTRO["<b>INTROSPECTION</b><br/>Runtime Toggle"]
+                I1["TUI Monitor: Enter on topic"]
+                I2["✓ Timing measured<br/>✓ Summary logged<br/>✓ Metrics updated<br/>• <b>+200-500ns when active</b>"]
             end
         end
         subgraph EXT["<b>EXTERNAL INTROSPECTION</b> (Passive)"]
@@ -91,48 +91,46 @@ if let Some(value) = topic.recv() {
 - No logging
 - **Latency: ~3-167ns** depending on backend
 
-### Introspection Mode (Opt-in via `with_logging()`)
+### Runtime Debug Logging (via TUI Monitor)
 
-Enable logging and metrics at topic creation time using `with_logging()`. Once enabled, the standard `send()` and `recv()` methods automatically record timing and metrics. Requires `T: LogSummary`.
+Debug logging is toggled **at runtime** from the TUI monitor — no code changes, no recompilation, no `LogSummary` trait bound required. Open the TUI, navigate to the **Topics** tab, and press **Enter** on any topic to start logging. Press **Esc** to stop.
+
+```bash
+horus monitor --tui    # Open TUI, go to Topics tab, press Enter on a topic
+```
+
+**How it works:** Each topic has a `debug_log` flag in its shared memory header. The TUI monitor mmaps the topic's SHM file and sets this flag to `1`. Every `send()` and `recv()` checks this flag (one `Relaxed` atomic load, ~1ns) and branches to the logging path when set.
+
+**What gets logged on `send()`:**
+1. Records `Instant::now()` before the IPC operation
+2. Performs the IPC send
+3. Calculates elapsed IPC time
+4. If `T: LogSummary` — calls `msg.log_summary()` for a rich summary
+5. Otherwise — logs metadata only: topic name, direction (PUB), IPC latency
+6. Records a log entry with timestamp, node name, tick number, topic, summary, and IPC latency
+
+**What gets logged on `recv()`:**
+1. Records `Instant::now()` before the IPC operation
+2. Performs the IPC receive
+3. If a message was received:
+   - If `T: LogSummary` — calls `msg.log_summary()` for a rich summary
+   - Otherwise — logs metadata only: topic name, direction (SUB), IPC latency
+
+**Latency:** +200-500ns overhead per operation when enabled.
+
+**How it stays zero-overhead when disabled:** The `send()` / `recv()` hot path uses `unlikely()` branch prediction hints and `#[cold]` / `#[inline(never)]` annotations on the logging path. The debug flag check is a single `Relaxed` atomic load on the read-mostly cache line — the same cost as the previous `log_fn.is_some()` check (~1ns, L1-hot).
+
+**Optional: Rich summaries with `LogSummary`**
+
+For richer log messages, derive or implement `LogSummary` on your message type. This is optional — debug logging works without it, producing metadata-only entries.
 
 ```rust
-use horus::prelude::*;
-
 #[derive(Clone, Copy, Serialize, Deserialize, LogSummary)]
 struct SensorData {
     temperature: f32,
     pressure: f32,
 }
-
-// Configure once — logging is enabled for the lifetime of this topic
-let topic: Topic<SensorData> = Topic::new("sensors")?.with_logging();
-
-// send() and recv() now include introspection automatically
-topic.send(SensorData { temperature: 25.0, pressure: 101.3 });
-
-if let Some(data) = topic.recv() {
-    // Timing and logging recorded automatically
-    process(data);
-}
 ```
-
-The `with_logging()` method requires `T: LogSummary`. Use `#[derive(LogSummary)]` for automatic `Debug`-based summaries, or implement the trait manually for custom formatting (useful for large types like images where you want to log only metadata).
-
-**What `with_logging()` adds to `send()`:**
-1. Calls `msg.log_summary()` to produce a compact string
-2. Records `Instant::now()` before the IPC operation
-3. Performs the IPC send
-4. Calculates elapsed IPC time
-5. Records a log entry with timestamp, node name, tick number, topic, summary, and IPC latency
-
-**What `with_logging()` adds to `recv()`:**
-1. Records `Instant::now()` before the IPC operation
-2. Performs the IPC receive
-3. If a message was received, calls `msg.log_summary()` and records a log entry
-
-**Latency:** +200-500ns overhead per operation
-
-**How it stays zero-overhead when disabled:** The default path uses `unlikely()` branch prediction hints and `#[cold]` / `#[inline(never)]` annotations on the logging path, ensuring the branch predictor treats the non-logging path as the fast path. The overhead when logging is disabled is less than 1 CPU cycle.
 
 ## External Introspection
 
@@ -153,6 +151,8 @@ horus monitor 8080         # Web dashboard on custom port
 - Reads file metadata (size, mtime, accessing PIDs)
 - Calculates message rate from timestamps
 - **Zero impact on publishers** — reads existing shared memory
+
+**Topic debug logging (TUI mode):** In the Topics tab, press **Enter** on any topic to enable runtime debug logging. The TUI sets a flag in the topic's shared memory header, causing `send()`/`recv()` to emit live log entries. Press **Esc** to disable — zero overhead resumes immediately. No code changes or `LogSummary` trait bound required.
 
 ### `horus topic echo <name>`
 
@@ -234,22 +234,18 @@ impl Node for MotorController {
 }
 ```
 
-### Use `with_logging()` Topics (Introspection)
+### Use Runtime Debug Logging (TUI Monitor)
 
 - Development and debugging
-- Low-frequency topics (\<10 Hz)
-- When you need timing data in your node
-- System health monitoring topics
+- Inspecting any topic on-demand without code changes
+- When you need timing data or message flow visibility
+- Works with any message type — no `LogSummary` required
 
-```rust
-// Health status - introspection useful, low frequency
-// The status type must implement LogSummary for with_logging()
-let status_pub: Topic<HealthStatus> = Topic::new("health.status")?.with_logging();
-
-// In your node's tick:
-let status = self.collect_health();
-// Logging happens automatically — only 1 Hz so overhead is negligible
-self.status_pub.send(status);
+```bash
+# No code changes needed — just open the TUI and select a topic
+horus monitor --tui
+# Navigate to Topics tab, press Enter on any topic to start logging
+# Press Esc to stop — zero overhead resumes immediately
 ```
 
 ### Use External Tools
