@@ -95,7 +95,6 @@ const allPages: DocLink[] = [
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },
   { title: "Execution Modes", href: "/advanced/execution-modes" },
   { title: "Deterministic Execution", href: "/advanced/deterministic-execution" },
-  { title: "GPU Tensor Sharing", href: "/advanced/gpu-tensor-sharing" },
   { title: "Network Backends", href: "/advanced/network-backends" },
   { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence" },
   { title: "BlackBox Recorder", href: "/advanced/blackbox" },

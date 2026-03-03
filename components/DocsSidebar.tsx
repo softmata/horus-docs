@@ -150,7 +150,6 @@ const sections: SidebarSection[] = [
       { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
       { title: "Execution Modes", href: "/advanced/execution-modes", order: 2 },
       { title: "Deterministic Execution", href: "/advanced/deterministic-execution", order: 3 },
-      { title: "GPU Tensor Sharing", href: "/advanced/gpu-tensor-sharing", order: 4 },
       { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
       { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence", order: 6 },
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
