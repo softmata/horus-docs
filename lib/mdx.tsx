@@ -74,9 +74,18 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
     // Try the direct file path first
     let filePath = path.join(contentDirectory, ...slug) + '.mdx';
 
+    // Prevent path traversal — resolved path must stay within content directory
+    const resolvedContent = path.resolve(contentDirectory);
+    if (!path.resolve(filePath).startsWith(resolvedContent + path.sep)) {
+      return null;
+    }
+
     // If that doesn't exist, try looking for an index.mdx file in a directory
     if (!fs.existsSync(filePath)) {
       const indexPath = path.join(contentDirectory, ...slug, 'index.mdx');
+      if (!path.resolve(indexPath).startsWith(resolvedContent + path.sep)) {
+        return null;
+      }
       if (fs.existsSync(indexPath)) {
         filePath = indexPath;
       } else {

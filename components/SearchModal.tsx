@@ -163,7 +163,10 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
         setSelectedIndex(prev => Math.max(prev - 1, 0));
       } else if (e.key === "Enter" && results[selectedIndex]) {
         e.preventDefault();
-        window.location.href = results[selectedIndex].slug;
+        const slug = results[selectedIndex].slug;
+        if (slug.startsWith('/')) {
+          window.location.href = slug;
+        }
         onClose();
       }
     };
@@ -353,7 +356,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
                       <div className="flex items-center gap-2 mb-1">
                         <span
                           className="font-medium text-[var(--text)]"
-                          dangerouslySetInnerHTML={{ __html: result.highlights.title || result.title }}
+                          dangerouslySetInnerHTML={{ __html: result.highlights.title || escapeHtml(result.title) }}
                         />
                         <span className={`text-xs uppercase tracking-wide ${getCategoryColor()}`}>
                           {result.category.replace('-', ' ')}

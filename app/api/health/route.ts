@@ -13,7 +13,6 @@ export async function GET() {
     services: {
       documentation: 'healthy',
     },
-    version: process.env.npm_package_version || '0.1.0',
   };
 
   return NextResponse.json(health, { status: 200 });

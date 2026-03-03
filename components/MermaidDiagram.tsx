@@ -188,9 +188,9 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
       // Initialize mermaid with current theme
       mermaid.initialize({
         startOnLoad: false,
-        securityLevel: 'loose',
+        securityLevel: 'strict',
         flowchart: {
-          htmlLabels: true,
+          htmlLabels: false,
           padding: 20,
           nodeSpacing: 50,
           rankSpacing: 50,
@@ -257,7 +257,7 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
           <pre className="mt-2 text-xs overflow-auto p-2 rounded" style={{
             backgroundColor: isDark ? '#111827' : '#f3f4f6',
           }}>
-            {chart}
+            Diagram source hidden
           </pre>
         </details>
       </div>
