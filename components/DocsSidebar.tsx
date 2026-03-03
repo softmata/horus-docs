@@ -32,14 +32,13 @@ const sections: SidebarSection[] = [
       { title: "Common Mistakes", href: "/getting-started/common-mistakes", order: 8 },
       { title: "Troubleshooting", href: "/troubleshooting", order: 9 },
       { title: "Runtime Errors", href: "/troubleshooting-runtime", order: 10 },
-      { title: "Advanced Examples", href: "/advanced-examples", order: 11 },
+      { title: "Advanced Examples", href: "/rust/examples/advanced-examples", order: 11 },
     ],
   },
   {
     title: "Core Concepts",
     links: [
       { title: "Overview", href: "/concepts", order: 0 },
-      { title: "Core Architecture", href: "/concepts/core", order: 1 },
       { title: "Nodes", href: "/concepts/core-concepts-nodes", order: 2 },
       {
         title: "Communication Patterns",
@@ -48,16 +47,7 @@ const sections: SidebarSection[] = [
         children: [
           { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic", order: 1 },
           { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic", order: 2 },
-        ]
-      },
-      {
-        title: "Communication Transport",
-        href: "/concepts/communication-transport",
-        order: 4,
-        children: [
-          { title: "Local (Shared Memory)", href: "/concepts/core-concepts-shared-memory", order: 1 },
-          { title: "Network", href: "/concepts/network-communication", order: 2 },
-          { title: "Configuration", href: "/concepts/communication-configuration", order: 3 },
+          { title: "Shared Memory", href: "/concepts/core-concepts-shared-memory", order: 3 },
         ]
       },
       { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 5 },
@@ -83,7 +73,6 @@ const sections: SidebarSection[] = [
           { title: "horus_macros", href: "/rust/api/macros", order: 2 },
           { title: "TensorPool", href: "/rust/api/tensor-pool", order: 3 },
           { title: "Tensor Messages", href: "/rust/api/tensor-messages", order: 4 },
-          { title: "Hardware Discovery", href: "/rust/api/hardware", order: 5 },
           {
             title: "Messages",
             href: "/rust/api/messages",
@@ -135,10 +124,8 @@ const sections: SidebarSection[] = [
         href: "/python/library",
         order: 2,
         children: [
-          { title: "Overview", href: "/python/library", order: 0 },
           { title: "Message Library", href: "/python/library/python-message-library", order: 1 },
-          { title: "Hardware Nodes", href: "/python/library/python-hardware-nodes", order: 2 },
-          { title: "ML Utilities", href: "/python/library/ml-utilities", order: 3 },
+          { title: "ML Utilities", href: "/python/library/ml-utilities", order: 2 },
         ]
       },
       { title: "Examples", href: "/python/examples", order: 3 },
@@ -153,11 +140,8 @@ const sections: SidebarSection[] = [
       { title: "Testing", href: "/development/testing", order: 5 },
       { title: "Parameters", href: "/development/parameters", order: 6 },
       { title: "Static Analysis", href: "/development/static-analysis", order: 7 },
-      { title: "Library Reference", href: "/development/library-reference", order: 8 },
-      { title: "Error Handling", href: "/development/error-handling", order: 9 },
-      { title: "AI Integration", href: "/development/ai-integration", order: 10 },
-      { title: "ROS2 Bridge", href: "/development/ros2-bridge", order: 11 },
-      { title: "Hardware Discovery", href: "/development/hardware-discovery", order: 12 },
+      { title: "Error Handling", href: "/development/error-handling", order: 8 },
+      { title: "AI Integration", href: "/development/ai-integration", order: 9 },
     ],
   },
   {
@@ -172,7 +156,6 @@ const sections: SidebarSection[] = [
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
       { title: "Circuit Breaker", href: "/advanced/circuit-breaker", order: 9 },
       { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },
-      { title: "Model Registry", href: "/advanced/model-registry", order: 11 },
       { title: "Record & Replay", href: "/advanced/record-replay", order: 12 },
       { title: "Real-Time Configuration", href: "/advanced/rt-config", order: 13 },
     ],
@@ -182,8 +165,7 @@ const sections: SidebarSection[] = [
     links: [
       { title: "Overview", href: "/plugins", order: 0 },
       { title: "Creating CLI Plugins", href: "/plugins/creating-plugins", order: 1 },
-      { title: "Driver Plugins", href: "/plugins/driver-plugins", order: 2 },
-      { title: "Managing Plugins", href: "/plugins/managing-plugins", order: 3 },
+      { title: "Managing Plugins", href: "/plugins/managing-plugins", order: 2 },
     ],
   },
   {
