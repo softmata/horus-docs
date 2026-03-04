@@ -808,6 +808,216 @@ horus run pipeline.rs
 
 ---
 
+## 6. Camera Image Pipeline
+
+Send and receive camera images using `Image` with zero-copy shared memory.
+
+### Camera Sender
+
+**File: `camera_sender.rs`**
+
+```rust
+use horus::prelude::*;
+
+struct CameraSender {
+    topic: Topic<Image>,
+}
+
+impl Node for CameraSender {
+    fn name(&self) -> &str { "CameraSender" }
+
+    fn tick(&mut self) {
+        // Create a 480x640 RGB8 image in shared memory
+        let mut img = Image::new(480, 640, ImageEncoding::Rgb8)
+            .expect("failed to allocate image");
+
+        // Fill with a solid color (blue)
+        img.fill(&[0, 0, 255]);
+
+        // Set a red pixel at (100, 200)
+        img.set_pixel(100, 200, &[255, 0, 0]);
+
+        // Send — only the 168-byte descriptor goes through the ring buffer.
+        // The pixel data stays in shared memory (zero-copy).
+        self.topic.send(&img);
+        hlog!(debug, "Sent {}x{} image", img.width(), img.height());
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        hlog!(info, "Camera sender stopped");
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(CameraSender {
+        topic: Topic::new("camera/rgb")?,
+    }).order(0).done();
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+### Camera Receiver
+
+**File: `camera_receiver.rs`**
+
+```rust
+use horus::prelude::*;
+
+struct CameraReceiver {
+    topic: Topic<Image>,
+}
+
+impl Node for CameraReceiver {
+    fn name(&self) -> &str { "CameraReceiver" }
+
+    fn tick(&mut self) {
+        if let Some(img) = self.topic.recv() {
+            // Read a pixel
+            if let Some(px) = img.pixel(100, 200) {
+                hlog!(info, "Pixel at (100,200): R={} G={} B={}",
+                    px[0], px[1], px[2]);
+            }
+
+            hlog!(debug, "Received {}x{} {:?} image ({} bytes)",
+                img.width(), img.height(), img.encoding(), img.nbytes());
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        hlog!(info, "Camera receiver stopped");
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(CameraReceiver {
+        topic: Topic::new("camera/rgb")?,
+    }).order(0).done();
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+**Run it** (two terminals):
+```bash
+# Terminal 1
+horus run camera_sender.rs
+
+# Terminal 2
+horus run camera_receiver.rs
+```
+
+**Key Concepts**:
+- `Image::new(height, width, encoding)` allocates from a global shared memory pool
+- `topic.send(&img)` sends the 168-byte descriptor; pixel data stays in shared memory
+- `topic.recv()` returns `Option<Image>` — zero-copy access to the sender's data
+- `pixel()` / `set_pixel()` / `fill()` / `roi()` for pixel-level access
+
+---
+
+## 7. Point Cloud Processing
+
+Create, send, and process 3D point clouds.
+
+**File: `pointcloud_demo.rs`**
+
+```rust
+use horus::prelude::*;
+
+struct PointCloudSender {
+    topic: Topic<PointCloud>,
+}
+
+impl Node for PointCloudSender {
+    fn name(&self) -> &str { "PointCloudSender" }
+
+    fn tick(&mut self) {
+        // Create a point cloud: 1000 points, 3 fields each (XYZ), float32
+        let mut pc = PointCloud::new(1000, 3, TensorDtype::F32)
+            .expect("failed to allocate point cloud");
+
+        // Fill with sample data — a sphere of radius 1.0
+        let floats: &mut [f32] = bytemuck::cast_slice_mut(pc.data_mut());
+        for i in 0..1000 {
+            let theta = (i as f32 / 1000.0) * std::f32::consts::TAU;
+            let phi = (i as f32 / 1000.0) * std::f32::consts::PI;
+            floats[i * 3] = phi.sin() * theta.cos();     // x
+            floats[i * 3 + 1] = phi.sin() * theta.sin(); // y
+            floats[i * 3 + 2] = phi.cos();               // z
+        }
+
+        pc.set_frame_id("lidar_frame");
+        self.topic.send(&pc);
+        hlog!(debug, "Sent {} points", pc.point_count());
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        hlog!(info, "PointCloud sender stopped");
+        Ok(())
+    }
+}
+
+struct PointCloudReceiver {
+    topic: Topic<PointCloud>,
+}
+
+impl Node for PointCloudReceiver {
+    fn name(&self) -> &str { "PointCloudReceiver" }
+
+    fn tick(&mut self) {
+        if let Some(pc) = self.topic.recv() {
+            // Extract all XYZ points as Vec<[f32; 3]>
+            if let Some(points) = pc.extract_xyz() {
+                let centroid = points.iter().fold([0.0f32; 3], |acc, p| {
+                    [acc[0] + p[0], acc[1] + p[1], acc[2] + p[2]]
+                });
+                let n = points.len() as f32;
+                hlog!(info, "Received {} points, centroid: ({:.2}, {:.2}, {:.2})",
+                    points.len(),
+                    centroid[0] / n, centroid[1] / n, centroid[2] / n);
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        hlog!(info, "PointCloud receiver stopped");
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    scheduler.add(PointCloudSender {
+        topic: Topic::new("lidar/points")?,
+    }).order(0).done();
+
+    scheduler.add(PointCloudReceiver {
+        topic: Topic::new("lidar/points")?,
+    }).order(1).done();
+
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+**Run it**:
+```bash
+horus run pointcloud_demo.rs
+```
+
+**Key Concepts**:
+- `PointCloud::new(num_points, fields_per_point, dtype)` — 3=XYZ, 4=XYZI, 6=XYZRGB
+- `extract_xyz()` returns `Option<Vec<[f32; 3]>>` for F32 clouds
+- `point_count()`, `fields_per_point()`, `is_xyz()` for metadata
+- Uses the same zero-copy shared memory transport as Image
+
+---
+
 ## Next Steps
 
 Now that you understand basic patterns, explore:
@@ -819,5 +1029,5 @@ Now that you understand basic patterns, explore:
 - [Message Types](/concepts/message-types) - Complete message reference
 
 Stuck? Check:
-- [Troubleshooting Runtime Errors](/troubleshooting-runtime) - Fix common issues
+- [Troubleshooting](/troubleshooting) - Fix common issues
 - [Monitor](/development/monitor) - Debug with the web UI
