@@ -1,0 +1,384 @@
+---
+title: Actions
+description: Long-running tasks with feedback, cancellation, and preemption
+order: 11
+---
+
+# Actions
+
+Actions handle **long-running tasks** that need progress feedback and cancellation support. Unlike topics (fire-and-forget) or services (request/response), actions provide a full lifecycle: send a goal, receive periodic feedback, and get a final result.
+
+**Use actions when:**
+- The task takes more than one tick (navigation, arm motion, calibration)
+- You need progress updates (distance remaining, percent complete)
+- You need to cancel or preempt in-flight tasks
+- You need to know if the task succeeded or failed
+
+## Defining an Action
+
+Use the `action!` macro to define Goal, Feedback, and Result types:
+
+```rust
+use horus::prelude::*;
+
+action! {
+    /// Navigate to a target position
+    Navigate {
+        goal {
+            target_x: f64,
+            target_y: f64,
+            max_speed: f64 = 1.0,  // Default value
+        }
+        feedback {
+            distance_remaining: f64,
+            percent_complete: f32,
+        }
+        result {
+            success: bool,
+            final_x: f64,
+            final_y: f64,
+        }
+    }
+}
+```
+
+This generates:
+- `NavigateGoal` struct with the goal fields
+- `NavigateFeedback` struct with the feedback fields
+- `NavigateResult` struct with the result fields
+- `Navigate` marker type implementing the `Action` trait
+
+### Standard Action Templates
+
+For common robotics patterns, use the `standard_action!` shortcut:
+
+```rust
+standard_action!(navigate MyNavAction);    // Goal: target pose, Feedback: distance, Result: final pose
+standard_action!(manipulate MyPickPlace);  // Goal: object + target, Feedback: phase, Result: success
+standard_action!(wait MyWaitAction);       // Goal: duration, Feedback: elapsed, Result: completed
+standard_action!(dock MyDockAction);       // Goal: dock ID, Feedback: alignment, Result: docked
+```
+
+For single-field actions:
+
+```rust
+simple_action!(Spin, angular_velocity: f64, current_angle: f64, total_rotations: u32);
+//                    ^ goal                  ^ feedback           ^ result
+```
+
+---
+
+## Action Server
+
+The action server receives goals, executes them, and sends back feedback and results.
+
+### Building a Server
+
+```rust
+let server = ActionServerNode::<Navigate>::builder()
+    // Validate incoming goals
+    .on_goal(|goal| {
+        if goal.max_speed <= 0.0 {
+            GoalResponse::Reject("Speed must be positive".into())
+        } else {
+            GoalResponse::Accept
+        }
+    })
+    // Handle cancellation requests
+    .on_cancel(|goal_id| {
+        hlog!(info, "Cancel requested for {:?}", goal_id);
+        CancelResponse::Accept
+    })
+    // Execute the action
+    .on_execute(|handle| {
+        let goal = handle.goal();
+        let mut distance = ((goal.target_x).powi(2) + (goal.target_y).powi(2)).sqrt();
+        let total = distance;
+
+        while distance > 0.1 {
+            // Check for cancellation
+            if handle.is_cancel_requested() {
+                return handle.canceled(NavigateResult {
+                    success: false,
+                    final_x: goal.target_x - distance,
+                    final_y: goal.target_y - distance,
+                });
+            }
+
+            // Simulate movement
+            distance -= goal.max_speed * 0.1;
+
+            // Publish feedback
+            handle.publish_feedback(NavigateFeedback {
+                distance_remaining: distance.max(0.0),
+                percent_complete: ((total - distance) / total * 100.0) as f32,
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        handle.succeed(NavigateResult {
+            success: true,
+            final_x: goal.target_x,
+            final_y: goal.target_y,
+        })
+    })
+    .build();
+```
+
+### Server Configuration
+
+```rust
+let server = ActionServerNode::<Navigate>::builder()
+    .on_goal(|_| GoalResponse::Accept)
+    .on_execute(|handle| { /* ... */ handle.succeed(result) })
+    .max_concurrent_goals(Some(1))          // Only one goal at a time
+    .feedback_rate(20.0)                     // 20 Hz feedback rate
+    .goal_timeout(Duration::from_secs(30))  // Timeout after 30s
+    .preemption_policy(PreemptionPolicy::PreemptOld)  // New goals preempt active
+    .build();
+```
+
+### Preemption Policies
+
+| Policy | Behavior |
+|--------|----------|
+| `PreemptOld` | New goals cancel the active goal (default) |
+| `RejectNew` | Reject new goals while one is active |
+| `Priority` | Higher-priority goals preempt lower-priority ones |
+| `Queue { max_size }` | Queue goals in FIFO order |
+
+### ServerGoalHandle
+
+The `handle` passed to `on_execute` provides:
+
+```rust
+handle.goal_id()              // Unique goal identifier
+handle.goal()                 // The goal request (&A::Goal)
+handle.priority()             // Goal priority level
+handle.status()               // Current GoalStatus
+handle.elapsed()              // Time since goal started
+handle.is_cancel_requested()  // Client requested cancellation?
+handle.is_preempt_requested() // Higher-priority goal arrived?
+handle.should_abort()         // Timeout or other abort condition?
+handle.publish_feedback(fb)   // Send feedback to client
+
+// Terminal methods (consume the handle):
+handle.succeed(result)        // -> GoalOutcome::Succeeded
+handle.abort(result)          // -> GoalOutcome::Aborted
+handle.canceled(result)       // -> GoalOutcome::Canceled
+handle.preempted(result)      // -> GoalOutcome::Preempted
+```
+
+### Server Metrics
+
+```rust
+let metrics = server.metrics();
+println!("Goals received: {}", metrics.goals_received);
+println!("Active: {}, Queued: {}", metrics.active_goals, metrics.queued_goals);
+println!("Succeeded: {}, Aborted: {}", metrics.goals_succeeded, metrics.goals_aborted);
+```
+
+---
+
+## Action Client
+
+### Async Client (Node-Based)
+
+Use `ActionClientNode` when running inside a scheduler:
+
+```rust
+let client = ActionClientNode::<Navigate>::builder()
+    .on_feedback(|goal_id, feedback| {
+        println!("Progress: {:.0}%", feedback.percent_complete);
+    })
+    .on_result(|goal_id, status, result| {
+        println!("Goal {:?} finished: {:?}", goal_id, status);
+    })
+    .build();
+
+// Send a goal
+let handle = client.send_goal(NavigateGoal {
+    target_x: 5.0,
+    target_y: 3.0,
+    max_speed: 1.0,
+})?;
+
+// Or with priority
+let handle = client.send_goal_with_priority(goal, GoalPriority::HIGH)?;
+```
+
+### ClientGoalHandle
+
+```rust
+handle.goal_id()          // Unique goal ID
+handle.status()           // Current GoalStatus
+handle.is_active()        // Pending or Active?
+handle.is_done()          // In terminal state?
+handle.is_success()       // Succeeded?
+handle.elapsed()          // Time since sent
+handle.last_feedback()    // Most recent feedback (Option)
+handle.result()           // Final result if done (Option)
+handle.cancel()           // Request cancellation
+
+// Blocking wait
+let result = handle.await_result(Duration::from_secs(10));
+
+// Wait with feedback callback
+let result = handle.await_result_with_feedback(
+    Duration::from_secs(10),
+    |feedback| println!("Distance: {:.1}m", feedback.distance_remaining),
+)?;
+```
+
+### Sync Client (Standalone)
+
+Use `SyncActionClient` for simple scripts without a scheduler:
+
+```rust
+let client = SyncActionClient::<Navigate>::new()?;
+
+// Blocking call
+let result = client.send_goal_and_wait(
+    NavigateGoal { target_x: 5.0, target_y: 3.0, max_speed: 1.0 },
+    Duration::from_secs(30),
+)?;
+
+// With feedback
+let result = client.send_goal_and_wait_with_feedback(
+    goal,
+    Duration::from_secs(30),
+    |feedback| println!("{:.0}% complete", feedback.percent_complete),
+)?;
+```
+
+---
+
+## Goal Lifecycle
+
+```
+Client                          Server
+  |                                |
+  |--- GoalRequest ------------->  |
+  |                                | on_goal() → Accept/Reject
+  |<----------- StatusUpdate ---   | (Pending → Active)
+  |                                |
+  |<----------- Feedback -------   | on_execute() running
+  |<----------- Feedback -------   |   publish_feedback()
+  |<----------- Feedback -------   |
+  |                                |
+  |--- CancelRequest ---------->   | (optional)
+  |                                | on_cancel() → Accept/Reject
+  |                                |
+  |<----------- Result ---------   | succeed() / abort() / canceled()
+  |                                |
+```
+
+### GoalStatus
+
+| Status | Description |
+|--------|-------------|
+| `Pending` | Received but not yet executing |
+| `Active` | Currently executing |
+| `Succeeded` | Completed successfully |
+| `Aborted` | Failed during execution |
+| `Canceled` | Canceled by client request |
+| `Preempted` | Canceled by higher-priority goal |
+| `Rejected` | Rejected by `on_goal` validation |
+
+### GoalPriority
+
+```rust
+GoalPriority::HIGHEST  // 0 - Critical tasks
+GoalPriority::HIGH     // 64
+GoalPriority::NORMAL   // 128 (default)
+GoalPriority::LOW      // 192
+GoalPriority::LOWEST   // 255 - Background tasks
+```
+
+---
+
+## Running Actions in a Scheduler
+
+```rust
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Action server
+    scheduler.add(
+        ActionServerNode::<Navigate>::builder()
+            .on_goal(|_| GoalResponse::Accept)
+            .on_execute(|handle| {
+                // ... navigation logic ...
+                handle.succeed(result)
+            })
+            .build()
+    ).order(0).done();
+
+    // Action client
+    scheduler.add(
+        ActionClientNode::<Navigate>::builder()
+            .on_result(|_, status, result| {
+                println!("Navigation {:?}: arrived={}", status, result.success);
+            })
+            .build()
+    ).order(1).done();
+
+    scheduler.run()
+}
+```
+
+---
+
+## Error Handling
+
+```rust
+match client.send_goal(goal) {
+    Ok(handle) => { /* goal accepted */ }
+    Err(ActionError::GoalRejected(reason)) => { /* validation failed */ }
+    Err(ActionError::ServerUnavailable) => { /* no server running */ }
+    Err(ActionError::GoalTimeout) => { /* server didn't respond */ }
+    Err(e) => { /* other error */ }
+}
+```
+
+| Error | Cause |
+|-------|-------|
+| `GoalRejected(reason)` | `on_goal` returned `Reject` |
+| `GoalCanceled` | Goal was canceled |
+| `GoalPreempted` | Goal was preempted by higher priority |
+| `GoalTimeout` | Execution exceeded timeout |
+| `ServerUnavailable` | No action server found |
+| `CommunicationError(msg)` | IPC failure |
+| `ExecutionError(msg)` | Error during execution |
+| `InvalidGoal(msg)` | Malformed goal data |
+| `GoalNotFound(id)` | Unknown goal ID |
+
+---
+
+## CLI Commands
+
+```bash
+# List active actions
+horus action list
+
+# Get action details
+horus action info navigate
+
+# Send a goal (JSON)
+horus action send_goal navigate '{"target_x": 5.0, "target_y": 3.0, "max_speed": 1.0}'
+
+# Send and wait for result
+horus action send_goal navigate '{"target_x": 5.0}' --wait --timeout 30
+
+# Cancel a goal
+horus action cancel_goal navigate --goal-id <uuid>
+```
+
+---
+
+## Next Steps
+
+- **[Communication Overview](/concepts/communication-overview)** - When to use topics vs actions vs services
+- **[Services](/concepts/services)** - Synchronous request/response pattern
+- **[Scheduler](/concepts/core-concepts-scheduler)** - Running action nodes
