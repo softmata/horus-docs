@@ -10,10 +10,11 @@ order: 7
 
 After reading this guide, you will understand:
 - How the Scheduler orchestrates node execution through init(), tick(), and shutdown() phases
-- The difference between `Scheduler::new()` (lightweight) and preset constructors like `deploy()`, `safety_critical()`, `high_performance()`
+- `Scheduler::new()` as the single entry point, with `SchedulerConfig` + `from_config()` for global settings
+- Per-node execution classes: `.rt()`, `.compute()`, `.on(topic)`, `.async_io()`
 - The fluent NodeBuilder API for adding nodes with `.add(node).order(0).rt().done()`
+- Per-node configuration: `.order()`, `.rate_hz()`, `.wcet_us()`, `.deadline_ms()`
 - Priority-based execution where lower numbers run first (0 = highest priority)
-- Builder methods for opting into RT features, blackbox recording, and tick rate configuration
 - Graceful shutdown via Ctrl+C signal handling
 
 The Scheduler is the **execution orchestrator** in HORUS. It manages the node lifecycle, coordinates priority-based execution, and handles graceful shutdown.
@@ -49,26 +50,25 @@ scheduler.add(my_node).order(0).done();
 scheduler.run()?;
 ```
 
-### Scheduler::deploy() — Production Preset
+### SchedulerConfig + from_config() — Global Settings
 
-Applies RT features (best-effort) + BlackBox flight recorder.
+For production deployments, use `SchedulerConfig` to configure global scheduler behaviour, then create the scheduler with `from_config()`:
 
 ```rust
-let mut scheduler = Scheduler::deploy();
-scheduler.add(motor_ctrl).order(0).rt().done();
+use horus::prelude::*;
+
+let mut config = SchedulerConfig::default();
+config.tick_hz = 1000.0;                          // 1 kHz control loop
+config.monitoring.black_box_enabled = true;        // Flight recorder
+config.monitoring.safety_monitor_enabled = true;   // Watchdog / WCET enforcement
+config.rt.enabled = true;                          // Attempt RT priority, mlockall, CPU affinity
+
+let mut scheduler = Scheduler::from_config(config);
+scheduler.add(motor_ctrl).order(0).rt().wcet_us(500).done();
 scheduler.run()?;
 ```
 
-### Other Presets
-
-| Preset | Tick Rate | Execution | Use Case |
-|--------|-----------|-----------|----------|
-| `Scheduler::new()` | 60 Hz | Sequential | Development, prototyping |
-| `Scheduler::deploy()` | 60 Hz | Sequential + RT | Production deployment |
-| `Scheduler::safety_critical()` | 1 kHz | Sequential + WCET + watchdog | Medical, safety systems |
-| `Scheduler::high_performance()` | 10 kHz | Parallel | Racing, competition |
-| `Scheduler::hard_realtime()` | 1 kHz | Parallel + strict deadlines | CNC, aerospace |
-| `Scheduler::deterministic()` | 60 Hz | Sequential + deterministic | Formal verification, testing |
+All RT features that cannot be applied at runtime are recorded as degradations, not errors (see [Real-Time Features](#real-time-features) below).
 
 ## Adding Nodes
 
@@ -100,11 +100,21 @@ scheduler.add(logger).order(200).done();
 
 ### NodeBuilder Methods
 
+**Execution classes** (mutually exclusive — pick one per node):
+
+| Method | Description |
+|--------|-------------|
+| `.rt()` | Mark as real-time node (SCHED_FIFO, memory-locked) |
+| `.compute()` | Mark as CPU-heavy compute node (may be scheduled on worker threads) |
+| `.on(topic)` | Event-driven — node ticks only when the given topic receives a message |
+| `.async_io()` | Async I/O node (non-blocking, suitable for network / file operations) |
+
+**Per-node configuration:**
+
 | Method | Description |
 |--------|-------------|
 | `.order(n)` | Set execution order (lower = runs first) |
 | `.rate_hz(hz)` | Set node-specific tick rate in Hz |
-| `.rt()` | Mark as real-time node |
 | `.wcet_us(n)` | Set WCET budget in microseconds (implies `.rt()`) |
 | `.deadline_us(n)` | Set deadline in microseconds (implies `.rt()`) |
 | `.deadline_ms(n)` | Set deadline in milliseconds (implies `.rt()`) |
@@ -180,14 +190,26 @@ let scheduler = Scheduler::new()
 
 ### Real-Time Features
 
-RT features are applied through Scheduler presets. Use `deploy()`, `safety_critical()`, or `hard_realtime()` for pre-configured RT settings:
+RT features are configured per-node with `.rt()` and globally through `SchedulerConfig`:
 
 ```rust
-// Use a preset with RT features
-let scheduler = Scheduler::deploy();
+let mut config = SchedulerConfig::default();
+config.rt.enabled = true; // Enable RT scheduling globally
 
-// Or use a specialized preset directly
-let scheduler = Scheduler::safety_critical();
+let mut scheduler = Scheduler::from_config(config);
+
+// Per-node: mark individual nodes as real-time
+scheduler.add(motor_ctrl)
+    .order(0)
+    .rt()                 // RT execution class
+    .wcet_us(500)         // 500us WCET budget
+    .deadline_ms(1)       // 1ms deadline
+    .done();
+
+scheduler.add(sensor)
+    .order(50)
+    .compute()            // CPU-heavy, non-RT
+    .done();
 
 // Check what degraded (features that couldn't be applied)
 for deg in scheduler.degradations() {
@@ -195,7 +217,7 @@ for deg in scheduler.degradations() {
 }
 ```
 
-RT presets attempt to apply (in order):
+When `config.rt.enabled = true`, the scheduler attempts to apply (in order):
 1. **RT priority** (SCHED_FIFO) — if available
 2. **Memory locking** (mlockall) — if permitted
 3. **CPU affinity** — only to isolated CPUs if they exist
@@ -204,25 +226,33 @@ Features that fail are recorded as degradations, not errors.
 
 ### BlackBox Flight Recorder
 
-BlackBox recording is enabled through Scheduler presets (e.g., `deploy()` includes it by default):
+Enable BlackBox recording through `SchedulerConfig`:
 
 ```rust
-let scheduler = Scheduler::deploy(); // Includes BlackBox recording
+let mut config = SchedulerConfig::default();
+config.monitoring.black_box_enabled = true;
+
+let mut scheduler = Scheduler::from_config(config);
+// All node ticks are now recorded to the flight recorder
 ```
 
 ### Safety Monitor
 
-Safety monitoring is enabled through Scheduler presets (e.g., `safety_critical()` includes it):
+Enable safety monitoring through `SchedulerConfig`, then use per-node builder methods for WCET and deadlines:
 
 ```rust
-use std::time::Duration;
+let mut config = SchedulerConfig::default();
+config.monitoring.safety_monitor_enabled = true;
 
-// safety_critical() enables the safety monitor automatically
-let mut scheduler = Scheduler::safety_critical();
+let mut scheduler = Scheduler::from_config(config);
 
-// Mark a node as critical (watchdog + WCET enforcement)
-scheduler.add_critical_node("motor_ctrl", Duration::from_millis(100))?;
-scheduler.set_wcet_budget("motor_ctrl", Duration::from_micros(500))?;
+// Mark a node as RT with WCET budget and deadline enforcement
+scheduler.add(motor_ctrl)
+    .order(0)
+    .rt()
+    .wcet_us(500)          // 500us WCET budget
+    .deadline_ms(100)      // 100ms watchdog deadline
+    .done();
 ```
 
 ### Other Builder Methods
@@ -295,11 +325,13 @@ Scheduler shutdown complete
 
 ### Recording Sessions
 
-Recording is enabled through the `deploy()` preset, which includes BlackBox recording by default:
+Enable recording through `SchedulerConfig` by turning on the BlackBox flight recorder:
 
 ```rust
-// deploy() enables recording automatically
-let mut scheduler = Scheduler::deploy();
+let mut config = SchedulerConfig::default();
+config.monitoring.black_box_enabled = true;
+
+let mut scheduler = Scheduler::from_config(config);
 scheduler.add(my_node).order(0).done();
 
 // Run normally — all node ticks are recorded
@@ -401,12 +433,17 @@ scheduler.add(diagnostics).order(200).done();
 ### Production Deployment
 
 ```rust
-let mut scheduler = Scheduler::deploy();
+let mut config = SchedulerConfig::default();
+config.rt.enabled = true;
+config.monitoring.black_box_enabled = true;
+config.monitoring.safety_monitor_enabled = true;
+
+let mut scheduler = Scheduler::from_config(config);
 
 scheduler.add(safety_monitor).order(0).rt().wcet_us(100).done();
 scheduler.add(motor_ctrl).order(5).rt().wcet_us(500).done();
-scheduler.add(sensor).order(50).rate_hz(1000.0).done();
-scheduler.add(logger).order(200).done();
+scheduler.add(sensor).order(50).compute().rate_hz(1000.0).done();
+scheduler.add(logger).order(200).async_io().done();
 
 scheduler.run()?;
 ```
@@ -438,9 +475,13 @@ scheduler.add(sensor).order(50).done();           // Normal
 scheduler.add(logger).order(200).done();          // Background
 ```
 
-**Use deploy() for production** — it enables RT features and crash recording:
+**Use SchedulerConfig for production** — enable RT features, recording, and safety monitoring:
 ```rust
-let mut scheduler = Scheduler::deploy();
+let mut config = SchedulerConfig::default();
+config.rt.enabled = true;
+config.monitoring.black_box_enabled = true;
+config.monitoring.safety_monitor_enabled = true;
+let mut scheduler = Scheduler::from_config(config);
 ```
 
 ## Next Steps

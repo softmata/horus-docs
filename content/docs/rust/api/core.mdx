@@ -561,77 +561,9 @@ scheduler.run()?;
 
 ---
 
-#### `deploy`
-
-```rust
-pub fn deploy() -> Self
-```
-
-Production preset. Applies RT features (best-effort) + BlackBox flight recorder.
-
-**Example:**
-```rust
-let mut scheduler = Scheduler::deploy();
-scheduler.add(motor_ctrl).order(0).rt().done();
-scheduler.run()?;
-```
-
----
-
-#### `safety_critical`
-
-```rust
-pub fn safety_critical() -> Self
-```
-
-Safety-critical preset. 1 kHz tick rate, WCET enforcement, watchdog monitoring.
-
----
-
-#### `high_performance`
-
-```rust
-pub fn high_performance() -> Self
-```
-
-High-performance preset. 10 kHz tick rate, parallel execution.
-
----
-
-#### `hard_realtime`
-
-```rust
-pub fn hard_realtime() -> Self
-```
-
-Hard real-time preset. 1 kHz tick rate, parallel execution, strict deadlines.
-
----
-
-#### `deterministic`
-
-```rust
-pub fn deterministic() -> Self
-```
-
-Deterministic execution preset. 60 Hz, sequential execution, deterministic clock for formal verification and testing.
-
----
-
-### Preset Summary
-
-| Preset | Tick Rate | Use Case |
-|--------|-----------|----------|
-| `Scheduler::new()` | 60 Hz | Development, prototyping |
-| `Scheduler::deploy()` | 60 Hz | Production deployment |
-| `Scheduler::safety_critical()` | 1 kHz | Medical, safety systems |
-| `Scheduler::high_performance()` | 10 kHz | Racing, competition |
-| `Scheduler::hard_realtime()` | 1 kHz | CNC, aerospace |
-| `Scheduler::deterministic()` | 60 Hz | Formal verification, testing |
-
----
-
 ### Builder Methods
+
+`Scheduler::new()` returns a builder. Chain methods to configure global behavior before adding nodes:
 
 #### `tick_hz`
 
@@ -668,6 +600,47 @@ Pre-allocates capacity for nodes (prevents runtime allocations).
 
 ---
 
+#### `with_config`
+
+```rust
+pub fn with_config(self, config: SchedulerConfig) -> Self
+```
+
+Applies a `SchedulerConfig` for global scheduler settings. Use this to configure production behavior instead of the removed preset constructors.
+
+**Example:**
+```rust
+let config = SchedulerConfig {
+    enable_rt: true,           // Request RT scheduling (best-effort)
+    enable_blackbox: true,     // Enable flight recorder
+    lock_memory: true,         // Lock pages (prevents page faults)
+    ..Default::default()
+};
+
+let mut scheduler = Scheduler::new()
+    .tick_hz(1000.0)
+    .with_config(config);
+```
+
+---
+
+### SchedulerConfig
+
+Global configuration struct for scheduler behavior. Replaces the old preset constructors with explicit, composable settings.
+
+```rust
+pub struct SchedulerConfig {
+    pub enable_rt: bool,           // Request SCHED_FIFO for RT nodes (default: false)
+    pub enable_blackbox: bool,     // Enable BlackBox flight recorder (default: false)
+    pub lock_memory: bool,         // mlockall to prevent page faults (default: false)
+    pub watchdog_timeout_ms: u64,  // Watchdog timeout in ms, 0 = disabled (default: 0)
+    pub parallel: bool,            // Enable parallel execution (default: false)
+    pub deterministic_clock: bool, // Use deterministic clock (default: false)
+}
+```
+
+---
+
 ### Node Management
 
 #### `add`
@@ -686,13 +659,27 @@ Adds a node using the fluent builder API. Returns a `NodeBuilder` for configurin
 |--------|-------------|
 | `.order(n)` | Set execution order (lower = runs first) |
 | `.rate_hz(hz)` | Set node-specific tick rate in Hz |
-| `.rt()` | Mark as real-time node |
+| `.rt()` | Mark as **real-time** execution class (pinned thread, FIFO scheduling) |
+| `.compute()` | Mark as **compute** execution class (thread-pool, CPU-bound work) |
+| `.on(topic)` | Mark as **event-driven** execution class (wakes on topic publish) |
+| `.async_io()` | Mark as **async I/O** execution class (tokio runtime, network/disk) |
 | `.wcet_us(n)` | Set WCET budget in microseconds (implies `.rt()`) |
 | `.deadline_us(n)` | Set deadline in microseconds (implies `.rt()`) |
 | `.deadline_ms(n)` | Set deadline in milliseconds (implies `.rt()`) |
 | `.tier(tier)` | Set explicit execution tier |
 | `.failure_policy(policy)` | Override failure handling policy |
 | `.done()` | Finalize and register the node |
+
+**Execution Classes:**
+
+| Class | Method | Thread Model | Use Case |
+|-------|--------|-------------|----------|
+| Real-time | `.rt()` | Pinned thread, SCHED_FIFO | Safety monitors, motor control |
+| Compute | `.compute()` | Thread pool | Path planning, ML inference |
+| Event-driven | `.on("topic")` | Wakes on topic publish | Data-driven processing |
+| Async I/O | `.async_io()` | Tokio runtime | Network, disk, cloud APIs |
+
+If no execution class is specified, the node runs in the default scheduler loop (inline, sequential).
 
 **NodeTier Options:**
 - `NodeTier::UltraFast` - Ultra-fast (&lt;1us), inline execution
@@ -705,6 +692,9 @@ use horus::prelude::*;
 
 scheduler.add(safety_monitor).order(0).rt().wcet_us(100).done();
 scheduler.add(motor_ctrl).order(5).rt().wcet_us(500).done();
+scheduler.add(path_planner).order(10).compute().done();
+scheduler.add(data_processor).order(20).on("sensor_data").done();
+scheduler.add(cloud_uploader).order(100).async_io().rate_hz(1.0).done();
 scheduler.add(sensor).order(50).rate_hz(1000.0).done();
 scheduler.add(logger).order(200).done();
 ```
@@ -846,12 +836,22 @@ use horus::prelude::*;
 use std::time::Duration;
 
 fn main() -> Result<()> {
-    let mut scheduler = Scheduler::deploy();
+    // Configure for production: RT scheduling + flight recorder
+    let config = SchedulerConfig {
+        enable_rt: true,
+        enable_blackbox: true,
+        ..Default::default()
+    };
 
-    // Add nodes with priorities using fluent API
+    let mut scheduler = Scheduler::new()
+        .with_config(config);
+
+    // Add nodes with execution classes using fluent API
     scheduler.add(EmergencyStop::new()?).order(0).rt().done();
     scheduler.add(MotorController::new()?).order(5).rt().wcet_us(500).done();
+    scheduler.add(PathPlanner::new()?).order(10).compute().done();
     scheduler.add(SensorReader::new()?).order(50).rate_hz(1000.0).done();
+    scheduler.add(CloudSync::new()?).order(100).async_io().rate_hz(1.0).done();
     scheduler.add(DataLogger::new()?).order(200).rate_hz(10.0).done();
 
     // Run for 60 seconds

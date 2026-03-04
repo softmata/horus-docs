@@ -1,126 +1,84 @@
 ---
 title: "Scheduler Configuration"
-description: "Scheduler presets and node configuration for real-time, safety-critical, and high-performance robotics"
+description: "Configuring the HORUS scheduler with the fluent node builder API, execution classes, and per-node settings"
 weight: 40
 ---
 
 # Scheduler Configuration
 
-HORUS provides preset schedulers optimized for different robotics scenarios. Pick a preset, add your nodes, and run.
+HORUS uses a single scheduler entry point — `Scheduler::new()` — with a fluent node builder API that gives you full control over execution class, timing, ordering, and failure handling on a per-node basis.
 
-## Scheduler Presets
+## Creating a Scheduler
 
-### Standard (`Scheduler::new()`)
-
-```rust
-use horus::prelude::*;
-
-let scheduler = Scheduler::new();
-```
-
-- **Execution**: Sequential
-- **Tick Rate**: 60 Hz
-- **Fault Tolerance**: Circuit breaker (5 failures, 3 recovery, 5s timeout)
-- **Per-Node Rates**: Enabled
-- **Profiling**: Enabled
-- **Best for**: Most robotics applications, general purpose
-
-### Deploy (`Scheduler::deploy()`)
-
-```rust
-let scheduler = Scheduler::deploy();
-```
-
-- **Execution**: Sequential
-- **Tick Rate**: 60 Hz
-- **Features**: Deadline monitoring, 16MB black box, profiling
-- **Best for**: Production deployments
-
-### Safety-Critical
-
-```rust
-let scheduler = Scheduler::safety_critical();
-```
-
-- **Execution**: Sequential
-- **Tick Rate**: 1000 Hz (1kHz)
-- **Real-Time**: WCET enforcement, deadline monitoring, watchdogs (100ms), safety monitor, memory locking, SCHED_FIFO
-- **Deadline Misses**: 0 (emergency stop on first miss)
-- **Recording**: Full recording, 1GB black box
-- **CPU**: Pinned to cores 0-1, NUMA-aware
-
-**Best for**: Medical devices, surgical robots, safety-critical systems
-
-### High-Performance
-
-```rust
-let scheduler = Scheduler::high_performance();
-```
-
-- **Execution**: Parallel
-- **Tick Rate**: 10,000 Hz (10kHz)
-- **Real-Time**: WCET enforcement, deadline monitoring, memory locking, SCHED_FIFO
-- **Deadline Misses**: 10 (tolerates some misses for throughput)
-- **Fault Tolerance**: Circuit breaker (3 failures, 100ms timeout)
-- **NUMA**: Aware
-
-**Best for**: Racing robots, competition, high-speed control
-
-### Hard Real-Time
-
-```rust
-let scheduler = Scheduler::hard_realtime();
-```
-
-- **Execution**: Parallel
-- **Tick Rate**: 1000 Hz
-- **Real-Time**: WCET enforcement, deadline monitoring, watchdogs (10ms), safety monitor, memory locking, SCHED_FIFO
-- **Deadline Misses**: 3 (strict but allows brief transients)
-- **Fault Tolerance**: Circuit breaker (3 failures)
-- **Recording**: Minimal recording, 100MB black box
-
-**Best for**: CNC machines, surgical robots, aerospace
-
-### Deterministic
-
-```rust
-let scheduler = Scheduler::deterministic();
-```
-
-- **Execution**: Sequential
-- **Tick Rate**: 1000 Hz
-- **Deterministic**: Virtual time, seeded RNG (seed=42), execution trace recording
-- **Recording**: Full recording enabled
-- **Black Box**: 100MB flight recorder
-- **Best for**: Testing, replay, simulation, safety certification
-
-## Adding Nodes
-
-Use the fluent API to configure nodes when adding them to the scheduler:
+Every scheduler starts with `Scheduler::new()`. From there you can optionally set global parameters with builder methods before adding nodes:
 
 ```rust
 use horus::prelude::*;
 
 fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
+    let mut scheduler = Scheduler::new()
+        .tick_hz(1000.0)          // Global tick rate (default: 60 Hz)
+        .with_capacity(32)        // Pre-allocate for 32 nodes
+        .with_name("arm_control");// Name for logging/profiling
 
-    // Simple node with priority
-    scheduler.add(SensorNode::new("lidar"))
+    // ... add nodes ...
+
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+### Builder Methods
+
+| Method | Description | Default |
+|--------|-------------|---------|
+| `.tick_hz(hz)` | Global scheduler tick rate in Hz | `60.0` |
+| `.with_capacity(n)` | Pre-allocate node storage | `16` |
+| `.with_name(name)` | Human-readable scheduler name | `"default"` |
+
+## Adding Nodes
+
+Add nodes with `scheduler.node(n)`, then chain configuration calls, and finalize with `.done()`:
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .tick_hz(1000.0);
+
+    // Real-time motor control — runs first every tick
+    scheduler.node(MotorController::new("arm"))
+        .order(0)
+        .rt()
+        .wcet_us(200)
+        .deadline_ms(1)
+        .done();
+
+    // Sensor node — high priority, custom rate
+    scheduler.node(LidarDriver::new("/dev/lidar0"))
         .order(10)
+        .rt()
+        .rate_hz(500.0)
         .done();
 
-    // Real-time node with WCET and deadline
-    scheduler.add(MotorController::new("arm"))
-        .order(0)           // Highest priority
-        .rt()               // Mark as real-time
-        .wcet_us(200)       // 200μs max execution
-        .deadline_ms(1)     // 1ms deadline
+    // Compute-heavy planning — runs on a worker thread
+    scheduler.node(PathPlanner::new())
+        .order(50)
+        .compute()
         .done();
 
-    // Node with custom rate
-    scheduler.add(TelemetryNode::new())
-        .order(200)         // Low priority
-        .rate_hz(10.0)      // 10Hz (slower than scheduler)
+    // Event-driven node — wakes only when the topic has new data
+    scheduler.node(CollisionChecker::new())
+        .on("lidar/points")
+        .deadline_ms(5)
+        .done();
+
+    // Async I/O — network or disk, never blocks the real-time loop
+    scheduler.node(TelemetryUploader::new())
+        .order(200)
+        .async_io()
+        .rate_hz(10.0)
         .done();
 
     scheduler.run()?;
@@ -128,27 +86,84 @@ fn main() -> Result<()> {
 }
 ```
 
-### Node Builder Methods
+## Execution Classes
+
+Every node belongs to exactly one execution class. Set it in the builder chain:
+
+| Method | Class | Description |
+|--------|-------|-------------|
+| `.rt()` | Real-Time | Runs in the scheduler's RT loop. Use for control, safety, and sensors. |
+| `.compute()` | Compute | Offloaded to a worker thread pool. Use for planning, SLAM, or ML inference. |
+| `.on(topic)` | Event-Driven | Wakes only when the named topic receives new data. |
+| `.async_io()` | Async I/O | Runs on an async executor. Use for network, disk, or cloud calls. |
+
+If no execution class is specified, the node defaults to the RT class.
+
+### When to Use Each Class
+
+- **`.rt()`** — Motor controllers, safety monitors, sensor fusion, anything that must run every tick with bounded latency.
+- **`.compute()`** — Path planning, point cloud processing, ML inference. These can take longer than a single tick without blocking RT nodes.
+- **`.on(topic)`** — Collision detection, event handlers, reactive behaviors. Only runs when there is new data, saving CPU when idle.
+- **`.async_io()`** — Telemetry upload, log shipping, cloud API calls. Never blocks any real-time or compute work.
+
+## Per-Node Configuration
+
+### Ordering and Timing
 
 | Method | Description |
 |--------|-------------|
-| `.order(n)` | Execution priority (lower = higher priority) |
-| `.rt()` | Mark as real-time node |
-| `.rate_hz(hz)` | Node-specific tick rate |
-| `.wcet_us(us)` | WCET budget in microseconds |
-| `.deadline_us(us)` | Deadline in microseconds |
-| `.deadline_ms(ms)` | Deadline in milliseconds |
-| `.tier(NodeTier)` | Explicit execution tier |
+| `.order(n)` | Execution priority within a tick (lower = runs first) |
+| `.rate_hz(hz)` | Node-specific tick rate, independent of the global rate |
+| `.wcet_us(us)` | Worst-Case Execution Time budget in microseconds |
+| `.deadline_ms(ms)` | Deadline in milliseconds from tick start |
+| `.deadline_us(us)` | Deadline in microseconds from tick start |
+
+### Tier and Failure Policy
+
+| Method | Description |
+|--------|-------------|
+| `.tier(NodeTier)` | Explicit execution tier (`Critical`, `Standard`, `BestEffort`) |
 | `.failure_policy(policy)` | Per-node failure handling (see [Circuit Breaker](/advanced/circuit-breaker)) |
 | `.done()` | Finalize and register the node |
 
-### Priority Guidelines
+### Order Guidelines
 
 - **0-9**: Critical real-time (motor control, safety)
 - **10-49**: High priority (sensors, fast control loops)
 - **50-99**: Normal priority (processing, planning)
 - **100-199**: Low priority (logging, diagnostics)
 - **200+**: Background (telemetry, non-essential)
+
+## Global Configuration with `SchedulerConfig`
+
+For complex setups or configuration-file-driven deployments, use `SchedulerConfig`:
+
+```rust
+use horus::prelude::*;
+
+let config = SchedulerConfig {
+    tick_hz: 1000.0,
+    enable_profiling: true,
+    enable_deadline_monitoring: true,
+    memory_lock: true,
+    black_box_size_mb: 64,
+    circuit_breaker: Some(CircuitBreakerConfig {
+        max_failures: 5,
+        recovery_attempts: 3,
+        timeout_secs: 5,
+    }),
+    ..Default::default()
+};
+
+// Option 1: Create scheduler from config
+let mut scheduler = Scheduler::from_config(config);
+
+// Option 2: Apply config to an existing scheduler
+let mut scheduler = Scheduler::new();
+scheduler.apply_config(config);
+```
+
+This is useful when loading settings from a TOML/YAML file at startup, or when you need to toggle features like memory locking or black-box recording without changing node code.
 
 ## OS Priority
 
@@ -159,38 +174,45 @@ let scheduler = Scheduler::new();
 scheduler.set_os_priority(50)?;  // Set SCHED_FIFO priority 1-99
 ```
 
-Note: Requires root/CAP_SYS_NICE capability on Linux.
-
-## Preset Comparison
-
-| Setting | new() | deploy() | safety_critical() | high_performance() | hard_realtime() | deterministic() |
-|---------|-------|----------|-------------------|-------------------|----------------|----------------|
-| Execution | Sequential | Sequential | Sequential | Parallel | Parallel | Sequential |
-| Tick Rate | 60 Hz | 60 Hz | 1 kHz | 10 kHz | 1 kHz | 1 kHz |
-| WCET Enforce | No | No | Yes | Yes | Yes | No |
-| Deadline Monitor | No | Yes | Yes | Yes | Yes | Yes |
-| Watchdog | No | No | Yes (100ms) | No | Yes (10ms) | No |
-| Safety Monitor | No | No | Yes | No | Yes | No |
-| Circuit Breaker | Yes | Yes | No | Yes | Yes | No |
-| Memory Lock | No | No | Yes | Yes | Yes | No |
-| Black Box | No | 16 MB | 1 GB | No | 100 MB | 100 MB |
-| Recording | No | No | Full | No | Minimal | Full |
+Note: Requires root or `CAP_SYS_NICE` capability on Linux.
 
 ## Python API
+
+The Python API mirrors the Rust fluent builder:
 
 ```python
 from horus import Scheduler
 
-# Presets
-scheduler = Scheduler()                     # Default (1kHz)
-scheduler = Scheduler.deploy()              # Production
-scheduler = Scheduler.safety_critical()     # Medical/surgical
-scheduler = Scheduler.high_performance()    # Racing/competition
-scheduler = Scheduler.hard_realtime()       # Hard RT
-scheduler = Scheduler.deterministic()       # Testing/replay
+# Create scheduler with global settings
+scheduler = Scheduler(tick_hz=1000.0, name="arm_control")
 
-# Custom via kwargs (override individual fields)
-scheduler = Scheduler(tick_rate=500.0, circuit_breaker=True)
+# Real-time motor controller
+scheduler.node(motor_ctrl).order(0).rt().wcet_us(200).deadline_ms(1).done()
+
+# Sensor with custom rate
+scheduler.node(lidar).order(10).rt().rate_hz(500.0).done()
+
+# Compute node
+scheduler.node(planner).order(50).compute().done()
+
+# Event-driven node
+scheduler.node(collision).on("lidar/points").deadline_ms(5).done()
+
+# Async I/O node
+scheduler.node(telemetry).order(200).async_io().rate_hz(10.0).done()
+
+scheduler.run()
+```
+
+You can also pass a config dict for global settings:
+
+```python
+scheduler = Scheduler(config={
+    "tick_hz": 1000.0,
+    "enable_profiling": True,
+    "memory_lock": True,
+    "black_box_size_mb": 64,
+})
 ```
 
 ## See Also
