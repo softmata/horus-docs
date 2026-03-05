@@ -12,13 +12,7 @@ You don't need a separate API. The same `Topic::new()` call automatically select
 
 ## How Auto-Detection Works
 
-At topic creation time, HORUS checks:
-
-```rust
-fn is_pod<T>() -> bool {
-    !std::mem::needs_drop::<T>() && std::mem::size_of::<T>() > 0
-}
-```
+At topic creation time, HORUS checks whether your type is POD:
 
 - **No destructor** — The type has no `Drop` impl (no heap pointers like `String`, `Vec`, `Box`)
 - **Non-zero size** — Not a zero-sized type
@@ -39,17 +33,14 @@ log_topic.send("Motor started".to_string());
 
 ## Performance Impact
 
-POD detection affects which cross-process backend is selected:
+POD detection affects cross-process performance:
 
-| Backend | POD Required | Latency | Use Case |
-|---------|-------------|---------|----------|
-| PodShm | Yes | ~50ns | Broadcast to multiple consumers |
-| MpscShm | Yes | ~65ns | Many producers, one consumer |
-| SpmcShm | Yes | ~70ns | One producer, many consumers |
-| SpscShm | Yes | ~85ns | Point-to-point |
-| MpmcShm | No | ~167ns | Many-to-many (non-POD fallback) |
+| Type | Cross-Process Latency | Notes |
+|------|----------------------|-------|
+| POD (e.g. `CmdVel`, `Imu`) | ~50-85ns | Zero-serialization, raw memory copy |
+| Non-POD (e.g. `String`, `Vec`) | ~167ns | Bincode serialization |
 
-Same-process backends (DirectChannel, SpscIntra, MpmcIntra) handle both POD and non-POD types efficiently since no shared memory serialization is needed.
+Same-process communication is fast for both POD and non-POD types since no shared memory serialization is needed.
 
 ## Built-in POD Messages
 
@@ -201,10 +192,10 @@ feedback.send(MotorFeedback {
 
 The `PodMessage` trait is `unsafe` because incorrect implementations can cause data corruption. Ensure:
 
-- **No implicit padding** — All struct fields should pack naturally without gaps, or use explicit padding fields (`_pad: [u8; N]`)
 - **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`, `bool`) and fixed-size arrays of primitives
 - **No enums with discriminants** — Unless `#[repr(C)]` or `#[repr(u8)]` with explicit values
 - **Consistent layout** — The struct must have the same binary layout on all target platforms
+- **No implicit padding** — Use explicit padding fields (`_pad: [u8; N]`) if needed
 
 ## When Types Are Not POD
 
@@ -218,18 +209,6 @@ Topic<HashMap<K,V>>  // HashMap has Drop
 ```
 
 Non-POD types use bincode serialization through shared memory. This is still fast (~167ns cross-process) but ~3x slower than the POD path. For most applications, this difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
-
-## Cache-Line Optimization
-
-For POD types that are small enough (type size + 8 bytes &le; 64 bytes), HORUS uses a **co-located layout** where the sequence number and message data share the same CPU cache line:
-
-```
-[ sequence (8 bytes) | message data | padding ] = 64 bytes (one cache line)
-```
-
-This reduces inter-core cache transfers from 2 to 1 when reading messages, providing an additional performance boost for small POD messages like `CmdVel` (16 bytes), `Pose2D` (32 bytes), and `Twist` (56 bytes).
-
-Larger POD types still use the zero-copy memcpy path but with separate cache lines for the sequence number and data.
 
 ## See Also
 

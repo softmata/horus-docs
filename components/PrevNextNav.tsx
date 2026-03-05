@@ -33,7 +33,6 @@ const allPages: DocLink[] = [
   { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic" },
   { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic" },
   { title: "Communication Transport", href: "/concepts/communication-transport" },
-  { title: "Local (Shared Memory)", href: "/concepts/core-concepts-shared-memory" },
   { title: "Network", href: "/concepts/network-communication" },
   { title: "Configuration", href: "/concepts/communication-configuration" },
   { title: "Scheduler", href: "/concepts/core-concepts-scheduler" },

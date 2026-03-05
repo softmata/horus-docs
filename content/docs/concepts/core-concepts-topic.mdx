@@ -189,7 +189,7 @@ For multi-machine communication, HORUS supports zero-configuration peer discover
 
 ## API Reference
 
-> **Note**: HORUS uses a [zero-overhead IPC architecture](/concepts/zero-overhead-ipc) where introspection is separated from the hot path. The `send()` and `recv()` methods have zero logging overhead by default.
+> **Note**: HORUS separates introspection from the hot path. The `send()` and `recv()` methods have zero logging overhead by default.
 
 ### send()
 
@@ -286,7 +286,7 @@ When debug logging is active, every `send()` and `recv()` records timing and mes
 horus monitor --tui    # Open TUI, navigate to Topics tab, press Enter on a topic
 ```
 
-See [Zero-Overhead IPC Architecture](/concepts/zero-overhead-ipc) for details on the logging architecture.
+Debug logging adds no overhead when disabled — introspection is fully separated from the hot path.
 
 ### with_capacity()
 
@@ -662,35 +662,76 @@ impl Node for FilteringSubscriber {
 
 ## Shared Memory Details
 
-### Location
+### Storage Location
 
-Topic stores data in `/dev/shm` (Linux shared memory):
+HORUS stores shared memory in platform-specific directories:
 
-```bash
-# View HORUS shared memory segments
-ls -lh /dev/shm/horus_*
-```
-
-### Size Limitations
-
-Shared memory has finite space. Check available space:
+| Platform | Path | Notes |
+|----------|------|-------|
+| Linux | `/dev/shm/horus/` | tmpfs (RAM-backed), fastest |
+| macOS | `/tmp/horus/` | Uses temp directory |
+| Windows | `%TEMP%\horus\` | Uses temp directory |
 
 ```bash
-df -h /dev/shm
+# View HORUS shared memory segments (Linux)
+ls -lh /dev/shm/horus/topics/
 ```
 
-Typical default: 50% of RAM or 32MB-2GB depending on system.
+### Memory Usage Per Topic
+
+By default, `Topic::new()` auto-sizes capacity based on message type size:
+
+| Message Type | Auto Capacity | Approximate Memory |
+|--------------|---------------|--------------------|
+| `f32` (4 bytes) | 1024 slots | ~73 KB |
+| `CmdVel` (16 bytes) | 256 slots | ~19 KB |
+| `Pose2D` (32 bytes) | 128 slots | ~10 KB |
+| `Twist` (56 bytes) | 73 slots | ~6 KB |
+| `Imu` (~300 bytes) | 16 slots | ~129 KB |
+
+For most robotics applications, memory usage per topic is under 1 MB.
 
 ### Cleaning Up
 
-Remove stale shared memory segments:
+Shared memory files persist after processes exit (by design — allows new processes to join existing topics). Clean up between sessions:
 
 ```bash
-# Remove all HORUS shared memory
-rm -f /dev/shm/horus_*
+# Clean shared memory only (recommended)
+horus clean --shm
+
+# Preview what would be cleaned
+horus clean --shm --dry-run
+
+# Clean everything (shared memory + build cache)
+horus clean --all
 ```
 
-HORUS automatically cleans up when nodes shut down gracefully (Ctrl+C).
+HORUS also performs automatic stale-topic cleanup — files with no active process are removed automatically.
+
+### Troubleshooting
+
+**"No space left on device"** — Shared memory directory is full:
+
+```bash
+df -h /dev/shm              # Check usage (Linux)
+horus clean --shm            # Clean up
+sudo mount -o remount,size=4G /dev/shm   # Increase if needed
+```
+
+**"Permission denied"**:
+
+```bash
+ls -la /dev/shm/horus/       # Check permissions
+chmod 755 /dev/shm/horus/    # Fix if needed
+```
+
+**Type mismatch** — Ensure publisher and subscriber use the exact same type for a topic name:
+
+```rust
+// Both sides MUST use the same type
+let pub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+let sub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+```
 
 ## Performance
 
@@ -761,6 +802,5 @@ self.pub_topic.send(data);
 ## Next Steps
 
 - Learn about the [Scheduler](/concepts/core-concepts-scheduler) for orchestrating nodes
-- Understand [Shared Memory](/concepts/core-concepts-shared-memory) internals
 - Explore [Message Types](/concepts/message-types) for standard robotics messages
 - Read the [API Reference](/rust/api) for complete Topic documentation
