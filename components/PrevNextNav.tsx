@@ -34,14 +34,12 @@ const allPages: DocLink[] = [
   { title: "Scheduler", href: "/concepts/core-concepts-scheduler" },
   { title: "node! Macro", href: "/concepts/node-macro" },
   { title: "Message Types", href: "/concepts/message-types" },
-  { title: "Real-Time Nodes", href: "/concepts/realtime-nodes" },
   { title: "HFrame Transforms", href: "/concepts/hframe" },
   { title: "Multi-Language", href: "/concepts/multi-language" },
 
   // Rust
   { title: "Rust Overview", href: "/rust" },
   { title: "API Reference", href: "/rust/api" },
-  { title: "horus_core", href: "/rust/api/core" },
   { title: "horus_macros", href: "/rust/api/macros" },
   { title: "TensorPool", href: "/rust/api/tensor-pool" },
   { title: "Tensor Messages", href: "/rust/api/tensor-messages" },
@@ -80,14 +78,12 @@ const allPages: DocLink[] = [
   // Advanced Topics
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },
   { title: "Execution Modes", href: "/advanced/execution-modes" },
-  { title: "Deterministic Execution", href: "/advanced/deterministic-execution" },
   { title: "Network Backends", href: "/advanced/network-backends" },
   { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence" },
   { title: "BlackBox Recorder", href: "/advanced/blackbox" },
-  { title: "Circuit Breaker", href: "/advanced/circuit-breaker" },
+  { title: "Fault Tolerance", href: "/advanced/circuit-breaker" },
   { title: "Safety Monitor", href: "/advanced/safety-monitor" },
   { title: "Record & Replay", href: "/advanced/record-replay" },
-  { title: "Real-Time Configuration", href: "/advanced/rt-config" },
 
   // Plugins
   { title: "Plugins Overview", href: "/plugins" },

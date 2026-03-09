@@ -48,7 +48,6 @@ const segmentLabels: Record<string, string> = {
   "network-communication": "Network",
   "node-macro": "node! Macro",
   "message-types": "Message Types",
-  "realtime-nodes": "Real-Time Nodes",
 
   // Development
   "cli-reference": "CLI Reference",

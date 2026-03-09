@@ -52,7 +52,6 @@ const sections: SidebarSection[] = [
       { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 5 },
       { title: "node! Macro", href: "/concepts/node-macro", order: 6 },
       { title: "Message Types", href: "/concepts/message-types", order: 7 },
-      { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 9 },
       { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
       { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
     ],
@@ -67,7 +66,6 @@ const sections: SidebarSection[] = [
         order: 1,
         children: [
           { title: "Overview", href: "/rust/api", order: 0 },
-          { title: "horus_core", href: "/rust/api/core", order: 1 },
           { title: "horus_macros", href: "/rust/api/macros", order: 2 },
           { title: "TensorPool", href: "/rust/api/tensor-pool", order: 3 },
           { title: "Tensor Messages", href: "/rust/api/tensor-messages", order: 4 },
@@ -146,14 +144,12 @@ const sections: SidebarSection[] = [
     links: [
       { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
       { title: "Execution Modes", href: "/advanced/execution-modes", order: 2 },
-      { title: "Deterministic Execution", href: "/advanced/deterministic-execution", order: 3 },
       { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
       { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence", order: 6 },
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
-      { title: "Circuit Breaker", href: "/advanced/circuit-breaker", order: 9 },
+      { title: "Fault Tolerance", href: "/advanced/circuit-breaker", order: 9 },
       { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },
       { title: "Record & Replay", href: "/advanced/record-replay", order: 12 },
-      { title: "Real-Time Configuration", href: "/advanced/rt-config", order: 13 },
     ],
   },
   {

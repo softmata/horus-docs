@@ -142,12 +142,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.65,
     },
     {
-      url: `${baseUrl}/advanced/deterministic-execution`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.6,
-    },
-    {
       url: `${baseUrl}/advanced/custom-nodes`,
       lastModified: new Date(),
       changeFrequency: 'monthly',
@@ -160,12 +154,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
       lastModified: new Date(),
       changeFrequency: 'monthly',
       priority: 0.6,
-    },
-    {
-      url: `${baseUrl}/api/core`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.55,
     },
   ]
 }
