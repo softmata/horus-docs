@@ -15,7 +15,7 @@ The TensorPool system consists of:
 - **TensorPool** - CPU tensor allocation via shared memory
 - **CudaTensorPool** - GPU tensor allocation with CUDA IPC support
 - **TensorHandle** - RAII wrapper for automatic memory management
-- **HorusTensor** - 168-byte Pod tensor descriptor (metadata only)
+- **Tensor** - 168-byte Pod tensor descriptor (metadata only)
 - **Device** - Pod-safe device location (`Device::cpu()`, `Device::cuda(N)`)
 
 For most users, the high-level domain types (`Image`, `PointCloud`, `DepthImage`) are the recommended API — they handle pool management automatically. `TensorPool` and `TensorHandle` are internal types for advanced use cases.
@@ -51,18 +51,18 @@ See [Basic Examples — Camera Image Pipeline](/rust/examples/basic-examples#6-c
 
 ## Auto-Managed Pools (Advanced)
 
-The simplest way to use tensor pools is through `Topic<HorusTensor>`, which auto-manages a pool per topic:
+The simplest way to use tensor pools is through `Topic<Tensor>`, which auto-manages a pool per topic:
 
 ```rust
 use horus::prelude::*;
 
-let topic: Topic<HorusTensor> = Topic::new("camera.rgb")?;
+let topic: Topic<Tensor> = Topic::new("camera.rgb")?;
 
 // Allocate from the topic's auto-managed pool
 let handle = topic.alloc_tensor(&[1080, 1920, 3], TensorDtype::U8, Device::cpu())?;
 
 // Write pixel data
-let pixels = handle.data_slice_mut();
+let pixels = handle.data_slice_mut()?;
 // ... fill pixels ...
 
 // Send — only the 168-byte descriptor goes through the ring buffer
@@ -71,16 +71,16 @@ topic.send_handle(&handle);
 
 ```rust
 // Receiver side
-let topic: Topic<HorusTensor> = Topic::new("camera.rgb")?;
+let topic: Topic<Tensor> = Topic::new("camera.rgb")?;
 
 if let Some(handle) = topic.recv_handle() {
-    let data = handle.data_slice();  // Zero-copy access
+    let data = handle.data_slice()?;  // Zero-copy access
     println!("Shape: {:?}, Dtype: {:?}", handle.shape(), handle.dtype());
 }
 // Refcount decremented automatically on drop
 ```
 
-The pool is created lazily on first use and shared across all `Topic<HorusTensor>` instances with the same name — even across processes. Pool IDs are derived deterministically from the topic name using FNV-1a hashing.
+The pool is created lazily on first use and shared across all `Topic<Tensor>` instances with the same name — even across processes. Pool IDs are derived deterministically from the topic name using FNV-1a hashing.
 
 ## Manual CPU TensorPool
 
@@ -125,10 +125,10 @@ let handle = TensorHandle::alloc(
 )?;
 
 // Access data
-let data: &mut [u8] = handle.data_slice_mut();
+let data: &mut [u8] = handle.data_slice_mut()?;
 
 // Get tensor descriptor (for sending through Topic)
-let tensor: &HorusTensor = handle.tensor();
+let tensor: &Tensor = handle.tensor();
 
 // Clone increases refcount automatically
 let handle2 = handle.clone();
@@ -159,7 +159,7 @@ let handle2 = handle.clone();
 |-------|------|---------|-------------|
 | `pool_size` | `usize` | 1GB | Total pool size in bytes |
 | `max_slots` | `usize` | 1024 | Maximum concurrent tensors |
-| `slot_alignment` | `usize` | 64 | Memory alignment (cache-line) |
+| `slot_alignment` | `usize` | 64 | Memory alignment in bytes |
 
 **Presets:** `TensorPoolConfig::small()` (64MB, 256 slots), `TensorPoolConfig::large()` (4GB, 4096 slots).
 
@@ -172,69 +172,31 @@ println!("Pool: {}/{} slots used, {}/{} bytes",
     stats.used_bytes, stats.pool_size);
 ```
 
-## GPU TensorPool (CUDA)
+## GPU Support (CUDA)
 
-Enable with the `cuda` feature flag:
-
-```bash
-horus run --enable cuda
-```
-
-### Creating a GPU Pool
+HORUS includes CUDA availability detection via `cuda_available()` and `cuda_device_count()`. Tensors can target GPU devices using `Device::cuda(N)`:
 
 ```rust
 use horus::prelude::*;
 
+// Check CUDA availability
 if cuda_available() {
-    // Create pool on device 0
-    let pool = CudaTensorPool::new(1, 0, CudaTensorPoolConfig::default())?;
-
-    // Or open existing pool (for consumer processes)
-    let pool = CudaTensorPool::open(1, 0)?;
+    println!("CUDA devices: {}", cuda_device_count());
 }
+
+// Create a tensor descriptor targeting GPU
+let mut tensor = Tensor::default();
+tensor.set_device(Device::cuda(0));
 ```
 
-### GPU Tensor Allocation
+GPU tensor pool management is exposed to Python via `horus.cuda_is_available()` and the `horus.ai` module. See the Python API docs for details.
+
+## Tensor Descriptor
+
+`Tensor` is a 168-byte `Pod` descriptor that acts as a lightweight handle to tensor data in shared memory. Only the descriptor travels through the ring buffer — the actual data stays in-place.
 
 ```rust
-use horus::prelude::*;
-
-// Allocate GPU tensor (returns CudaTensor, not HorusTensor)
-let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::F32)?;
-
-// Get device pointer for CUDA kernels
-let gpu_ptr = pool.device_ptr(&tensor);
-
-// Get IPC handle for cross-process sharing (64 bytes)
-let ipc_handle = tensor.ipc_handle_bytes();
-
-// Release when done
-pool.release(&tensor)?;
-```
-
-### Cross-Process GPU Sharing
-
-```rust
-// Process A (producer): Create tensor and get IPC handle
-let tensor = pool.alloc(&[1080, 1920, 3], TensorDtype::F32)?;
-let ipc_handle = tensor.ipc_handle_bytes(); // 64 bytes
-// Send ipc_handle to Process B via Topic...
-
-// Process B (consumer): Import GPU memory
-let pool = CudaTensorPool::open(1, 0)?;
-let (gpu_ptr, tensor) = pool.import_ipc(ipc_handle, &[1080, 1920, 3], TensorDtype::F32)?;
-// gpu_ptr points to SAME GPU memory - zero copy!
-
-// When done
-pool.close_ipc(gpu_ptr)?;
-```
-
-## HorusTensor Descriptor
-
-`HorusTensor` is a 168-byte `Pod` descriptor that acts as a lightweight handle to tensor data in shared memory. Only the descriptor travels through the ring buffer — the actual data stays in-place.
-
-```rust
-// Key methods on HorusTensor:
+// Key methods on Tensor:
 let shape = tensor.shape();         // &[u64] - dimensions
 let dtype = tensor.dtype();         // TensorDtype
 let dev = tensor.device();          // Device (cpu or cuda)
@@ -306,7 +268,7 @@ For a 1080p RGB f32 tensor (~24MB):
 
 ## Best Practices
 
-1. **Use auto-managed pools**: Prefer `Topic<HorusTensor>` with `alloc_tensor()`/`send_handle()`/`recv_handle()` — the framework handles pool lifecycle
+1. **Use auto-managed pools**: Prefer `Topic<Tensor>` with `alloc_tensor()`/`send_handle()`/`recv_handle()` — the framework handles pool lifecycle
 2. **Wrap in Arc**: When using manual pools, TensorPool doesn't implement Clone — use `Arc<TensorPool>` for sharing
 3. **Reuse pools**: Create pools once at startup, not per-tensor
 4. **Use TensorHandle**: Prefer `TensorHandle` over manual `retain`/`release` for automatic refcounting
@@ -316,5 +278,5 @@ For a 1080p RGB f32 tensor (~24MB):
 
 ## See Also
 
-- [Tensor Messages](/rust/api/tensor-messages) - HorusTensor, TensorDtype, Device types and domain wrappers
+- [Tensor Messages](/rust/api/tensor-messages) - Tensor, TensorDtype, Device types and domain wrappers
 - [Topic & Shared Memory](/concepts/core-concepts-topic#shared-memory-details) - How HORUS achieves zero-copy IPC

@@ -119,7 +119,7 @@ const sections: SidebarSection[] = [
       },
       {
         title: "Library",
-        href: "/python/library",
+        href: "/python/library/python-message-library",
         order: 2,
         children: [
           { title: "Message Library", href: "/python/library/python-message-library", order: 1 },

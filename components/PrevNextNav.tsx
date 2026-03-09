@@ -14,7 +14,6 @@ const allPages: DocLink[] = [
   // Getting Started
   { title: "What is HORUS?", href: "/concepts/what-is-horus" },
   { title: "Goals & Vision", href: "/concepts/goals" },
-  { title: "Complete Beginner's Guide", href: "/getting-started/complete-beginners-guide" },
   { title: "Installation", href: "/getting-started/installation" },
   { title: "Quick Start", href: "/getting-started/quick-start" },
   { title: "Choosing a Language", href: "/getting-started/choosing-language" },
@@ -22,19 +21,16 @@ const allPages: DocLink[] = [
   { title: "Architecture", href: "/concepts/architecture" },
   { title: "Common Mistakes", href: "/getting-started/common-mistakes" },
   { title: "Troubleshooting", href: "/troubleshooting" },
-  { title: "Runtime Errors", href: "/troubleshooting-runtime" },
-  { title: "Advanced Examples", href: "/advanced-examples" },
+  { title: "Advanced Examples", href: "/rust/examples/advanced-examples" },
 
   // Core Concepts
   { title: "Overview", href: "/concepts" },
-  { title: "Core Architecture", href: "/concepts/core" },
   { title: "Nodes", href: "/concepts/core-concepts-nodes" },
   { title: "Communication Patterns", href: "/concepts/communication-overview" },
   { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic" },
   { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic" },
-  { title: "Communication Transport", href: "/concepts/communication-transport" },
-  { title: "Network", href: "/concepts/network-communication" },
-  { title: "Configuration", href: "/concepts/communication-configuration" },
+  { title: "Services (Beta)", href: "/concepts/services" },
+  { title: "Actions (Beta)", href: "/concepts/actions" },
   { title: "Scheduler", href: "/concepts/core-concepts-scheduler" },
   { title: "node! Macro", href: "/concepts/node-macro" },
   { title: "Message Types", href: "/concepts/message-types" },
@@ -49,13 +45,11 @@ const allPages: DocLink[] = [
   { title: "horus_macros", href: "/rust/api/macros" },
   { title: "TensorPool", href: "/rust/api/tensor-pool" },
   { title: "Tensor Messages", href: "/rust/api/tensor-messages" },
-  { title: "Hardware Discovery", href: "/rust/api/hardware" },
   { title: "Messages Overview", href: "/rust/api/messages" },
   { title: "Control Messages", href: "/rust/api/control-messages" },
   { title: "Diagnostics Messages", href: "/rust/api/diagnostics-messages" },
   { title: "Force Messages", href: "/rust/api/force-messages" },
   { title: "Geometry Messages", href: "/rust/api/geometry-messages" },
-
   { title: "ML Messages", href: "/rust/api/ml-messages" },
   { title: "Navigation Messages", href: "/rust/api/navigation-messages" },
   { title: "Perception Messages", href: "/rust/api/perception-messages" },
@@ -63,7 +57,6 @@ const allPages: DocLink[] = [
   { title: "Vision Messages", href: "/rust/api/vision-messages" },
   { title: "Rust Examples", href: "/rust/examples" },
   { title: "Basic Examples", href: "/rust/examples/basic-examples" },
-  { title: "Advanced Examples", href: "/rust/examples/advanced-examples" },
 
   // Python
   { title: "Python Overview", href: "/python" },
@@ -71,24 +64,18 @@ const allPages: DocLink[] = [
   { title: "Python Bindings", href: "/python/api/python-bindings" },
   { title: "Async Nodes", href: "/python/api/async-nodes" },
   { title: "Custom Messages", href: "/python/api/custom-messages" },
-  { title: "Python Library", href: "/python/library" },
   { title: "Message Library", href: "/python/library/python-message-library" },
-  { title: "Hardware Nodes", href: "/python/library/python-hardware-nodes" },
   { title: "ML Utilities", href: "/python/library/ml-utilities" },
   { title: "Python Examples", href: "/python/examples" },
 
   // Development
   { title: "CLI Reference", href: "/development/cli-reference" },
   { title: "Monitor", href: "/development/monitor" },
-  { title: "Monitor Security", href: "/development/monitor-security" },
   { title: "Testing", href: "/development/testing" },
   { title: "Parameters", href: "/development/parameters" },
   { title: "Static Analysis", href: "/development/static-analysis" },
-  { title: "Library Reference", href: "/development/library-reference" },
   { title: "Error Handling", href: "/development/error-handling" },
   { title: "AI Integration", href: "/development/ai-integration" },
-  { title: "ROS2 Bridge", href: "/development/ros2-bridge" },
-  { title: "Hardware Discovery", href: "/development/hardware-discovery" },
 
   // Advanced Topics
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },
@@ -99,12 +86,13 @@ const allPages: DocLink[] = [
   { title: "BlackBox Recorder", href: "/advanced/blackbox" },
   { title: "Circuit Breaker", href: "/advanced/circuit-breaker" },
   { title: "Safety Monitor", href: "/advanced/safety-monitor" },
-  { title: "Checkpoint System", href: "/advanced/checkpoint" },
-  { title: "Model Registry", href: "/advanced/model-registry" },
   { title: "Record & Replay", href: "/advanced/record-replay" },
-  { title: "Redundancy", href: "/advanced/redundancy" },
-  { title: "Telemetry", href: "/advanced/telemetry" },
   { title: "Real-Time Configuration", href: "/advanced/rt-config" },
+
+  // Plugins
+  { title: "Plugins Overview", href: "/plugins" },
+  { title: "Creating CLI Plugins", href: "/plugins/creating-plugins" },
+  { title: "Managing Plugins", href: "/plugins/managing-plugins" },
 
   // Package Management
   { title: "Package Management", href: "/package-management/package-management" },

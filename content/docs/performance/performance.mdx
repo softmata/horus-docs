@@ -37,28 +37,9 @@ All performance features use **graceful degradation** - your code runs everywher
 
 **Zero-copy loan pattern**: Publishers write directly to shared memory slots
 
-### Cache-Optimized Structures
+### Optimized Data Structures
 
-**64-byte alignment**: Ring buffer headers are cache-line aligned to prevent false sharing
-
-```rust
-#[repr(C, align(64))]  // Cache-line aligned
-pub struct RingBufferHeader {
-    // Producer (head) and consumer (tail) on SEPARATE cache lines
-}
-```
-
-**Padding prevention**: False sharing eliminated with explicit padding between producer and consumer fields
-
-**Atomic operations**: Lock-free operations with appropriate memory ordering
-
-### Wait-Free & Lock-Free Operations
-
-**Wait-free Topic (SPSC)**: 87ns send-only latency - no CAS loops, bounded constant time
-
-**Lock-free Topic (MPMC)**: 313ns send-only latency - CAS-based for multi-producer coordination
-
-**Per-consumer tracking**: Each subscriber maintains independent position
+HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — single-producer paths achieve ~87ns, multi-producer paths achieve ~313ns.
 
 ## Benchmark Results
 
@@ -124,98 +105,14 @@ HORUS compiles with Rust compiler optimizations enabled in release mode. For adv
 
 **Gains**: 5-15% from CPU-specific SIMD instructions (automatically enabled in release builds).
 
-## SIMD Acceleration
+### Hardware Acceleration
 
-HORUS uses SIMD (Single Instruction Multiple Data) intrinsics for high-performance memory operations, achieving sub-100ns IPC latency for small messages.
+HORUS automatically uses hardware-accelerated memory operations when available (e.g., SIMD on x86_64). No configuration needed — your code runs on any platform, with extra performance on supported hardware.
 
-### Cross-Platform Support
-
-SIMD acceleration works across platforms with automatic fallback:
-
-| Platform | SIMD Support | Fallback |
-|----------|--------------|----------|
-| **x86_64 (Linux/Windows/macOS)** | AVX2 | Standard memcpy |
-| **ARM64 (macOS M1/M2, Linux)** | NEON (future) | Standard memcpy |
-| **Other architectures** | None | Standard memcpy |
-
-Your code runs on **any platform** - SIMD just provides extra performance on supported hardware.
-
-### How SIMD is Used
-
-On x86_64, the framework uses `std::arch::x86_64` intrinsics for:
-
-| Operation | SIMD Instruction | Speedup |
-|-----------|------------------|---------|
-| Memory copy (4KB+) | AVX2 `_mm256_*` | 2-4x |
-| Cache prefetch | `_mm_prefetch` | Reduces latency |
-| Non-temporal stores | `_mm256_stream_*` | Bypasses cache for large writes |
-
-### Automatic Feature Detection
-
-SIMD features are detected at **runtime** using `is_x86_feature_detected!()`:
+For maximum performance, compile targeting your specific CPU:
 
 ```bash
-# Check available SIMD features on your CPU
-rustc --print cfg | grep target_feature
-
-# Common features on modern CPUs:
-# target_feature="avx2"
-# target_feature="sse4.2"
-```
-
-### Enabling Maximum SIMD
-
-For maximum performance, compile with native CPU features:
-
-```bash
-# Build for your specific CPU (enables all supported features)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
-
-# Or specify AVX2 explicitly
-RUSTFLAGS="-C target-feature=+avx2" cargo build --release
-```
-
-### When SIMD Applies
-
-SIMD acceleration automatically applies to:
-
-- **Topic send/recv**: Message copying for messages >= 4KB
-- **Shared memory operations**: Large buffer transfers using non-temporal streaming stores
-
-For messages smaller than 4KB, standard `ptr::copy_nonoverlapping` is used (setup overhead exceeds SIMD benefit for small copies).
-
-### SIMD Impact on Latency
-
-Benchmarks on Intel Core i9-13900K (AVX2 enabled):
-
-| Message Size | Without SIMD | With SIMD | Improvement |
-|--------------|--------------|-----------|-------------|
-| 16B (CmdVel) | ~150ns | ~87ns | 1.7x |
-| 304B (IMU) | ~280ns | ~160ns | 1.75x |
-| 1.5KB (LaserScan) | ~800ns | ~400ns | 2x |
-
-> **Note**: SIMD acceleration applies to messages >= 4KB. Smaller messages use standard `ptr::copy_nonoverlapping`. The latency improvements above are from the overall Topic pipeline, including cache-line alignment and lock-free algorithms.
-
-### Fallback Behavior
-
-On CPUs without AVX2, HORUS automatically falls back to:
-
-1. Standard `memcpy` / `ptr::copy_nonoverlapping` (always available)
-
-Performance remains good, but peak throughput is reduced.
-
-### Verifying SIMD is Active
-
-```rust
-// At runtime, check CPU features
-#[cfg(target_arch = "x86_64")]
-{
-    if is_x86_feature_detected!("avx2") {
-        println!("AVX2 acceleration enabled");
-    } else {
-        println!("Using standard memcpy fallback");
-    }
-}
 ```
 
 ## Message Optimization
@@ -242,7 +139,7 @@ pub struct BadLaserScan {
 // FAST: Small, fixed-size struct
 let topic: Topic<Pose2D> = Topic::new("pose")?;
 topic.send(Pose2D { x: 1.0, y: 2.0, theta: 0.5 });
-// IPC latency: ~87-313ns depending on SPSC/MPMC
+// IPC latency: ~87-313ns depending on topology
 
 // SLOWER: Larger struct with more data
 let topic: Topic<SensorBundle> = Topic::new("sensors")?;
@@ -445,8 +342,8 @@ HORUS provides optional kernel bypass networking for sub-microsecond latency req
 
 | Transport | Latency (send-only) | Throughput | Requirements |
 |-----------|---------|------------|--------------|
-| Shared Memory (Topic SPSC) | ~87ns | 12M+ msg/s | Local only (wait-free) |
-| Shared Memory (Topic MPMC) | ~313ns | 3M+ msg/s | Local only (lock-free) |
+| Shared Memory (Topic, 1:1) | ~87ns | 12M+ msg/s | Local only |
+| Shared Memory (Topic, many:many) | ~313ns | 3M+ msg/s | Local only |
 | io_uring | 2-3µs | 500K+ msg/s | Linux 5.1+ |
 | Batch UDP | 3-5µs | 300K+ msg/s | Linux 3.0+ |
 | Standard UDP | 5-10µs | 200K+ msg/s | Cross-platform |
@@ -682,7 +579,7 @@ Before deployment, verify:
 - [ ] No allocations in tick()
 - [ ] Messages use fixed-size types
 - [ ] Logging is rate-limited
-- [ ] `/dev/shm` has sufficient space
+- [ ] Shared memory has sufficient space
 - [ ] IPC latency is &lt;10µs
 - [ ] Priority levels set correctly
 

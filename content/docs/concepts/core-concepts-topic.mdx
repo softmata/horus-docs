@@ -9,14 +9,12 @@ order: 6
 ## Key Takeaways
 
 After reading this guide, you will understand:
-- How Topic provides zero-copy, lock-free pub/sub communication with automatic backend selection (~3ns to ~167ns latency)
-- The 10 auto-detected backends optimized for different topologies (same-thread, same-process, cross-process)
+- How Topic provides ultra-fast pub/sub communication (~3ns to ~167ns latency) with automatic optimization
 - The send() and recv() methods for publishing and subscribing to typed topics
 - Communication patterns (one-to-one, one-to-many, many-to-one, many-to-many) for different architectures
-- How shared memory in /dev/shm enables processes to communicate without serialization
 - When to use Topic for real-time, single-machine communication vs network-based messaging
 
-The Topic is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **automatic backend selection** — from **~3ns** (same-thread) to **~167ns** (cross-process MPMC) depending on topology.
+The Topic is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **automatic optimization** — from **~3ns** (same-thread) to **~167ns** (cross-process, many-to-many) depending on topology.
 
 ## What is a Topic?
 
@@ -24,81 +22,42 @@ A `Topic<T>` is a **typed communication channel** that connects publishers and s
 
 - **Where** participants are (same thread, same process, or different processes)
 - **How many** publishers and subscribers exist
-- **What type** the message is (POD types get a faster zero-copy path)
 
 You just call `send()` and `recv()` — HORUS handles the rest.
 
 ### Key Features
 
-**Automatic Backend Selection**: 10 optimized backends, auto-detected at runtime
+**Automatic Optimization**: The fastest communication path is auto-detected at runtime
 
-**Zero-Copy Communication**: POD messages written directly to shared memory without serialization
-
-**Lock-Free Operations**: Atomic operations for thread-safe communication without mutexes
+**Zero-Copy Communication**: Simple fixed-size types are shared directly in memory without serialization
 
 **Type Safety**: Compile-time guarantees for message types
 
-**Cache-Aligned**: Optimized memory layout prevents false sharing
+**Live Migration**: Communication paths upgrade/downgrade transparently as participants join or leave
 
-**Live Migration**: Backends upgrade/downgrade transparently as participants join or leave
+## Automatic Optimization
 
-## Smart Backend Detection
+HORUS auto-selects the fastest communication path based on your topology. You never need to configure this — it happens automatically when participants call `send()` or `recv()`.
 
-HORUS auto-selects the fastest backend based on your topology. You never need to configure this — it happens automatically when participants call `send()` or `recv()`.
-
-| Backend | Latency | When Used |
-|---------|---------|-----------|
-| DirectChannel | ~3ns | Publisher and subscriber on the **same thread** |
-| SpscIntra | ~18ns | Same process, 1 publisher, 1 subscriber |
-| SpmcIntra | ~24ns | Same process, 1 publisher, multiple subscribers |
-| MpscIntra | ~26ns | Same process, multiple publishers, 1 subscriber |
-| MpmcIntra | ~36ns | Same process, multiple publishers, multiple subscribers |
-| PodShm | ~50ns | Cross-process, POD type (no heap allocations) |
-| MpscShm | ~65ns | Cross-process, multiple publishers, 1 subscriber |
-| SpmcShm | ~70ns | Cross-process, 1 publisher, multiple subscribers |
-| SpscShm | ~85ns | Cross-process, 1 publisher, 1 subscriber (non-POD) |
-| MpmcShm | ~167ns | Cross-process, multiple publishers, multiple subscribers |
+| Scenario | Latency |
+|----------|---------|
+| Same thread | ~3ns |
+| Same process, 1:1 | ~18ns |
+| Same process, many-to-many | ~36ns |
+| Cross-process | ~50-167ns |
 
 > **Note**: Latencies are for small messages (16B). Larger messages scale linearly with size.
 
-### How Detection Works
-
-1. When you call `Topic::new("name")`, HORUS creates a shared memory region
-2. On first `send()` or `recv()`, the participant registers in the header
-3. HORUS reads the participant table and selects the optimal backend
-4. If topology changes (e.g., a second subscriber joins), HORUS **live-migrates** to a new backend — pending messages are drained into the new ring buffer automatically
+If topology changes (e.g., a second subscriber joins), HORUS automatically migrates to the optimal path without dropping messages.
 
 ```rust
-// All of these use the same API — backend is selected automatically
+// All of these use the same API — optimization is automatic
 let topic: Topic<f32> = Topic::new("velocity")?;
-topic.send(1.5);                    // First send registers as producer
-let msg = topic.recv();             // First recv registers as consumer
-// Backend detected based on topology ^^
+topic.send(1.5);
+let msg = topic.recv();
 ```
 
-### POD Type Optimization
-
-HORUS automatically detects "Plain Old Data" types — structs with no heap allocations (no `String`, `Vec`, `Box`, etc.). POD types use a faster zero-copy shared memory path (~50ns cross-process instead of ~85-167ns).
-
-```rust
-// POD type — auto-detected, uses fast zero-copy path
-#[derive(Clone, Serialize, Deserialize)]
-struct MotorCommand {
-    velocity: f32,
-    torque: f32,
-}
-
-// Non-POD type — still works, uses serialized path
-#[derive(Clone, Serialize, Deserialize)]
-struct LogMessage {
-    level: u8,
-    message: String,  // String = heap allocation = non-POD
-}
-
-// Both use the same API — HORUS picks the fastest path automatically
-let motor: Topic<MotorCommand> = Topic::new("motor")?;  // POD path
-let logs: Topic<LogMessage> = Topic::new("logs")?;       // Serialized path
-```
+> **Tip**: Simple fixed-size structs (no `String`, `Vec`, `Box`) automatically get a faster zero-copy path. Both types work with the same API — HORUS picks the fastest path for you.
 
 ## Basic Usage
 
@@ -251,7 +210,7 @@ where
 
 Returns the most recent message **without advancing the consumer position**. Calling it multiple times returns the same message until a new one is published. Useful for reading infrequently-updated data like static transforms or configuration.
 
-> **`T: Copy` requirement**: Multi-consumer backends have a race condition where a consumer can free heap memory between reading the slot index and copying the data. `T: Copy` guarantees no heap pointers, making the bitwise copy always safe.
+> **`T: Copy` requirement**: `read_latest()` requires `T: Copy` to guarantee safe concurrent reads. Types with heap allocations (`String`, `Vec`, etc.) should use `recv()` instead.
 
 ```rust
 // Read latest transform (doesn't consume it)
@@ -341,7 +300,7 @@ This prevents common errors like:
 
 ### One-to-One
 
-Single publisher, single subscriber. HORUS auto-selects SPSC backend (~18ns same-process, ~85ns cross-process).
+Single publisher, single subscriber (~18ns same-process, ~85ns cross-process).
 
 ```rust
 struct PubNode {
@@ -373,7 +332,7 @@ impl Node for SubNode {
 
 ### One-to-Many (Broadcast)
 
-Single publisher, multiple subscribers. HORUS auto-selects SPMC backend (~24ns same-process, ~70ns cross-process).
+Single publisher, multiple subscribers (~24ns same-process, ~70ns cross-process).
 
 ```rust
 // One publisher
@@ -389,7 +348,7 @@ struct Listener3 { broadcast_sub: Topic<String> }
 
 ### Many-to-One (Aggregation)
 
-Multiple publishers, single subscriber. HORUS auto-selects MPSC backend (~26ns same-process, ~65ns cross-process).
+Multiple publishers, single subscriber (~26ns same-process, ~65ns cross-process).
 
 ```rust
 // Multiple publishers
@@ -414,7 +373,7 @@ impl Node for Aggregator {
 
 ### Many-to-Many
 
-Multiple publishers and subscribers. HORUS auto-selects MPMC backend (~36ns same-process, ~167ns cross-process).
+Multiple publishers and subscribers (~36ns same-process, ~167ns cross-process).
 
 ```rust
 struct Agent1 {
@@ -446,21 +405,14 @@ let topic = Topic::new("robot/cmd_vel");   // Will cause errors!
 
 **Why dots instead of slashes?**
 
-HORUS uses shared memory files in `/dev/shm` for ultra-low latency communication. Topic names become part of the file path:
-
-```
-Topic: "sensors.lidar"  →  /dev/shm/horus_default_sensors.lidar
-Topic: "sensors/lidar"  →  /dev/shm/horus_default_sensors/lidar  (ERROR!)
-```
-
-When you use a slash in the topic name, the system interprets it as a subdirectory path. Since that directory doesn't exist, you get a **"No such file or directory"** error.
+Slashes in topic names cause errors because they conflict with the underlying storage format. Always use dots.
 
 **Coming from ROS?**
 
-| Framework | Topic Separator | Example | Reason |
-|-----------|----------------|---------|--------|
-| ROS/ROS2 | `/` | `/sensor/lidar` | Network URI-style naming |
-| HORUS | `.` | `sensor.lidar` | File-based shared memory |
+| Framework | Topic Separator | Example |
+|-----------|----------------|---------|
+| ROS/ROS2 | `/` | `/sensor/lidar` |
+| HORUS | `.` | `sensor.lidar` |
 
 ### Best Practices
 
@@ -660,22 +612,7 @@ impl Node for FilteringSubscriber {
 }
 ```
 
-## Shared Memory Details
-
-### Storage Location
-
-HORUS stores shared memory in platform-specific directories:
-
-| Platform | Path | Notes |
-|----------|------|-------|
-| Linux | `/dev/shm/horus/` | tmpfs (RAM-backed), fastest |
-| macOS | `/tmp/horus/` | Uses temp directory |
-| Windows | `%TEMP%\horus\` | Uses temp directory |
-
-```bash
-# View HORUS shared memory segments (Linux)
-ls -lh /dev/shm/horus/topics/
-```
+## Memory and Capacity
 
 ### Memory Usage Per Topic
 
@@ -710,19 +647,10 @@ HORUS also performs automatic stale-topic cleanup — files with no active proce
 
 ### Troubleshooting
 
-**"No space left on device"** — Shared memory directory is full:
+**"No space left on device"** — Shared memory is full:
 
 ```bash
-df -h /dev/shm              # Check usage (Linux)
 horus clean --shm            # Clean up
-sudo mount -o remount,size=4G /dev/shm   # Increase if needed
-```
-
-**"Permission denied"**:
-
-```bash
-ls -la /dev/shm/horus/       # Check permissions
-chmod 755 /dev/shm/horus/    # Fix if needed
 ```
 
 **Type mismatch** — Ensure publisher and subscriber use the exact same type for a topic name:
@@ -735,22 +663,16 @@ let sub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 
 ## Performance
 
-### Latency by Backend (16B message)
+### Latency by Topology (16B message)
 
-| Backend | Topology | Latency |
-|---------|----------|---------|
-| DirectChannel | Same thread | ~3ns |
-| SpscIntra | Same process, 1:1 | ~18ns |
-| SpmcIntra | Same process, 1:N | ~24ns |
-| MpscIntra | Same process, N:1 | ~26ns |
-| MpmcIntra | Same process, N:N | ~36ns |
-| PodShm | Cross-process, POD | ~50ns |
-| MpscShm | Cross-process, N:1 | ~65ns |
-| SpmcShm | Cross-process, 1:N | ~70ns |
-| SpscShm | Cross-process, 1:1 | ~85ns |
-| MpmcShm | Cross-process, N:N | ~167ns |
+| Scenario | Latency |
+|----------|---------|
+| Same thread | ~3ns |
+| Same process, 1:1 | ~18ns |
+| Same process, many-to-many | ~36ns |
+| Cross-process | ~50-167ns |
 
-### Latency by Message Size (cross-process MPMC)
+### Latency by Message Size (cross-process)
 
 | Message Type | Size | Latency |
 |--------------|------|---------|
@@ -769,10 +691,10 @@ Latency scales linearly with message size.
 
 ## Best Practices
 
-**Use appropriate types** — POD types get the fastest path automatically:
+**Use simple fixed-size types when possible** — they get the fastest path automatically:
 ```rust
-Topic::<[f32; 3]>::new("position")?;   // POD: ~50ns cross-process
-Topic::<Vec<f32>>::new("position")?;   // Non-POD: ~167ns cross-process
+Topic::<[f32; 3]>::new("position")?;   // Fixed-size: fastest path
+Topic::<Vec<f32>>::new("position")?;   // Dynamic: still fast, but uses serialization
 ```
 
 **Keep messages small** — latency scales linearly with size.
