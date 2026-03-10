@@ -145,7 +145,6 @@ const sections: SidebarSection[] = [
       { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
       { title: "Execution Modes", href: "/advanced/execution-modes", order: 2 },
       { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
-      { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence", order: 6 },
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
       { title: "Fault Tolerance", href: "/advanced/circuit-breaker", order: 9 },
       { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },

@@ -79,7 +79,6 @@ const allPages: DocLink[] = [
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },
   { title: "Execution Modes", href: "/advanced/execution-modes" },
   { title: "Network Backends", href: "/advanced/network-backends" },
-  { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence" },
   { title: "BlackBox Recorder", href: "/advanced/blackbox" },
   { title: "Fault Tolerance", href: "/advanced/circuit-breaker" },
   { title: "Safety Monitor", href: "/advanced/safety-monitor" },
