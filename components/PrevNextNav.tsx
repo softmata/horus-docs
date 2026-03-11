@@ -34,7 +34,7 @@ const allPages: DocLink[] = [
   { title: "Scheduler", href: "/concepts/core-concepts-scheduler" },
   { title: "node! Macro", href: "/concepts/node-macro" },
   { title: "Message Types", href: "/concepts/message-types" },
-  { title: "HFrame Transforms", href: "/concepts/hframe" },
+  { title: "Transform Frame", href: "/concepts/transform-frame" },
   { title: "Multi-Language", href: "/concepts/multi-language" },
 
   // Rust

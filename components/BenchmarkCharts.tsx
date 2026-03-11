@@ -872,17 +872,17 @@ export function PythonRustComparisonChart() {
 }
 
 /**
- * HFrame vs TF2 Latency Comparison Chart
+ * TransformFrame vs TF2 Latency Comparison Chart
  */
-export function HFrameLatencyChart() {
+export function TransformFrameLatencyChart() {
   const colors = useColors();
 
   const data = [
-    { name: 'Lookup\nby ID', hframe: 50, tf2: null, unit: 'ns' },
-    { name: 'Lookup\nby Name', hframe: 200, tf2: 2000, unit: 'ns' },
-    { name: 'Chain\n(depth 3)', hframe: 150, tf2: 5000, unit: 'ns' },
-    { name: 'Chain\n(depth 10)', hframe: 2500, tf2: 15000, unit: 'ns' },
-    { name: 'Update', hframe: 500, tf2: 1000, unit: 'ns' },
+    { name: 'Lookup\nby ID', transform_frame: 50, tf2: null, unit: 'ns' },
+    { name: 'Lookup\nby Name', transform_frame: 200, tf2: 2000, unit: 'ns' },
+    { name: 'Chain\n(depth 3)', transform_frame: 150, tf2: 5000, unit: 'ns' },
+    { name: 'Chain\n(depth 10)', transform_frame: 2500, tf2: 15000, unit: 'ns' },
+    { name: 'Update', transform_frame: 500, tf2: 1000, unit: 'ns' },
   ];
 
   return (
@@ -891,7 +891,7 @@ export function HFrameLatencyChart() {
       style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
     >
       <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        HFrame vs ROS2 TF2 Latency
+        TransformFrame vs ROS2 TF2 Latency
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
         Lower is better. Logarithmic scale (nanoseconds)
@@ -917,14 +917,14 @@ export function HFrameLatencyChart() {
           <Legend
             formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
           />
-          <Bar dataKey="hframe" fill={colors.horus} radius={[4, 4, 0, 0]} name="HORUS HFrame" />
+          <Bar dataKey="transform_frame" fill={colors.horus} radius={[4, 4, 0, 0]} name="HORUS TransformFrame" />
           <Bar dataKey="tf2" fill={colors.ros2} radius={[4, 4, 0, 0]} name="ROS2 TF2" />
         </BarChart>
       </ResponsiveContainer>
       <div className="mt-4 flex flex-wrap justify-center gap-4 md:gap-6 text-sm">
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.horus }}></div>
-          <span style={{ color: colors.text }}>HORUS HFrame (lock-free)</span>
+          <span style={{ color: colors.text }}>HORUS TransformFrame (lock-free)</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.ros2 }}></div>
@@ -936,9 +936,9 @@ export function HFrameLatencyChart() {
 }
 
 /**
- * HFrame Speedup vs TF2 Chart
+ * TransformFrame Speedup vs TF2 Chart
  */
-export function HFrameSpeedupChart() {
+export function TransformFrameSpeedupChart() {
   const colors = useColors();
 
   const data = [
@@ -955,10 +955,10 @@ export function HFrameSpeedupChart() {
       style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
     >
       <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        HFrame Speedup vs TF2
+        TransformFrame Speedup vs TF2
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
-        How many times faster HFrame is compared to TF2
+        How many times faster TransformFrame is compared to TF2
       </p>
       <ResponsiveContainer width="100%" height={300}>
         <BarChart data={data} layout="vertical" margin={{ top: 20, right: 80, left: 120, bottom: 20 }}>
@@ -1011,9 +1011,9 @@ export function HFrameSpeedupChart() {
 }
 
 /**
- * HFrame Memory Configuration Chart
+ * TransformFrame Memory Configuration Chart
  */
-export function HFrameMemoryChart() {
+export function TransformFrameMemoryChart() {
   const colors = useColors();
 
   const data = [
@@ -1029,7 +1029,7 @@ export function HFrameMemoryChart() {
       style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
     >
       <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        HFrame Memory Usage
+        TransformFrame Memory Usage
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
         Pre-allocated memory by configuration preset (KB)
@@ -1081,17 +1081,17 @@ export function HFrameMemoryChart() {
 }
 
 /**
- * HFrame Concurrent Performance Chart
+ * TransformFrame Concurrent Performance Chart
  */
-export function HFrameConcurrentChart() {
+export function TransformFrameConcurrentChart() {
   const colors = useColors();
 
   const data = [
-    { threads: 1, hframe: 500, tf2: 2000 },
-    { threads: 2, hframe: 550, tf2: 3500 },
-    { threads: 4, hframe: 800, tf2: 8000 },
-    { threads: 8, hframe: 1100, tf2: 18000 },
-    { threads: 16, hframe: 1400, tf2: 45000 },
+    { threads: 1, transform_frame: 500, tf2: 2000 },
+    { threads: 2, transform_frame: 550, tf2: 3500 },
+    { threads: 4, transform_frame: 800, tf2: 8000 },
+    { threads: 8, transform_frame: 1100, tf2: 18000 },
+    { threads: 16, transform_frame: 1400, tf2: 45000 },
   ];
 
   return (
@@ -1103,7 +1103,7 @@ export function HFrameConcurrentChart() {
         Concurrent Read Performance
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Latency under contention (ns). HFrame uses lock-free reads.
+        Latency under contention (ns). TransformFrame uses lock-free reads.
       </p>
       <ResponsiveContainer width="100%" height={350}>
         <LineChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
@@ -1133,11 +1133,11 @@ export function HFrameConcurrentChart() {
           />
           <Line
             type="monotone"
-            dataKey="hframe"
+            dataKey="transform_frame"
             stroke={colors.horus}
             strokeWidth={3}
             dot={{ fill: colors.horus, strokeWidth: 2, r: 5 }}
-            name="HORUS HFrame"
+            name="HORUS TransformFrame"
           />
           <Line
             type="monotone"
@@ -1151,7 +1151,7 @@ export function HFrameConcurrentChart() {
         </LineChart>
       </ResponsiveContainer>
       <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        HFrame maintains <span style={{ color: colors.horus, fontWeight: 'bold' }}>near-constant latency</span> under contention due to lock-free design
+        TransformFrame maintains <span style={{ color: colors.horus, fontWeight: 'bold' }}>near-constant latency</span> under contention due to lock-free design
       </div>
     </div>
   );
@@ -1169,8 +1169,8 @@ export default {
   PythonThroughputChart,
   PythonStressChart,
   PythonRustComparisonChart,
-  HFrameLatencyChart,
-  HFrameSpeedupChart,
-  HFrameMemoryChart,
-  HFrameConcurrentChart,
+  TransformFrameLatencyChart,
+  TransformFrameSpeedupChart,
+  TransformFrameMemoryChart,
+  TransformFrameConcurrentChart,
 };

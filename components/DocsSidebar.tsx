@@ -52,7 +52,7 @@ const sections: SidebarSection[] = [
       { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 5 },
       { title: "node! Macro", href: "/concepts/node-macro", order: 6 },
       { title: "Message Types", href: "/concepts/message-types", order: 7 },
-      { title: "HFrame Transforms", href: "/concepts/hframe", order: 10 },
+      { title: "Transform Frame", href: "/concepts/transform-frame", order: 10 },
       { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
     ],
   },

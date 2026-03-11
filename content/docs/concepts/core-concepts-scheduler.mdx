@@ -13,7 +13,7 @@ After reading this guide, you will understand:
 - `Scheduler::new()` as the single entry point, with builder methods for global settings
 - Per-node execution classes: `.compute()`, `.on(topic)`, `.async_io()` — plus auto-RT from `.budget_us()` / `.rate()`
 - The fluent NodeBuilder API for adding nodes with `.add(node).order(0).build()`
-- Per-node configuration: `.order()`, `.rate_hz()`, `.budget_us()`, `.deadline_ms()`, `.on_miss()`
+- Per-node configuration: `.order()`, `.rate()`, `.budget_us()`, `.deadline_ms()`, `.on_miss()`
 - Scheduler profile presets: `Scheduler::deploy()`, `hard_rt()`, `safety_critical()`
 - Priority-based execution where lower numbers run first (0 = highest priority)
 - Graceful shutdown via Ctrl+C signal handling
@@ -34,7 +34,7 @@ The Scheduler is responsible for:
 
 **Performance Monitoring**: Tracking execution metrics for all nodes
 
-**Fault Tolerance**: Failure policies per node (fatal, restart, skip, ignore)
+**Failure Policies**: Per-node failure handling (fatal, restart, skip, ignore)
 
 ## Creating a Scheduler
 
@@ -58,9 +58,9 @@ For production deployments, use profile presets that bundle the right settings:
 ```rust
 use horus::prelude::*;
 
-// Production robot — safety monitor, watchdog, fault tolerance, blackbox
+// Production robot — safety monitor, watchdog, blackbox
 let mut scheduler = Scheduler::deploy()
-    .tick_hz(1000.0)           // 1 kHz control loop
+    .tick_rate(1000.0.hz())           // 1 kHz control loop
     .cores(&[2, 3]);           // Pin to cores 2 and 3
 
 scheduler.add(motor_ctrl).order(0).budget_us(500).build()?;
@@ -74,9 +74,9 @@ All RT features that cannot be applied at runtime are recorded as degradations, 
 | Preset | What it enables | When to use |
 |--------|----------------|-------------|
 | `Scheduler::new()` | Capability detection only | Development, prototyping |
-| `Scheduler::deploy()` | Safety monitor, budget enforcement, deadline monitoring, watchdog (500ms), fault tolerance, blackbox (64MB) | Production robots |
+| `Scheduler::deploy()` | Safety monitor, budget enforcement, deadline monitoring, watchdog (500ms), blackbox (64MB) | Production robots |
 | `Scheduler::hard_rt()` | All RT features + memory locking + RT scheduling class. **Panics** without RT capabilities | Hard real-time systems |
-| `Scheduler::safety_critical()` | `hard_rt()` + fault tolerance + blackbox + profiling | Medical, aerospace |
+| `Scheduler::safety_critical()` | `hard_rt()` + blackbox + profiling | Medical, aerospace |
 
 ## Adding Nodes
 
@@ -89,7 +89,7 @@ let mut scheduler = Scheduler::new();
 scheduler.add(sensor_node).order(0).build()?;
 
 // With per-node tick rate
-scheduler.add(fast_sensor).order(0).rate_hz(1000.0).build()?;
+scheduler.add(fast_sensor).order(0).rate(1000.0.hz()).build()?;
 
 // Real-time node with tick budget (auto-marks as RT)
 scheduler.add(motor_ctrl)
@@ -123,7 +123,7 @@ scheduler.add(logger).order(200).build()?;
 | Method | Description |
 |--------|-------------|
 | `.order(n)` | Set execution order (lower = runs first) |
-| `.rate_hz(hz)` | Set node-specific tick rate in Hz |
+| `.rate(hz.hz())` | Set node-specific tick rate in Hz |
 | `.rate(freq)` | Set tick rate from a `Frequency` (e.g. `100.hz()`) — auto-derives budget (80% period) and deadline (95% period), auto-marks RT |
 | `.budget_us(n)` | Set tick budget in microseconds — auto-marks as RT |
 | `.budget(dur)` | Set tick budget as a `Duration` — auto-marks as RT |
@@ -132,7 +132,7 @@ scheduler.add(logger).order(200).build()?;
 | `.deadline_dur(dur)` | Set deadline as a `Duration` — auto-marks as RT |
 | `.on_miss(Miss)` | Set deadline miss policy (`Warn`, `Skip`, `SafeMode`, `Stop`) |
 | `.failure_policy(policy)` | Override failure handling policy |
-| `.build()` / `.done()` | Finalize and register the node (returns `HorusResult`) |
+| `.build()` / `.build()` | Finalize and register the node (returns `HorusResult`) |
 
 ## Priority-Based Execution
 
@@ -197,7 +197,7 @@ scheduler.tick_for(&["SensorNode"], Duration::from_secs(10))?;
 ```rust
 // Set global tick rate (default: 60 Hz)
 let scheduler = Scheduler::new()
-    .tick_hz(1000.0); // 1kHz control loop
+    .tick_rate(1000.0.hz()); // 1kHz control loop
 ```
 
 ### Real-Time Features
@@ -207,7 +207,7 @@ RT is configured through profile presets and per-node builder methods. Nodes are
 ```rust
 // Hard real-time — panics without RT capabilities
 let mut scheduler = Scheduler::hard_rt()
-    .tick_hz(1000.0)
+    .tick_rate(1000.0.hz())
     .cores(&[2, 3]);
 
 // Per-node: budget_us / deadline auto-mark as RT
@@ -271,13 +271,35 @@ Individual nodes can run at different frequencies:
 
 ```rust
 let mut scheduler = Scheduler::new();
-scheduler.add(fast_sensor).order(0).rate_hz(1000.0).build()?;  // 1kHz
-scheduler.add(slow_logger).order(200).rate_hz(10.0).build()?;  // 10Hz
+scheduler.add(fast_sensor).order(0).rate(1000.0.hz()).build()?;  // 1kHz
+scheduler.add(slow_logger).order(200).rate(10.0.hz()).build()?;  // 10Hz
 
 // Or set rates after adding
 scheduler.set_node_rate("FastSensor", 100.0);
 scheduler.set_node_rate("SlowLogger", 10.0);
 ```
+
+### Ergonomic Timing with DurationExt
+
+HORUS provides extension methods on numeric types for creating `Duration` and `Frequency` values:
+
+```rust
+use horus::prelude::*;
+
+// Duration helpers — works on u64, f64, i32
+let budget = 200.us();   // Duration::from_micros(200)
+let deadline = 1.ms();   // Duration::from_millis(1)
+
+// Frequency — auto-derives budget (80% period) and deadline (95% period)
+let freq = 500.hz();
+scheduler.add(motor_ctrl)
+    .order(0)
+    .rate(freq)           // auto-marks as RT, sets budget + deadline
+    .on_miss(Miss::Skip)
+    .build()?;
+```
+
+See [DurationExt and Frequency](/advanced/scheduler-configuration#durationext-and-frequency) for the full API reference.
 
 The scheduler automatically adjusts its internal tick period to be fast enough for the highest-frequency node.
 
@@ -435,12 +457,12 @@ scheduler.add(diagnostics).order(200).build()?;
 
 ```rust
 let mut scheduler = Scheduler::deploy()
-    .tick_hz(1000.0)           // 1 kHz control loop
+    .tick_rate(1000.0.hz())           // 1 kHz control loop
     .with_blackbox(16);        // Flight recorder (deploy() includes 64MB by default)
 
 scheduler.add(safety_monitor).order(0).budget_us(100).build()?;
 scheduler.add(motor_ctrl).order(5).budget_us(500).build()?;
-scheduler.add(sensor).order(50).compute().rate_hz(1000.0).build()?;
+scheduler.add(sensor).order(50).compute().rate(1000.0.hz()).build()?;
 scheduler.add(logger).order(200).async_io().build()?;
 
 scheduler.run()?;
@@ -477,7 +499,7 @@ scheduler.add(logger).order(200).build()?;          // Background
 ```rust
 // Use profile presets for production
 let mut scheduler = Scheduler::deploy()
-    .tick_hz(500.0)
+    .tick_rate(500.0.hz())
     .with_blackbox(16);
 ```
 
