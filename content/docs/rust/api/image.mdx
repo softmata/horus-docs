@@ -1,0 +1,324 @@
+---
+title: "Image"
+description: "Zero-copy shared memory image type for camera pipelines"
+weight: 60
+---
+
+# Image
+
+Pool-backed RAII image type with zero-copy shared memory transport. `Image` allocates from a global tensor pool automatically — you never manage memory directly. Only a 168-byte descriptor travels through topics; the pixel data stays in shared memory at ~50ns IPC latency.
+
+## Quick Start
+
+```rust
+use horus::prelude::*;
+
+// Create a 640x480 RGB image
+let mut img = Image::new(640, 480, ImageEncoding::Rgb8)?;
+
+// Fill with red
+img.fill(&[255, 0, 0]);
+
+// Set metadata (chainable)
+img.set_frame_id("camera_front")
+   .set_timestamp_ns(1_700_000_000_000_000_000);
+
+// Publish on a topic — zero-copy, only the descriptor is sent
+let topic: Topic<Image> = Topic::new("camera/rgb")?;
+topic.send(&img);
+```
+
+```rust
+// Receiver side
+let topic: Topic<Image> = Topic::new("camera/rgb")?;
+
+if let Some(img) = topic.recv() {
+    println!("{}x{} {:?}", img.width(), img.height(), img.encoding());
+    println!("Frame: {}, Timestamp: {}ns", img.frame_id(), img.timestamp_ns());
+
+    // Direct pixel access — zero-copy
+    if let Some(px) = img.pixel(0, 0) {
+        println!("Top-left pixel: R={} G={} B={}", px[0], px[1], px[2]);
+    }
+}
+```
+
+## Pixel Access
+
+```rust
+use horus::prelude::*;
+
+let mut img = Image::new(640, 480, ImageEncoding::Rgb8)?;
+
+// Read a pixel — returns None if out of bounds
+if let Some(pixel) = img.pixel(100, 200) {
+    println!("R={} G={} B={}", pixel[0], pixel[1], pixel[2]);
+}
+
+// Write a pixel — no-op if out of bounds, chainable
+img.set_pixel(100, 200, &[255, 128, 0])
+   .set_pixel(101, 200, &[255, 128, 0]);
+
+// Fill entire image with a single color
+img.fill(&[0, 0, 0]); // Black
+
+// Extract a region of interest (returns raw bytes)
+if let Some(roi_data) = img.roi(10, 10, 100, 100) {
+    println!("ROI: {} bytes", roi_data.len());
+}
+```
+
+## Raw Data Access
+
+```rust
+use horus::prelude::*;
+
+let mut img = Image::new(640, 480, ImageEncoding::Rgb8)?;
+
+// Zero-copy read access to the underlying buffer
+let data: &[u8] = img.data();
+println!("Total bytes: {}", data.len()); // 640 * 480 * 3
+
+// Mutable access for bulk operations
+let data_mut: &mut [u8] = img.data_mut();
+data_mut[0] = 255; // Set first byte directly
+
+// Copy from an external buffer
+let pixels: Vec<u8> = vec![128; 640 * 480 * 3];
+img.copy_from(&pixels);
+```
+
+## Camera Pipeline Example
+
+A complete camera processing node that receives images, processes them, and publishes results.
+
+```rust
+use horus::prelude::*;
+
+struct CameraNode {
+    raw_sub: Topic<Image>,
+    processed_pub: Topic<Image>,
+}
+
+impl Node for CameraNode {
+    fn name(&self) -> &str { "CameraProcessor" }
+
+    fn tick(&mut self) {
+        if let Some(raw) = self.raw_sub.recv() {
+            // Create output image with same dimensions
+            let mut out = Image::new(
+                raw.width(), raw.height(), ImageEncoding::Mono8
+            ).unwrap();
+
+            // Convert RGB to grayscale (simple luminance)
+            let src = raw.data();
+            let dst = out.data_mut();
+            for i in 0..((raw.width() * raw.height()) as usize) {
+                let r = src[i * 3] as f32;
+                let g = src[i * 3 + 1] as f32;
+                let b = src[i * 3 + 2] as f32;
+                dst[i] = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
+            }
+
+            out.set_frame_id(raw.frame_id())
+               .set_timestamp_ns(raw.timestamp_ns());
+
+            self.processed_pub.send(&out);
+        }
+    }
+}
+```
+
+## Depth Camera Example
+
+```rust
+use horus::prelude::*;
+
+// Create a 16-bit depth image (values in millimeters)
+let mut depth = Image::new(640, 480, ImageEncoding::Depth16)?;
+
+// Each pixel is 2 bytes (u16 little-endian)
+let data = depth.data_mut();
+let distance_mm: u16 = 1500; // 1.5 meters
+data[0] = (distance_mm & 0xFF) as u8;
+data[1] = (distance_mm >> 8) as u8;
+
+println!("Depth image: {}x{}, {} bytes/pixel, step={}",
+    depth.width(), depth.height(),
+    depth.encoding().bytes_per_pixel(),
+    depth.step());
+```
+
+## Rust API Reference
+
+### Constructor
+
+| Signature | Returns | Description |
+|-----------|---------|-------------|
+| `Image::new(width, height, encoding)` | `HorusResult<Image>` | Create an image, allocating from the global tensor pool |
+
+### Pixel Access
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `pixel(x, y)` | `Option<&[u8]>` | Get pixel bytes at (x, y). Returns `None` if out of bounds |
+| `set_pixel(x, y, value)` | `&mut Self` | Set pixel value. No-op if out of bounds. Chainable |
+| `fill(value)` | `&mut Self` | Fill every pixel with the same value. Chainable |
+| `roi(x, y, w, h)` | `Option<Vec<u8>>` | Extract a rectangular region as raw bytes |
+
+### Metadata
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `width()` | `u32` | Image width in pixels |
+| `height()` | `u32` | Image height in pixels |
+| `channels()` | `u32` | Number of channels (e.g., 3 for RGB) |
+| `encoding()` | `ImageEncoding` | Pixel encoding format |
+| `step()` | `u32` | Bytes per row (`width * bytes_per_pixel`) |
+
+### Data Access
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `data()` | `&[u8]` | Zero-copy read access to raw pixel bytes |
+| `data_mut()` | `&mut [u8]` | Mutable access to raw pixel bytes |
+| `copy_from(src)` | `&mut Self` | Copy bytes from a slice into the image buffer. Chainable |
+
+### Frame & Timestamp
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `set_frame_id(id)` | `&mut Self` | Set the camera frame identifier. Chainable |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds. Chainable |
+| `frame_id()` | `&str` | Get the camera frame identifier |
+| `timestamp_ns()` | `u64` | Get timestamp in nanoseconds |
+
+### Type Info
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `dtype()` | `TensorDtype` | Underlying tensor data type (e.g., `U8` for 8-bit encodings) |
+| `nbytes()` | `u64` | Total size of the pixel buffer in bytes |
+| `is_cpu()` | `bool` | Whether the image data resides on CPU |
+| `is_cuda()` | `bool` | Whether the image data resides on a CUDA GPU |
+
+## ImageEncoding
+
+Pixel format enum (`#[repr(u8)]`, default: `Rgb8`).
+
+| Variant | Channels | Bytes/Pixel | Description |
+|---------|----------|-------------|-------------|
+| `Mono8` | 1 | 1 | 8-bit grayscale |
+| `Mono16` | 1 | 2 | 16-bit grayscale |
+| `Rgb8` | 3 | 3 | 8-bit RGB (default) |
+| `Bgr8` | 3 | 3 | 8-bit BGR (OpenCV convention) |
+| `Rgba8` | 4 | 4 | 8-bit RGBA with alpha |
+| `Bgra8` | 4 | 4 | 8-bit BGRA with alpha |
+| `Yuv422` | — | 2 | YUV 4:2:2 packed |
+| `Mono32F` | 1 | 4 | 32-bit float grayscale |
+| `Rgb32F` | 3 | 12 | 32-bit float RGB |
+| `BayerRggb8` | 1 | 1 | Bayer RGGB raw sensor data |
+| `Depth16` | 1 | 2 | 16-bit depth in millimeters |
+
+**Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `bytes_per_pixel()` | `u32` | Number of bytes per pixel |
+| `channels()` | `u32` | Number of color channels |
+
+## Python API
+
+The Python `Image` class wraps the same shared memory backend, with zero-copy interop to NumPy, PyTorch, and JAX.
+
+### Constructor & Factories
+
+```python
+import horus
+
+# Create an empty image (height, width, encoding)
+img = horus.Image(480, 640, encoding="rgb8")
+
+# From a NumPy array — encoding auto-detected from shape
+import numpy as np
+arr = np.zeros((480, 640, 3), dtype=np.uint8)
+img = horus.Image.from_numpy(arr, encoding="rgb8")
+
+# From a PyTorch tensor
+import torch
+t = torch.zeros(480, 640, 3, dtype=torch.uint8)
+img = horus.Image.from_torch(t, encoding="rgb8")
+
+# From raw bytes
+data = bytes(480 * 640 * 3)
+img = horus.Image.from_bytes(data, height=480, width=640, encoding="rgb8")
+```
+
+### Zero-Copy Conversions
+
+```python
+# To NumPy — zero-copy view
+arr = img.to_numpy()  # shape: (480, 640, 3), dtype: uint8
+
+# To PyTorch — zero-copy via DLPack
+tensor = img.to_torch()
+
+# To JAX — zero-copy via DLPack
+jax_arr = img.to_jax()
+```
+
+### Pixel Operations
+
+```python
+# Read pixel at (x, y)
+r, g, b = img.pixel(100, 200)
+
+# Write pixel
+img.set_pixel(100, 200, [255, 0, 0])
+
+# Fill entire image
+img.fill([128, 128, 128])
+
+# Extract region of interest
+roi_bytes = img.roi(0, 0, 100, 100)
+```
+
+### Properties & Setters
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `height` | `int` | Image height in pixels |
+| `width` | `int` | Image width in pixels |
+| `channels` | `int` | Number of channels |
+| `encoding` | `str` | Encoding name (e.g., `"rgb8"`) |
+| `dtype` | `str` | Tensor data type |
+| `nbytes` | `int` | Total buffer size in bytes |
+| `step` | `int` | Bytes per row |
+| `frame_id` | `str` | Camera frame identifier |
+| `timestamp_ns` | `int` | Timestamp in nanoseconds |
+
+```python
+img.set_frame_id("camera_front")
+img.set_timestamp_ns(1_700_000_000_000_000_000)
+```
+
+### Encoding Aliases
+
+Python accepts flexible encoding strings:
+
+| Canonical | Aliases |
+|-----------|---------|
+| `"mono8"` | `"gray"`, `"grey"`, `"l"` |
+| `"rgb8"` | `"rgb"` |
+| `"bgr8"` | `"bgr"` |
+| `"rgba8"` | `"rgba"` |
+| `"bgra8"` | `"bgra"` |
+| `"yuv422"` | `"yuyv"` |
+| `"mono32f"` | `"gray32f"`, `"float"` |
+| `"depth16"` | — |
+
+## See Also
+
+- [Vision Messages](/rust/api/vision-messages) — CompressedImage, CameraInfo, Detection types
+- [TensorPool API](/rust/api/tensor-pool) — Advanced pool management and GPU support
+- [Tensor Messages](/rust/api/tensor-messages) — Tensor descriptor, TensorDtype, Device

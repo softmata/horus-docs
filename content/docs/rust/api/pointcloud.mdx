@@ -1,0 +1,409 @@
+---
+title: "PointCloud"
+description: "Zero-copy shared memory point cloud type for LiDAR and 3D sensing"
+weight: 61
+---
+
+# PointCloud
+
+HORUS provides a pool-backed RAII `PointCloud` type for LiDAR and 3D sensing workloads. Point cloud data lives in shared memory and is transported zero-copy between nodes — only a 168-byte descriptor travels through the ring buffer.
+
+## Creating a PointCloud
+
+```rust
+use horus::prelude::*;
+
+// XYZ point cloud: 10,000 points, 3 fields per point (x, y, z), float32
+let mut cloud = PointCloud::new(10_000, 3, TensorDtype::F32)?;
+
+// XYZI point cloud (with intensity): 4 fields per point
+let mut cloud_i = PointCloud::new(50_000, 4, TensorDtype::F32)?;
+
+// XYZRGB point cloud (with color): 6 fields per point
+let mut cloud_rgb = PointCloud::new(20_000, 6, TensorDtype::F32)?;
+```
+
+## Writing Point Data
+
+```rust
+use horus::prelude::*;
+
+let mut cloud = PointCloud::new(3, 3, TensorDtype::F32)?;
+
+// Copy raw bytes into the cloud
+let points: Vec<f32> = vec![
+    1.0, 2.0, 3.0,   // point 0
+    4.0, 5.0, 6.0,   // point 1
+    7.0, 8.0, 9.0,   // point 2
+];
+let bytes: &[u8] = bytemuck::cast_slice(&points);
+cloud.copy_from(bytes);
+
+// Or write directly via mutable data access
+let data: &mut [u8] = cloud.data_mut();
+// ... fill data ...
+```
+
+## Reading Points
+
+```rust
+use horus::prelude::*;
+
+let cloud = PointCloud::new(10_000, 3, TensorDtype::F32)?;
+
+// Extract all XYZ coordinates (F32 clouds only)
+if let Some(points) = cloud.extract_xyz() {
+    for p in &points[..5] {
+        println!("({:.2}, {:.2}, {:.2})", p[0], p[1], p[2]);
+    }
+}
+
+// Access a single point as raw bytes
+if let Some(point_bytes) = cloud.point_at(0) {
+    let floats: &[f32] = bytemuck::cast_slice(point_bytes);
+    println!("Point 0: x={}, y={}, z={}", floats[0], floats[1], floats[2]);
+}
+
+// Zero-copy access to the entire buffer
+let raw: &[u8] = cloud.data();
+```
+
+## Metadata and Properties
+
+```rust
+use horus::prelude::*;
+
+let mut cloud = PointCloud::new(10_000, 4, TensorDtype::F32)?;
+
+// Set frame and timestamp (method chaining)
+cloud.set_frame_id("velodyne_top")
+     .set_timestamp_ns(1_700_000_000_000_000_000);
+
+// Read back
+println!("Frame: {}", cloud.frame_id());
+println!("Timestamp: {} ns", cloud.timestamp_ns());
+
+// Point layout queries
+println!("Points: {}", cloud.point_count());       // 10000
+println!("Fields/point: {}", cloud.fields_per_point()); // 4
+println!("Is XYZ: {}", cloud.is_xyz());             // false (4 fields)
+println!("Has intensity: {}", cloud.has_intensity()); // true
+println!("Has color: {}", cloud.has_color());        // false
+
+// Type info
+println!("Dtype: {:?}", cloud.dtype());   // F32
+println!("Total bytes: {}", cloud.nbytes()); // 10000 * 4 * 4
+println!("Is CPU: {}", cloud.is_cpu());    // true
+```
+
+## Sending and Receiving via Topic
+
+Only the 168-byte descriptor goes through the ring buffer. The point data stays in shared memory — true zero-copy IPC.
+
+```rust
+use horus::prelude::*;
+
+// Publisher
+let pub_topic: Topic<PointCloud> = Topic::new("lidar/points")?;
+
+let mut cloud = PointCloud::new(64_000, 4, TensorDtype::F32)?;
+cloud.set_frame_id("velodyne_top");
+// ... fill point data from sensor driver ...
+pub_topic.send(cloud);
+```
+
+```rust
+// Subscriber
+let sub_topic: Topic<PointCloud> = Topic::new("lidar/points")?;
+
+if let Some(cloud) = sub_topic.recv() {
+    println!("Received {} points from '{}'",
+        cloud.point_count(), cloud.frame_id());
+
+    if let Some(xyz) = cloud.extract_xyz() {
+        let closest = xyz.iter()
+            .map(|p| (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt())
+            .fold(f32::INFINITY, f32::min);
+        println!("Closest point: {:.2}m", closest);
+    }
+}
+```
+
+## LiDAR Processing Pipeline
+
+A complete node that receives raw LiDAR scans, filters ground points, and publishes the result:
+
+```rust
+use horus::prelude::*;
+
+struct LidarFilterNode {
+    raw_sub: Topic<PointCloud>,
+    filtered_pub: Topic<PointCloud>,
+    ground_threshold: f32,
+}
+
+impl Node for LidarFilterNode {
+    fn name(&self) -> &str { "LidarFilter" }
+
+    fn tick(&mut self) {
+        if let Some(raw) = self.raw_sub.recv() {
+            if let Some(points) = raw.extract_xyz() {
+                // Filter out ground points (z below threshold)
+                let non_ground: Vec<f32> = points.iter()
+                    .filter(|p| p[2] > self.ground_threshold)
+                    .flat_map(|p| p.iter().copied())
+                    .collect();
+
+                let num_points = non_ground.len() / 3;
+                if let Ok(mut filtered) = PointCloud::new(
+                    num_points as u32, 3, TensorDtype::F32
+                ) {
+                    filtered.copy_from(bytemuck::cast_slice(&non_ground))
+                        .set_frame_id(raw.frame_id())
+                        .set_timestamp_ns(raw.timestamp_ns());
+
+                    self.filtered_pub.send(filtered);
+                }
+            }
+        }
+    }
+}
+```
+
+## API Reference
+
+### Constructor
+
+| Signature | Description |
+|-----------|-------------|
+| `PointCloud::new(num_points: u32, fields_per_point: u32, dtype: TensorDtype) -> HorusResult<Self>` | Create a point cloud, allocating from the global tensor pool |
+
+### Point Access
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `point_at(idx)` | `Option<&[u8]>` | Raw bytes of the i-th point |
+| `extract_xyz()` | `Option<Vec<[f32; 3]>>` | All XYZ coordinates as float arrays (F32 only, validates alignment) |
+
+### Metadata
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `point_count()` | `u64` | Number of points in the cloud |
+| `fields_per_point()` | `u32` | Fields per point (3=XYZ, 4=XYZI, 6=XYZRGB) |
+| `is_xyz()` | `bool` | True if this is a plain XYZ cloud (3 fields) |
+| `has_intensity()` | `bool` | True if cloud includes an intensity field (4+ fields) |
+| `has_color()` | `bool` | True if cloud includes color fields (6+ fields) |
+
+### Data Access (Zero-Copy)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `data()` | `&[u8]` | Immutable access to the raw point buffer |
+| `data_mut()` | `&mut [u8]` | Mutable access to the raw point buffer |
+| `copy_from(src)` | `&mut Self` | Copy bytes into the point buffer (chainable) |
+
+### Frame and Timestamp
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `set_frame_id(id)` | `&mut Self` | Set sensor/coordinate frame identifier (chainable) |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds (chainable) |
+| `frame_id()` | `&str` | Get the frame identifier |
+| `timestamp_ns()` | `u64` | Get timestamp in nanoseconds |
+
+### Type Info
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `dtype()` | `TensorDtype` | Data type of each field (e.g., F32, F64) |
+| `nbytes()` | `u64` | Total size of the point buffer in bytes |
+| `is_cpu()` | `bool` | Whether data resides on CPU (shared memory) |
+
+## Point Types
+
+Fixed-size `#[repr(C)]` point structs for direct memory mapping. These are Pod types suitable for zero-copy transport via `PodTopic` or `bytemuck` casting.
+
+### PointXYZ
+
+Basic 3D point (12 bytes).
+
+```rust
+use horus::prelude::*;
+
+let p = PointXYZ::new(1.0, 2.0, 3.0);
+
+println!("Distance from origin: {:.2}m", p.distance());
+
+let q = PointXYZ::new(4.0, 6.0, 3.0);
+println!("Distance between: {:.2}m", p.distance_to(&q));
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x` | `f32` | X coordinate (meters) |
+| `y` | `f32` | Y coordinate (meters) |
+| `z` | `f32` | Z coordinate (meters) |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(x, y, z)` | `PointXYZ` | Create a point |
+| `distance()` | `f32` | Euclidean distance from the origin |
+| `distance_to(other)` | `f32` | Euclidean distance to another point |
+
+### PointXYZI
+
+3D point with intensity (16 bytes). Common for LiDAR sensors (Velodyne, Ouster, Livox).
+
+```rust
+use horus::prelude::*;
+
+let p = PointXYZI::new(1.0, 2.0, 3.0, 128.0);
+
+// Convert from PointXYZ (zero intensity)
+let xyz = PointXYZ::new(1.0, 2.0, 3.0);
+let with_intensity = PointXYZI::from_xyz(xyz);
+
+// Convert back to PointXYZ (drop intensity)
+let xyz_only = p.xyz();
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters) |
+| `intensity` | `f32` | Reflectance intensity (typically 0-255) |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(x, y, z, intensity)` | `PointXYZI` | Create a point with intensity |
+| `from_xyz(xyz)` | `PointXYZI` | Convert from PointXYZ (intensity = 0) |
+| `xyz()` | `PointXYZ` | Convert to PointXYZ (drop intensity) |
+
+### PointXYZRGB
+
+3D point with RGB color (16 bytes). Common for RGB-D cameras like Intel RealSense.
+
+```rust
+use horus::prelude::*;
+
+let p = PointXYZRGB::new(1.0, 2.0, 3.0, 255, 0, 0); // Red point
+
+// Convert from PointXYZ (defaults to white)
+let xyz = PointXYZ::new(1.0, 2.0, 3.0);
+let colored = PointXYZRGB::from_xyz(xyz);
+
+// Get packed RGB as u32 (0xRRGGBBAA)
+let packed = p.rgb_packed();
+
+// Convert back to PointXYZ (drop color)
+let xyz_only = p.xyz();
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters) |
+| `r`, `g`, `b` | `u8` | Color components (0-255) |
+| `a` | `u8` | Alpha/padding (255 default) |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(x, y, z, r, g, b)` | `PointXYZRGB` | Create a colored point |
+| `from_xyz(xyz)` | `PointXYZRGB` | Convert from PointXYZ (white, alpha 255) |
+| `rgb_packed()` | `u32` | Get color as packed 0xRRGGBBAA |
+| `xyz()` | `PointXYZ` | Convert to PointXYZ (drop color) |
+
+## Python API (PyPointCloud)
+
+### Constructor and Factories
+
+```python
+import horus
+import numpy as np
+
+# Create from scratch
+cloud = horus.PointCloud(num_points=10000, fields=3, dtype="float32")
+
+# Create from NumPy array (shape must be [N, fields])
+arr = np.random.randn(10000, 3).astype(np.float32)
+cloud = horus.PointCloud.from_numpy(arr)
+
+# Create from PyTorch tensor
+import torch
+tensor = torch.randn(10000, 4)
+cloud = horus.PointCloud.from_torch(tensor)
+```
+
+### Conversions
+
+```python
+# Convert to NumPy (zero-copy when possible)
+arr = cloud.to_numpy()    # shape: (N, fields)
+
+# Convert to PyTorch tensor
+tensor = cloud.to_torch() # shape: (N, fields)
+
+# Convert to JAX array
+jax_arr = cloud.to_jax()  # shape: (N, fields)
+```
+
+### Access and Properties
+
+```python
+cloud = horus.PointCloud(num_points=10000, fields=4, dtype="float32")
+
+# Properties
+print(cloud.point_count)       # 10000
+print(cloud.fields_per_point)  # 4
+print(cloud.dtype)             # "float32"
+print(cloud.nbytes)            # 160000
+
+# Point access
+coords = cloud.point_at(0)    # [x, y, z, intensity] as list of floats
+
+# Metadata
+cloud.set_frame_id("velodyne_top")
+cloud.set_timestamp_ns(1700000000000000000)
+print(cloud.frame_id)         # "velodyne_top"
+print(cloud.timestamp_ns)     # 1700000000000000000
+
+# Layout queries
+cloud.is_xyz()           # False (4 fields)
+cloud.has_intensity()    # True
+cloud.has_color()        # False
+```
+
+### Python LiDAR Pipeline
+
+```python
+import horus
+import numpy as np
+
+sub = horus.Topic("lidar/points", horus.PointCloud)
+pub = horus.Topic("lidar/filtered", horus.PointCloud)
+
+while True:
+    cloud = sub.recv()
+    if cloud is None:
+        continue
+
+    # Convert to NumPy for processing
+    points = cloud.to_numpy()  # (N, 3)
+
+    # Remove points below ground plane
+    mask = points[:, 2] > -0.3
+    filtered = points[mask]
+
+    # Publish filtered cloud
+    out = horus.PointCloud.from_numpy(filtered.astype(np.float32))
+    out.set_frame_id(cloud.frame_id)
+    out.set_timestamp_ns(cloud.timestamp_ns)
+    pub.send(out)
+```
+
+## See Also
+
+- [Perception Messages](/rust/api/perception-messages) - PointField, PointCloudHeader, DepthImage, landmarks, tracking
+- [Tensor Messages](/rust/api/tensor-messages) - TensorDtype, Device, auto-managed tensor pools
+- [TensorPool API](/rust/api/tensor-pool) - Advanced pool management
+- [Sensor Messages](/rust/api/sensor-messages) - LaserScan for 2D LiDAR
+- [Vision Messages](/rust/api/vision-messages) - Image, CameraInfo, Detection3D

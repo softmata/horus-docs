@@ -11,10 +11,10 @@ order: 7
 After reading this guide, you will understand:
 - How the Scheduler orchestrates node execution through init(), tick(), and shutdown() phases
 - `Scheduler::new()` as the single entry point, with builder methods for global settings
-- Per-node execution classes: `.compute()`, `.on(topic)`, `.async_io()` — plus auto-RT from `.budget_us()` / `.rate()`
+- Per-node execution classes: `.compute()`, `.on(topic)`, `.async_io()` — plus auto-RT from `.budget()` / `.rate()`
 - The fluent NodeBuilder API for adding nodes with `.add(node).order(0).build()`
-- Per-node configuration: `.order()`, `.rate()`, `.budget_us()`, `.deadline_ms()`, `.on_miss()`
-- Scheduler profile presets: `Scheduler::deploy()`, `hard_rt()`, `safety_critical()`
+- Per-node configuration: `.order()`, `.rate()`, `.budget()`, `.deadline()`, `.on_miss()`
+- Composable scheduler builders: `.monitoring(true)`, `.require_rt()`, `.with_blackbox(n)`, `.with_profiling()`
 - Priority-based execution where lower numbers run first (0 = highest priority)
 - Graceful shutdown via Ctrl+C signal handling
 
@@ -53,30 +53,37 @@ scheduler.run()?;
 
 ### Builder Methods — Global Settings
 
-For production deployments, use profile presets that bundle the right settings:
+For production deployments, combine builder methods for the right settings:
 
 ```rust
 use horus::prelude::*;
 
 // Production robot — safety monitor, watchdog, blackbox
-let mut scheduler = Scheduler::deploy()
-    .tick_rate(1000.0.hz())           // 1 kHz control loop
-    .cores(&[2, 3]);           // Pin to cores 2 and 3
+let mut scheduler = Scheduler::new()
+    .monitoring(true)           // safety monitor + watchdog + budget enforcement
+    .tick_rate(1000.0.hz())     // 1 kHz control loop
+    .cores(&[2, 3]);            // Pin to cores 2 and 3
 
-scheduler.add(motor_ctrl).order(0).budget_us(500).build()?;
+scheduler.add(motor_ctrl).order(0).budget(500.us()).build()?;
 scheduler.run()?;
 ```
 
 All RT features that cannot be applied at runtime are recorded as degradations, not errors (see [Real-Time Features](#real-time-features) below).
 
-### Profile Presets
+### Composable Builders
 
-| Preset | What it enables | When to use |
+Instead of presets, combine builder methods for your deployment needs:
+
+| Builder Method | What it enables | When to use |
 |--------|----------------|-------------|
-| `Scheduler::new()` | Capability detection only | Development, prototyping |
-| `Scheduler::deploy()` | Safety monitor, budget enforcement, deadline monitoring, watchdog (500ms), blackbox (64MB) | Production robots |
-| `Scheduler::hard_rt()` | All RT features + memory locking + RT scheduling class. **Panics** without RT capabilities | Hard real-time systems |
-| `Scheduler::safety_critical()` | `hard_rt()` + blackbox + profiling | Medical, aerospace |
+| `.monitoring(true)` | Safety monitor, budget enforcement, deadline monitoring, watchdog (500ms) | Production robots |
+| `.require_rt()` | All RT features + memory locking + RT scheduling class. **Panics** without RT capabilities | Hard real-time systems |
+| `.with_blackbox(n)` | BlackBox flight recorder with n MB buffer | Post-mortem debugging |
+| `.with_profiling()` | Runtime profiling | Performance analysis |
+| `.deterministic(true)` | Deterministic execution mode | Certification, replay |
+| `.prefer_rt()` | Request RT features (degrades gracefully if unavailable) | Best-effort RT |
+| `.max_deadline_misses(n)` | Emergency stop after n deadline misses | Safety-critical |
+| `.cores(&[0,1])` | Pin to specific CPU cores | RT isolation |
 
 ## Adding Nodes
 
@@ -94,8 +101,8 @@ scheduler.add(fast_sensor).order(0).rate(1000.0.hz()).build()?;
 // Real-time node with tick budget (auto-marks as RT)
 scheduler.add(motor_ctrl)
     .order(0)
-    .budget_us(500)       // 500μs max execution time → auto RT
-    .deadline_ms(1)       // 1ms deadline
+    .budget(500.us())     // 500μs max execution time → auto RT
+    .deadline(1.ms())     // 1ms deadline
     .on_miss(Miss::Skip)  // Skip tick on deadline miss
     .build()?;
 
@@ -116,7 +123,7 @@ scheduler.add(logger).order(200).build()?;
 | `.on(topic)` | Event-driven — node ticks only when the given topic receives a message |
 | `.async_io()` | Async I/O node (non-blocking, suitable for network / file operations) |
 
-> **Note:** RT is auto-detected when you set `.budget_us()`, `.budget()`, `.deadline_*()`, or `.rate(Frequency)`. There is no `.rt()` method — just set a budget or rate and the node is automatically marked as real-time. The default execution class is `BestEffort`.
+> **Note:** RT is auto-detected when you set `.budget()`, `.deadline()`, or `.rate(Frequency)`. There is no `.rt()` method — just set a budget or rate and the node is automatically marked as real-time. The default execution class is `BestEffort`.
 
 **Per-node configuration:**
 
@@ -125,11 +132,8 @@ scheduler.add(logger).order(200).build()?;
 | `.order(n)` | Set execution order (lower = runs first) |
 | `.rate(hz.hz())` | Set node-specific tick rate in Hz |
 | `.rate(freq)` | Set tick rate from a `Frequency` (e.g. `100.hz()`) — auto-derives budget (80% period) and deadline (95% period), auto-marks RT |
-| `.budget_us(n)` | Set tick budget in microseconds — auto-marks as RT |
-| `.budget(dur)` | Set tick budget as a `Duration` — auto-marks as RT |
-| `.deadline_us(n)` | Set deadline in microseconds — auto-marks as RT |
-| `.deadline_ms(n)` | Set deadline in milliseconds — auto-marks as RT |
-| `.deadline_dur(dur)` | Set deadline as a `Duration` — auto-marks as RT |
+| `.budget(dur)` | Set tick budget as a `Duration`, e.g. `200.us()` — auto-marks as RT |
+| `.deadline(dur)` | Set deadline as a `Duration`, e.g. `1.ms()` — auto-marks as RT |
 | `.on_miss(Miss)` | Set deadline miss policy (`Warn`, `Skip`, `SafeMode`, `Stop`) |
 | `.failure_policy(policy)` | Override failure handling policy |
 | `.build()` / `.build()` | Finalize and register the node (returns `HorusResult`) |
@@ -202,20 +206,21 @@ let scheduler = Scheduler::new()
 
 ### Real-Time Features
 
-RT is configured through profile presets and per-node builder methods. Nodes are automatically marked as RT when you set `.budget_us()`, `.budget()`, `.deadline_*()`, or `.rate(Frequency)`:
+RT is configured through composable builder methods. Nodes are automatically marked as RT when you set `.budget()`, `.deadline()`, or `.rate(Frequency)`:
 
 ```rust
 // Hard real-time — panics without RT capabilities
-let mut scheduler = Scheduler::hard_rt()
+let mut scheduler = Scheduler::new()
+    .require_rt()
     .tick_rate(1000.0.hz())
     .cores(&[2, 3]);
 
-// Per-node: budget_us / deadline auto-mark as RT
+// Per-node: budget / deadline auto-mark as RT
 scheduler.add(motor_ctrl)
     .order(0)
-    .budget_us(500)         // 500μs tick budget → auto RT
-    .deadline_ms(1)         // 1ms deadline
-    .on_miss(Miss::SafeMode) // Enter safe mode on miss
+    .budget(500.us())         // 500μs tick budget → auto RT
+    .deadline(1.ms())         // 1ms deadline
+    .on_miss(Miss::SafeMode)  // Enter safe mode on miss
     .build()?;
 
 scheduler.add(sensor)
@@ -224,12 +229,12 @@ scheduler.add(sensor)
     .build()?;
 ```
 
-When using `Scheduler::hard_rt()` or `Scheduler::safety_critical()`, the scheduler applies (in order):
+When using `.require_rt()`, the scheduler applies (in order):
 1. **RT priority** (SCHED_FIFO) — if available
 2. **Memory locking** (mlockall) — if permitted
 3. **CPU affinity** — only to isolated CPUs if they exist
 
-Features that fail are recorded as degradations, not errors.
+Features that fail are recorded as degradations, not errors. Use `.prefer_rt()` instead if you want graceful degradation.
 
 ### BlackBox Flight Recorder
 
@@ -244,17 +249,18 @@ let mut scheduler = Scheduler::new()
 
 ### Safety Monitor
 
-`Scheduler::deploy()` enables safety monitoring (budget enforcement, deadline monitoring, watchdog) automatically:
+`.monitoring(true)` enables safety monitoring (budget enforcement, deadline monitoring, watchdog) automatically:
 
 ```rust
-let mut scheduler = Scheduler::deploy();
+let mut scheduler = Scheduler::new()
+    .monitoring(true);           // enables safety monitoring, watchdog, budget enforcement
 
 // RT node with budget and deadline enforcement
 scheduler.add(motor_ctrl)
     .order(0)
-    .budget_us(500)          // 500μs tick budget
-    .deadline_ms(100)        // 100ms deadline
-    .on_miss(Miss::SafeMode) // Enter safe mode on miss
+    .budget(500.us())            // 500μs tick budget
+    .deadline(100.ms())          // 100ms deadline
+    .on_miss(Miss::SafeMode)     // Enter safe mode on miss
     .build()?;
 ```
 
@@ -456,12 +462,13 @@ scheduler.add(diagnostics).order(200).build()?;
 ### Production Deployment
 
 ```rust
-let mut scheduler = Scheduler::deploy()
-    .tick_rate(1000.0.hz())           // 1 kHz control loop
-    .with_blackbox(16);        // Flight recorder (deploy() includes 64MB by default)
+let mut scheduler = Scheduler::new()
+    .monitoring(true)
+    .tick_rate(1000.0.hz())
+    .with_blackbox(16);
 
-scheduler.add(safety_monitor).order(0).budget_us(100).build()?;
-scheduler.add(motor_ctrl).order(5).budget_us(500).build()?;
+scheduler.add(safety_monitor).order(0).budget(100.us()).build()?;
+scheduler.add(motor_ctrl).order(5).budget(500.us()).build()?;
 scheduler.add(sensor).order(50).compute().rate(1000.0.hz()).build()?;
 scheduler.add(logger).order(200).async_io().build()?;
 
@@ -495,10 +502,11 @@ scheduler.add(sensor).order(50).build()?;           // Normal
 scheduler.add(logger).order(200).build()?;          // Background
 ```
 
-**Use profile presets for production** — enable RT features, recording, and safety monitoring:
+**Use composable builders for production** — enable RT features, recording, and safety monitoring:
 ```rust
-// Use profile presets for production
-let mut scheduler = Scheduler::deploy()
+// Use composable builders for production
+let mut scheduler = Scheduler::new()
+    .monitoring(true)
     .tick_rate(500.0.hz())
     .with_blackbox(16);
 ```
@@ -512,8 +520,8 @@ use horus::prelude::*;
 
 scheduler.add(motor_ctrl)
     .order(0)
-    .budget_us(500)
-    .deadline_ms(1)
+    .budget(500.us())
+    .deadline(1.ms())
     .on_miss(Miss::SafeMode)  // Enter safe mode on miss
     .build()?;
 ```
@@ -526,6 +534,59 @@ scheduler.add(motor_ctrl)
 | `Miss::Stop` | Stop the entire scheduler | Hard real-time safety-critical nodes |
 
 The default is `Miss::Warn`.
+
+## Method Reference
+
+### Constructor & Configuration
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `Scheduler::new()` | `Scheduler` | Create scheduler with auto-detected capabilities |
+| `.with_name(name)` | `Self` | Set scheduler name for logging |
+| `.tick_rate(freq)` | `Self` | Set global tick rate (default: 60 Hz) |
+| `.monitoring(bool)` | `Self` | Enable safety monitor, budget enforcement, watchdog |
+| `.prefer_rt()` | `Self` | Try RT features, degrade gracefully if unavailable |
+| `.require_rt()` | `Self` | Enable RT features, panic if unavailable |
+| `.deterministic(bool)` | `Self` | Sequential execution on main thread |
+| `.verbose(bool)` | `Self` | Enable/disable verbose executor logging |
+| `.cores(&[usize])` | `Self` | Pin scheduler and RT threads to CPU cores |
+| `.max_deadline_misses(n)` | `Self` | Max deadline misses before emergency stop |
+| `.with_profiling()` | `Self` | Enable runtime profiling |
+| `.with_blackbox(size_mb)` | `Self` | Enable flight recorder with buffer size |
+| `.with_recording()` | `Self` | Enable recording with sensible defaults |
+| `.with_telemetry(endpoint)` | `Self` | Enable telemetry export (`"udp://host:port"` or `"file:///path"`) |
+
+### Node Registration
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.add(node)` | `NodeBuilder` | Add node via fluent builder (recommended) |
+
+### Execution Control
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.run()` | `HorusResult<()>` | Main loop — run until Ctrl+C |
+| `.run_for(duration)` | `HorusResult<()>` | Run for specific duration, then shutdown |
+| `.tick_once()` | `HorusResult<()>` | Execute exactly one tick cycle (no loop, no sleep) |
+| `.tick_once_nodes(&[names])` | `HorusResult<()>` | One tick cycle for specific nodes only |
+| `.stop()` | `()` | Stop the scheduler |
+| `.is_running()` | `bool` | Check if scheduler is currently running |
+
+### Monitoring & Statistics
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.metrics()` | `Vec<NodeMetrics>` | Performance metrics for all nodes |
+| `.safety_stats()` | `Option<SafetyStats>` | Budget overruns, deadline misses, watchdog expirations |
+| `.node_list()` | `Vec<String>` | List of registered node names |
+| `.status()` | `String` | Formatted status report (platform, RT features, safety) |
+
+### Runtime Configuration
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.set_node_rate(name, freq)` | `&mut Self` | Change per-node rate at runtime |
 
 ## Next Steps
 

@@ -6,7 +6,7 @@ weight: 40
 
 # Scheduler Configuration
 
-HORUS uses a single scheduler entry point — `Scheduler::new()` — with profile presets (`Scheduler::deploy()`, `Scheduler::hard_rt()`, `Scheduler::safety_critical()`) and a fluent node builder API that gives you full control over execution class, timing, ordering, and failure handling on a per-node basis.
+HORUS uses a single scheduler entry point — `Scheduler::new()` — with composable builder methods (`.monitoring(true)`, `.require_rt()`, `.with_blackbox(n)`, `.with_profiling()`) and a fluent node builder API that gives you full control over execution class, timing, ordering, and failure handling on a per-node basis.
 
 ## Creating a Scheduler
 
@@ -35,9 +35,12 @@ fn main() -> Result<()> {
 | `.tick_rate(hz.hz())` | Global scheduler tick rate in Hz | `60.0` |
 | `.with_capacity(n)` | Pre-allocate node storage | `16` |
 | `.with_name(name)` | Human-readable scheduler name | `"default"` |
-| `Scheduler::deploy()` | Production preset — safety + watchdog + blackbox | — |
-| `Scheduler::hard_rt()` | Hard real-time preset — panics without RT capabilities | — |
-| `Scheduler::safety_critical()` | Safety-critical preset — hard_rt + blackbox + profiling | — |
+| `.monitoring(true)` | Safety monitor + watchdog + budget enforcement | — |
+| `.require_rt()` | Hard real-time — panics without RT capabilities | — |
+| `.prefer_rt()` | Request RT features (degrades gracefully) | — |
+| `.with_blackbox(n)` | BlackBox flight recorder (n MB) | — |
+| `.with_profiling()` | Runtime profiling | — |
+| `.deterministic(true)` | Deterministic execution | — |
 
 ## Adding Nodes
 
@@ -51,11 +54,11 @@ fn main() -> Result<()> {
         .tick_rate(1000.0.hz());
 
     // Real-time motor control — runs first every tick
-    // budget_us() auto-marks this node as RT
+    // budget() auto-marks this node as RT
     scheduler.add(MotorController::new("arm"))
         .order(0)
-        .budget_us(200)
-        .deadline_ms(1)
+        .budget(200.us())
+        .deadline(1.ms())
         .on_miss(Miss::Skip)
         .build()?;
 
@@ -75,7 +78,7 @@ fn main() -> Result<()> {
     // Event-driven node — wakes only when the topic has new data
     scheduler.add(CollisionChecker::new())
         .on("lidar/points")
-        .deadline_ms(5)
+        .deadline(5.ms())
         .build()?;
 
     // Async I/O — network or disk, never blocks the real-time loop
@@ -100,11 +103,11 @@ Every node belongs to exactly one execution class. Set it in the builder chain:
 | `.on(topic)` | Event-Driven | Wakes only when the named topic receives new data. |
 | `.async_io()` | Async I/O | Runs on an async executor. Use for network, disk, or cloud calls. |
 
-If no execution class is specified, the node defaults to **BestEffort**. A node is automatically promoted to the **RT** class when you set `.budget_us()`, `.budget()`, `.deadline_us()`, `.deadline_ms()`, or `.rate(Frequency)`.
+If no execution class is specified, the node defaults to **BestEffort**. A node is automatically promoted to the **RT** class when you set `.budget()`, `.deadline()`, or `.rate(Frequency)`.
 
 ### When to Use Each Class
 
-- **RT (auto-detected)** — Motor controllers, safety monitors, sensor fusion, anything that must run every tick with bounded latency. Triggered by `.budget_us()`, `.budget()`, `.deadline_*()`, or `.rate(Frequency)`.
+- **RT (auto-detected)** — Motor controllers, safety monitors, sensor fusion, anything that must run every tick with bounded latency. Triggered by `.budget()`, `.deadline()`, or `.rate(Frequency)`.
 - **`.compute()`** — Path planning, point cloud processing, ML inference. These can take longer than a single tick without blocking RT nodes.
 - **`.on(topic)`** — Collision detection, event handlers, reactive behaviors. Only runs when there is new data, saving CPU when idle.
 - **`.async_io()`** — Telemetry upload, log shipping, cloud API calls. Never blocks any real-time or compute work.
@@ -118,10 +121,8 @@ If no execution class is specified, the node defaults to **BestEffort**. A node 
 | `.order(n)` | Execution priority within a tick (lower = runs first) |
 | `.rate(hz.hz())` | Node-specific tick rate, independent of the global rate |
 | `.rate(Frequency)` | Rate from `100.hz()` — auto-derives budget and deadline (auto-marks as RT) |
-| `.budget_us(us)` | Tick budget in microseconds (auto-marks as RT) |
-| `.budget(Duration)` | Tick budget as Duration, e.g. `200.us()` (auto-marks as RT) |
-| `.deadline_ms(ms)` | Deadline in milliseconds from tick start |
-| `.deadline_us(us)` | Deadline in microseconds from tick start |
+| `.budget(Duration)` | Tick budget, e.g. `200.us()` (auto-marks as RT) |
+| `.deadline(Duration)` | Deadline, e.g. `1.ms()` (auto-marks as RT) |
 | `.on_miss(Miss)` | What to do on deadline miss (`Miss::Warn`, `Miss::Skip`, `Miss::SafeMode`, `Miss::Stop`) |
 
 ### Failure Policy
@@ -139,9 +140,9 @@ If no execution class is specified, the node defaults to **BestEffort**. A node 
 - **100-199**: Low priority (logging, diagnostics)
 - **200+**: Background (telemetry, non-essential)
 
-## Global Configuration with Profile Presets
+## Global Configuration with Composable Builders
 
-Instead of toggling individual flags, use profile presets that bundle the right settings for each deployment stage:
+Instead of toggling individual flags, compose the builder methods you need for each deployment stage:
 
 ```rust
 use horus::prelude::*;
@@ -151,17 +152,22 @@ let mut scheduler = Scheduler::new()
     .tick_rate(1000.0.hz())
     .with_profiling();
 
-// Production — safety + watchdog + blackbox
-let mut scheduler = Scheduler::deploy()
+// Production — safety + watchdog + budget enforcement
+let mut scheduler = Scheduler::new()
+    .monitoring(true)
     .tick_rate(1000.0.hz())
     .cores(&[2, 3]);
 
 // Hard real-time — panics without RT capabilities
-let mut scheduler = Scheduler::hard_rt()
+let mut scheduler = Scheduler::new()
+    .require_rt()
     .tick_rate(1000.0.hz());
 
-// Safety-critical — hard_rt + blackbox + profiling
-let mut scheduler = Scheduler::safety_critical()
+// Safety-critical — require_rt + blackbox + profiling
+let mut scheduler = Scheduler::new()
+    .require_rt()
+    .with_blackbox(64)
+    .with_profiling()
     .tick_rate(1000.0.hz())
     .max_deadline_misses(3);
 ```
@@ -173,43 +179,52 @@ The Python API mirrors the Rust fluent builder:
 ```python
 from horus import Scheduler
 
-# Create scheduler with global settings
-scheduler = Scheduler(tick_rate=1000.0, name="arm_control")
-
-# Real-time motor controller (budget_us auto-marks as RT)
-scheduler.add(motor_ctrl).order(0).budget_us(200).deadline_ms(1).on_miss("skip").build()
-
-# Sensor with custom rate
-scheduler.add(lidar).order(10).rate(500.0.hz()).build()
-
-# Compute node
-scheduler.add(planner).order(50).compute().build()
-
-# Event-driven node
-scheduler.add(collision).on("lidar/points").deadline_ms(5).on_miss("safe_mode").build()
-
-# Async I/O node
-scheduler.add(telemetry).order(200).async_io().rate(10.0.hz()).build()
-
-scheduler.run()
+# Fluent API — configure nodes inline with chained calls
+scheduler = Scheduler()
+scheduler.node(motor_ctrl).order(0).budget(200).rate(1000.0).build()
+scheduler.node(planner).order(5).compute().build()
+scheduler.node(telemetry).order(10).async_io().rate(1.0).build()
 ```
 
-You can also pass a config dict for global settings:
+You can also use keyword arguments with `add()`:
 
 ```python
-scheduler = Scheduler(config={
-    "tick_rate": 1000.0,
-    "enable_profiling": True,
-    "black_box_size_mb": 64,
-})
+scheduler.add(sensor, order=0, rate=100.0)
+scheduler.add(controller, order=1, budget=200, on_miss="safe_mode", deadline=5.0)
+scheduler.add(logger, order=2, rate=10.0)
+scheduler.add(monitor, order=3, failure_policy="skip")
 ```
 
-Or use profile presets:
+Create a scheduler with a `SchedulerConfig`:
 
 ```python
-scheduler = Scheduler.deploy(tick_rate=1000.0)
-scheduler = Scheduler.hard_rt(tick_rate=1000.0)
-scheduler = Scheduler.safety_critical(tick_rate=1000.0)
+from horus import Scheduler, SchedulerConfig
+
+# Create scheduler with config
+cfg = SchedulerConfig.with_monitoring()
+cfg.tick_rate = 1000.0
+scheduler = Scheduler(config=cfg)
+```
+
+Composable config for different deployment stages:
+
+```python
+from horus import Scheduler, SchedulerConfig
+
+# Development — lightweight
+scheduler = Scheduler()
+
+# Production — safety + monitoring
+cfg = SchedulerConfig.with_monitoring()
+cfg.tick_rate = 1000.0
+scheduler = Scheduler(config=cfg)
+
+# With blackbox
+cfg = SchedulerConfig.with_monitoring()
+cfg.tick_rate = 1000.0
+cfg.black_box_enabled = True
+cfg.black_box_size_mb = 64
+scheduler = Scheduler(config=cfg)
 ```
 
 ## Execution Modes
@@ -237,10 +252,10 @@ Nodes execute one-by-one in priority order — same execution order every tick. 
 use horus::prelude::*;
 
 // Safety-critical robot controller — 1 kHz tick
-// budget_us() auto-marks nodes as RT
+// budget() auto-marks nodes as RT
 let mut scheduler = Scheduler::new().tick_rate(1000.0.hz());
-scheduler.add(safety_monitor).order(0).budget_us(100).build()?;
-scheduler.add(controller).order(1).budget_us(200).build()?;
+scheduler.add(safety_monitor).order(0).budget(100.us()).build()?;
+scheduler.add(controller).order(1).budget(200.us()).build()?;
 scheduler.run()?;
 ```
 
