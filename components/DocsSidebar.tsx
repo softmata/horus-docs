@@ -80,7 +80,7 @@ const sections: SidebarSection[] = [
               { title: "Force", href: "/rust/api/force-messages", order: 4 },
               { title: "Geometry", href: "/rust/api/geometry-messages", order: 5 },
 
-              { title: "ML", href: "/rust/api/ml-messages", order: 7 },
+              { title: "ML (Removed)", href: "/rust/api/ml-messages", order: 7 },
               { title: "Navigation", href: "/rust/api/navigation-messages", order: 8 },
               { title: "Perception", href: "/rust/api/perception-messages", order: 9 },
               { title: "Sensor", href: "/rust/api/sensor-messages", order: 10 },
