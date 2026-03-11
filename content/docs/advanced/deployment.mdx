@@ -14,17 +14,17 @@ Five steps to go from development to production.
 
 ### 1. Enable Safety Monitoring
 
-The `.monitoring(true)` method enables budget enforcement, deadline monitoring, watchdog timers (500 ms default), and the safety monitor -- all four at once:
+The `.watchdog(Duration)` method enables frozen node detection and creates the safety monitor. Budget enforcement is implicit when nodes have `.rate()` set:
 
 ```rust
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .monitoring(true)
+    .watchdog(500_u64.ms())
     .tick_rate(100_u64.hz());
 ```
 
-This is the single most important setting for production. Without it, budget overruns and deadline misses are silently ignored.
+This is the single most important setting for production. The watchdog detects hung nodes and triggers graduated degradation automatically.
 
 ### 2. Configure Real-Time (Optional)
 
@@ -34,13 +34,13 @@ HORUS provides two RT modes that enable OS-level `SCHED_FIFO` scheduling and `ml
 // Graceful: try RT, warn and continue if unavailable
 let mut scheduler = Scheduler::new()
     .prefer_rt()
-    .monitoring(true)
+    .watchdog(500_u64.ms())
     .tick_rate(100_u64.hz());
 
 // Strict: panic if the system lacks RT capabilities
 let mut scheduler = Scheduler::new()
     .require_rt()
-    .monitoring(true)
+    .watchdog(500_u64.ms())
     .tick_rate(1000_u64.hz());
 ```
 
@@ -57,7 +57,7 @@ scheduler.add(motor_controller)
     .rate(1000_u64.hz())
     .budget(200_u64.us())       // Must finish within 200 us
     .deadline(800_u64.us())     // Absolute latest: 800 us
-    .on_miss(Miss::Degrade)     // Enter safe state on miss
+    .on_miss(Miss::SafeMode)    // Enter safe state on miss
     .build()?;
 
 scheduler.add(lidar_processor)
@@ -73,7 +73,7 @@ The `Miss` policy controls what happens on deadline miss:
 |--------|----------|
 | `Miss::Warn` | Log a warning and continue (default) |
 | `Miss::Skip` | Skip the current tick, resume next cycle |
-| `Miss::Degrade` | Call `enter_safe_state()` on the node |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node |
 | `Miss::Stop` | Stop the entire scheduler |
 
 ### 4. Enable Flight Recorder
@@ -82,26 +82,26 @@ The blackbox records scheduler events to a ring buffer on disk for post-mortem a
 
 ```rust
 let mut scheduler = Scheduler::new()
-    .monitoring(true)
-    .with_blackbox(64)    // 64 MB ring buffer
+    .watchdog(500_u64.ms())
+    .blackbox(64)             // 64 MB ring buffer
     .tick_rate(100_u64.hz());
 ```
 
 Data is written to `.horus/blackbox/` in the working directory. See the [Blackbox](/docs/advanced/blackbox) page for analysis tools.
 
-### 5. Pin CPU Cores
+### 5. Require Real-Time
 
-Pin the scheduler and RT threads to specific CPU cores to avoid cache thrashing and OS scheduler interference:
+For hard real-time deployments, require RT capabilities:
 
 ```rust
 let mut scheduler = Scheduler::new()
     .require_rt()
-    .cores(&[2, 3])       // Pin to cores 2 and 3
-    .monitoring(true)
+    .watchdog(500_u64.ms())
+    .blackbox(64)
     .tick_rate(1000_u64.hz());
 ```
 
-If you do not call `.cores()`, the scheduler uses the system's recommended RT CPUs when available.
+This panics if the system lacks `SCHED_FIFO` or `mlockall` capabilities, ensuring your safety-critical system never runs in degraded mode silently.
 
 ## RT Kernel Setup (Linux)
 
@@ -162,33 +162,31 @@ use horus::prelude::*;
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new()
-        .with_name("arm_controller")
         .prefer_rt()
-        .monitoring(true)
-        .with_blackbox(64)
-        .with_profiling()
+        .watchdog(500_u64.ms())
+        .blackbox(64)
         .max_deadline_misses(5)
-        .cores(&[2, 3])
         .tick_rate(1000_u64.hz());
 
     // Safety-critical: motor control at 1 kHz
     scheduler.add(MotorController::new())
+        .order(0)
         .rate(1000_u64.hz())
-        .budget(200_u64.us())
-        .deadline(800_u64.us())
-        .on_miss(Miss::Degrade)
+        .on_miss(Miss::SafeMode)
         .build()?;
 
     // Important: state estimation at 200 Hz
     scheduler.add(StateEstimator::new())
+        .order(10)
         .rate(200_u64.hz())
-        .budget(1_u64.ms())
         .on_miss(Miss::Warn)
         .build()?;
 
     // Best-effort: telemetry at 10 Hz
     scheduler.add(TelemetryPublisher::new())
+        .order(200)
         .rate(10_u64.hz())
+        .async_io()
         .on_miss(Miss::Skip)
         .build()?;
 
@@ -239,20 +237,8 @@ for m in scheduler.metrics() {
 
 After an incident, the blackbox contains a timestamped log of scheduler events including start/stop, budget violations, deadline misses, and watchdog expirations. See [Blackbox](/docs/advanced/blackbox) for details.
 
-### Telemetry Export
-
-Stream metrics to an external collector:
-
-```rust
-let mut scheduler = Scheduler::new()
-    .monitoring(true)
-    .with_telemetry("udp://localhost:9999");
-```
-
-Supported endpoints: `udp://host:port` and `file:///path/to/metrics.json`.
-
 ## See Also
 
-- [Safety Monitor](/docs/advanced/safety-monitor) -- watchdog, budget enforcement, and deadline miss policies
-- [Scheduler Configuration](/docs/advanced/scheduler-configuration) -- full builder API reference
-- [Blackbox](/docs/advanced/blackbox) -- flight recorder and post-mortem analysis
+- [Safety Monitor](/advanced/safety-monitor) -- watchdog, budget enforcement, and deadline miss policies
+- [Scheduler Configuration](/advanced/scheduler-configuration) -- full builder API reference
+- [BlackBox Flight Recorder](/advanced/blackbox) -- flight recorder and post-mortem analysis

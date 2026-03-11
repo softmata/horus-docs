@@ -1,6 +1,6 @@
 ---
 title: Communication Patterns Overview
-description: Understanding HORUS communication primitives — Topics, Actions, and Network
+description: Understanding HORUS communication primitives — Topics and Actions
 order: 20
 ---
 
@@ -22,22 +22,14 @@ Both work locally (shared memory) and across machines (network transport via con
 ```rust
 use horus::prelude::*;
 
-// Create a topic — backend is auto-detected
 let pub_topic: Topic<f32> = Topic::new("sensor.temperature")?;
 pub_topic.send(25.3);
 
-// Any number of subscribers can listen
 let sub_topic: Topic<f32> = Topic::new("sensor.temperature")?;
 if let Some(temp) = sub_topic.recv() {
     hlog!(info, "Temperature: {}", temp);
 }
 ```
-
-### Automatic Optimization
-
-You never choose a backend — HORUS detects the optimal one automatically based on:
-- **Topology**: Same thread, same process, or cross-process
-- **Participants**: How many publishers and subscribers
 
 | Scenario | Latency |
 |----------|---------|
@@ -45,13 +37,7 @@ You never choose a backend — HORUS detects the optimal one automatically based
 | Same process | ~18-36ns |
 | Cross-process | ~50-167ns |
 
-The communication path can change at runtime — if a second subscriber joins, HORUS automatically migrates to a multi-consumer path without dropping messages.
-
-### Key Characteristics
-
-- **Infallible send**: `send()` always succeeds. Overwrites oldest message when full ("keep last" semantics).
-- **Non-blocking recv**: `recv()` returns `Option<T>`. Returns `None` if no message available.
-- **Zero introspection overhead**: No timing, logging, or tracing in the default path. Opt-in via `with_logging()`.
+The backend is auto-selected based on topology and participant count. Communication paths upgrade transparently at runtime as participants join.
 
 For full Topic API details, see [Topic Communication](/concepts/core-concepts-topic).
 
@@ -59,154 +45,7 @@ For full Topic API details, see [Topic Communication](/concepts/core-concepts-to
 
 Actions handle tasks that take time to complete and benefit from progress feedback and cancellation. They follow the **Goal / Feedback / Result** pattern.
 
-### Defining an Action
-
-```rust
-use horus::prelude::*;
-
-#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
-pub struct NavigateGoal {
-    pub target_x: f64,
-    pub target_y: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
-pub struct NavigateFeedback {
-    pub distance_remaining: f64,
-    pub progress_percent: f32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
-pub struct NavigateResult {
-    pub success: bool,
-    pub final_x: f64,
-    pub final_y: f64,
-}
-
-pub struct NavigateToGoal;
-
-impl Action for NavigateToGoal {
-    type Goal = NavigateGoal;
-    type Feedback = NavigateFeedback;
-    type Result = NavigateResult;
-
-    fn name(&self) -> &str {
-        "navigate_to_goal"
-    }
-}
-```
-
-### Action Server
-
-The server receives goals and executes them:
-
-```rust
-let server = ActionServerBuilder::<NavigateToGoal>::new()
-    .on_goal(|goal| {
-        // Accept or reject the goal
-        if goal.target_x.abs() < 100.0 {
-            GoalResponse::Accept
-        } else {
-            GoalResponse::Reject("Target out of range".into())
-        }
-    })
-    .on_execute(|handle| {
-        // Execute the task, sending feedback along the way
-        let goal = handle.goal();
-        let initial_distance = compute_distance(goal);
-
-        loop {
-            let distance = compute_distance(goal);
-            handle.publish_feedback(NavigateFeedback {
-                distance_remaining: distance,
-                progress_percent: (1.0 - distance / initial_distance) * 100.0,
-            });
-
-            if handle.is_cancel_requested() {
-                return GoalOutcome::Canceled(NavigateResult {
-                    success: false, final_x: 0.0, final_y: 0.0,
-                });
-            }
-
-            if distance < 0.1 {
-                return GoalOutcome::Succeeded(NavigateResult {
-                    success: true,
-                    final_x: goal.target_x,
-                    final_y: goal.target_y,
-                });
-            }
-        }
-    })
-    .on_cancel(|_goal_id| {
-        CancelResponse::Accept
-    })
-    .build();
-```
-
-### Action Client
-
-The client sends goals and tracks progress:
-
-```rust
-let client = ActionClientBuilder::<NavigateToGoal>::new()
-    .on_feedback(|_goal_id, feedback| {
-        hlog!(info, "Progress: {:.1}%", feedback.progress_percent);
-    })
-    .on_result(|_goal_id, status, result| {
-        match status {
-            GoalStatus::Succeeded => {
-                hlog!(info, "Arrived at ({}, {})", result.final_x, result.final_y);
-            }
-            GoalStatus::Aborted => hlog!(warn, "Navigation aborted"),
-            GoalStatus::Canceled => hlog!(info, "Navigation canceled"),
-            GoalStatus::Preempted => hlog!(info, "Navigation preempted"),
-            _ => {}
-        }
-    })
-    .build();
-
-// Send a goal
-let goal_handle = client.send_goal(NavigateGoal {
-    target_x: 5.0,
-    target_y: 3.0,
-})?;
-
-// Cancel if needed
-goal_handle.cancel();
-```
-
-### Goal Lifecycle
-
-<MermaidDiagram
-  chart={`%%{init: {'stateDiagram': {'padding': 20}}}%%
-stateDiagram-v2
-    [*] --> Pending
-    Pending --> Active
-    Pending --> Rejected : validation failed
-    Active --> Succeeded
-    Active --> Aborted : server error
-    Active --> Canceled : client request
-    Active --> Preempted : higher-priority goal
-`}
-  caption="Goal lifecycle state transitions"
-/>
-
-### Preemption Policies
-
-Configure how the server handles new goals while one is active:
-
-| Policy | Behavior |
-|--------|----------|
-| `PreemptionPolicy::PreemptOld` | New goals cancel the active goal (default) |
-| `PreemptionPolicy::RejectNew` | New goals are rejected while one is active |
-| `PreemptionPolicy::Priority` | Higher-priority goals preempt lower ones |
-| `PreemptionPolicy::Queue { max_size }` | Goals are queued FIFO up to a limit |
-
-## Network Communication
-
-By default, Topics and Actions use shared memory for ultra-fast communication between processes on the same machine. HORUS also supports zero-configuration peer discovery via mDNS (requires the `mdns` feature flag), allowing robots on the same local network to discover each other automatically.
-
-For multi-machine communication, HORUS supports zero-configuration peer discovery via mDNS (requires the `mdns` feature flag).
+For full Action API details, see [Actions](/concepts/actions).
 
 ## When to Use What
 
@@ -225,7 +64,7 @@ For multi-machine communication, HORUS supports zero-configuration peer discover
 
 ## Composing Patterns
 
-A typical robot system combines all patterns:
+A typical robot system combines both patterns:
 
 ```rust
 struct NavigationSystem {
@@ -247,3 +86,4 @@ The navigation action server subscribes to sensor topics internally, computes a 
 ## Next Steps
 
 - [Topic Details](/concepts/core-concepts-topic) - Full Topic API reference
+- [Actions](/concepts/actions) - Goal/feedback/result pattern

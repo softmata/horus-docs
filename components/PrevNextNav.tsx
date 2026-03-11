@@ -13,7 +13,6 @@ interface DocLink {
 const allPages: DocLink[] = [
   // Getting Started
   { title: "What is HORUS?", href: "/concepts/what-is-horus" },
-  { title: "Goals & Vision", href: "/concepts/goals" },
   { title: "Installation", href: "/getting-started/installation" },
   { title: "Quick Start", href: "/getting-started/quick-start" },
   { title: "Choosing a Language", href: "/getting-started/choosing-language" },
@@ -77,7 +76,6 @@ const allPages: DocLink[] = [
 
   // Advanced Topics
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },
-  { title: "Execution Modes", href: "/advanced/execution-modes" },
   { title: "Network Backends", href: "/advanced/network-backends" },
   { title: "BlackBox Recorder", href: "/advanced/blackbox" },
   { title: "Fault Tolerance", href: "/advanced/circuit-breaker" },

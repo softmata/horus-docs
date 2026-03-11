@@ -12,7 +12,7 @@ The Safety Monitor provides real-time safety monitoring for safety-critical robo
 
 The Safety Monitor includes:
 - **Watchdogs**: Monitor node liveness — trigger action if a critical node hangs
-- **Budget Enforcement**: Per-node tick budgets — act if a node takes too long
+- **Budget Enforcement**: Per-node tick budgets — act if a node takes too long (implicit when nodes have `.rate()` set)
 - **Deadline Tracking**: Count deadline misses and apply the configured `Miss` policy
 - **Miss Policies**: `Warn`, `Skip`, `SafeMode`, or `Stop` — per-node control over what happens on deadline miss
 
@@ -25,54 +25,53 @@ Use composable builder methods to enable safety monitoring. Each method adds a s
 ```rust
 use horus::prelude::*;
 
-// Production: safety monitor + watchdog + budget enforcement
+// Production: watchdog for frozen node detection
+// Budget enforcement is implicit when nodes have .rate() set
 let mut scheduler = Scheduler::new()
-    .monitoring(true)
-    .tick_rate(1000.0.hz());
+    .watchdog(500_u64.ms())
+    .tick_rate(1000_u64.hz());
 
-// Safety-critical: require RT + blackbox + profiling
+// Safety-critical: require RT + blackbox + strict deadline limit
 let mut scheduler = Scheduler::new()
     .require_rt()
-    .with_blackbox(64)
-    .with_profiling()
-    .tick_rate(1000.0.hz())
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(1000_u64.hz())
     .max_deadline_misses(3);
 ```
 
 ### Composable Builder Comparison
 
-| Builder | Safety Monitor | Watchdog | Budget Enforcement | Memory Locking | Blackbox |
-|---------|---------------|----------|-------------------|----------------|----------|
-| `new()` | No | No | No | No | No |
-| `.monitoring(true)` | **Yes** | **Yes** (500ms) | **Yes** | No | No |
-| `.require_rt()` | No | No | No | **Yes** | No |
-| `.monitoring(true).require_rt()` | **Yes** | **Yes** (500ms) | **Yes** | **Yes** | No |
-| `.monitoring(true).with_blackbox(64)` | **Yes** | **Yes** (500ms) | **Yes** | No | **Yes** (64MB) |
+| Builder | Watchdog | Budget Enforcement | Memory Locking | Blackbox |
+|---------|----------|-------------------|----------------|----------|
+| `new()` | No | Implicit (when nodes have `.rate()`) | No | No |
+| `.watchdog(500_u64.ms())` | **Yes** (500ms) | Implicit | No | No |
+| `.require_rt()` | No | Implicit | **Yes** | No |
+| `.watchdog(500_u64.ms()).require_rt()` | **Yes** (500ms) | Implicit | **Yes** | No |
+| `.watchdog(500_u64.ms()).blackbox(64)` | **Yes** (500ms) | Implicit | No | **Yes** (64MB) |
 
-## Configuring Nodes with Budgets
+## Configuring Nodes with Rates
 
-After configuring the scheduler, add nodes with timing constraints using the node builder. Setting `.budget()` automatically marks the node as RT — no separate `.rt()` call needed:
+After configuring the scheduler, add nodes with timing constraints using the node builder. Setting `.rate()` automatically marks the node as RT and derives budget (80% of period) and deadline (95% of period):
 
 ```rust
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .monitoring(true)
-    .tick_rate(1000.0.hz());
+    .watchdog(500_u64.ms())
+    .tick_rate(1000_u64.hz());
 
-// RT node with budget and deadline — budget auto-marks as RT
+// RT node — rate auto-derives budget and deadline
 scheduler.add(motor_controller)
     .order(0)
-    .budget(500.us())        // 500μs tick budget
-    .deadline(1.ms())        // 1ms deadline
-    .on_miss(Miss::SafeMode) // Enter safe state on miss
+    .rate(1000_u64.hz())       // budget=800us, deadline=950us
+    .on_miss(Miss::SafeMode)   // Enter safe state on miss
     .build()?;
 
 scheduler.add(sensor_fusion)
     .order(1)
-    .budget(2000.us())
-    .deadline(5.ms())
-    .on_miss(Miss::Skip)     // Skip tick on miss
+    .rate(200_u64.hz())        // budget=4ms, deadline=4.75ms
+    .on_miss(Miss::Skip)       // Skip tick on miss
     .build()?;
 
 scheduler.run()?;
@@ -80,14 +79,14 @@ scheduler.run()?;
 
 ## Watchdogs
 
-Watchdogs monitor node liveness. The scheduler automatically feeds watchdogs on successful node ticks. If a critical node fails to execute within the watchdog timeout, an emergency stop is triggered.
+Watchdogs monitor node liveness. The scheduler automatically feeds watchdogs on successful node ticks. If a critical node fails to execute within the watchdog timeout, the safety monitor triggers graduated degradation.
 
 ```
 Normal operation:
   Node tick → success → watchdog fed → timer reset
 
 Failure scenario:
-  Node hangs → watchdog timeout expires → EMERGENCY STOP
+  Node hangs → watchdog timeout expires → graduated degradation → EMERGENCY STOP
 ```
 
 ### Timeout Guidelines
@@ -105,18 +104,17 @@ Example:
 
 ## Budget Enforcement
 
-Per-node tick budgets ensure nodes complete within time limits. Set budgets via the node builder:
+Budget enforcement is implicit when nodes have `.rate()` set. The auto-derived budget (80% of the period from `.rate()`) ensures nodes complete within time limits:
 
 ```rust
 scheduler.add(motor_controller)
     .order(0)
-    .budget(500.us())        // 500μs tick budget
-    .deadline(1.ms())        // 1ms deadline
-    .on_miss(Miss::SafeMode) // Enter safe state on budget/deadline miss
+    .rate(1000_u64.hz())       // auto-derives budget=800us, deadline=950us
+    .on_miss(Miss::SafeMode)   // Enter safe state on budget/deadline miss
     .build()?;
 ```
 
-When a node exceeds its budget, the configured `Miss` policy is applied. Violations are also recorded in the [BlackBox](/advanced/blackbox) when using `.monitoring(true)` or `.with_blackbox(n)`.
+When a node exceeds its budget, the configured `Miss` policy is applied. Violations are also recorded in the BlackBox when using `.blackbox(n)`.
 
 ## Node Health States
 
@@ -164,7 +162,7 @@ Both systems work together: the `Miss` policy handles immediate responses, while
 
 ### Shutdown Report
 
-When the scheduler shuts down with `.monitoring(true)`, the timing report includes a health summary:
+When the scheduler shuts down with `.watchdog()` enabled, the timing report includes a health summary:
 
 ```
 Node Health:
@@ -232,14 +230,15 @@ When emergency stop triggers:
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .monitoring(true)
-    .tick_rate(1000.0.hz());
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(1000_u64.hz());
 
 // ... application runs and hits emergency stop ...
 
 // Inspect what happened via BlackBox
-if let Some(bb) = scheduler.blackbox() {
-    let anomalies = bb.anomalies();
+if let Some(bb) = scheduler.get_blackbox() {
+    let anomalies = bb.lock().unwrap().anomalies();
     println!("=== SAFETY EVENTS ({}) ===", anomalies.len());
     for record in &anomalies {
         println!("[tick {}] {:?}", record.tick, record.event);
@@ -249,46 +248,48 @@ if let Some(bb) = scheduler.blackbox() {
 
 ## Best Practices
 
-### 1. Start with Conservative Budgets
+### 1. Start with Conservative Rates
 
-Set generous budgets initially, then tighten after profiling:
+Set rates generously initially, then tighten after profiling:
 
 ```rust
-// Start: 3× expected execution time
+// Start: use rate() — auto-derives budget at 80% of period
 scheduler.add(motor_controller)
     .order(0)
-    .budget(1500.us())       // 3× expected
-    .on_miss(Miss::Warn)     // Log only while tuning
+    .rate(500_u64.hz())        // period=2ms, budget=1.6ms
+    .on_miss(Miss::Warn)       // Log only while tuning
     .build()?;
 
-// After profiling: 2× measured worst case
+// After profiling: tighten to 1kHz
 scheduler.add(motor_controller)
     .order(0)
-    .budget(1000.us())       // 2× measured worst case
-    .on_miss(Miss::SafeMode) // Enforce in production
+    .rate(1000_u64.hz())       // period=1ms, budget=800us
+    .on_miss(Miss::SafeMode)   // Enforce in production
     .build()?;
 ```
 
 ### 2. Layer Safety Checks
 
-Use composable builders (watchdog + budget enforcement) with per-node miss policies:
+Use composable builders (watchdog + blackbox) with per-node miss policies:
 
 ```rust
-// .monitoring(true) gives you watchdog + budget enforcement
+// .watchdog() gives you frozen node detection
+// Budget enforcement is implicit from .rate()
 let mut scheduler = Scheduler::new()
-    .monitoring(true)
-    .tick_rate(1000.0.hz());
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(1000_u64.hz());
 
 // Then set per-node policies for fine-grained control
 scheduler.add(motor_controller)
     .order(0)
-    .budget(500.us())
+    .rate(1000_u64.hz())
     .on_miss(Miss::SafeMode)  // Critical — enter safe state
     .build()?;
 
 scheduler.add(telemetry)
     .order(10)
-    .budget(5000.us())
+    .rate(10_u64.hz())
     .on_miss(Miss::Skip)      // Non-critical — just skip
     .build()?;
 ```
@@ -297,10 +298,10 @@ scheduler.add(telemetry)
 
 | Use Case | Configuration |
 |----------|--------------|
-| Medical / surgical robots | `.require_rt().with_blackbox(64).with_profiling()` |
-| Industrial control | `.require_rt().monitoring(true)` |
-| CNC / aerospace | `.require_rt().with_blackbox(64).with_profiling()` |
-| General production | `.monitoring(true)` |
+| Medical / surgical robots | `.require_rt().watchdog(500_u64.ms()).blackbox(64)` |
+| Industrial control | `.require_rt().watchdog(500_u64.ms())` |
+| CNC / aerospace | `.require_rt().watchdog(500_u64.ms()).blackbox(64).max_deadline_misses(3)` |
+| General production | `.watchdog(500_u64.ms()).blackbox(64)` |
 
 ### 4. Test Safety Setup
 
@@ -310,12 +311,12 @@ Verify your system handles deadline misses correctly:
 #[test]
 fn test_safety_critical_setup() {
     let mut scheduler = Scheduler::new()
-        .monitoring(true)
-        .tick_rate(1000.0.hz());
+        .watchdog(500_u64.ms())
+        .tick_rate(1000_u64.hz());
 
     scheduler.add(test_node)
         .order(0)
-        .budget(100.us())
+        .rate(1000_u64.hz())
         .on_miss(Miss::SafeMode)
         .build()
         .expect("should build node");

@@ -22,7 +22,6 @@ const sections: SidebarSection[] = [
     title: "Getting Started",
     links: [
       { title: "What is HORUS?", href: "/concepts/what-is-horus", order: 0 },
-      { title: "Goals & Vision", href: "/concepts/goals", order: 1 },
       { title: "Installation", href: "/getting-started/installation", order: 2 },
       { title: "Quick Start", href: "/getting-started/quick-start", order: 3 },
       { title: "Choosing a Language", href: "/getting-started/choosing-language", order: 4 },
@@ -143,7 +142,6 @@ const sections: SidebarSection[] = [
     title: "Advanced Topics",
     links: [
       { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
-      { title: "Execution Modes", href: "/advanced/execution-modes", order: 2 },
       { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
       { title: "Fault Tolerance", href: "/advanced/circuit-breaker", order: 9 },

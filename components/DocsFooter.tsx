@@ -88,8 +88,8 @@ export function DocsFooter() {
                 </a>
               </li>
               <li>
-                <Link href="/goals" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
-                  Goals & Vision
+                <Link href="/concepts/what-is-horus" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                  About HORUS
                 </Link>
               </li>
               <li>
