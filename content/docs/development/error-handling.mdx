@@ -33,22 +33,25 @@ The main error type for all HORUS operations (also available as `HorusError` for
 
 ### Error Variants
 
-| Variant | Description |
-|---------|-------------|
-| `Io` | File system and I/O errors (`#[from] std::io::Error`) |
-| `Config` | Configuration parsing/validation |
-| `Communication` | IPC and network errors |
-| `Node { node, message }` | Node-specific errors (named fields) |
-| `Memory` | Memory allocation errors |
-| `Serialization` | Serialization/deserialization errors |
-| `NotFound` | Resource not found |
-| `PermissionDenied` | Access denied |
-| `InvalidInput` | Invalid argument/input |
-| `AlreadyExists` | Resource already exists |
-| `Parse` | Parsing errors |
-| `Unsupported` | Operation not supported on this platform |
-| `Internal { message, file, line }` | Internal errors with source location |
-| `Contextual { message, source }` | Error with preserved source chain |
+Each variant wraps a structured **sub-error enum** with specific fields for pattern matching:
+
+| Variant | Sub-error type | Domain |
+|---------|---------------|--------|
+| `Io(std::io::Error)` | — | File system and I/O errors |
+| `Config(ConfigError)` | `ConfigError` | Configuration parsing/validation |
+| `Communication(CommunicationError)` | `CommunicationError` | IPC, topics, mDNS, network |
+| `Node(NodeError)` | `NodeError` | Node lifecycle (init, tick, shutdown) |
+| `Memory(MemoryError)` | `MemoryError` | SHM, mmap, tensor pools |
+| `Serialization(SerializationError)` | `SerializationError` | JSON, YAML, TOML, binary |
+| `NotFound(NotFoundError)` | `NotFoundError` | Missing frames, topics, nodes |
+| `Resource(ResourceError)` | `ResourceError` | Already exists, permission denied, unsupported |
+| `InvalidInput(ValidationError)` | `ValidationError` | Out-of-range, invalid format, constraints |
+| `Parse(ParseError)` | `ParseError` | Integer, float, boolean parsing |
+| `InvalidDescriptor(String)` | — | Cross-process tensor descriptor validation |
+| `Transform(TransformError)` | `TransformError` | Extrapolation, stale data |
+| `Timeout(TimeoutError)` | `TimeoutError` | Operation exceeded time limit |
+| `Internal { message, file, line }` | — | Internal errors with source location |
+| `Contextual { message, source }` | — | Error with preserved source chain |
 
 ## Creating Errors
 
@@ -65,14 +68,11 @@ let err = Error::config("Invalid frequency: must be positive");
 // Node error with context (takes node name + message)
 let err = Error::node("MotorController", "Failed to initialize PWM");
 
-// Communication error
-let err = Error::communication("Topic not found: cmd_vel");
+// Network fault (communication sub-type)
+let err = Error::network_fault("192.168.1.100", "Connection refused");
 
-// Memory error
-let err = Error::memory("Failed to allocate 1GB for buffer");
-
-// Invalid input (use variant directly)
-let err = Error::InvalidInput("Speed must be between 0 and 100".to_string());
+// mDNS failure (communication sub-type)
+let err = Error::mdns_failed("register", "Avahi daemon not running");
 
 // Internal error (prefer horus_internal! macro for file/line capture)
 let err = horus_internal!("Unexpected state reached");
@@ -80,12 +80,25 @@ let err = horus_internal!("Unexpected state reached");
 
 ### Using Variants Directly
 
+For errors without convenience constructors, construct the sub-error directly:
+
 ```rust
 use horus::prelude::*;
+use horus::error::{ResourceError, NotFoundError, CommunicationError};
 
-let err = Error::PermissionDenied("/dev/ttyUSB0".to_string());
-let err = Error::AlreadyExists("Session 'main' already exists".to_string());
-let err = Error::Parse("Invalid YAML syntax at line 5".to_string());
+let err = Error::Resource(ResourceError::PermissionDenied {
+    resource: "/dev/ttyUSB0".into(),
+    required_permission: "read/write".into(),
+});
+
+let err = Error::Resource(ResourceError::AlreadyExists {
+    resource_type: "session".into(),
+    name: "main".into(),
+});
+
+let err = Error::NotFound(NotFoundError::Topic {
+    name: "cmd_vel".into(),
+});
 ```
 
 ### Internal Errors with Source Location
@@ -159,20 +172,27 @@ fn load_robot_config(path: &str) -> Result<Config> {
 
 ```rust
 use horus::prelude::*;
+use horus::error::{NotFoundError, NodeError, ResourceError};
 
 match result {
     Ok(value) => process(value),
-    Err(Error::NotFound(resource)) => {
-        eprintln!("Resource not found: {}", resource);
+    Err(Error::NotFound(NotFoundError::Topic { name })) => {
+        eprintln!("Topic not found: {}", name);
     }
-    Err(Error::Node { node, message }) => {
-        eprintln!("Node {} error: {}", node, message);
+    Err(Error::Node(node_err)) => {
+        eprintln!("Node error: {}", node_err);
+    }
+    Err(Error::Resource(ResourceError::PermissionDenied { resource, .. })) => {
+        eprintln!("Permission denied: {}", resource);
     }
     Err(Error::Internal { message, file, line }) => {
         eprintln!("Internal error at {}:{}: {}", file, line, message);
     }
     Err(e) => {
         eprintln!("Unexpected error: {}", e);
+        if let Some(hint) = e.help() {
+            eprintln!("  hint: {}", hint);
+        }
     }
 }
 ```
@@ -336,44 +356,43 @@ fn horus_function() -> Result<Robot> {
 
 ## HorusError Variants Reference
 
-The `HorusError` enum (aliased as `Error`) contains all possible error types:
+The `HorusError` enum (aliased as `Error`) is `#[non_exhaustive]` and wraps structured sub-error types:
 
-| Variant | Description |
-|---------|-------------|
-| `Io(std::io::Error)` | File system, network, or other I/O errors |
-| `Config(String)` | Configuration parsing or validation failure |
-| `Communication(String)` | IPC or shared memory communication failure |
-| `Node { node, message }` | Node-specific error with node name and message |
-| `Memory(String)` | Shared memory allocation or mapping failure |
-| `Serialization(String)` | Message serialization/deserialization error |
-| `NotFound(String)` | Resource (topic, node, service) not found |
-| `PermissionDenied(String)` | Insufficient permissions (e.g., `/dev/shm` access) |
-| `InvalidInput(String)` | Invalid argument or parameter |
-| `AlreadyExists(String)` | Duplicate creation (topic name collision) |
-| `Parse(String)` | String/config parsing failure |
-| `InvalidDescriptor(String)` | Cross-process tensor descriptor validation failure |
-| `Unsupported(String)` | Platform or feature not supported |
-| `OutOfRange(String)` | Numeric overflow or value out of bounds |
-| `Timeout(String)` | Operation exceeded time limit |
-| `Internal { message, file, line }` | Internal error with source location |
-| `Contextual { message, source }` | Error chain wrapping an underlying cause |
+| Variant | Wraps | Example sub-variants |
+|---------|-------|----------------------|
+| `Io(std::io::Error)` | std I/O error | — |
+| `Config(ConfigError)` | Config parsing/validation | `MissingField`, `ParseFailed`, `Other` |
+| `Communication(CommunicationError)` | IPC, topics, network | `TopicFull`, `TopicNotFound`, `NetworkFault`, `MdnsFailed` |
+| `Node(NodeError)` | Node lifecycle | `InitPanic`, `InitFailed`, `TickFailed`, `Other { node, message }` |
+| `Memory(MemoryError)` | SHM, tensor pools | `PoolExhausted`, `ShmCreateFailed`, `MmapFailed`, `AllocationFailed` |
+| `Serialization(SerializationError)` | Serde errors | `Json`, `Yaml`, `Toml`, `Binary` |
+| `NotFound(NotFoundError)` | Missing resources | `Frame`, `Topic`, `Node`, `Service`, `Parameter` |
+| `Resource(ResourceError)` | Resource lifecycle | `AlreadyExists`, `PermissionDenied`, `Unsupported` |
+| `InvalidInput(ValidationError)` | Input validation | `OutOfRange`, `InvalidFormat`, `InvalidEnum`, `MissingRequired` |
+| `Parse(ParseError)` | Parsing failures | `Int`, `Float`, `Bool`, `Custom` |
+| `InvalidDescriptor(String)` | Tensor descriptor | — |
+| `Transform(TransformError)` | TF errors | `Extrapolation`, `StaleData` |
+| `Timeout(TimeoutError)` | Timeouts | — |
+| `Internal { message, file, line }` | Debug errors | — |
+| `Contextual { message, source }` | Error chains | — |
 
 ### Constructing Errors
 
 ```rust
-// Named constructors
-Error::config("Invalid YAML syntax")
-Error::node("SensorNode", "Sensor not responding")
-Error::communication("Topic not found")
+// Named constructors (4 available)
+Error::config("Invalid YAML syntax");
+Error::node("SensorNode", "Sensor not responding");
+Error::network_fault("192.168.1.100", "Connection refused");
+Error::mdns_failed("register", "Avahi not running");
 
 // Internal errors (captures file and line automatically)
-horus_internal!("Unexpected state: {:?}", state)
+horus_internal!("Unexpected state: {:?}", state);
 
 // Contextual errors (wrapping another error)
 Error::Contextual {
     message: "Failed to initialize sensor".into(),
     source: Box::new(io_error),
-}
+};
 ```
 
 ### Type Aliases

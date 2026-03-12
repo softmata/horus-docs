@@ -239,13 +239,13 @@ fn main() -> Result<()> {
 
     // Add nodes in priority order:
     // 1. SensorNode (order 0) - Runs first to generate data
-    scheduler.add(SensorNode::new()?).order(0).build();
+    scheduler.add(SensorNode::new()?).order(0).build()?;
 
     // 2. FilterNode (order 1) - Runs second to process data
-    scheduler.add(FilterNode::new()?).order(1).build();
+    scheduler.add(FilterNode::new()?).order(1).build()?;
 
     // 3. DisplayNode (order 2) - Runs last to display results
-    scheduler.add(DisplayNode::new()?).order(2).build();
+    scheduler.add(DisplayNode::new()?).order(2).build()?;
 
     println!("All nodes initialized. Running...\n");
 
@@ -462,14 +462,35 @@ let mut file = OpenOptions::new()
 writeln!(file, "{:.1}", temp).ok();
 ```
 
-### 4. Add Multiple Sensors
+### 4. Use Rate-Limited Logging
+
+In a real robot running at 1kHz, you don't want every tick flooding the log. Use `hlog_once!` for one-time events and `hlog_every!` for periodic status:
+
+```rust
+fn tick(&mut self) {
+    // Log once when sensor first connects
+    hlog_once!(info, "Sensor online, streaming data");
+
+    // Log status every 5 seconds (not every tick)
+    hlog_every!(5000, info, "Filter running — last value: {:.1}°C", self.filtered_value.unwrap_or(0.0));
+
+    // Log warnings at most once per second
+    if let Some(temp) = self.raw_sub.recv() {
+        if temp > 35.0 {
+            hlog_every!(1000, warn, "High temperature: {:.1}°C", temp);
+        }
+    }
+}
+```
+
+### 5. Add Multiple Sensors
 
 Create a second sensor node:
 
 ```rust
 // In main()
-scheduler.add(SensorNode::new()?).order(0).build();  // Sensor 1
-scheduler.add(SensorNode::new()?).order(0).build();  // Sensor 2
+scheduler.add(SensorNode::new()?).order(0).build()?;  // Sensor 1
+scheduler.add(SensorNode::new()?).order(0).build()?;  // Sensor 2
 ```
 
 Both will publish to the same topic, and FilterNode will process both!
@@ -485,6 +506,84 @@ Both will publish to the same topic, and FilterNode will process both!
 **Shared Memory IPC**: Sub-microsecond communication between nodes
 
 **Priority Scheduling**: Sensor runs before filter, filter before display
+
+## Shorter Version: node! Macro
+
+The entire pipeline above can be written more concisely with the `node!` macro. Here's the same 3-node system in roughly half the code:
+
+```rust
+use horus::prelude::*;
+use std::time::{Duration, Instant};
+
+node! {
+    SensorNode {
+        pub { temp_pub: f32 -> "raw_temp" }
+        data {
+            last_publish: Instant = Instant::now(),
+            reading: f32 = 20.0,
+        }
+        init {
+            hlog!(info, "Temperature sensor initialized");
+            Ok(())
+        }
+        tick {
+            if self.last_publish.elapsed() >= Duration::from_secs(1) {
+                let base_temp = 25.0 + (self.reading * 0.1).sin() * 5.0;
+                let noise = (self.reading * 0.7).sin() * 2.0;
+                self.temp_pub.send(base_temp + noise);
+                self.reading += 1.0;
+                self.last_publish = Instant::now();
+            }
+        }
+    }
+}
+
+node! {
+    FilterNode {
+        sub { raw_sub: f32 -> "raw_temp" }
+        pub { filtered_pub: f32 -> "filtered_temp" }
+        data {
+            filtered_value: Option<f32> = None,
+            alpha: f32 = 0.3,
+        }
+        tick {
+            if let Some(raw) = self.raw_sub.recv() {
+                let filtered = match self.filtered_value {
+                    Some(prev) => self.alpha * raw + (1.0 - self.alpha) * prev,
+                    None => raw,
+                };
+                self.filtered_value = Some(filtered);
+                self.filtered_pub.send(filtered);
+            }
+        }
+    }
+}
+
+node! {
+    DisplayNode {
+        sub { filtered_sub: f32 -> "filtered_temp" }
+        data { count: u32 = 0 }
+        tick {
+            if let Some(temp) = self.filtered_sub.recv() {
+                self.count += 1;
+                let status = if temp < 22.0 { "COLD" } else if temp > 28.0 { "HOT" } else { "NORMAL" };
+                println!("[#{}] {:.1}°C - {}", self.count, temp, status);
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(SensorNode::new()).order(0).build()?;
+    scheduler.add(FilterNode::new()).order(1).build()?;
+    scheduler.add(DisplayNode::new()).order(2).build()?;
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+The `node!` macro generates the struct, constructor, and `Node` trait implementation. Both versions produce identical runtime behavior. See the [node! Macro Guide](/concepts/node-macro) for the full syntax.
 
 ## Next Steps
 

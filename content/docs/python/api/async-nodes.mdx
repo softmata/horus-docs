@@ -12,7 +12,7 @@ HORUS provides native Python async/await support through `AsyncNode` and `AsyncT
 
 | Class | Description |
 |-------|-------------|
-| `AsyncNode` | Base class for async nodes with `async def tick()` |
+| `AsyncNode` | Base class for async nodes with `async def async_tick()` |
 | `AsyncTopic` | Async wrapper for Topic with `await send()` and `await recv()` |
 
 ## AsyncNode
@@ -24,12 +24,12 @@ import horus
 import asyncio
 
 class MyAsyncNode(horus.AsyncNode):
-    async def setup(self):
+    async def async_init(self):
         """Called once at startup"""
-        self.topic = horus.AsyncTopic("sensor_data", dict)
+        self.topic = horus.AsyncTopic(dict)
         self.api_url = "https://api.example.com/data"
 
-    async def tick(self):
+    async def async_tick(self):
         """Called each scheduler cycle - use await freely!"""
         # Fetch from HTTP API (non-blocking)
         async with aiohttp.ClientSession() as session:
@@ -39,7 +39,7 @@ class MyAsyncNode(horus.AsyncNode):
         # Publish to HORUS topic
         await self.topic.send(data)
 
-    async def shutdown(self):
+    async def async_shutdown(self):
         """Called once at shutdown"""
         print("Node shutting down")
 ```
@@ -48,24 +48,30 @@ class MyAsyncNode(horus.AsyncNode):
 
 | Method | Description |
 |--------|-------------|
-| `async def setup()` | One-time initialization before first tick |
-| `async def tick()` | Called each scheduler cycle |
-| `async def shutdown()` | Cleanup when node stops |
+| `async def async_init()` | One-time initialization before first tick |
+| `async def async_tick()` | Called each scheduler cycle |
+| `async def async_shutdown()` | Cleanup when node stops |
 
 ### Running an AsyncNode
 
 ```python
 import horus
 
-# Create scheduler
+# AsyncNode accepts the same kwargs as Node
+node = MyAsyncNode(
+    name="async_processor",
+    subs=["input"],
+    pubs=["output"],
+    rate=30,
+)
+
+# Via scheduler
 scheduler = horus.Scheduler()
-
-# Add async node
-node = MyAsyncNode()
 scheduler.add(node, order=0)
-
-# Run - scheduler handles the async event loop
 scheduler.run()
+
+# Or via horus.run()
+horus.run(node)
 ```
 
 ## AsyncTopic
@@ -74,15 +80,22 @@ scheduler.run()
 
 ```python
 import horus
+from horus import AsyncTopic, CmdVel
 
-# Create async topic
-topic = horus.AsyncTopic("my_topic", str)
+# Create async topic (same constructor as Topic — pass msg_type)
+topic = AsyncTopic(CmdVel)
+
+# With custom capacity
+topic = AsyncTopic(dict, capacity=2048)
 
 # Async send
-await topic.send("hello world")
+await topic.send(CmdVel(linear=1.0, angular=0.5))
 
-# Async receive (waits for message)
+# Async receive (waits for message with exponential backoff)
 msg = await topic.recv()
+
+# Async receive with timeout (raises asyncio.TimeoutError)
+msg = await topic.recv(timeout=5.0)
 
 # Try receive (returns None immediately if no message)
 msg = await topic.try_recv()
@@ -92,51 +105,32 @@ msg = await topic.try_recv()
 
 ```python
 class AsyncTopic:
-    def __init__(self, topic: str, msg_type: type):
-        """Create async topic with message type"""
+    def __init__(self, msg_type, capacity: int = 1024):
+        """Create async topic wrapping a Topic(msg_type, capacity)"""
 
     async def send(self, msg: Any) -> None:
-        """Send message asynchronously"""
+        """Send message asynchronously (runs in executor)"""
 
-    async def recv(self) -> Any:
-        """Receive message, waiting until available"""
+    async def recv(self, timeout: Optional[float] = None) -> Any:
+        """Receive message, waiting with exponential backoff.
+        Raises asyncio.TimeoutError if timeout expires."""
 
     async def try_recv(self) -> Optional[Any]:
-        """Try to receive, returns None if no message"""
-
-    def subscribe(self, callback: Callable) -> None:
-        """Subscribe with synchronous callback"""
-
-    async def async_subscribe(self, async_callback: Callable) -> None:
-        """Subscribe with async callback"""
-```
-
-### Async Subscriptions
-
-Subscribe with async callbacks for reactive patterns:
-
-```python
-async def handle_sensor_data(msg):
-    """Async callback - can use await!"""
-    processed = await process_data(msg)
-    await database.save(processed)
-
-topic = horus.AsyncTopic("sensors", dict)
-await topic.async_subscribe(handle_sensor_data)
+        """Try to receive, returns None immediately if no message"""
 ```
 
 ## Utility Functions
 
-HORUS provides async utility functions:
+Use Python's standard `asyncio` utilities alongside async nodes:
 
 ```python
-import horus
+import asyncio
 
 # Non-blocking sleep
-await horus.sleep(0.1)
+await asyncio.sleep(0.1)
 
 # Run multiple async operations concurrently
-results = await horus.gather(
+results = await asyncio.gather(
     fetch_sensor_a(),
     fetch_sensor_b(),
     fetch_sensor_c()
@@ -144,7 +138,7 @@ results = await horus.gather(
 
 # Wait with timeout
 try:
-    result = await horus.wait_for(slow_operation(), timeout=5.0)
+    result = await asyncio.wait_for(slow_operation(), timeout=5.0)
 except asyncio.TimeoutError:
     print("Operation timed out")
 ```
@@ -159,13 +153,13 @@ import asyncio
 class WeatherNode(horus.AsyncNode):
     """Fetches weather data from API and publishes to HORUS"""
 
-    async def setup(self):
-        self.weather_pub = horus.AsyncTopic("weather", dict)
+    async def async_init(self):
+        self.weather_pub = horus.AsyncTopic(dict)
         self.location = "San Francisco"
         self.api_key = "your-api-key"
         self.session = aiohttp.ClientSession()
 
-    async def tick(self):
+    async def async_tick(self):
         url = f"https://api.weather.com/v1/{self.location}?key={self.api_key}"
 
         try:
@@ -180,19 +174,19 @@ class WeatherNode(horus.AsyncNode):
         except aiohttp.ClientError as e:
             print(f"API error: {e}")
 
-    async def shutdown(self):
+    async def async_shutdown(self):
         await self.session.close()
 
 
 class WeatherConsumer(horus.AsyncNode):
     """Consumes weather data and logs to database"""
 
-    async def setup(self):
-        self.weather_sub = horus.AsyncTopic("weather", dict)
+    async def async_init(self):
+        self.weather_sub = horus.AsyncTopic(dict)
         # Setup async database connection
         self.db = await asyncpg.connect("postgresql://localhost/robotics")
 
-    async def tick(self):
+    async def async_tick(self):
         weather = await self.weather_sub.try_recv()
         if weather:
             await self.db.execute(
@@ -202,7 +196,7 @@ class WeatherConsumer(horus.AsyncNode):
                 weather["timestamp"]
             )
 
-    async def shutdown(self):
+    async def async_shutdown(self):
         await self.db.close()
 
 
@@ -255,10 +249,10 @@ sync_node = horus.Node(
 # Async node uses class inheritance
 class AsyncCloudNode(horus.AsyncNode):
     """Async node for cloud upload"""
-    async def setup(self):
-        self.topic = horus.AsyncTopic("sensor.processed", dict)
+    async def async_init(self):
+        self.topic = horus.AsyncTopic(dict)
 
-    async def tick(self):
+    async def async_tick(self):
         msg = await self.topic.try_recv()
         if msg:
             await self.upload_to_cloud(msg)
