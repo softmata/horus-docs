@@ -1,0 +1,188 @@
+---
+title: "Deterministic Mode"
+description: "Run-to-run reproducible execution with SimClock, dependency ordering, and deterministic RNG for simulation, testing, and replay"
+weight: 35
+---
+
+# Deterministic Mode
+
+HORUS provides run-to-run deterministic execution: the same binary on the same hardware produces bit-identical outputs across unlimited runs. This is the industry standard for robotics simulation (Gazebo, Drake, Isaac Sim).
+
+## Enabling Deterministic Mode
+
+```rust
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .deterministic(true)       // SimClock + dependency ordering
+    .tick_rate(100_u64.hz());
+
+scheduler.add(Controller::new())
+    .order(0)
+    .rate(100_u64.hz())
+    .build()?;
+
+// Each tick_once() produces identical results every run
+for _ in 0..1000 {
+    scheduler.tick_once()?;
+}
+```
+
+## What Changes in Deterministic Mode
+
+| Aspect | Normal Mode | Deterministic Mode |
+|--------|-------------|-------------------|
+| Clock | Wall clock (real time) | Virtual SimClock (fixed dt per tick) |
+| RNG | System entropy | Tick-seeded (reproducible) |
+| Execution order | Parallel by execution class | Dependency-ordered steps |
+| Independent nodes | Parallel | Still parallel |
+| Dependent nodes | Parallel (races possible) | Sequenced (producer before consumer) |
+| Execution classes | All active | All active |
+| Failure policies | Active | Active |
+| Watchdog | Active | Active |
+
+**What does NOT change**: execution classes (RT, Compute, AsyncIo, Event, BestEffort), failure policies, watchdog, budget/deadline monitoring. Deterministic mode does not degrade the scheduling system — it adds ordering guarantees.
+
+## Framework Time API
+
+Use `horus::now()`, `horus::dt()`, and `horus::rng()` instead of `Instant::now()` and `rand::random()`. These are the standard framework API — same pattern as `hlog!()` for logging.
+
+```rust
+use horus::prelude::*;
+
+struct Controller {
+    position: f64,
+    velocity: f64,
+}
+
+impl Node for Controller {
+    fn tick(&mut self) {
+        // horus::dt() returns fixed 1/rate in deterministic mode,
+        // real elapsed in normal mode
+        let dt = horus::dt();
+        self.position += self.velocity * dt.as_secs_f64();
+
+        // horus::rng() is tick-seeded in deterministic mode,
+        // system entropy in normal mode
+        let noise: f64 = horus::rng(|r| {
+            use rand::Rng;
+            r.gen_range(-0.01..0.01)
+        });
+        self.velocity += noise;
+
+        hlog!(debug, "pos={:.3} at t={:?}", self.position, horus::elapsed());
+    }
+}
+```
+
+See the [Time API reference](/docs/rust/time-api) for the full API.
+
+## Dependency Ordering
+
+The scheduler builds a dependency graph from nodes' `publishers()` and `subscribers()` metadata. Dependent nodes are sequenced (producer before consumer). Independent nodes run in parallel.
+
+```rust
+struct SensorDriver {
+    scan_topic: Topic<LaserScan>,
+}
+
+impl Node for SensorDriver {
+    fn name(&self) -> &str { "sensor" }
+
+    fn publishers(&self) -> Vec<TopicMetadata> {
+        vec![TopicMetadata {
+            topic_name: "scan".into(),
+            type_name: "LaserScan".into(),
+        }]
+    }
+
+    fn tick(&mut self) {
+        self.scan_topic.send(self.read_hardware());
+    }
+}
+
+struct Controller {
+    scan_topic: Topic<LaserScan>,
+    cmd_topic: Topic<CmdVel>,
+}
+
+impl Node for Controller {
+    fn name(&self) -> &str { "controller" }
+
+    fn subscribers(&self) -> Vec<TopicMetadata> {
+        vec![TopicMetadata {
+            topic_name: "scan".into(),
+            type_name: "LaserScan".into(),
+        }]
+    }
+
+    fn publishers(&self) -> Vec<TopicMetadata> {
+        vec![TopicMetadata {
+            topic_name: "cmd".into(),
+            type_name: "CmdVel".into(),
+        }]
+    }
+
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_topic.try_recv() {
+            let cmd = self.compute_velocity(&scan);
+            self.cmd_topic.send(cmd);
+        }
+    }
+}
+```
+
+The scheduler automatically ensures `sensor` ticks before `controller` because `controller` subscribes to a topic that `sensor` publishes.
+
+### Fallback Without Metadata
+
+If nodes don't implement `publishers()` / `subscribers()`, the scheduler uses `.order()` values as a proxy: lower order runs first, same order = independent (parallel).
+
+## Normal vs Deterministic: When to Use Which
+
+| Purpose | Mode | Why |
+|---------|------|-----|
+| Real robot deployment | Normal | Wall clock matches hardware reality |
+| Simulation (physics engine) | Deterministic | Virtual clock matches physics time |
+| Unit / integration tests | Deterministic | Reproducible, no flakes |
+| CI pipeline | Deterministic | Same result every run |
+| Record/replay debugging | Replay (`replay_from()`) | Recorded clock reproduces exact scenario |
+| Recording a session on real robot | Normal + `.with_recording()` | Wall clock for hardware, recording for later |
+
+**Deterministic mode uses virtual time** — it cannot drive real hardware. A motor controller receiving `horus::dt()` in deterministic mode gets a fixed value (e.g., exactly 1ms for 1kHz), regardless of how fast ticks actually execute. This is correct for simulation but wrong for real actuators.
+
+## Record and Replay
+
+```rust
+// Record a session
+let mut scheduler = Scheduler::new()
+    .deterministic(true)
+    .with_recording()
+    .tick_rate(100_u64.hz());
+
+scheduler.add(Sensor::new()).order(0).build()?;
+scheduler.add(Controller::new()).order(1).build()?;
+scheduler.run_for(10_u64.secs())?;
+
+// Replay — bit-identical output
+let mut replay = Scheduler::replay_from(
+    "~/.horus/recordings/session_001/scheduler@abc123.horus".into()
+)?;
+replay.run()?;
+
+// Mixed replay — recorded sensors, new controller
+let mut replay = Scheduler::replay_from(path)?;
+replay.add(ControllerV2::new()).order(1).rate(100_u64.hz()).build()?;
+replay.run()?;
+```
+
+During replay, recorded topic data is injected into shared memory so live subscriber nodes see the replayed data.
+
+## Determinism Guarantees
+
+**What HORUS guarantees**: same binary + same hardware produces bit-identical outputs, tick for tick, across unlimited runs.
+
+**What is NOT deterministic** (hardware/compiler, not HORUS):
+- **Cross-platform float**: IEEE 754 differs across CPUs (FMA, extended precision). Same binary + same hardware = deterministic.
+- **Direct `Instant::now()`**: Bypasses the framework clock. Use `horus::now()` instead.
+- **`HashMap` iteration**: Rust randomizes per process. Use `BTreeMap` in deterministic nodes.

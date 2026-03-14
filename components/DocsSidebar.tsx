@@ -59,10 +59,11 @@ const sections: SidebarSection[] = [
     title: "Rust",
     links: [
       { title: "Overview", href: "/rust", order: 0 },
+      { title: "Time API", href: "/rust/time-api", order: 1 },
       {
         title: "API Reference",
         href: "/rust/api",
-        order: 1,
+        order: 2,
         children: [
           { title: "Overview", href: "/rust/api", order: 0 },
           { title: "horus_macros", href: "/rust/api/macros", order: 2 },
@@ -142,6 +143,7 @@ const sections: SidebarSection[] = [
     title: "Advanced Topics",
     links: [
       { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
+      { title: "Deterministic Mode", href: "/advanced/deterministic-mode", order: 3 },
       { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
       { title: "Fault Tolerance", href: "/advanced/circuit-breaker", order: 9 },
