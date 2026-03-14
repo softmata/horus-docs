@@ -1,0 +1,486 @@
+---
+title: "TransformFrame API"
+description: "Lock-free coordinate frame tree with sub-microsecond transform lookups"
+weight: 30
+---
+
+# TransformFrame API
+
+`TransformFrame` manages coordinate frame trees for real-time robotics. All lookups are lock-free and wait-free. Register frames with `FrameBuilder`, query transforms with `TransformQuery`, and update dynamic frames at sensor rates.
+
+## Creating a TransformFrame
+
+```rust
+use horus::prelude::*;
+
+// Default: 256 frames, 128 static, 32-entry history
+let tf = TransformFrame::new();
+
+// Presets
+let tf = TransformFrame::small();    // 256 frames (~550KB)
+let tf = TransformFrame::medium();   // 1024 frames (~2.2MB)
+let tf = TransformFrame::large();    // 4096 frames (~9MB)
+let tf = TransformFrame::massive();  // 16384 frames (~35MB)
+
+// Custom
+let tf = TransformFrame::with_config(
+    TransformFrameConfig::custom()
+        .max_frames(512)
+        .history_len(64)
+        .enable_overflow(false)  // Hard RT: no heap fallback
+        .build()?
+);
+```
+
+| Constructor | Description |
+|-------------|-------------|
+| `TransformFrame::new()` | Default (256 frames, small preset) |
+| `TransformFrame::small()` | 256 frames, embedded/single robot |
+| `TransformFrame::medium()` | 1024 frames, complex/multi-robot |
+| `TransformFrame::large()` | 4096 frames, simulations |
+| `TransformFrame::massive()` | 16384 frames, 100+ robots |
+| `TransformFrame::with_config(config)` | Custom configuration |
+
+---
+
+## TransformFrameConfig
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_frames` | `usize` | `256` | Maximum frames (16–65536) |
+| `max_static_frames` | `usize` | `max_frames/2` | Static frame slots |
+| `history_len` | `usize` | `32` | History buffer per dynamic frame (4–256) |
+| `enable_overflow` | `bool` | `true` | Fallback to HashMap if capacity exceeded |
+| `chain_cache_size` | `usize` | `64` | Cache for transform chain lookups |
+
+### Presets
+
+| Preset | Capacity | Static | Memory | Use Case |
+|--------|----------|--------|--------|----------|
+| `small()` | 256 | 128 | ~550KB | Single robots, embedded |
+| `medium()` | 1024 | 512 | ~2.2MB | Complex robots, multi-robot |
+| `large()` | 4096 | 2048 | ~9MB | Multi-robot simulations |
+| `massive()` | 16384 | 8192 | ~35MB | Large-scale simulations (100+ robots) |
+| `unlimited()` | 4096 | 2048 | 35MB+ | Dynamic/unpredictable counts (no RT guarantee) |
+| `rt_fixed(max_frames)` | custom | max_frames/2 | variable | Hard real-time (no overflow) |
+
+### TransformFrameConfigBuilder
+
+```rust
+let config = TransformFrameConfig::custom()
+    .max_frames(512)
+    .max_static_frames(256)
+    .history_len(64)
+    .enable_overflow(false)
+    .chain_cache_size(128)
+    .build()?;
+
+println!("Memory: {}", config.memory_estimate());  // "1.1 MB"
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `TransformFrameConfig::custom()` | `TransformFrameConfigBuilder` | Start custom config |
+| `.max_frames(n)` | `Self` | Set max frames |
+| `.max_static_frames(n)` | `Self` | Set static frame slots |
+| `.history_len(n)` | `Self` | Set history buffer size |
+| `.enable_overflow(bool)` | `Self` | Enable/disable heap fallback |
+| `.chain_cache_size(n)` | `Self` | Set chain cache size |
+| `.build()` | `Result<TransformFrameConfig, String>` | Validate and build |
+| `config.validate()` | `Result<(), String>` | Check constraints |
+| `config.estimated_memory_bytes()` | `usize` | Memory estimate in bytes |
+| `config.memory_estimate()` | `String` | Human-readable memory (e.g., "2.2 MB") |
+
+---
+
+## Registering Frames
+
+### FrameBuilder (Fluent API)
+
+The recommended way to register frames:
+
+```rust
+// Root frame (no parent)
+tf.add_frame("world").build()?;
+
+// Dynamic child frame
+tf.add_frame("base_link").parent("world").build()?;
+
+// Static frame with fixed offset (e.g., sensor mount)
+tf.add_frame("camera")
+    .parent("base_link")
+    .static_transform(&Transform::xyz(0.1, 0.0, 0.5))
+    .build()?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `tf.add_frame(name)` | `FrameBuilder` | Start registering a frame |
+| `.parent(name)` | `Self` | Set parent frame |
+| `.static_transform(transform)` | `Self` | Mark as static with fixed transform (requires parent) |
+| `.build()` | `HorusResult<FrameId>` | Register and return frame ID |
+
+### Direct Registration
+
+```rust
+// Dynamic frame
+let id = tf.register_frame("base_link", Some("world"))?;
+
+// Static frame with fixed transform
+let id = tf.register_static_frame("camera", Some("base_link"), &Transform::xyz(0.1, 0.0, 0.5))?;
+
+// Unregister (dynamic only)
+tf.unregister_frame("temp_frame")?;
+```
+
+### Frame Lookup
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `frame_id(name)` | `Option<FrameId>` | Get frame ID by name (cache this for hot paths) |
+| `frame_name(id)` | `Option<String>` | Get name by ID |
+| `has_frame(name)` | `bool` | Check if frame exists |
+| `all_frames()` | `Vec<String>` | All frame names |
+| `frame_count()` | `usize` | Total registered frames |
+| `parent(name)` | `Option<String>` | Parent frame name |
+| `children(name)` | `Vec<String>` | Direct child frames |
+
+---
+
+## Updating Transforms
+
+Update dynamic frames with new transform data at sensor rates:
+
+```rust
+let now = timestamp_now();
+tf.update_transform("base_link", &Transform::xyz(1.0, 2.0, 0.0), now)?;
+
+// By ID (fastest, lock-free, no name lookup)
+let id = tf.frame_id("base_link").unwrap();
+tf.update_transform_by_id(id, &Transform::xyz(1.0, 2.0, 0.0), now)?;
+
+// Update static frame offset
+tf.set_static_transform("camera", &Transform::xyz(0.1, 0.0, 0.6))?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `update_transform(name, transform, timestamp_ns)` | `HorusResult<()>` | Update by name (validates transform) |
+| `update_transform_by_id(id, transform, timestamp_ns)` | `HorusResult<()>` | Update by ID (fastest, lock-free) |
+| `set_static_transform(name, transform)` | `HorusResult<()>` | Update a static frame's offset |
+
+Transforms are automatically validated — NaN/Inf values are rejected and quaternions are auto-normalized.
+
+---
+
+## Querying Transforms
+
+### TransformQuery (Fluent API)
+
+The recommended way to look up transforms:
+
+```rust
+// Latest transform from camera to world
+let t = tf.query("camera").to("world").lookup()?;
+
+// At a specific timestamp (with LERP + SLERP interpolation)
+let t = tf.query("camera").to("world").at(timestamp_ns)?;
+
+// Strict: error if extrapolation needed
+let t = tf.query("camera").to("world").at_strict(timestamp_ns)?;
+
+// With tolerance window
+let t = tf.query("camera").to("world").at_with_tolerance(timestamp_ns, 100_000_000)?;  // 100ms
+
+// Transform a point
+let world_pt = tf.query("lidar").to("world").point([1.0, 0.0, 0.0])?;
+
+// Transform a vector (rotation only, no translation)
+let world_vec = tf.query("imu").to("world").vector([0.0, 0.0, 9.81])?;
+
+// Check availability
+if tf.query("sensor").to("world").can_at(timestamp_ns) {
+    let t = tf.query("sensor").to("world").at(timestamp_ns)?;
+}
+
+// Get the frame chain
+let chain = tf.query("camera").to("world").chain()?;  // ["camera", "base_link", "world"]
+```
+
+### TransformQueryFrom
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `tf.query(src)` | `TransformQueryFrom` | Start query from source frame |
+| `.to(dst)` | `TransformQuery` | Set destination frame |
+
+### TransformQuery Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `lookup()` | `HorusResult<Transform>` | Latest transform |
+| `at(timestamp_ns)` | `HorusResult<Transform>` | At timestamp with interpolation |
+| `at_strict(timestamp_ns)` | `HorusResult<Transform>` | Error if extrapolation needed |
+| `at_with_tolerance(timestamp_ns, tolerance_ns)` | `HorusResult<Transform>` | Error if gap exceeds tolerance |
+| `point(xyz)` | `HorusResult<[f64; 3]>` | Transform a 3D point |
+| `vector(xyz)` | `HorusResult<[f64; 3]>` | Transform a vector (rotation only) |
+| `can_at(timestamp_ns)` | `bool` | Check if transform available at timestamp |
+| `can_at_with_tolerance(timestamp_ns, tolerance_ns)` | `bool` | Check within tolerance window |
+| `chain()` | `HorusResult<Vec<String>>` | Frame chain from source to destination |
+| `wait(timeout)` | `HorusResult<Transform>` | Block until available (feature `wait`) |
+| `wait_at(timestamp_ns, timeout)` | `HorusResult<Transform>` | Block until timestamp data available (feature `wait`) |
+| `wait_async(timeout)` | `HorusResult<Transform>` | Async wait (feature `async-wait`) |
+| `wait_at_async(timestamp_ns, timeout)` | `HorusResult<Transform>` | Async wait at timestamp (feature `async-wait`) |
+
+### Direct Query Methods
+
+For cases where you don't need the fluent builder:
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `tf(src, dst)` | `HorusResult<Transform>` | Latest transform src→dst |
+| `tf_by_id(src_id, dst_id)` | `Option<Transform>` | By ID (fastest, lock-free) |
+| `tf_at(src, dst, timestamp_ns)` | `HorusResult<Transform>` | At timestamp with interpolation |
+| `tf_at_strict(src, dst, timestamp_ns)` | `HorusResult<Transform>` | Error if extrapolation needed |
+| `tf_at_with_tolerance(src, dst, ts, tol)` | `HorusResult<Transform>` | Error if gap exceeds tolerance |
+| `can_transform(src, dst)` | `bool` | Check if path exists |
+| `can_transform_at(src, dst, timestamp_ns)` | `bool` | Check at timestamp |
+| `can_transform_at_with_tolerance(src, dst, ts, tol)` | `bool` | Check within tolerance |
+| `transform_point(src, dst, point)` | `HorusResult<[f64; 3]>` | One-shot point transform |
+| `transform_vector(src, dst, vector)` | `HorusResult<[f64; 3]>` | Rotation-only vector transform |
+
+> **Argument order**: `tf.tf("camera", "world")` means "transform FROM camera TO world". This is the opposite of ROS2 TF2's `lookupTransform(target, source)`.
+
+---
+
+## Transform
+
+A 3D rigid body transform (translation + quaternion rotation) in f64 precision.
+
+### Fields
+
+```rust
+pub struct Transform {
+    pub translation: [f64; 3],  // [x, y, z] in meters
+    pub rotation: [f64; 4],     // [x, y, z, w] Hamilton quaternion
+}
+```
+
+### Constructors
+
+```rust
+let t = Transform::identity();
+let t = Transform::new([1.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]);
+let t = Transform::xyz(1.0, 2.0, 0.0);
+let t = Transform::x(1.0);         // X-axis only
+let t = Transform::yaw(1.57);      // Z-axis rotation (radians)
+let t = Transform::rpy(0.0, 0.0, 1.57);  // Roll, pitch, yaw
+let t = Transform::from_euler([1.0, 2.0, 0.0], [0.0, 0.0, 1.57]);
+let t = Transform::from_translation([1.0, 2.0, 0.0]);
+let t = Transform::from_rotation([0.0, 0.0, 0.707, 0.707]);
+let t = Transform::from_matrix(matrix_4x4);
+
+// Chainable
+let t = Transform::xyz(1.0, 0.0, 0.0).with_yaw(1.57);
+let t = Transform::xyz(1.0, 0.0, 0.5).with_rpy(0.0, 0.1, 0.0);
+```
+
+| Constructor | Description |
+|-------------|-------------|
+| `identity()` | No translation or rotation |
+| `new(translation, rotation)` | Custom translation + quaternion (auto-normalized) |
+| `from_translation(xyz)` | Translation only |
+| `from_rotation(xyzw)` | Rotation only (auto-normalized) |
+| `from_euler(translation, rpy)` | Translation + Euler angles (radians) |
+| `xyz(x, y, z)` | Translation shorthand |
+| `x(v)` / `y(v)` / `z(v)` | Single-axis translation |
+| `yaw(angle)` / `pitch(angle)` / `roll(angle)` | Single-axis rotation (radians) |
+| `rpy(roll, pitch, yaw)` | Combined rotation (radians) |
+| `from_matrix(m)` | From 4x4 homogeneous matrix (row-major) |
+| `.with_yaw(angle)` | Compose yaw rotation (chainable) |
+| `.with_rpy(r, p, y)` | Compose RPY rotation (chainable) |
+
+### Operations
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `compose(other)` | `Transform` | Compose transforms (self * other) |
+| `inverse()` | `Transform` | Reverse direction |
+| `transform_point(xyz)` | `[f64; 3]` | Apply rotation + translation to point |
+| `transform_vector(xyz)` | `[f64; 3]` | Apply rotation only (no translation) |
+| `interpolate(other, t)` | `Transform` | LERP + SLERP interpolation (t in [0, 1]) |
+| `to_euler()` | `[f64; 3]` | Convert rotation to [roll, pitch, yaw] radians |
+| `to_matrix()` | `[[f64; 4]; 4]` | Convert to 4x4 homogeneous matrix |
+| `validate()` | `Result<(), String>` | Check for NaN/Inf and valid quaternion |
+| `validated()` | `Result<Self, String>` | Validate and auto-normalize |
+| `is_identity(epsilon)` | `bool` | Approximate identity test |
+| `translation_magnitude()` | `f64` | Translation vector length |
+| `rotation_angle()` | `f64` | Rotation angle in radians |
+
+---
+
+## Staleness Detection
+
+Check if frames have gone stale (e.g., sensor disconnected):
+
+```rust
+// Using wall-clock time
+if tf.is_stale_now("imu", 500_000_000) {  // 500ms
+    hlog!(warn, "IMU data is stale!");
+}
+
+// Using custom time (for simulation)
+if tf.is_stale("imu", 500_000_000, sim_time_ns) {
+    hlog!(warn, "IMU stale in sim time");
+}
+
+// Time since last update
+if let Some(age_ns) = tf.time_since_last_update_now("imu") {
+    println!("IMU age: {}ms", age_ns / 1_000_000);
+}
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `is_stale(name, max_age_ns, now_ns)` | `bool` | Stale relative to custom time |
+| `is_stale_now(name, max_age_ns)` | `bool` | Stale relative to wall-clock |
+| `time_since_last_update(name, now_ns)` | `Option<u64>` | Age in nanoseconds (custom time) |
+| `time_since_last_update_now(name)` | `Option<u64>` | Age in nanoseconds (wall-clock) |
+| `time_range(name)` | `Option<(u64, u64)>` | Buffer window (oldest_ns, newest_ns) |
+
+---
+
+## Diagnostics
+
+### TransformFrameStats
+
+```rust
+let stats = tf.stats();
+println!("{}", stats);  // Pretty-printed summary
+
+println!("Total: {}, Static: {}, Dynamic: {}",
+    stats.total_frames, stats.static_frames, stats.dynamic_frames);
+println!("Tree depth: {}, Roots: {}", stats.tree_depth, stats.root_count);
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_frames` | `usize` | Total registered frames |
+| `static_frames` | `usize` | Static frame count |
+| `dynamic_frames` | `usize` | Dynamic frame count |
+| `max_frames` | `usize` | Configured max |
+| `history_len` | `usize` | History buffer size |
+| `tree_depth` | `usize` | Maximum tree depth |
+| `root_count` | `usize` | Frames with no parent |
+
+### FrameInfo
+
+```rust
+if let Some(info) = tf.frame_info("camera") {
+    println!("Frame: {}, Parent: {:?}, Static: {}", info.name, info.parent, info.is_static);
+    println!("Depth: {}, Children: {}", info.depth, info.children_count);
+}
+
+// All frames
+let all = tf.frame_info_all();
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Frame name |
+| `id` | `FrameId` | Numeric ID (for hot-path lookups) |
+| `parent` | `Option<String>` | Parent name (`None` = root) |
+| `is_static` | `bool` | Static vs dynamic |
+| `time_range` | `Option<(u64, u64)>` | (oldest_ns, newest_ns) |
+| `children_count` | `usize` | Direct children |
+| `depth` | `usize` | Depth in tree (root = 0) |
+
+### Tree Export
+
+```rust
+tf.print_tree();                    // Print to stderr
+let text = tf.format_tree();        // Human-readable tree string
+let dot = tf.frames_as_dot();       // Graphviz DOT format
+let yaml = tf.frames_as_yaml();     // YAML (TF2-style)
+tf.validate()?;                     // Validate tree structure
+```
+
+---
+
+## timestamp_now()
+
+```rust
+use horus::prelude::*;
+
+let now: u64 = timestamp_now();  // Current time in nanoseconds (UNIX epoch)
+```
+
+---
+
+## FrameId
+
+Type alias for `u32`. Use for hot-path lookups to avoid string-based name resolution:
+
+```rust
+let id: FrameId = tf.frame_id("base_link").unwrap();
+
+// Fast by-ID operations (no string lookup)
+tf.update_transform_by_id(id, &transform, timestamp_now())?;
+let t = tf.tf_by_id(src_id, dst_id);
+```
+
+---
+
+## Complete Example
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    let tf = TransformFrame::new();
+
+    // Build frame tree
+    tf.add_frame("world").build()?;
+    tf.add_frame("odom").parent("world").build()?;
+    tf.add_frame("base_link").parent("odom").build()?;
+    tf.add_frame("lidar")
+        .parent("base_link")
+        .static_transform(&Transform::xyz(0.2, 0.0, 0.3))
+        .build()?;
+    tf.add_frame("camera")
+        .parent("base_link")
+        .static_transform(&Transform::xyz(0.1, 0.0, 0.5).with_rpy(0.0, 0.1, 0.0))
+        .build()?;
+
+    // Update dynamic frames
+    let now = timestamp_now();
+    tf.update_transform("odom", &Transform::xyz(1.0, 0.5, 0.0).with_yaw(0.3), now)?;
+    tf.update_transform("base_link", &Transform::xyz(0.05, 0.02, 0.0), now)?;
+
+    // Query transforms
+    let lidar_to_world = tf.query("lidar").to("world").lookup()?;
+    println!("Lidar position in world: {:?}", lidar_to_world.translation);
+
+    // Transform a LiDAR point into world frame
+    let world_pt = tf.query("lidar").to("world").point([5.0, 0.0, 0.0])?;
+    println!("Obstacle at world: ({:.2}, {:.2}, {:.2})", world_pt[0], world_pt[1], world_pt[2]);
+
+    // Check staleness
+    if tf.is_stale_now("base_link", 100_000_000) {  // 100ms
+        println!("Odometry is stale!");
+    }
+
+    // Print tree
+    tf.print_tree();
+
+    Ok(())
+}
+```
+
+---
+
+## See Also
+
+- [TransformFrame Concepts](/concepts/transform-frame) — Architecture and design patterns
+- [Python TransformFrame API](/python/api/transform-frame) — Python bindings
+- [Scheduler API](/rust/api/scheduler) — Running nodes that use transforms

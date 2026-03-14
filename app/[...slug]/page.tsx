@@ -30,7 +30,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const baseTitle = doc.frontmatter.title || 'HORUS Documentation';
   const title = `${baseTitle} | HORUS - 575x Faster Than ROS2`;
   const description = doc.frontmatter.description || 'Learn to build production robots with HORUS - the world\'s fastest robotics framework. 87ns latency, 575x faster than ROS2. Rust & Python. FREE & open source.';
-  const url = `https://docs.horus-registry.dev/${slug.join('/')}`;
+  const url = `https://docs.horusrobotics.dev/${slug.join('/')}`;
 
   return {
     title,
@@ -79,7 +79,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       locale: 'en_US',
       images: [
         {
-          url: 'https://docs.horus-registry.dev/og-image.png',
+          url: 'https://docs.horusrobotics.dev/og-image.png',
           width: 1200,
           height: 630,
           alt: `${baseTitle} - HORUS Documentation | 575x Faster Than ROS2`,
@@ -90,7 +90,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       card: 'summary_large_image',
       title: `${baseTitle} | HORUS - 575x Faster`,
       description: `${description.substring(0, 200)}...`,
-      images: ['https://docs.horus-registry.dev/og-image.png'],
+      images: ['https://docs.horusrobotics.dev/og-image.png'],
       creator: '@horus_robotics',
       site: '@horus_robotics',
     },

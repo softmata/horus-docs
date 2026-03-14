@@ -16,12 +16,12 @@ export const metadata: Metadata = {
     'robot programming', 'robotics documentation',
   ],
   alternates: {
-    canonical: 'https://docs.horus-registry.dev',
+    canonical: 'https://docs.horusrobotics.dev',
   },
   openGraph: {
     title: 'HORUS Documentation | Real-Time Robotics Framework',
     description: 'Build production robots 575x faster than ROS2. Sub-microsecond latency, zero-copy messaging, Rust & Python.',
-    url: 'https://docs.horus-registry.dev',
+    url: 'https://docs.horusrobotics.dev',
     siteName: 'HORUS Documentation',
     type: 'website',
   },

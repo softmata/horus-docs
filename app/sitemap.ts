@@ -1,7 +1,7 @@
 import { MetadataRoute } from 'next'
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const baseUrl = 'https://docs.horus-registry.dev'
+  const baseUrl = 'https://docs.horusrobotics.dev'
 
   return [
     // HIGHEST PRIORITY - Landing & Discovery Pages

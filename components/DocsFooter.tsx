@@ -78,7 +78,7 @@ export function DocsFooter() {
               </li>
               <li>
                 <a
-                  href="https://marketplace.horus-registry.dev/"
+                  href="https://registry.horusrobotics.dev/"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors inline-flex items-center gap-1"
