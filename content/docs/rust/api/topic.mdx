@@ -1,0 +1,264 @@
+---
+title: "Topic API"
+description: "Zero-copy pub/sub communication channels between HORUS nodes"
+weight: 20
+---
+
+# Topic API
+
+`Topic<T>` is the primary communication primitive in HORUS. It provides typed publish/subscribe channels backed by shared memory for zero-copy IPC within a single machine.
+
+## Creating a Topic
+
+```rust
+use horus::prelude::*;
+
+// Default capacity and slot size
+let topic = Topic::<Twist>::new("cmd_vel");
+
+// Custom capacity (number of slots) and slot size (bytes per slot)
+let topic = Topic::<LaserScan>::with_capacity("scan", 8, 4096);
+```
+
+| Constructor | Returns | Description |
+|-------------|---------|-------------|
+| `Topic::<T>::new(name)` | `Topic<T>` | Create with default capacity and slot size |
+| `Topic::<T>::with_capacity(name, capacity, slot_size)` | `Topic<T>` | Create with explicit capacity and slot size |
+
+The `name` string identifies the shared-memory channel. Two `Topic` instances with the same name and type connect automatically — one publishes, the other subscribes. Backend selection (in-process ring buffer vs cross-process SHM) is automatic based on whether publisher and subscriber live in the same process.
+
+---
+
+## Sending Messages
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `send(msg)` | `()` | Publish a message (non-blocking, drops oldest if full) |
+| `try_send(msg)` | `Result<(), T>` | Publish if space available; returns message back on failure |
+| `send_blocking(msg, timeout)` | `Result<(), SendBlockingError>` | Block until space is available or timeout elapses |
+
+### SendBlockingError
+
+| Variant | Description |
+|---------|-------------|
+| `Timeout` | Timed out waiting for space in the ring buffer |
+
+### Example
+
+```rust
+let topic = Topic::<CmdVel>::new("cmd_vel");
+
+// Fire-and-forget (overwrites oldest if full)
+topic.send(CmdVel { linear: 1.0, angular: 0.0 });
+
+// Try without blocking
+match topic.try_send(CmdVel { linear: 0.5, angular: 0.1 }) {
+    Ok(()) => { /* sent */ }
+    Err(msg) => { /* buffer full, msg returned */ }
+}
+
+// Block up to 10ms
+use horus::prelude::*;
+match topic.send_blocking(CmdVel { linear: 1.0, angular: 0.0 }, 10_u64.ms()) {
+    Ok(()) => { /* sent */ }
+    Err(SendBlockingError::Timeout) => { /* timed out */ }
+}
+```
+
+---
+
+## Receiving Messages
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `recv()` | `Option<T>` | Take the next unread message (FIFO order) |
+| `read_latest()` | `Option<T>` | Read the most recent message, skipping older ones (requires `T: Copy`) |
+
+`recv()` returns messages in order. Each message is delivered to each subscriber exactly once. `read_latest()` is useful for state-like data (sensor readings, poses) where you only care about the newest value.
+
+### Example
+
+```rust
+let topic = Topic::<Imu>::new("imu");
+
+// Process all pending messages
+while let Some(msg) = topic.recv() {
+    println!("Accel: ({}, {}, {})", msg.linear_accel.x, msg.linear_accel.y, msg.linear_accel.z);
+}
+
+// Or just get the latest reading
+if let Some(latest) = topic.read_latest() {
+    println!("Latest orientation: {:?}", latest.orientation);
+}
+```
+
+---
+
+## State & Metrics
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `name()` | `&str` | The topic name |
+| `has_message()` | `bool` | Whether there is at least one unread message |
+| `pending_count()` | `usize` | Number of unread messages in the buffer |
+| `dropped_count()` | `u64` | Total messages dropped due to full buffer |
+| `metrics()` | `TopicMetrics` | Aggregate send/receive statistics |
+
+### TopicMetrics
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `messages_sent()` | `u64` | Total messages published on this topic |
+| `messages_received()` | `u64` | Total messages consumed from this topic |
+| `send_failures()` | `u64` | Failed send attempts (e.g., `try_send` on a full buffer) |
+| `recv_failures()` | `u64` | Failed receive attempts (e.g., `recv` on empty buffer) |
+
+### Example
+
+```rust
+let topic = Topic::<Twist>::new("cmd_vel");
+
+// Check state
+if topic.has_message() {
+    println!("{} messages pending", topic.pending_count());
+}
+
+// Check for dropped messages
+if topic.dropped_count() > 0 {
+    hlog!(warn, "Dropped {} messages", topic.dropped_count());
+}
+
+// Check metrics
+let m = topic.metrics();
+println!("Sent: {}, Received: {}", m.messages_sent(), m.messages_received());
+```
+
+---
+
+## Pool-Backed Types (Zero-Copy)
+
+For large data types (`Image`, `PointCloud`, `DepthImage`, `Tensor`), HORUS uses pool-backed allocation to avoid copying payloads through the ring buffer. The `Topic` API provides specialized methods for these types.
+
+### Image Topics
+
+```rust
+let topic = Topic::<Image>::new("camera/rgb");
+
+// Send (moves the Image into the pool slot)
+topic.send(image);
+
+// Try send (returns the Image on failure)
+match topic.try_send(image) {
+    Ok(()) => {}
+    Err(img) => { /* buffer full */ }
+}
+
+// Receive
+if let Some(img) = topic.recv() {
+    println!("{}x{} image received", img.width(), img.height());
+}
+```
+
+### PointCloud Topics
+
+```rust
+let topic = Topic::<PointCloud>::new("lidar/points");
+
+topic.send(cloud);
+
+if let Some(cloud) = topic.recv() {
+    println!("{} points received", cloud.len());
+}
+```
+
+### DepthImage Topics
+
+```rust
+let topic = Topic::<DepthImage>::new("camera/depth");
+
+topic.send(depth);
+
+if let Some(depth) = topic.recv() {
+    println!("{}x{} depth image", depth.width(), depth.height());
+}
+```
+
+### Tensor Topics
+
+For advanced ML pipelines, you can use `Topic<Tensor>` directly. The same zero-copy transport that backs `Image`, `PointCloud`, and `DepthImage` is available for raw tensor data. See the [Tensor Messages](/rust/api/tensor-messages) page for details.
+
+```rust
+let topic = Topic::<Tensor>::new("model/output");
+
+// Send and receive work the same as any other topic type
+topic.send(tensor);
+
+if let Some(t) = topic.recv() {
+    println!("Tensor shape: {:?}", t.shape());
+}
+```
+
+For most use cases, prefer the domain types above (`Image`, `PointCloud`, `DepthImage`) — they provide convenience methods like `pixel()`, `point_at()`, and `get_depth()` while using the same zero-copy path internally.
+
+---
+
+## Using Topics in Nodes
+
+Topics are typically used inside `Node` implementations registered with a `Scheduler`:
+
+```rust
+use horus::prelude::*;
+
+struct LidarProcessor {
+    scan_in: Topic<LaserScan>,
+    cmd_out: Topic<CmdVel>,
+}
+
+impl LidarProcessor {
+    fn new() -> Self {
+        Self {
+            scan_in: Topic::new("scan"),
+            cmd_out: Topic::new("cmd_vel"),
+        }
+    }
+}
+
+impl Node for LidarProcessor {
+    fn name(&self) -> &str { "LidarProcessor" }
+
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_in.recv() {
+            // Find closest obstacle
+            let min_range = scan.ranges.iter()
+                .copied()
+                .filter(|r| *r > scan.range_min && *r < scan.range_max)
+                .fold(f32::MAX, f32::min);
+
+            // Stop if too close
+            let speed = if min_range < 0.5 { 0.0 } else { 1.0 };
+            self.cmd_out.send(CmdVel { linear: speed, angular: 0.0 });
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(LidarProcessor::new())
+        .rate(50.hz())
+        .build()?;
+    scheduler.run()
+}
+```
+
+---
+
+## See Also
+
+- [Topic Concepts](/concepts/core-concepts-topic) — Architecture, backends, and design patterns
+- [Communication Overview](/concepts/communication-overview) — When to use topics vs services vs actions
+- [Image API](/rust/api/image) — Pool-backed camera images
+- [PointCloud API](/rust/api/pointcloud) — Pool-backed 3D point clouds
+- [DepthImage API](/rust/api/depth-image) — Pool-backed depth images
+- [Tensor Messages](/rust/api/tensor-messages) — Tensor, Device, TensorDtype, and domain types
+- [Scheduler API](/rust/api/scheduler) — Running nodes that use topics
+- [Python Topic API](/python/api/python-bindings) — Python topic bindings

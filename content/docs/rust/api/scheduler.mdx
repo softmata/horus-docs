@@ -1,0 +1,274 @@
+---
+title: "Scheduler API"
+description: "Complete API reference for the HORUS Scheduler, NodeBuilder, and NodeMetrics"
+weight: 5
+---
+
+# Scheduler API
+
+The Scheduler orchestrates node execution with composable builder configuration.
+
+```rust
+use horus::prelude::*;
+```
+
+## Scheduler
+
+### Constructor
+
+```rust
+let mut scheduler = Scheduler::new();
+```
+
+Creates a scheduler with auto-detected platform capabilities (RT support, CPU topology, memory locking).
+
+### Builder Methods
+
+All builder methods return `Self` for chaining:
+
+```rust
+let mut scheduler = Scheduler::new()
+    .tick_rate(1000_u64.hz())
+    .prefer_rt()
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .max_deadline_misses(3)
+    .verbose(false)
+    .with_recording();
+```
+
+```rust
+// Named scheduler (useful for multi-scheduler setups)
+let mut scheduler = Scheduler::new()
+    .name("motor_control")
+    .tick_rate(1000_u64.hz());
+```
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `.name(name)` | `"horus"` | Set the scheduler name |
+| `.tick_rate(freq)` | 100 Hz | Global scheduler tick rate |
+| `.prefer_rt()` | — | Try RT features (mlockall, SCHED_FIFO), warn on failure |
+| `.require_rt()` | — | Enable RT features, **panic** if unavailable |
+| `.deterministic(bool)` | `false` | Sequential single-threaded execution (no parallelism) |
+| `.watchdog(Duration)` | disabled | Detect frozen nodes (auto-creates safety monitor) |
+| `.blackbox(size_mb)` | disabled | Flight recorder for crash forensics |
+| `.max_deadline_misses(n)` | 100 | Emergency stop threshold |
+| `.cores(&[usize])` | all cores | Pin scheduler threads to specific CPU cores |
+| `.verbose(bool)` | true | Enable/disable non-emergency logging |
+| `.with_recording()` | disabled | Enable session record/replay |
+| `.telemetry(endpoint)` | disabled | Export metrics to HTTP endpoint |
+
+### Node Registration
+
+```rust
+scheduler.add(my_node)         // Returns NodeBuilder for fluent configuration
+    .order(10)
+    .rate(500_u64.hz())
+    .build()?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.add(node)` | `NodeBuilder` | Register a node and configure it via fluent builder |
+
+### Execution Control
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.run()` | `HorusResult<()>` | Main loop — runs until Ctrl+C or `.stop()` |
+| `.run_for(duration)` | `HorusResult<()>` | Run for specific duration, then shut down |
+| `.tick_once()` | `HorusResult<()>` | Execute exactly one tick cycle (no loop, no sleep) |
+| `.tick_once_nodes(&[names])` | `HorusResult<()>` | One tick for specific nodes only |
+| `.set_node_rate(name, freq)` | `&mut Self` | Change a node's tick rate at runtime |
+| `.stop()` | `()` | Signal graceful shutdown |
+| `.is_running()` | `bool` | Check if scheduler is actively ticking |
+
+### Monitoring
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.metrics()` | `Vec<NodeMetrics>` | Performance metrics for all nodes |
+| `.node_list()` | `Vec<String>` | Names of all registered nodes |
+| `.status()` | `String` | Formatted status report |
+
+### Example
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .tick_rate(1000_u64.hz())
+        .prefer_rt()
+        .watchdog(500_u64.ms());
+
+    scheduler.add(SensorNode::new())
+        .order(0)
+        .rate(500_u64.hz())
+        .build()?;
+
+    scheduler.add(PlannerNode::new())
+        .order(50)
+        .compute()
+        .build()?;
+
+    scheduler.add(ControlNode::new())
+        .order(10)
+        .rate(1000_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+---
+
+## NodeBuilder
+
+Returned by `scheduler.add(node)`. Configure execution class, timing, ordering, and failure handling with method chaining.
+
+### Timing & Ordering
+
+| Method | Description |
+|--------|-------------|
+| `.order(n)` | Execution priority within a tick (lower runs first) |
+| `.rate(Frequency)` | Node-specific tick rate — auto-derives budget (80%) and deadline (95%), auto-marks as RT |
+| `.budget(Duration)` | Explicit CPU time budget per tick |
+| `.deadline(Duration)` | Explicit deadline per tick |
+| `.on_miss(Miss)` | Deadline miss policy: `Warn`, `Skip`, `SafeMode`, `Stop` |
+
+### Execution Class
+
+| Method | Class | Description |
+|--------|-------|-------------|
+| `.compute()` | Compute | Offloaded to worker thread pool (planning, SLAM, ML) |
+| `.on(topic)` | Event | Wakes only when the named topic has new data |
+| `.async_io()` | AsyncIo | Runs on async executor (network, disk, cloud) |
+| *(none)* | BestEffort | Default — ticks every scheduler cycle |
+| `.rate(freq)` | RT (auto) | Auto-promoted when rate is set on a BestEffort node |
+
+### Failure & Finalization
+
+| Method | Description |
+|--------|-------------|
+| `.failure_policy(policy)` | Per-node failure handling (`Fatal`, `Restart`, `Skip`, `Ignore`) |
+| `.build()` | Finalize and register — returns `HorusResult<&mut Scheduler>` |
+
+### Order Guidelines
+
+| Range | Use |
+|-------|-----|
+| 0-9 | Critical real-time (motor control, safety) |
+| 10-49 | High priority (sensors, fast loops) |
+| 50-99 | Normal (processing, planning) |
+| 100-199 | Low (logging, diagnostics) |
+| 200+ | Background (telemetry) |
+
+### Miss Enum
+
+| Variant | Behavior | Use Case |
+|---------|----------|----------|
+| `Miss::Warn` | Log warning, continue | Soft real-time (logging, UI) |
+| `Miss::Skip` | Skip this tick | Firm real-time (video encoding) |
+| `Miss::SafeMode` | Call `enter_safe_state()` | Motor controllers, safety nodes |
+| `Miss::Stop` | Stop entire scheduler | Hard real-time safety-critical |
+
+Default is `Miss::Warn`.
+
+---
+
+## NodeMetrics
+
+Returned by `scheduler.metrics()`. Read-only performance data for each node.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.name()` | `&str` | Node name |
+| `.order()` | `u32` | Execution order |
+| `.total_ticks()` | `u64` | Total tick count |
+| `.successful_ticks()` | `u64` | Ticks without errors |
+| `.avg_tick_duration_ms()` | `f64` | Mean tick duration |
+| `.max_tick_duration_ms()` | `f64` | Worst-case tick duration |
+| `.min_tick_duration_ms()` | `f64` | Best-case tick duration |
+| `.last_tick_duration_ms()` | `f64` | Most recent tick duration |
+| `.messages_sent()` | `u64` | Total messages published |
+| `.messages_received()` | `u64` | Total messages consumed |
+| `.errors_count()` | `u64` | Error count |
+| `.warnings_count()` | `u64` | Warning count |
+| `.uptime_seconds()` | `f64` | Node uptime |
+
+### Performance Monitoring Example
+
+```rust
+// After running for a while, check node health
+for metric in scheduler.metrics() {
+    if metric.max_tick_duration_ms() > 1.0 {
+        hlog!(warn, "Node '{}' worst case: {:.2}ms (avg: {:.2}ms)",
+            metric.name(),
+            metric.max_tick_duration_ms(),
+            metric.avg_tick_duration_ms(),
+        );
+    }
+}
+```
+
+---
+
+## RtStats
+
+Real-time execution statistics for nodes with `.rate()` set. Access via node-level timing reports.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.deadline_misses()` | `u64` | Total deadline misses |
+| `.budget_violations()` | `u64` | Total budget violations |
+| `.worst_execution()` | `Duration` | Worst-case tick duration |
+| `.last_execution()` | `Duration` | Most recent tick duration |
+| `.jitter_us()` | `f64` | Execution jitter in microseconds |
+| `.avg_execution_us()` | `f64` | Average tick duration in microseconds |
+| `.sampled_ticks()` | `u64` | Number of ticks sampled |
+| `.summary()` | `String` | Formatted timing summary |
+
+### Example
+
+```rust
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .tick_rate(1000_u64.hz())
+    .prefer_rt();
+
+scheduler.add(MotorController::new())
+    .order(0)
+    .rate(1000_u64.hz())
+    .on_miss(Miss::SafeMode)
+    .build()?;
+
+// Run for 5 seconds, then check stats
+scheduler.run_for(5_u64.secs())?;
+
+for metric in scheduler.metrics() {
+    println!("{}: avg={:.2}ms, worst={:.2}ms, misses={}",
+        metric.name(),
+        metric.avg_tick_duration_ms(),
+        metric.max_tick_duration_ms(),
+        metric.errors_count(),
+    );
+}
+```
+
+---
+
+## See Also
+
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) — Conceptual overview and architecture
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Advanced tuning and deployment patterns
+- [Safety Monitor](/advanced/safety-monitor) — Budget enforcement and graduated degradation
+- [BlackBox](/advanced/blackbox) — Flight recorder for post-mortem analysis
+- [Node API](/concepts/core-concepts-nodes) — The Node trait and lifecycle
+- [HealthStatus](/rust/api/health-status) — Node health states (Healthy, Warning, Unhealthy, Isolated)
+- [NodeState](/rust/api/node-state) — Node lifecycle states and transitions
+- [Python Bindings](/python/api/python-bindings) — Python Scheduler and NodeBuilder API
