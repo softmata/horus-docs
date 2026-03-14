@@ -1,6 +1,6 @@
 ---
 title: "Tensor"
-description: "GPU/CPU tensor with DLPack interop for ML pipelines"
+description: "Zero-copy tensor descriptor with DLPack interop for ML pipelines"
 weight: 63
 ---
 
@@ -12,14 +12,13 @@ A lightweight tensor descriptor for zero-copy ML data sharing across nodes and p
 use horus::prelude::*;
 ```
 
+<Callout type="info">
+**Most users do not need Tensor directly.** For camera images use [Image](/rust/api/tensor-messages), for 3D points use [PointCloud](/rust/api/tensor-messages), for depth data use [DepthImage](/rust/api/tensor-messages). Tensor is for advanced ML pipelines where you need direct control over shape, dtype, and layout — for example, feeding preprocessed batches into a model or reading raw model outputs.
+</Callout>
+
 ## Overview
 
 `Tensor` is a lightweight descriptor that references data in shared memory. Only the descriptor is transmitted through topics — the actual tensor data stays in-place, enabling zero-copy transport for large ML payloads.
-
-You typically obtain a `Tensor` in one of two ways:
-
-1. **Allocate from a TensorPool** (via `Topic<Tensor>` or a manual pool) -- see [TensorPool API](/rust/api/tensor-pool)
-2. **Receive from a Topic** -- another node sends it, you read the descriptor and access the backing data
 
 ## Methods
 
@@ -32,7 +31,7 @@ You typically obtain a `Tensor` in one of two ways:
 | `dtype()` | `TensorDtype` | Element data type |
 | `device()` | `Device` | Device location (CPU or CUDA) |
 | `is_cpu()` | `bool` | True if data resides on CPU / shared memory |
-| `is_cuda()` | `bool` | True if data resides on a CUDA GPU |
+| `is_cuda()` | `bool` | True if device descriptor is set to CUDA |
 | `is_contiguous()` | `bool` | True if memory layout is C-contiguous |
 | `view(new_shape)` | `Option<Self>` | Reshape without copying (fails if not contiguous or element count changes) |
 | `slice_first_dim(start, end)` | `Option<Self>` | Slice along the first dimension, adjusting strides |
@@ -42,15 +41,15 @@ You typically obtain a `Tensor` in one of two ways:
 ```rust
 let topic: Topic<Tensor> = Topic::new("model.input")?;
 
-if let Some(handle) = topic.recv_handle() {
+if let Some(tensor) = topic.recv() {
     // Reshape a flat 1D tensor into a batch of images
-    if let Some(reshaped) = handle.view(&[4, 3, 224, 224]) {
-        println!("Batch shape: {:?}", reshaped.tensor().shape()); // [4, 3, 224, 224]
+    if let Some(reshaped) = tensor.view(&[4, 3, 224, 224]) {
+        println!("Batch shape: {:?}", reshaped.shape()); // [4, 3, 224, 224]
     }
 
     // Take the first 2 items from a batch
-    if let Some(sliced) = handle.slice_first_dim(0, 2) {
-        println!("Sliced shape: {:?}", sliced.tensor().shape()); // [2, 3, 224, 224]
+    if let Some(sliced) = tensor.slice_first_dim(0, 2) {
+        println!("Sliced shape: {:?}", sliced.shape()); // [2, 3, 224, 224]
     }
 }
 ```
@@ -95,13 +94,12 @@ let parsed = TensorDtype::parse("bool").unwrap();     // Bool
 
 ## Device
 
-Pod-safe device descriptor supporting CPU and unlimited CUDA GPU indices.
+Pod-safe device descriptor supporting CPU and CUDA device tags. `Device` is metadata only — `Device::cuda(N)` tags a tensor with a device target but does not allocate GPU memory (GPU tensor pools are not yet implemented).
 
 ```rust
 // Constructors
 let cpu = Device::cpu();
-let gpu0 = Device::cuda(0);
-let gpu7 = Device::cuda(7); // No limit on GPU index
+let gpu0 = Device::cuda(0);  // Descriptor only — no GPU allocation
 
 // Check device type
 assert!(cpu.is_cpu());
@@ -112,54 +110,68 @@ println!("{}", gpu0); // "cuda:0"
 
 // Parse from string
 let dev = Device::parse("cpu").unwrap();
-let dev = Device::parse("cuda").unwrap();    // cuda:0
 let dev = Device::parse("cuda:0").unwrap();
-let dev = Device::parse("gpu:2").unwrap();   // Also accepted — maps to cuda:2
 ```
 
 ## ML Pipeline Example
 
-A complete example showing a camera node feeding frames to an inference node via `Topic<Tensor>`:
+A camera node captures frames using `Image`, while a preprocessing node converts them into batched `Tensor` data for model inference:
 
 ```rust
 use horus::prelude::*;
 
-// Producer: camera capture node
+// Producer: camera capture node — uses Image, not raw Tensor
 node! {
     CameraNode {
-        pub { frames: Tensor -> "camera.rgb" }
+        pub { frames: Image -> "camera.rgb" }
         data { frame_count: u64 = 0 }
 
         tick {
-            // Allocate from the topic's auto-managed pool
-            if let Ok(mut handle) = self.frames.alloc_tensor(
-                &[480, 640, 3],
-                TensorDtype::U8,
-                Device::cpu(),
-            ) {
-                let pixels = handle.data_slice_mut().unwrap();
-                // ... fill pixel data from camera driver ...
+            let image = Image::new(640, 480, ImageEncoding::Rgb8);
+            // ... fill pixel data from camera driver ...
+            self.frames.send(&image);
+            self.frame_count += 1;
+        }
+    }
+}
 
-                self.frames.send_handle(&handle);
-                self.frame_count += 1;
+// Preprocessor: converts Image frames into batched Tensor for ML
+node! {
+    PreprocessNode {
+        sub { frames: Image -> "camera.rgb" }
+        pub { batch: Tensor -> "model.input" }
+        data { buffer: Vec<Image> = Vec::new() }
+
+        tick {
+            if let Some(img) = self.frames.recv() {
+                self.buffer.push(img);
+
+                if self.buffer.len() >= 4 {
+                    // Build a [4, 3, 224, 224] F32 batch tensor for the model
+                    let tensor = Tensor::from_shape(
+                        &[4, 3, 224, 224],
+                        TensorDtype::F32,
+                        Device::cpu(),
+                    );
+                    // ... resize, normalize, and copy frames into tensor ...
+                    self.batch.send(&tensor);
+                    self.buffer.clear();
+                }
             }
         }
     }
 }
 
-// Consumer: inference node
+// Consumer: inference node — works with raw Tensor input/output
 node! {
     InferenceNode {
-        sub { frames: Tensor -> "camera.rgb" }
+        sub { input: Tensor -> "model.input" }
         pub { detections: GenericMessage -> "model.detections" }
 
         tick {
-            if let Some(handle) = self.frames.recv_handle() {
-                let data = handle.data_slice().unwrap(); // Zero-copy access
-                let shape = handle.shape();
-                hlog!(debug, "Frame: {:?}, {} bytes", shape, handle.nbytes());
-
-                // Run inference, publish results ...
+            if let Some(tensor) = self.input.recv() {
+                hlog!(debug, "Input: {:?}, {} bytes", tensor.shape(), tensor.nbytes());
+                // Run inference on the batch tensor, publish results ...
             }
         }
     }
@@ -205,11 +217,10 @@ jax_arr = handle.to_jax()
 |-------------------|-------------|
 | `shape` | Tuple of dimensions |
 | `dtype` | Data type string (e.g., `"float32"`) |
-| `device` | Device string (e.g., `"cpu"`, `"cuda:0"`) |
+| `device` | Device descriptor string (e.g., `"cpu"`) |
 | `is_contiguous()` | Check C-contiguous layout |
 | `view(new_shape)` | Reshape without copying |
 | `slice(start, end)` | Slice along first dimension |
-| `cpu()` | Copy to CPU if on GPU |
 
 ### Python ML Pipeline
 
@@ -217,23 +228,24 @@ jax_arr = handle.to_jax()
 import horus
 import numpy as np
 
-# Subscribe to camera frames
-topic = horus.Topic("camera.rgb", horus.Tensor)
+# Subscribe to preprocessed model input tensors
+topic = horus.Topic("model.input", horus.Tensor)
 
 while True:
-    handle = topic.recv_handle()
-    if handle is not None:
+    tensor = topic.recv()
+    if tensor is not None:
         # Zero-copy to NumPy for processing
-        frame = handle.to_numpy()
-        print(f"Frame shape: {frame.shape}, dtype: {frame.dtype}")
+        batch = tensor.to_numpy()
+        print(f"Batch shape: {batch.shape}, dtype: {batch.dtype}")
 
         # Or pass directly to PyTorch model
         import torch
-        tensor = handle.to_torch()
-        # output = model(tensor.unsqueeze(0))
+        batch_pt = tensor.to_torch()
+        # output = model(batch_pt)
 ```
 
 ## See Also
 
-- [TensorPool API](/rust/api/tensor-pool) -- Pool management, allocation, and configuration
-- [Tensor Messages](/rust/api/tensor-messages) -- Tensor descriptor, TensorDtype, Device reference
+- [Data Types & Encoding](/rust/api/tensor-messages) — Image, PointCloud, DepthImage for common robotics data
+- [Message Types](/concepts/message-types) — All HORUS message types
+- [Python Memory Types](/python/api/memory-types) — Python TensorHandle with NumPy/PyTorch/JAX zero-copy interop
