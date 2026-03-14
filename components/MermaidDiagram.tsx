@@ -190,7 +190,7 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
         startOnLoad: false,
         securityLevel: 'strict',
         flowchart: {
-          htmlLabels: false,
+          htmlLabels: true,
           padding: 20,
           nodeSpacing: 50,
           rankSpacing: 50,
