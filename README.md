@@ -1,10 +1,10 @@
 # HORUS Documentation Site
 
-Open-source documentation for the HORUS robotics framework.
+Open-source documentation for the **HORUS** (**H**ybrid **O**ptimized **R**obotics **U**nified **S**ystem) robotics framework.
 
 ## Overview
 
-This is the official documentation site for HORUS - a production-grade, open-source robotics framework built in Rust. The site provides comprehensive guides, API references, and performance benchmarks.
+This is the official documentation site for HORUS (Hybrid Optimized Robotics Unified System) - a production-grade, open-source robotics framework built in Rust. The site provides comprehensive guides, API references, and performance benchmarks.
 
 ## Running Locally
 
