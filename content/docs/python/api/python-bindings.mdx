@@ -14,10 +14,10 @@ order: 51
 - **Flexible API**: Functional style or class inheritance - your choice
 - **Production Performance**: ~500ns latency (same shared memory as Rust)
 - **Per-Node Rate Control**: Different nodes at different frequencies (100Hz sensor, 10Hz logger)
-- **Automatic Timestamps**: Built-in message timing and staleness detection
+- **Message Timestamps**: Typed messages include `timestamp_ns` for timing
 - **Typed Messages**: Optional type-safe messages from Rust
 - **Multiprocess Support**: Process isolation and multi-language nodes
-- **Pythonic**: Feels like native Python, not wrapped C++
+- **Pythonic**: Feels like native Python, not a foreign function wrapper
 - **Rich Ecosystem**: Use NumPy, OpenCV, scikit-learn, etc.
 
 ---
@@ -104,39 +104,35 @@ node = horus.Node(
 - `on_error` (callable, optional): Error handler, called if tick raises an exception
 - `default_capacity` (int, optional): Buffer capacity for auto-created topics (default: 1024)
 
-### Alternative: Class-Based Inheritance
+### Alternative: Class as State Container
 
-For those who prefer OOP, you can inherit from `horus.Node`:
+For nodes with complex state, use a plain class and pass its method as the tick function:
 
 ```python
 import horus
 
-class SensorNode(horus.Node):
+class SensorState:
     def __init__(self):
-        super().__init__(
-            name="sensor",
-            pubs=["temperature"],
-            rate=10
-        )
+        self.reading = 0.0
 
-    def tick(self, info=None):
-        # Override tick method
-        self.send("temperature", 25.0)
+    def tick(self, node):
+        self.reading += 0.1
+        node.send("temperature", self.reading)
 
-    def init(self, info=None):
-        # Optional: override init
+    def init(self, node):
         print("Sensor initialized!")
 
-    def shutdown(self, info=None):
-        # Optional: override shutdown
+    def shutdown(self, node):
         print("Sensor shutting down!")
 
 # Use it
-sensor = SensorNode()
+state = SensorState()
+sensor = horus.Node(name="sensor", tick=state.tick, init=state.init,
+                    shutdown=state.shutdown, pubs=["temperature"], rate=10)
 horus.run(sensor)
 ```
 
-**Both patterns work!** Use functional style for simplicity or class inheritance for complex nodes with state.
+**Both patterns work!** Use functional style for simplicity or class containers for complex nodes with state.
 
 ### Node Functions
 
@@ -146,10 +142,10 @@ Your tick function receives the node as a parameter:
 def my_tick(node):
     # Check for messages
     if node.has_msg("input"):
-        data = node.get("input")  # Get one message
+        data = node.recv("input")  # Get one message
 
     # Get all messages
-    all_msgs = node.get_all("input")
+    all_msgs = node.recv_all("input")
 
     # Send messages
     node.send("output", {"value": 42})
@@ -160,20 +156,47 @@ def my_tick(node):
 | Method | Description |
 |--------|-------------|
 | `node.send(topic, data)` | Publish a message to a topic |
-| `node.get(topic)` | Get one message (returns `None` if empty) |
-| `node.get_all(topic)` | Get all available messages as a list |
+| `node.recv(topic)` | Receive one message (returns `None` if empty) |
+| `node.recv_all(topic)` | Receive all available messages as a list |
 | `node.has_msg(topic)` | Check if messages are available |
-| `node.get_timestamp(topic)` | Peek at the timestamp of the next message without consuming it |
-| `node.get_message_age(topic)` | Get the age of the next message in seconds |
-| `node.is_stale(topic, max_age)` | Check if the next message is older than `max_age` seconds |
-| `node.get_with_timestamp(topic)` | Get message and its timestamp as a `(msg, timestamp)` tuple |
 | `node.log_info(msg)` | Log an informational message |
 | `node.log_warning(msg)` | Log a warning message |
 | `node.log_error(msg)` | Log an error message |
 | `node.log_debug(msg)` | Log a debug message |
 | `node.request_stop()` | Request the scheduler to stop execution |
-| `node.publishers` | Property: list of publisher topic names |
-| `node.subscribers` | Property: list of subscriber topic names |
+
+**Node scheduling kwargs** (maps 1:1 to Rust NodeBuilder):
+
+| Kwarg | Default | Rust equivalent |
+|-------|---------|-----------------|
+| `rate` | `30` | `.rate()` |
+| `order` | `100` | `.order()` |
+| `budget` | `None` | `.budget()` |
+| `deadline` | `None` | `.deadline()` |
+| `on_miss` | `None` (warn) | `.on_miss()` |
+| `failure_policy` | `None` (fatal) | `.failure_policy()` |
+| `compute` | `False` | `.compute()` |
+| `on` | `None` | `.on(topic)` |
+| `priority` | `None` | `.priority()` |
+| `core` | `None` | `.core()` |
+| `watchdog` | `None` | `.watchdog()` |
+| async `tick` | auto-detected | `.async_io()` |
+
+:::tip Python Timing Guide
+**Budget/deadline** in Python detect overruns, not guarantee timing. Python ticks take milliseconds, not microseconds. Use realistic values:
+
+```python
+# Rust node: microsecond budget
+Node(tick=motor_ctrl, rate=1000, budget=300 * us)  # 300μs — Rust can do this
+
+# Python ML node: millisecond budget — detects when inference is too slow
+Node(tick=run_model, rate=30, budget=50 * ms)  # 50ms — triggers on_miss if exceeded
+```
+
+**compute=True** is useful when your tick calls C extensions that release the GIL (NumPy, PyTorch, OpenCV) — they run in parallel on the thread pool.
+
+**priority/core** are for mixed Rust+Python systems — tell the OS to schedule Rust RT nodes before Python, and keep Python off RT cores.
+:::
 
 ### Running Nodes
 
@@ -214,7 +237,7 @@ import horus
 
 def display_temperature(node):
     if node.has_msg("temperature"):
-        temp = node.get("temperature")
+        temp = node.recv("temperature")
         print(f"Temperature: {temp}°C")
 
 display = horus.Node(
@@ -236,13 +259,13 @@ def publish(node):
 
 def process(node):
     if node.has_msg("raw"):
-        data = node.get("raw")
+        data = node.recv("raw")
         result = data * 2.0
         node.send("processed", result)
 
 def display(node):
     if node.has_msg("processed"):
-        value = node.get("processed")
+        value = node.recv("processed")
         print(f"Result: {value}")
 
 # Create pipeline
@@ -287,10 +310,10 @@ def robot_controller(node):
     camera_data = None
 
     if node.has_msg("lidar"):
-        lidar_data = node.get("lidar")
+        lidar_data = node.recv("lidar")
 
     if node.has_msg("camera"):
-        camera_data = node.get("camera")
+        camera_data = node.recv("camera")
 
     # Compute commands
     if lidar_data and camera_data:
@@ -357,14 +380,14 @@ The Scheduler orchestrates node execution with priority ordering, per-node rate 
 **Creating a Scheduler:**
 
 ```python
-# Fluent API — configure nodes inline with chained calls
+# All config on Node(), scheduler.add() takes only the node
 scheduler = horus.Scheduler()
-scheduler.node(motor_ctrl).order(0).budget(200).rate(1000.0).build()
-scheduler.node(planner).order(5).compute().build()
-scheduler.node(telemetry).order(10).async_io().rate(1.0).build()
+scheduler.add(horus.Node(tick=motor_fn, rate=1000, order=0, budget=200))
+scheduler.add(horus.Node(tick=planner_fn, order=5, compute=True))
+scheduler.add(horus.Node(tick=telemetry_fn, rate=1, order=10))
 ```
 
-**NodeBuilder Methods** (returned by `scheduler.node()`):
+**Node configuration** (kwargs on `Node()`):
 
 | Method | Description |
 |--------|-------------|
@@ -380,35 +403,25 @@ scheduler.node(telemetry).order(10).async_io().rate(1.0).build()
 
 **Adding Nodes:**
 
+All configuration (order, rate, budget, etc.) goes on the `Node()` constructor. `scheduler.add()` takes only the node:
+
 ```python
-scheduler.add(sensor, order=0, rate=100.0)
-scheduler.add(controller, order=1, budget=200, on_miss="safe_mode", deadline=5.0)
-scheduler.add(logger, order=2, rate=10.0)
-scheduler.add(monitor, order=3, failure_policy="skip")
+sensor = horus.Node(name="sensor", tick=sensor_fn, rate=100, order=0)
+controller = horus.Node(name="ctrl", tick=ctrl_fn, rate=100, order=1)
+logger = horus.Node(name="logger", tick=log_fn, rate=10, order=2)
+
+scheduler.add(sensor)
+scheduler.add(controller)
+scheduler.add(logger)
 ```
-
-**`add()` Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `node` | `Node` | required | Node instance |
-| `order` | `int` | `100` | Execution order (lower = earlier) |
-| `rate` | `float` | node's rate | Per-node tick rate in Hz |
-| `budget` | `int` | `None` | Tick budget in microseconds (auto-marks as RT) |
-| `on_miss` | `str` | `None` | `"warn"`, `"skip"`, `"safe_mode"`, or `"stop"` |
-| `deadline` | `float` | `None` | Soft deadline in milliseconds |
-| `failure_policy` | `str` | `None` | `"fatal"`, `"restart"`, `"skip"`, or `"ignore"` |
 
 **Execution:**
 
 | Method | Description |
 |--------|-------------|
 | `scheduler.run()` | Run until Ctrl+C or `.stop()` |
-| `scheduler.run_for(seconds)` | Run for a specific duration, then shut down |
-| `scheduler.tick(node_names)` | Tick specific nodes (list of name strings) |
-| `scheduler.tick_for(node_names, seconds)` | Tick specific nodes for a duration |
+| `scheduler.run(duration=10.0)` | Run for a specific duration, then shut down |
 | `scheduler.stop()` | Signal graceful shutdown |
-| `scheduler.is_running()` | Check if scheduler is actively ticking |
 | `scheduler.current_tick()` | Current tick count |
 
 **Monitoring:**
@@ -438,15 +451,36 @@ scheduler.add(monitor, order=3, failure_policy="skip")
 | `Scheduler.list_recordings()` | List available recordings (static method) |
 | `Scheduler.delete_recording(name)` | Delete a recording (static method) |
 
-**`horus.run()` Convenience Function:**
+**`horus.run()` — The ONE way to run nodes:**
 
 ```python
-# Quick helper — creates a Scheduler, auto-assigns execution order, and runs
-horus.run(sensor, controller, logger, duration=10)
-horus.run(node)  # Single node, no duration limit
+from horus import Node, run, us
+
+sensor = Node(tick=read_lidar, rate=10, order=0, pubs=["scan"])
+ctrl = Node(tick=navigate, rate=30, order=1, subs=["scan"], pubs=["cmd"])
+motor = Node(tick=drive, rate=1000, order=2, budget=300*us, subs=["cmd"])
+
+# All scheduler config as kwargs
+run(sensor, ctrl, motor, rt=True, watchdog_ms=500)
+run(node, duration=10, deterministic=True)
 ```
 
-`horus.run()` uses smart priority assignment: subscriber-only nodes run first, then nodes with both pubs/subs, then publisher-only nodes.
+**All `run()` kwargs** (maps to Rust Scheduler builder):
+
+| Kwarg | Default | Rust equivalent |
+|-------|---------|-----------------|
+| `duration` | `None` (forever) | `.run()` / `.run_for()` |
+| `tick_rate` | `1000.0` | `.tick_rate()` |
+| `rt` | `False` | `.prefer_rt()` |
+| `deterministic` | `False` | `.deterministic()` |
+| `watchdog_ms` | `0` | `.watchdog()` |
+| `blackbox_mb` | `0` | `.blackbox()` |
+| `recording` | `False` | `.with_recording()` |
+| `name` | `None` | `.name()` |
+| `cores` | `None` | `.cores()` |
+| `max_deadline_misses` | `None` | `.max_deadline_misses()` |
+| `verbose` | `False` | `.verbose()` |
+| `telemetry` | `None` | `.telemetry()` |
 
 ### Miss — Deadline Miss Policy
 
@@ -462,56 +496,53 @@ Miss.SAFE_MODE   # Call enter_safe_state() on the node
 Miss.STOP        # Stop the entire scheduler
 ```
 
-Use via the scheduler:
+Use via the Node constructor:
 ```python
-# Via add()
-scheduler.add(motor, order=0, budget=200, on_miss="safe_mode")
-
-# Via fluent builder
-scheduler.node(motor).order(0).budget(200).on_miss("safe_mode").build()
+# Config on Node, then add
+motor = horus.Node(name="motor", tick=motor_fn, rate=500, order=0, budget=200, on_miss="safe_mode")
+scheduler.add(motor)
 ```
 
 ### Scheduler Configuration
 
-Configure via `SchedulerConfig` or direct constructor kwargs:
+All configuration via constructor kwargs:
 
 ```python
-from horus import Scheduler, SchedulerConfig
+from horus import Scheduler, Node
 
-# Development — lightweight
+# Development — simple
 scheduler = Scheduler()
 
-# Production — watchdog + monitoring
-from horus._horus import SchedulerConfig
-cfg = SchedulerConfig.with_watchdog()
-cfg.tick_rate = 1000.0
-scheduler = Scheduler(config=cfg)
+# Production — watchdog + RT
+scheduler = Scheduler(tick_rate=1000, rt=True, watchdog_ms=500)
 
-# With blackbox
-cfg = SchedulerConfig.with_watchdog()
-cfg.tick_rate = 1000.0
-cfg = cfg.blackbox_mb(64)
-scheduler = Scheduler(config=cfg)
+# With blackbox + telemetry
+scheduler = Scheduler(
+    tick_rate=1000,
+    watchdog_ms=500,
+    blackbox_mb=64,
+    telemetry="http://localhost:9090",
+    verbose=True,
+)
+
+# Deterministic mode for simulation/testing
+scheduler = Scheduler(tick_rate=100, deterministic=True)
 ```
 
-**Testing with tick_once:**
+**Testing with short runs:**
 
 ```python
-# Single-tick execution for unit tests and simulation
 scheduler = Scheduler()
-scheduler.add(sensor, order=0)
-scheduler.add(controller, order=1)
+scheduler.add(Node(name="sensor", tick=sensor_fn, rate=100, order=0))
+scheduler.add(Node(name="ctrl", tick=ctrl_fn, rate=100, order=1))
 
-# Run exactly one tick cycle — no loop, no sleep
-scheduler.tick_once()
-
-# Or tick specific nodes
-scheduler.tick(["sensor"])
+# Run for a short duration
+scheduler.run(duration=0.1)
 ```
 
-### Automatic Timestamps
+### Message Timestamps
 
-All messages automatically get microsecond-precision timestamps:
+Timestamps are managed by the Rust Topic backend. Typed messages include a `timestamp_ns` field for nanosecond-precision timing:
 
 ```python
 import horus
@@ -519,32 +550,23 @@ import time
 
 def control_tick(node):
     if node.has_msg("sensor_data"):
-        # Check message age
-        age = node.get_message_age("sensor_data")
-        if age > 0.1:  # More than 100ms old
-            node.log_warning(f"Stale data: {age*1000:.1f}ms old")
-            return
+        msg = node.recv("sensor_data")
 
-        # Or use built-in staleness detection
-        if node.is_stale("sensor_data", max_age=0.1):
-            return  # Skip stale data
+        # Use message-level timestamps for latency checks
+        if hasattr(msg, 'timestamp_ns') and msg.timestamp_ns:
+            age_s = (time.time_ns() - msg.timestamp_ns) / 1e9
+            if age_s > 0.1:  # More than 100ms old
+                node.log_warning(f"Stale data: {age_s*1000:.1f}ms old")
+                return
 
-        # Get message with timestamp
-        msg, timestamp = node.get_with_timestamp("sensor_data")
-        latency = time.time() - timestamp
-        print(f"Latency: {latency*1000:.1f}ms")
+            latency = age_s
+            print(f"Latency: {latency*1000:.1f}ms")
 
         # Process fresh data
-        data = node.get("sensor_data")
-        process(data)
+        process(msg)
 ```
 
-**Timestamp Methods:**
-
-- `node.get_message_age(topic)` - Get age of next message in seconds
-- `node.is_stale(topic, max_age)` - Check if message is too old
-- `node.get_timestamp(topic)` - Peek at timestamp without consuming
-- `node.get_with_timestamp(topic)` - Get message and timestamp together
+**Timestamp access:** Use `msg.timestamp_ns` on typed messages (CmdVel, Pose2D, Imu, etc.) for nanosecond timestamps set by the Rust backend.
 
 ### Multiprocess Execution
 
@@ -583,7 +605,7 @@ import horus
 
 def control_tick(node):
     if node.has_msg("lidar_data"):
-        data = node.get("lidar_data")
+        data = node.recv("lidar_data")
         cmd = compute_control(data)
         node.send("motor_cmd", cmd)
 
@@ -617,38 +639,31 @@ def sensor_tick(node):
     """High-frequency sensor (100Hz)"""
     imu = {"accel_x": 1.0, "accel_y": 0.0, "accel_z": 9.8}
     node.send("imu_data", imu)
-    age = node.get_message_age("imu_data")
-    node.log_info(f"Published IMU (age: {age:.3f}s)")
+    node.log_info("Published IMU data")
 
 def control_tick(node):
     """Medium-frequency control (50Hz)"""
     if node.has_msg("imu_data"):
-        # Check for stale data
-        if node.is_stale("imu_data", max_age=0.05):
-            node.log_warning("Stale IMU data!")
-            return
-
-        imu = node.get("imu_data")
+        imu = node.recv("imu_data")
         cmd = {"linear": 1.0, "angular": 0.0}
         node.send("cmd_vel", cmd)
 
 def logger_tick(node):
     """Low-frequency logging (10Hz)"""
     if node.has_msg("cmd_vel"):
-        msg, timestamp = node.get_with_timestamp("cmd_vel")
-        latency = (time.time() - timestamp) * 1000
-        node.log_info(f"Command latency: {latency:.1f}ms")
+        msg = node.recv("cmd_vel")
+        node.log_info(f"Command received: {msg}")
 
-# Create nodes
-sensor = horus.Node(name="imu", pubs="imu_data", tick=sensor_tick)
-controller = horus.Node(name="ctrl", subs="imu_data", pubs="cmd_vel", tick=control_tick)
-logger = horus.Node(name="log", subs="cmd_vel", tick=logger_tick)
+# Create nodes with rate and order configured on the Node
+sensor = horus.Node(name="imu", pubs="imu_data", tick=sensor_tick, rate=100, order=0)
+controller = horus.Node(name="ctrl", subs="imu_data", pubs="cmd_vel", tick=control_tick, rate=50, order=1)
+logger = horus.Node(name="log", subs="cmd_vel", tick=logger_tick, rate=10, order=2)
 
-# Configure with different rates and priorities
+# Add nodes to scheduler
 scheduler = horus.Scheduler()
-scheduler.add(sensor, order=0, rate=100.0)
-scheduler.add(controller, order=1, rate=50.0, budget=500)
-scheduler.add(logger, order=2, rate=10.0)
+scheduler.add(sensor)
+scheduler.add(controller)
+scheduler.add(logger)
 
 scheduler.run(duration=5.0)
 
@@ -758,33 +773,30 @@ print(topic.is_generic())  # True
 | Typed (`Topic(CmdVel)`) | Direct field extraction (no serde) | Production, cross-language, high-frequency |
 | Generic (`Topic("name")`) | Python → JSON → MessagePack | Dynamic schemas, prototyping, Python-only |
 
-### Backend Hints
+### Automatic Transport Selection
 
-Topic automatically selects the optimal backend, but you can override it with the `backend` parameter for fine-grained control:
+HORUS automatically selects the fastest communication path based on where publishers and subscribers are located. You never need to configure this manually:
 
 ```python
 from horus import Topic, CmdVel
 
-# Auto-detected (default) — HORUS picks the best backend
-topic = Topic(CmdVel)
-
-# Explicit backend selection
-fast = Topic(CmdVel, backend="direct")      # ~3ns, same-thread callbacks
-spsc = Topic(CmdVel, backend="spsc")        # ~18ns, single producer/consumer
-mpmc = Topic(CmdVel, backend="mpmc")        # ~36ns, multiple producers/consumers
-shm  = Topic(CmdVel, backend="mpmc_shm")   # ~167ns, cross-process MPMC
+# Just create a topic — HORUS picks the fastest path automatically:
+# Same-thread:     ~3ns  (when pub+sub are in the same node)
+# Same-process:    ~18-36ns  (when pub+sub are in different nodes, same process)
+# Cross-process:   ~85-167ns  (when pub+sub are in different processes)
+topic = Topic("cmd_vel", CmdVel)
 ```
 
-**Available Backends:**
+**Automatic Transport Tiers:**
 
-| Backend | Latency | Description |
-|---------|---------|-------------|
-| `"direct"` | ~3ns | Same-thread direct channel |
-| `"spsc"` | ~18ns | Same-process, single producer/consumer |
-| `"mpsc"` | ~26ns | Same-process, multiple producers |
-| `"mpmc"` | ~36ns | Same-process, multiple producers/consumers |
-| `"spsc_shm"` | ~85ns | Cross-process, single producer/consumer |
-| `"mpmc_shm"` | ~167ns | Cross-process, multiple producers/consumers |
+| Scenario | Latency | When it applies |
+|----------|---------|-----------------|
+| Same thread | ~3ns | Publisher and subscriber are in the same node |
+| Same process (1:1) | ~18ns | One publisher, one subscriber, same process |
+| Same process (many:1) | ~26ns | Multiple publishers, one subscriber, same process |
+| Same process (many:many) | ~36ns | Multiple publishers and subscribers, same process |
+| Cross-process (1:1) | ~85ns | One publisher, one subscriber, different processes |
+| Cross-process (many:many) | ~167ns | Multiple publishers and subscribers, different processes |
 
 ### Router Client (WAN/NAT Traversal)
 
@@ -839,9 +851,9 @@ server.start()
 
 | Transport | Latency | Use Case |
 |-----------|---------|----------|
-| Local (`Topic(CmdVel)`) | ~85-167ns | Same-machine communication (auto-detected backend) |
-| Local SPSC (`backend="spsc_shm"`) | ~85ns | Same-machine, single producer/consumer |
-| Local MPMC (`backend="mpmc_shm"`) | ~167ns | Same-machine, multiple producers/consumers |
+| Same-process (`Topic(CmdVel)`) | ~18-36ns | In-process communication (automatic) |
+| Cross-process, 1:1 (`Topic(CmdVel)`) | ~85ns | Same machine, one publisher and one subscriber |
+| Cross-process, many:many (`Topic(CmdVel)`) | ~167ns | Same machine, multiple publishers and subscribers |
 | Network (`endpoint="topic@host:port"`) | &lt;50μs | Multi-machine on LAN (direct UDP) |
 | Router (`endpoint="topic@router"`) | 10-50ms | WAN, NAT traversal, cloud deployments |
 
@@ -883,7 +895,7 @@ import numpy as np
 
 def process_array(node):
     if node.has_msg("raw_data"):
-        data = node.get("raw_data")
+        data = node.recv("raw_data")
         # Convert to NumPy array
         arr = np.array(data)
         # Process with NumPy
@@ -906,7 +918,7 @@ import numpy as np
 
 def process_image(node):
     if node.has_msg("camera"):
-        img_data = node.get("camera")
+        img_data = node.recv("camera")
         # Convert to OpenCV format
         img = np.array(img_data, dtype=np.uint8).reshape((480, 640, 3))
 
@@ -936,7 +948,7 @@ model = LinearRegression()
 
 def train_model(node):
     if node.has_msg("training_data"):
-        data = node.get("training_data")
+        data = node.recv("training_data")
         X = np.array(data['features'])
         y = np.array(data['labels'])
 
@@ -972,10 +984,10 @@ state = RobotState()
 
 def update_state(node):
     if node.has_msg("velocity"):
-        state.velocity = node.get("velocity")
+        state.velocity = node.recv("velocity")
 
     if node.has_msg("position"):
-        state.position = node.get("position")
+        state.position = node.recv("position")
 
     # Publish combined state
     node.send("robot_state", {
@@ -1025,7 +1037,7 @@ import horus
 def safe_processing(node):
     try:
         if node.has_msg("input"):
-            data = node.get("input")
+            data = node.recv("input")
             result = risky_operation(data)
             node.send("output", result)
     except Exception as e:
@@ -1046,17 +1058,15 @@ processor = horus.Node(
 ### 1. Use Per-Node Rate Control
 
 ```python
-# NEW: Use scheduler with per-node rates for optimal performance
+# Configure rate and order on the Node, then add to scheduler
+sensor = horus.Node(name="sensor", tick=sensor_fn, rate=100, order=0)
+controller = horus.Node(name="ctrl", tick=ctrl_fn, rate=50, order=1)
+logger = horus.Node(name="logger", tick=log_fn, rate=10, order=2)
+
 scheduler = horus.Scheduler()
-
-# High-frequency sensor (100Hz)
-scheduler.add(sensor, order=0, rate=100.0)
-
-# Medium-frequency control (50Hz)
-scheduler.add(controller, order=1, rate=50.0)
-
-# Low-frequency logging (10Hz)
-scheduler.add(logger, order=2, rate=10.0)
+scheduler.add(sensor)
+scheduler.add(controller)
+scheduler.add(logger)
 
 scheduler.run()
 
@@ -1065,18 +1075,21 @@ stats = scheduler.get_node_stats("sensor")
 print(f"Sensor executed {stats['total_ticks']} ticks")
 ```
 
-### 2. Monitor Message Staleness
+### 2. Check Message Freshness
 
 ```python
-def control_tick(node):
-    # Skip stale data to maintain real-time performance
-    if node.is_stale("sensor_data", max_age=0.1):
-        node.log_warning("Skipping stale sensor data")
-        return
+import time
 
-    # Process fresh data only
-    data = node.get("sensor_data")
-    process(data)
+def control_tick(node):
+    if node.has_msg("sensor_data"):
+        data = node.recv("sensor_data")
+        # Use message-level timestamps for staleness checks
+        if hasattr(data, 'timestamp_ns') and data.timestamp_ns:
+            age_s = (time.time_ns() - data.timestamp_ns) / 1e9
+            if age_s > 0.1:
+                node.log_warning("Skipping stale sensor data")
+                return
+        process(data)
 ```
 
 ### 3. Use Dicts for Messages
@@ -1086,17 +1099,16 @@ def control_tick(node):
 cmd = {"linear": 1.5, "angular": 0.8}
 node.send("cmd_vel", cmd)
 
-# Check message age using node method
-if node.get_message_age("cmd_vel") > 0.1:
-    print("Message is stale")
+# For staleness checks, use typed messages with timestamp_ns
+# or track send time at the application level
 ```
 
 ### 4. Batch Processing
 
 ```python
-# Use node.get_all() to process all available messages at once
+# Use node.recv_all() to process all available messages at once
 def batch_processor(node):
-    messages = node.get_all("input")
+    messages = node.recv_all("input")
     if messages:
         results = [process(msg) for msg in messages]
         for result in results:
@@ -1109,7 +1121,7 @@ def batch_processor(node):
 # GOOD: Fast tick
 def good_tick(node):
     if node.has_msg("input"):
-        data = node.get("input")
+        data = node.recv("input")
         result = quick_operation(data)
         node.send("output", result)
 
@@ -1128,7 +1140,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 def heavy_processing_node(node):
     if node.has_msg("input"):
-        data = node.get("input")
+        data = node.recv("input")
         # Offload to thread pool
         future = executor.submit(expensive_operation, data)
         # Don't block - check result later or use callback
@@ -1198,16 +1210,17 @@ HORUS Python includes a mock mode for testing without Rust bindings:
 ```python
 # Check node statistics
 scheduler = horus.Scheduler()
-scheduler.add(my_node, order=0)
+scheduler.add(my_node)
 
 # Check node statistics
 stats = scheduler.get_node_stats("my_node")
 print(f"Ticks: {stats['total_ticks']}, Errors: {stats['errors_count']}")
 
-# Monitor message timestamps
-msg, timestamp = node.get_with_timestamp("topic")
-age = time.time() - timestamp
-print(f"Message age: {age*1000:.1f}ms")
+# Monitor message timestamps via message-level fields
+msg = node.recv("topic")
+if msg and hasattr(msg, 'timestamp_ns') and msg.timestamp_ns:
+    age = (time.time_ns() - msg.timestamp_ns) / 1e9
+    print(f"Message age: {age*1000:.1f}ms")
 ```
 
 ---
@@ -1253,6 +1266,163 @@ See [Python Message Library](/python/library/python-message-library) for details
 
 ---
 
+## Time API
+
+Framework clock functions — work in both normal and deterministic mode:
+
+```python
+import horus
+
+horus.now()               # Current time in seconds (wall clock or SimClock)
+horus.dt()                # Timestep for this tick in seconds
+horus.elapsed()           # Time since scheduler start in seconds
+horus.tick()              # Current tick number (int)
+horus.budget_remaining()  # Time left in tick budget (float('inf') if no budget)
+horus.rng_float()         # Random float [0, 1) — deterministic if deterministic=True
+horus.timestamp_ns()      # Nanosecond timestamp for TF queries (int)
+```
+
+In deterministic mode (`run(..., deterministic=True)`), `now()` returns SimClock time, `dt()` is fixed `1/rate`, and `rng_float()` is tick-seeded — identical results across runs.
+
+---
+
+## Runtime Parameters
+
+`horus.Params` — dict-like access to runtime configuration from `.horus/config/params.yaml`:
+
+```python
+import horus
+
+p = horus.Params()              # Load from default location
+p = horus.Params("path.yaml")  # Or explicit path
+
+# Dict-like access
+kp = p["pid_kp"]               # KeyError if missing
+kp = p.get("pid_kp", 1.0)     # Default if missing
+p["pid_kp"] = 2.5             # Set
+p.save()                       # Persist to disk
+
+# Iteration
+for key in p:
+    print(f"{key} = {p[key]}")
+
+"pid_kp" in p   # True
+len(p)           # Number of params
+list(p.keys())   # All param names
+p.reset()        # Reset to defaults
+```
+
+---
+
+## Rate Limiter
+
+`horus.Rate` — drift-compensated rate limiting for background threads (not for nodes — nodes use `rate=` kwarg):
+
+```python
+from horus import Rate
+
+rate = Rate(30)  # 30 Hz target
+
+while running:
+    do_work()
+    rate.sleep()  # Compensates for work time to maintain 30 Hz
+
+rate.actual_hz()  # Measured frequency (smoothed)
+rate.target_hz()  # Target frequency (30.0)
+rate.period()     # Target period in seconds (0.033...)
+rate.is_late()    # True if current cycle exceeded period
+rate.reset()      # Reset after a pause
+```
+
+---
+
+## Hardware Drivers
+
+`horus.drivers` — load hardware connections from `horus.toml` `[drivers]` section:
+
+```python
+import horus
+
+hw = horus.drivers.load()               # From horus.toml
+hw = horus.drivers.load_from("path")    # Explicit path
+
+# Typed accessors (return DriverParams)
+bus = hw.dynamixel("arm")
+lidar = hw.rplidar("lidar")
+cam = hw.realsense("camera")
+port = hw.serial("gps")
+
+# DriverParams — dict-like config access
+bus["port"]                # "/dev/ttyUSB0"
+bus.get("baudrate", 115200)
+bus.has("servo_ids")
+list(bus.keys())
+
+# Introspection
+hw.list()          # ["arm", "lidar", "camera", ...]
+hw.has("arm")      # True
+len(hw)            # Number of drivers
+"arm" in hw        # True
+
+# Register Python driver class
+horus.drivers.register_driver("MyDriver", MyDriverClass)
+node = hw.local("my_device")  # Instantiates MyDriverClass(params)
+```
+
+All 15 Terra accessors: `dynamixel`, `rplidar`, `realsense`, `i2c`, `serial`, `can`, `gpio`, `pwm`, `usb`, `webcam`, `input`, `bluetooth`, `net`, `ethercat`, `spi`, `adc`, `raw`.
+
+---
+
+## Unit Constants
+
+```python
+from horus import us, ms
+
+us  # 1e-6 — microseconds to seconds
+ms  # 1e-3 — milliseconds to seconds
+
+# Use with budget/deadline for readability
+node = horus.Node(tick=fn, rate=1000, budget=300 * us, deadline=900 * us)
+```
+
+---
+
+## Error Types
+
+```python
+from horus import HorusNotFoundError, HorusTransformError, HorusTimeoutError
+
+try:
+    tf.tf("missing_frame", "base")
+except HorusTransformError as e:
+    print(f"Transform failed: {e}")
+
+try:
+    tf.wait_for_transform("src", "dst", timeout_sec=1.0)
+except HorusTimeoutError:
+    print("Timed out waiting for transform")
+```
+
+| Exception | Rust source | Raised when |
+|-----------|-------------|-------------|
+| `HorusNotFoundError` | `NotFound(...)` | Missing topic, frame, node |
+| `HorusTransformError` | `Transform(...)` | TF extrapolation, stale data |
+| `HorusTimeoutError` | `Timeout(...)` | Blocking operation timed out |
+
+Other Rust errors map to stdlib: `Config` → `ValueError`, `Io` → `IOError`, `Memory` → `MemoryError`, etc.
+
+---
+
+## See Also
+
+- [Transform Frame](/python/api/transform-frame) — Coordinate transforms (`TransformFrame`, `Transform`)
+- [Perception](/python/api/perception) — Detection, landmarks, tracking (`DetectionList`, `PointXYZ`, `COCOPose`)
+- [Memory Types](/python/api/memory-types) — Image, PointCloud, DepthImage (zero-copy)
+- [Async Nodes](/python/api/async-nodes) — Async tick functions
+- [ML Utilities](/python/library/ml-utilities) — PyTorch/ONNX inference helpers
+
+---
+
 ## Common Patterns
 
 ### Producer-Consumer
@@ -1281,7 +1451,7 @@ def request_node(node):
 
 def response_node(node):
     if node.has_msg("requests"):
-        req = node.get("requests")
+        req = node.recv("requests")
         response = handle_request(req)
         node.send("responses", response)
 
@@ -1340,11 +1510,11 @@ node = horus.Node(tick=fn, rate=30)  # 30Hz is reasonable
 # BAD:
 all_data = []
 def bad_tick(node):
-    all_data.append(node.get("input"))  # Memory leak!
+    all_data.append(node.recv("input"))  # Memory leak!
 
 # GOOD:
 def good_tick(node):
-    data = node.get("input")
+    data = node.recv("input")
     process_and_discard(data)  # Process immediately
 ```
 
@@ -1388,7 +1558,7 @@ def tick(node):
 ```python
 def tick(node):
     if node.has_msg("input"):
-        data = node.get("input")
+        data = node.recv("input")
         print(f"[{node.name}] Received: {data}")
         node.send("output", result)
         print(f"[{node.name}] Published: {result}")
@@ -1397,7 +1567,7 @@ def tick(node):
 3. **Node statistics:**
 ```python
 scheduler = horus.Scheduler()
-scheduler.add(node, order=0)
+scheduler.add(node)
 scheduler.run(duration=10)
 
 # Get stats after running
@@ -1411,7 +1581,7 @@ print(f"Errors: {stats['errors_count']}")
 Monitor integration for Python nodes is planned for a future release. This will require:
 - Passing `NodeInfo` context through Python bindings
 - Implementing `LogSummary` for Python message types
-- Enabling monitor to read Python node logs from `/dev/shm/horus_logs`
+- Enabling monitor to read Python node logs from `shm_base_dir()/logs (namespaced)`
 
 ---
 
@@ -1493,7 +1663,7 @@ except RuntimeError:
 - [Python Message Library](/python/library/python-message-library) - Typed message classes
 - [Multi-Language Support](/concepts/multi-language) - Cross-language communication
 - [Performance](/performance/performance) - Optimization guide
-- [Rust Scheduler API](/rust/api/scheduler) — Rust Scheduler and NodeBuilder reference
+- [Rust Scheduler API](/rust/api/scheduler) — Rust Scheduler API reference
 - [Rust Standard Messages](/rust/api/messages) — All Rust POD message types
 
 ---

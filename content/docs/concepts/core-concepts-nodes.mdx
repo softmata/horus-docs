@@ -6,6 +6,8 @@ order: 5
 
 # Nodes and Lifecycle
 
+> New to HORUS? Start with [Nodes: The Building Blocks](/concepts/nodes-beginner) for a 5-minute introduction.
+
 ## Key Takeaways
 
 After reading this guide, you will understand:
@@ -47,6 +49,7 @@ pub trait Node: Send {
 
     // Optional lifecycle
     fn init(&mut self) -> Result<()> { Ok(()) }
+    // SAFETY: implement shutdown() for any node that controls actuators or holds hardware resources
     fn shutdown(&mut self) -> Result<()> { Ok(()) }
     fn on_error(&mut self, error: &str) { /* logs error */ }
 
@@ -54,7 +57,7 @@ pub trait Node: Send {
     fn publishers(&self) -> Vec<TopicMetadata> { Vec::new() }
     fn subscribers(&self) -> Vec<TopicMetadata> { Vec::new() }
 
-    // Safety (used by safety monitor for Miss::SafeMode)
+    // SAFETY: used by safety monitor when Miss::SafeMode triggers — override for actuator nodes
     fn is_safe_state(&self) -> bool { true }
     fn enter_safe_state(&mut self) { /* no-op */ }
 }
@@ -97,6 +100,7 @@ fn init(&mut self) -> Result<()> {
 **shutdown()**: Called once during graceful shutdown (default: no-op)
 
 ```rust
+// SAFETY: always implement shutdown() for nodes controlling motors, servos, or other actuators
 fn shutdown(&mut self) -> Result<()> {
     hlog!(info, "Node shutting down");
     // Clean up resources, close connections, etc.
@@ -107,6 +111,7 @@ fn shutdown(&mut self) -> Result<()> {
 **is_safe_state()**: Check if the node is in a safe state. Used by the safety monitor when `Miss::SafeMode` triggers. Override this to report your node's safety status:
 
 ```rust
+// SAFETY: override for actuator nodes — scheduler calls this during Miss::SafeMode
 fn is_safe_state(&self) -> bool {
     self.velocity == 0.0 && self.motor_disabled
 }
@@ -115,6 +120,7 @@ fn is_safe_state(&self) -> bool {
 **enter_safe_state()**: Transition the node to a safe state. Called by the scheduler when `Miss::SafeMode` is active and the node misses a deadline:
 
 ```rust
+// SAFETY: stop all actuators and disable outputs when entering safe state
 fn enter_safe_state(&mut self) {
     self.velocity = 0.0;
     self.disable_motor();
@@ -191,21 +197,21 @@ impl Node for LifecycleDemo {
     }
 
     fn init(&mut self) -> Result<()> {
-        // Called ONCE when node starts
+        // NOTE: called ONCE when node starts — open resources, allocate buffers here
         hlog!(info, "Initializing resources");
         self.counter = 0;
         Ok(())
     }
 
     fn tick(&mut self) {
-        // Called REPEATEDLY in main loop (~60 FPS default)
+        // NOTE: called REPEATEDLY in main loop (~60 FPS default)
         self.counter += 1;
 
         hlog!(debug, "Tick #{}", self.counter);
     }
 
+    // SAFETY: called ONCE during graceful shutdown — release resources, stop actuators here
     fn shutdown(&mut self) -> Result<()> {
-        // Called ONCE during graceful shutdown
         hlog!(info, "Shutting down after {} ticks", self.counter);
         Ok(())
     }
@@ -246,20 +252,20 @@ hlog!(debug, "Position: ({}, {})", x, y);
 
 ### Pub/Sub Logging
 
-With the zero-overhead IPC, `send()` and `recv()` no longer take `ctx`. For introspection, enable logging at construction time with `.with_logging()`:
+With the zero-overhead IPC, `send()` and `recv()` no longer take `ctx`. For introspection, enable logging at construction time with ``:
 
 ```rust
 // Construction: choose zero-overhead or with logging
 let velocity_pub: Topic<f32> = Topic::new("cmd_vel")?;                  // Zero-overhead (default)
-let velocity_pub_logged: Topic<f32> = Topic::new("cmd_vel")?.with_logging(); // With logging (requires T: LogSummary)
+let velocity_pub_logged: Topic<f32> = Topic::new("cmd_vel")?; // With logging (requires T: LogSummary)
 
 fn tick(&mut self) {
     // The only send method — logging depends on how the topic was constructed
     self.velocity_pub.send(1.5);
-    // If constructed with .with_logging():
+    // If constructed with :
     // Output: [12:34:56.789] MyNode --PUB--> 'cmd_vel' = 1.5
 
-    // The only recv method
+    // IMPORTANT: call recv() every tick to avoid stale data accumulation
     if let Some(scan) = self.lidar_sub.recv() {
         self.process(scan);
     }
@@ -398,6 +404,12 @@ impl Node for SensorNode {
         let data = 42.0; // Read sensor
         self.data_pub.send(data);
     }
+
+    // SAFETY: no actuators controlled — shutdown is optional for pure publisher nodes
+    fn shutdown(&mut self) -> Result<()> {
+        hlog!(info, "SensorNode stopped");
+        Ok(())
+    }
 }
 ```
 
@@ -444,6 +456,9 @@ impl Node for Publisher {
         let data = self.generate_data();
         self.data_pub.send(data);
     }
+
+    // SAFETY: implement shutdown() if this publisher controls actuators
+    fn shutdown(&mut self) -> Result<()> { Ok(()) }
 }
 ```
 
@@ -456,16 +471,20 @@ struct Subscriber {
 
 impl Node for Subscriber {
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the buffer and avoid stale data
         if let Some(data) = self.data_sub.recv() {
             self.process(data);
         }
     }
+
+    fn shutdown(&mut self) -> Result<()> { Ok(()) }
 }
 ```
 
 ### Pipeline Pattern
 
 ```rust
+// PATTERN: Pipeline — subscribe, transform, republish
 struct Filter {
     input_sub: Topic<f32>,
     output_pub: Topic<f32>,
@@ -473,17 +492,24 @@ struct Filter {
 
 impl Node for Filter {
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the buffer and avoid stale data
         if let Some(input) = self.input_sub.recv() {
             let output = input * 2.0;
             self.output_pub.send(output);
         }
     }
+
+    fn shutdown(&mut self) -> Result<()> { Ok(()) }
 }
 ```
 
 ### Aggregator Pattern
 
 ```rust
+// PATTERN: Aggregator — combine multiple inputs into one output
+// NOTE: if either input has no data, BOTH recv() calls still execute but output is skipped.
+// This means data from the other input is consumed and lost. For independent draining,
+// use the Multi-Topic Synchronization pattern below instead.
 struct Aggregator {
     input_a: Topic<f32>,
     input_b: Topic<f32>,
@@ -492,11 +518,14 @@ struct Aggregator {
 
 impl Node for Aggregator {
     fn tick(&mut self) {
+        // IMPORTANT: both recv() calls run every tick — data is consumed even if the other is None
         if let (Some(a), Some(b)) = (self.input_a.recv(), self.input_b.recv()) {
             let result = a + b;
             self.output_pub.send(result);
         }
     }
+
+    fn shutdown(&mut self) -> Result<()> { Ok(()) }
 }
 ```
 
@@ -507,13 +536,13 @@ impl Node for Aggregator {
 The tick method should complete quickly (ideally &lt;1ms):
 
 ```rust
-// GOOD: Fast computation
+// IMPORTANT: keep tick() under 1ms — the scheduler monitors tick duration
 fn tick(&mut self) {
     let result = self.compute_quickly();
     self.pub.send(result);
 }
 
-// BAD: Blocking I/O
+// WARNING: blocking I/O in tick() causes deadline misses — use .async_io() or .compute() instead
 fn tick(&mut self) {
     let data = std::fs::read_to_string("file.txt").unwrap(); // Blocks!
     // ...
@@ -546,13 +575,13 @@ fn init(&mut self) -> Result<()> {
         .open()
         .map_err(|e| Error::node("MyMotorNode", format!("Failed to open serial: {}", e)))?;
 
-    // 2. Pre-allocate buffers (avoid allocation in tick)
+    // IMPORTANT: pre-allocate buffers here — allocation in tick() causes jitter
     self.command_buffer = vec![0u8; 256];
 
     // 3. Initialize hardware state
     self.send_init_sequence()?;
 
-    // 4. Set initial values
+    // SAFETY: start with actuators in a known safe state
     self.velocity = 0.0;
     self.is_armed = false;
 
@@ -577,14 +606,15 @@ The `shutdown()` method runs **once** when your application exits (Ctrl+C, SIGIN
 | **Flush buffers** | Write pending data to disk | Prevent data loss |
 
 ```rust
+// SAFETY: shutdown() is called once on SIGINT/SIGTERM — stop all actuators before releasing resources
 fn shutdown(&mut self) -> Result<()> {
     hlog!(info, "MyMotorNode shutting down");
 
-    // 1. CRITICAL: Stop all actuators FIRST
+    // CRITICAL: stop all actuators FIRST — before closing connections or releasing resources
     self.velocity = 0.0;
     self.send_stop_command();
 
-    // 2. Disable hardware (safe state)
+    // SAFETY: disable hardware outputs to prevent runaway on power cycle
     self.disable_motor_driver();
 
     // 3. Close hardware connections
@@ -664,7 +694,7 @@ impl Node for MyMotorController {
     }
 
     fn tick(&mut self) {
-        // Process commands
+        // IMPORTANT: call recv() every tick to drain the command buffer
         if let Some(cmd) = self.cmd_sub.recv() {
             self.velocity = cmd.velocity;
             self.send_velocity(self.velocity);
@@ -678,10 +708,11 @@ impl Node for MyMotorController {
         self.status_pub.send(status);
     }
 
+    // SAFETY: must stop motors before releasing serial port
     fn shutdown(&mut self) -> Result<()> {
         hlog!(info, "Stopping motor for safe shutdown");
 
-        // CRITICAL: Stop motor first!
+        // CRITICAL: stop motor first — before closing serial port
         self.velocity = 0.0;
         self.send_velocity(0.0);
 
@@ -739,12 +770,12 @@ fn tick(&mut self) {
 Store state in the node struct, not static variables:
 
 ```rust
-// GOOD
+// IMPORTANT: store state in the node struct — the scheduler owns your node's lifetime
 struct MyNode {
     counter: u32,  // Instance state
 }
 
-// BAD
+// WARNING: static mut is unsound and breaks multi-node isolation
 static mut COUNTER: u32 = 0;  // Unsafe global state
 ```
 
@@ -771,6 +802,7 @@ Handle errors in tick() without panicking:
 
 ```rust
 fn tick(&mut self) {
+    // IMPORTANT: call recv() every tick — None is normal (no new data this tick)
     match self.data_sub.recv() {
         Some(data) => self.process(data),
         None => {
@@ -783,6 +815,7 @@ fn tick(&mut self) {
 ### Shutdown Errors
 
 ```rust
+// SAFETY: never panic in shutdown — log errors and continue cleanup
 fn shutdown(&mut self) -> Result<()> {
     if let Err(e) = self.device.close() {
         hlog!(warn, "Failed to close device: {}", e);
@@ -814,6 +847,7 @@ fn tick(&mut self) {
 Implement complex behavior with enum-based state patterns:
 
 ```rust
+// PATTERN: State machine — use enum states for complex behavior
 enum RobotState {
     Idle,
     Moving,
@@ -823,13 +857,19 @@ enum RobotState {
 struct RobotController {
     state: RobotState,
     cmd_sub: Topic<CmdVel>,
+    last_cmd: Option<CmdVel>,
 }
 
 impl Node for RobotController {
     fn tick(&mut self) {
+        // CRITICAL: always call recv() outside the match — calling it only in one branch
+        // causes the buffer to fill up in other states, leading to stale commands
+        // executing immediately on state transition
+        self.last_cmd = self.cmd_sub.recv();
+
         match self.state {
             RobotState::Idle => {
-                if let Some(cmd) = self.cmd_sub.recv() {
+                if self.last_cmd.is_some() {
                     self.state = RobotState::Moving;
                 }
             }
@@ -844,6 +884,12 @@ impl Node for RobotController {
             }
         }
     }
+
+    // SAFETY: stop actuators on shutdown even if in Moving state
+    fn shutdown(&mut self) -> Result<()> {
+        self.state = RobotState::Stopped;
+        Ok(())
+    }
 }
 ```
 
@@ -852,6 +898,7 @@ impl Node for RobotController {
 Wait for data from multiple topics:
 
 ```rust
+// PATTERN: Multi-Topic Synchronization — cache latest from each input, process when all available
 struct Synchronizer {
     topic_a: Topic<f32>,
     topic_b: Topic<f32>,
@@ -861,7 +908,7 @@ struct Synchronizer {
 
 impl Node for Synchronizer {
     fn tick(&mut self) {
-        // Update cached values
+        // IMPORTANT: call recv() on ALL topics every tick — never skip a recv() conditionally
         if let Some(a) = self.topic_a.recv() {
             self.last_a = Some(a);
         }
@@ -869,11 +916,13 @@ impl Node for Synchronizer {
             self.last_b = Some(b);
         }
 
-        // Process when both available
+        // NOTE: processes with stale data from slower topic until both update
         if let (Some(a), Some(b)) = (self.last_a, self.last_b) {
             self.process(a, b);
         }
     }
+
+    fn shutdown(&mut self) -> Result<()> { Ok(()) }
 }
 ```
 
@@ -907,13 +956,14 @@ flowchart TB
 **With shutdown()**: Motors receive stop commands before the application exits:
 
 ```rust
+// SAFETY: without this, motors continue at last commanded velocity after Ctrl+C
 fn shutdown(&mut self) -> Result<()> {
     hlog!(info, "Stopping all motors for safe shutdown");
 
-    // Send stop command to all motors
+    // CRITICAL: send stop command to all motors FIRST
     self.emergency_stop();
 
-    // Optionally: disable motor drivers
+    // SAFETY: disable motor drivers to prevent runaway
     self.disable_all_drivers();
 
     hlog!(info, "Motors stopped safely");
@@ -926,28 +976,23 @@ fn shutdown(&mut self) -> Result<()> {
 Python nodes also support shutdown callbacks. When the scheduler stops, your `shutdown` function runs automatically:
 
 ```python
-from horus import Node, Topic, Scheduler
+import horus
 
-class MotorController(Node):
-    def __init__(self):
-        super().__init__("MotorController")
+velocity = [0.0, 0.0]
 
-    def init(self):
-        self.cmd_sub = Topic("cmd_vel")
-        self.velocity = (0.0, 0.0)
+def motor_tick(node):
+    msg = node.recv("cmd_vel")
+    if msg is not None:
+        velocity[0], velocity[1] = msg
 
-    def tick(self):
-        msg = self.cmd_sub.recv()
-        if msg is not None:
-            self.velocity = msg
+def motor_shutdown(node):
+    velocity[0], velocity[1] = 0.0, 0.0
+    print("Motors stopped safely")
 
-    def shutdown(self):
-        self.velocity = (0.0, 0.0)
-        print("Motors stopped safely")
-
-scheduler = Scheduler()
-scheduler.node(MotorController()).order(10).build()
-scheduler.run()
+motor = horus.Node(name="MotorController", tick=motor_tick,
+                   shutdown=motor_shutdown, order=10,
+                   subs=["cmd_vel"])
+horus.run(motor)
 ```
 
 See the [Python Bindings](/python/api/python-bindings) documentation for details.
@@ -965,10 +1010,11 @@ impl Node for MyMotorController {
         self.motor_pub.send(self.velocity);
     }
 
+    // SAFETY: called on SIGINT/SIGTERM — stop actuators before releasing hardware
     fn shutdown(&mut self) -> Result<()> {
         hlog!(info, "MyMotorController shutting down");
 
-        // CRITICAL: Stop all motors
+        // CRITICAL: stop all motors FIRST — before closing any connections
         self.velocity = 0.0;
         self.motor_pub.send(0.0);
 
@@ -1012,8 +1058,9 @@ Verify in logs:
 5. **Don't panic in shutdown** - Handle errors gracefully, continue cleanup
 
 ```rust
+// SAFETY: never panic in shutdown — always attempt all cleanup steps
 fn shutdown(&mut self) -> Result<()> {
-    // Always try to stop motors, even if other cleanup fails
+    // CRITICAL: always try to stop motors, even if other cleanup fails
     if let Err(e) = self.stop_motors() {
         hlog!(error, "Failed to stop motors: {}", e);
         // Continue with other cleanup anyway

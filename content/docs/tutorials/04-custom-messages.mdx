@@ -1,0 +1,433 @@
+---
+title: "Tutorial 4: Custom Message Types"
+description: "Define custom messages for your robot — the message! macro, manual derives, and GenericMessage for dynamic data"
+order: 40
+---
+
+# Tutorial 4: Custom Message Types
+
+HORUS ships with 70+ standard message types, but every real project needs custom messages for its own hardware, protocols, or data formats. This tutorial covers three approaches.
+
+**Prerequisites:** [Tutorial 1](/tutorials/01-sensor-node) completed.
+
+**What you'll learn:**
+- Define POD messages with the `message!` macro (zero-copy IPC)
+- Define complex messages with manual derives (heap types like `String`, `Vec`)
+- Use `GenericMessage` for dynamic, cross-language data
+- Publish and subscribe to custom messages in a multi-node system
+
+**Time:** 20 minutes
+
+---
+
+## Approach 1: The `message!` Macro (Recommended)
+
+For fixed-size structs with only primitive fields (`f32`, `f64`, `u32`, `i64`, `bool`, `[f32; 3]`, etc.), use the `message!` macro. It generates all the boilerplate automatically:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    /// Motor feedback from an actuator
+    MotorFeedback {
+        motor_id: u32,
+        rpm: f32,
+        current_amps: f32,
+        temperature_c: f32,
+    }
+}
+```
+
+**What gets generated:**
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MotorFeedback {
+    pub motor_id: u32,
+    pub rpm: f32,
+    pub current_amps: f32,
+    pub temperature_c: f32,
+}
+
+impl LogSummary for MotorFeedback { /* Debug-based formatting */ }
+```
+
+The resulting type is immediately usable with `Topic&lt;MotorFeedback&gt;` — no additional trait implementations needed.
+
+### Using it
+
+```rust
+use horus::prelude::*;
+
+message! {
+    MotorFeedback {
+        motor_id: u32,
+        rpm: f32,
+        current_amps: f32,
+        temperature_c: f32,
+    }
+}
+
+// Publish
+let pub_topic: Topic<MotorFeedback> = Topic::new("motor.feedback")?;
+pub_topic.send(MotorFeedback {
+    motor_id: 1,
+    rpm: 3200.0,
+    current_amps: 1.2,
+    temperature_c: 45.0,
+});
+
+// Subscribe
+let sub_topic: Topic<MotorFeedback> = Topic::new("motor.feedback")?;
+if let Some(msg) = sub_topic.recv() {
+    println!("Motor {} at {} RPM", msg.motor_id, msg.rpm);
+}
+```
+
+### Multiple messages in one block
+
+You can define several messages in a single `message!` call:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    /// Wheel encoder ticks
+    EncoderReading {
+        left_ticks: i64,
+        right_ticks: i64,
+        timestamp_ns: u64,
+    }
+
+    /// PID controller output
+    PidOutput {
+        setpoint: f64,
+        measured: f64,
+        output: f64,
+        error: f64,
+    }
+}
+```
+
+### What types can you use?
+
+The `message!` macro works with any **fixed-size, Copy** type:
+
+| Allowed | Not Allowed |
+|---------|-------------|
+| `f32`, `f64` | `String` |
+| `u8`, `u16`, `u32`, `u64` | `Vec&lt;T&gt;` |
+| `i8`, `i16`, `i32`, `i64` | `HashMap&lt;K, V&gt;` |
+| `bool` | `Option&lt;T&gt;` (heap types) |
+| `[f32; 3]`, `[u8; 256]` | `Box&lt;T&gt;` |
+
+For heap-allocated types, use Approach 2.
+
+---
+
+## Approach 2: Manual Derives (Complex Types)
+
+When your message needs `String`, `Vec`, `Option`, or nested structs, derive the traits manually:
+
+```rust
+use horus::prelude::*;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RobotConfig {
+    pub name: String,
+    pub joint_names: Vec<String>,
+    pub max_speeds: Vec<f64>,
+    pub description: Option<String>,
+}
+```
+
+This type works with `Topic&lt;RobotConfig&gt;` because it implements `Clone + Serialize + Deserialize`. It uses serialization-based transport instead of zero-copy, which adds ~100ns of overhead — still fast, but not as fast as POD types from `message!`.
+
+### Adding LogSummary
+
+If you want debug logging on the topic (via `Topic::new("name")?`), implement `LogSummary`:
+
+```rust
+use horus::prelude::*;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RobotConfig {
+    pub name: String,
+    pub joint_names: Vec<String>,
+    pub max_speeds: Vec<f64>,
+    pub description: Option<String>,
+}
+
+impl LogSummary for RobotConfig {
+    fn log_summary(&self) -> String {
+        format!("RobotConfig({}, {} joints)", self.name, self.joint_names.len())
+    }
+}
+```
+
+Or derive it for `Debug`-based formatting:
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
+pub struct RobotConfig {
+    pub name: String,
+    pub joint_names: Vec<String>,
+    pub max_speeds: Vec<f64>,
+    pub description: Option<String>,
+}
+```
+
+### Nested types
+
+You can nest custom types — just make sure all nested types also derive the required traits:
+
+```rust
+use horus::prelude::*;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WaypointList {
+    pub waypoints: Vec<Waypoint>,
+    pub loop_back: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Waypoint {
+    pub x: f64,
+    pub y: f64,
+    pub speed: f64,
+    pub label: String,
+}
+```
+
+---
+
+## Approach 3: GenericMessage (Dynamic Data)
+
+`GenericMessage` is a fixed-size buffer (4KB max) that carries MessagePack-serialized data. Use it when you don't know the schema at compile time, or for quick Rust-Python prototyping.
+
+### Sending structured data
+
+```rust
+use horus::prelude::*;
+use std::collections::HashMap;
+
+let topic: Topic<GenericMessage> = Topic::new("experiment_data")?;
+
+// from_value() serializes any Serde type into the buffer
+let mut data = HashMap::new();
+data.insert("trial", 42.0);
+data.insert("accuracy", 0.95);
+
+let msg = GenericMessage::from_value(&data)?;
+topic.send(msg);
+```
+
+### Receiving and deserializing
+
+```rust
+use horus::prelude::*;
+use std::collections::HashMap;
+
+let topic: Topic<GenericMessage> = Topic::new("experiment_data")?;
+
+if let Some(msg) = topic.recv() {
+    let data: HashMap<String, f64> = msg.to_value()?;
+    println!("Trial {}: accuracy {:.1}%", data["trial"], data["accuracy"] * 100.0);
+}
+```
+
+### Adding metadata
+
+You can attach a string label (up to 255 bytes) to identify the message type at runtime:
+
+```rust
+use horus::prelude::*;
+
+let payload = GenericMessage::from_value(&sensor_data)?;
+// Or with metadata tag:
+let raw = rmp_serde::to_vec(&sensor_data)?;
+let payload = GenericMessage::with_metadata(raw, "lidar_v2".to_string())?;
+
+if let Some(msg) = topic.recv() {
+    if let Some(tag) = msg.metadata() {
+        println!("Got message type: {}", tag);
+    }
+}
+```
+
+### Performance notes
+
+| Message Type | IPC Latency | Max Size |
+|-------------|------------|----------|
+| `message!` (POD) | ~50ns (zero-copy) | Unlimited |
+| Manual derive | ~167ns (serde) | Unlimited |
+| `GenericMessage` | ~4.0-4.4&mu;s | 4KB |
+
+Use `GenericMessage` for prototyping. Switch to typed messages for production.
+
+---
+
+## Complete Example: Battery Monitor System
+
+Let's build a 2-node system: a battery sensor publishes custom readings, and a monitor checks for low battery and publishes alerts.
+
+```rust
+use horus::prelude::*;
+
+// --- Custom Messages ---
+
+message! {
+    /// Raw battery sensor data
+    BatteryReading {
+        cell_count: u32,
+        voltage: f32,
+        current_amps: f32,
+        temperature_c: f32,
+        charge_percent: f32,
+    }
+}
+
+message! {
+    /// Alert when battery is low
+    BatteryAlert {
+        severity: u8,        // 1=info, 2=warning, 3=critical
+        charge_percent: f32,
+        voltage: f32,
+    }
+}
+
+// --- Battery Sensor Node ---
+
+struct BatterySensor {
+    publisher: Topic<BatteryReading>,
+    tick_count: u32,
+}
+
+impl BatterySensor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            publisher: Topic::new("battery.raw")?,
+            tick_count: 0,
+        })
+    }
+}
+
+impl Node for BatterySensor {
+    fn name(&self) -> &str { "BatterySensor" }
+
+    fn tick(&mut self) {
+        self.tick_count += 1;
+
+        // Simulate draining battery
+        let charge = 100.0 - (self.tick_count as f32 * 2.5);
+        let voltage = 12.6 - (self.tick_count as f32 * 0.3);
+
+        let reading = BatteryReading {
+            cell_count: 3,
+            voltage,
+            current_amps: 2.1,
+            temperature_c: 35.0 + (self.tick_count as f32 * 0.5),
+            charge_percent: charge.max(0.0),
+        };
+
+        println!("[Battery] {:.0}% ({:.1}V)", reading.charge_percent, reading.voltage);
+        self.publisher.send(reading);
+    }
+}
+
+// --- Battery Monitor Node ---
+
+struct BatteryMonitor {
+    subscriber: Topic<BatteryReading>,
+    alert_pub: Topic<BatteryAlert>,
+}
+
+impl BatteryMonitor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            subscriber: Topic::new("battery.raw")?,
+            alert_pub: Topic::new("battery.alert")?,
+        })
+    }
+}
+
+impl Node for BatteryMonitor {
+    fn name(&self) -> &str { "BatteryMonitor" }
+
+    fn tick(&mut self) {
+        if let Some(reading) = self.subscriber.recv() {
+            let severity = if reading.charge_percent < 10.0 {
+                println!("[Monitor] CRITICAL: Battery at {:.0}%!", reading.charge_percent);
+                3
+            } else if reading.charge_percent < 30.0 {
+                println!("[Monitor] WARNING: Battery at {:.0}%", reading.charge_percent);
+                2
+            } else {
+                return; // No alert needed
+            };
+
+            self.alert_pub.send(BatteryAlert {
+                severity,
+                charge_percent: reading.charge_percent,
+                voltage: reading.voltage,
+            });
+        }
+    }
+}
+
+// --- Main ---
+
+fn main() -> Result<()> {
+    println!("=== Battery Monitor System ===\n");
+
+    let mut scheduler = Scheduler::new().tick_rate(1_u64.hz());
+
+    scheduler.add(BatterySensor::new()?).order(0).build()?;
+    scheduler.add(BatteryMonitor::new()?).order(1).build()?;
+
+    scheduler.run_for(10_u64.secs())?;
+
+    println!("\nDone!");
+    Ok(())
+}
+```
+
+**Expected output:**
+
+```text
+=== Battery Monitor System ===
+
+[Battery] 97% (12.3V)
+[Battery] 95% (12.0V)
+...
+[Battery] 25% (5.1V)
+[Monitor] WARNING: Battery at 25%
+[Battery] 22% (4.8V)
+[Monitor] WARNING: Battery at 22%
+...
+[Battery] 5% (3.0V)
+[Monitor] CRITICAL: Battery at 5%!
+```
+
+---
+
+## When to Use What
+
+| Approach | Use When | Performance | Heap Types |
+|----------|----------|-------------|------------|
+| `message!` macro | Fixed-size structs (most cases) | ~50ns (zero-copy) | No |
+| Manual derive | Need `String`, `Vec`, `Option`, nested structs | ~167ns (serde) | Yes |
+| `GenericMessage` | Dynamic schemas, quick prototyping, cross-language | ~4&mu;s | N/A (bytes) |
+
+**Rules of thumb:**
+- Start with `message!` — it covers most robotics use cases
+- Use manual derives when you need heap-allocated fields
+- Use `GenericMessage` only for prototyping or when the schema isn't known at compile time
+
+---
+
+## Next Steps
+
+- [Message Types Reference](/concepts/message-types) — all 70+ built-in messages
+- [POD Topics](/concepts/core-concepts-podtopic) — how zero-copy IPC works
+- [Python Custom Messages](/python/api/custom-messages) — using custom messages from Python

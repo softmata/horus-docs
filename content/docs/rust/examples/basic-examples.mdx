@@ -65,6 +65,7 @@ impl Node for SensorNode {
         self.counter += 0.1;
     }
 
+    // SAFETY: no actuators — shutdown is optional for pure sensor nodes
     fn shutdown(&mut self) -> Result<()> {
         hlog!(info, "Sensor shutdown");
         Ok(())
@@ -114,6 +115,7 @@ impl Node for ProcessorNode {
     }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the buffer and avoid stale data
         if let Some(data) = self.data_sub.recv() {
             // Process received data
             let processed = data * 2.0;
@@ -196,6 +198,7 @@ impl Node for ProcessorNode {
     }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the buffer
         if let Some(data) = self.data_sub.recv() {
             let processed = data * 2.0;
             hlog!(info, "Received: {:.2} -> {:.2}", data, processed);
@@ -277,8 +280,9 @@ impl Node for TeleopNode {
         self.cmd_pub.send(cmd);
     }
 
+    // SAFETY: send zero velocity on shutdown to stop the robot
     fn shutdown(&mut self) -> Result<()> {
-        // Send stop command on shutdown
+        // CRITICAL: send stop command before exiting — prevents runaway
         let stop = CmdVel::zero();
         self.cmd_pub.send(stop);
         hlog!(info, "Teleop stopped");
@@ -308,6 +312,7 @@ impl Node for MotorDriverNode {
     }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the command buffer
         if let Some(cmd) = self.cmd_sub.recv() {
             // Convert to differential drive (left/right wheel speeds)
             let left_speed = cmd.linear - cmd.angular;
@@ -322,6 +327,7 @@ impl Node for MotorDriverNode {
         }
     }
 
+    // SAFETY: stop motors on shutdown — in real code, send zero to hardware here
     fn shutdown(&mut self) -> Result<()> {
         hlog!(info, "Motors stopped");
         Ok(())
@@ -385,6 +391,7 @@ impl Node for LidarNode {
     }
 
     fn tick(&mut self) {
+        // NOTE: in real code, read from hardware instead of simulating
         let mut scan = LaserScan::new();
 
         // Simulate lidar readings (sine wave for demo)
@@ -432,11 +439,12 @@ impl Node for ObstacleDetector {
     }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick — stale scans cause delayed obstacle detection
         if let Some(scan) = self.scan_sub.recv() {
             // Find minimum distance
             if let Some(min_dist) = scan.min_range() {
                 if min_dist < self.safety_distance {
-                    // Emergency stop!
+                    // SAFETY: emergency stop — send zero velocity immediately
                     let stop = CmdVel::zero();
                     self.cmd_pub.send(stop);
                     hlog!(warn, "[WARNING] Obstacle detected at {:.2}m - STOPPING!",
@@ -449,7 +457,9 @@ impl Node for ObstacleDetector {
         }
     }
 
+    // SAFETY: send stop command on shutdown as a safety precaution
     fn shutdown(&mut self) -> Result<()> {
+        self.cmd_pub.send(CmdVel::zero());
         hlog!(info, "Obstacle detector offline");
         Ok(())
     }
@@ -526,7 +536,7 @@ impl Node for PIDController {
     }
 
     fn tick(&mut self) {
-        // Get setpoint and current position
+        // IMPORTANT: call recv() on ALL subscribed topics every tick
         let setpoint = self.setpoint_sub.recv().unwrap_or(0.0);
         let feedback = self.feedback_sub.recv().unwrap_or(0.0);
 
@@ -554,7 +564,9 @@ impl Node for PIDController {
         self.last_error = error;
     }
 
+    // SAFETY: send zero output on shutdown to stop actuators downstream
     fn shutdown(&mut self) -> Result<()> {
+        self.output_pub.send(0.0);
         hlog!(info, "PID controller stopped");
         Ok(())
     }
@@ -581,7 +593,7 @@ impl Node for TestSystem {
     fn name(&self) -> &str { "TestSystem" }
 
     fn tick(&mut self) {
-        // Apply control output to position
+        // IMPORTANT: call recv() every tick to consume control commands
         if let Some(output) = self.output_sub.recv() {
             self.position += output * 0.01;  // Simple integration
         }
@@ -716,6 +728,7 @@ impl FilterNode {
     }
 }
 
+// PATTERN: Pipeline stage — subscribe, transform, republish
 impl Node for FilterNode {
     fn name(&self) -> &str { "FilterNode" }
 
@@ -725,6 +738,7 @@ impl Node for FilterNode {
     }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the raw data buffer
         if let Some(raw) = self.raw_sub.recv() {
             // Exponential moving average
             self.filtered_value = self.alpha * raw
@@ -767,6 +781,7 @@ impl Node for ControllerNode {
     }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to consume filtered data
         if let Some(value) = self.filtered_sub.recv() {
             let command = if value > self.threshold { 1.0 } else { 0.0 };
             self.cmd_pub.send(command);
@@ -776,7 +791,9 @@ impl Node for ControllerNode {
         }
     }
 
+    // SAFETY: send zero command on shutdown to stop downstream actuators
     fn shutdown(&mut self) -> Result<()> {
+        self.cmd_pub.send(0.0);
         hlog!(info, "Controller offline");
         Ok(())
     }
@@ -827,7 +844,7 @@ impl Node for CameraSender {
     fn name(&self) -> &str { "CameraSender" }
 
     fn tick(&mut self) {
-        // Create a 480x640 RGB8 image in shared memory
+        // NOTE: Image::new() allocates from a global shared memory pool — zero-copy transport
         let mut img = Image::new(480, 640, ImageEncoding::Rgb8)
             .expect("failed to allocate image");
 
@@ -874,6 +891,7 @@ impl Node for CameraReceiver {
     fn name(&self) -> &str { "CameraReceiver" }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick — stale images waste shared memory pool slots
         if let Some(img) = self.topic.recv() {
             // Read a pixel
             if let Some(px) = img.pixel(100, 200) {
@@ -936,8 +954,8 @@ impl Node for PointCloudSender {
     fn name(&self) -> &str { "PointCloudSender" }
 
     fn tick(&mut self) {
-        // Create a point cloud: 1000 points, 3 fields each (XYZ), float32
-        let mut pc = PointCloud::new(1000, 3, TensorDtype::F32)
+        // NOTE: PointCloud::new() allocates from the shared memory pool — zero-copy transport
+        let mut pc = PointCloud::from_xyz(\&points)  // 1000 points, 3 fields
             .expect("failed to allocate point cloud");
 
         // Fill with sample data — a sphere of radius 1.0
@@ -969,6 +987,7 @@ impl Node for PointCloudReceiver {
     fn name(&self) -> &str { "PointCloudReceiver" }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick — stale point clouds waste shared memory pool slots
         if let Some(pc) = self.topic.recv() {
             // Extract all XYZ points as Vec<[f32; 3]>
             if let Some(points) = pc.extract_xyz() {
