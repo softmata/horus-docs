@@ -1,0 +1,172 @@
+---
+title: "Linux RT Setup"
+description: "Configure Linux for real-time scheduling — PREEMPT_RT, permissions, CPU isolation, and Horus RT integration"
+weight: 46
+---
+
+# Linux RT Setup
+
+Real-time scheduling requires kernel and permission configuration. This guide walks through every step, from checking your current capabilities to verifying Horus runs with RT scheduling.
+
+## Check Current RT Capabilities
+
+Before changing anything, check what your system already supports:
+
+```bash
+# Check if your kernel has PREEMPT_RT
+uname -v | grep -i preempt
+
+# Check your current RT priority limit (0 means no RT allowed)
+ulimit -r
+
+# Check if SCHED_FIFO works at all
+chrt -f 1 echo "RT scheduling works"
+```
+
+If `ulimit -r` returns `0` or `chrt` fails with "Operation not permitted", follow the sections below.
+
+## Grant RT Permissions
+
+Edit `/etc/security/limits.conf` to allow your user (or group) to use RT scheduling:
+
+```bash
+# Add to /etc/security/limits.conf
+# Replace 'robotics' with your username or group (@groupname for groups)
+robotics  soft  rtprio  99
+robotics  hard  rtprio  99
+robotics  soft  memlock  unlimited
+robotics  hard  memlock  unlimited
+```
+
+**Log out and back in** for changes to take effect. Verify with `ulimit -r` — it should now return `99`.
+
+## Install PREEMPT_RT Kernel
+
+A standard kernel uses `PREEMPT_VOLUNTARY` or `PREEMPT_DYNAMIC`, which gives millisecond-scale worst-case latency. `PREEMPT_RT` brings that down to microseconds.
+
+### Ubuntu / Debian
+
+```bash
+sudo apt install linux-image-rt-amd64    # Debian
+sudo apt install linux-lowlatency        # Ubuntu (close to RT)
+# For full PREEMPT_RT on Ubuntu:
+sudo apt install linux-image-realtime    # Ubuntu Pro / 24.04+
+```
+
+Reboot and select the RT kernel from GRUB. Verify:
+
+```bash
+uname -v
+# Should contain "PREEMPT_RT" or "PREEMPT RT"
+```
+
+### From Source (Any Distro)
+
+Download the PREEMPT_RT patch from [kernel.org/pub/linux/kernel/projects/rt](https://kernel.org/pub/linux/kernel/projects/rt/), apply it to a matching kernel version, and build with `CONFIG_PREEMPT_RT=y`.
+
+## CPU Isolation
+
+Isolate cores from the Linux scheduler so only your RT threads run on them. This eliminates scheduling jitter from other processes.
+
+Add `isolcpus` to your kernel command line in `/etc/default/grub`:
+
+```bash
+# Isolate cores 2 and 3 for RT use
+GRUB_CMDLINE_LINUX="isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
+```
+
+Then `sudo update-grub && sudo reboot`. Verify with:
+
+```bash
+cat /sys/devices/system/cpu/isolated
+# Should output: 2-3
+```
+
+Pin Horus nodes to isolated cores:
+
+```rust
+let mut scheduler = Scheduler::new()
+    .require_rt()
+    .cores(&[2, 3])
+    .tick_rate(1000_u64.hz());
+```
+
+## Grant CAP_SYS_NICE
+
+As an alternative to `limits.conf`, you can grant the RT capability directly to a binary:
+
+```bash
+sudo setcap cap_sys_nice=eip ./target/release/my_robot
+```
+
+This lets that specific binary use RT scheduling without root or limits.conf changes. Useful for deployment where you do not want blanket RT permissions.
+
+## Verify the Setup
+
+```bash
+# Run a program with SCHED_FIFO at priority 50
+chrt -f 50 ./target/release/my_robot
+
+# Check that it is actually running with RT scheduling
+ps -eo pid,cls,rtprio,comm | grep my_robot
+# Should show "FF" (FIFO) and priority 50
+```
+
+## Horus RT Integration
+
+### `.prefer_rt()` vs `.require_rt()`
+
+```rust
+// Prefer RT: use RT if available, fall back to normal scheduling
+let mut scheduler = Scheduler::new()
+    .prefer_rt()
+    .tick_rate(500_u64.hz());
+
+// Require RT: panic at startup if RT is not available
+let mut scheduler = Scheduler::new()
+    .require_rt()
+    .tick_rate(1000_u64.hz());
+```
+
+Use `.prefer_rt()` during development and `.require_rt()` in production when timing guarantees matter.
+
+### Checking Degradations
+
+After building the scheduler, inspect whether RT was successfully acquired:
+
+```rust
+let scheduler = Scheduler::new()
+    .prefer_rt()
+    .tick_rate(500_u64.hz());
+
+// After running, check status (includes any degradations)
+println!("{}", scheduler.status());
+```
+
+If RT was requested but unavailable, a degradation entry will explain why (missing permissions, no PREEMPT_RT, etc).
+
+## Troubleshooting
+
+### "Operation not permitted" / "cannot set SCHED_FIFO"
+
+1. Check `ulimit -r` — must be > 0
+2. Check that limits.conf changes are applied (requires re-login)
+3. Try `setcap cap_sys_nice=eip` on the binary
+4. If running in Docker: add `--cap-add SYS_NICE` to `docker run`
+
+### RT works but latency is high
+
+1. Verify `PREEMPT_RT` kernel: `uname -v | grep PREEMPT_RT`
+2. Check for isolated CPUs: `cat /sys/devices/system/cpu/isolated`
+3. Disable CPU frequency scaling: `cpupower frequency-set -g performance`
+4. Disable SMT/hyperthreading in BIOS for dedicated RT cores
+
+## Platform-Specific Notes
+
+### NVIDIA Jetson
+
+Jetson runs a custom L4T kernel. PREEMPT_RT patches are available from NVIDIA for Jetson Orin and later. Apply them when building the kernel with the Jetson Linux BSP. `isolcpus` works — isolate the performance cores (typically 4-7 on Orin).
+
+### Raspberry Pi
+
+Use the `linux-image-rt` package from the Raspberry Pi OS repo, or apply the PREEMPT_RT patch to the `rpi-6.x.y` kernel branch. The Pi 4/5 have 4 cores — isolating cores 2-3 for RT while leaving 0-1 for the OS works well. Set `arm_freq` in `config.txt` to a fixed value to avoid frequency scaling jitter.

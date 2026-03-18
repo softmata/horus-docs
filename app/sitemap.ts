@@ -4,6 +4,20 @@ export default function sitemap(): MetadataRoute.Sitemap {
   const baseUrl = 'https://docs.horusrobotics.dev'
 
   return [
+    // AI-READABLE DOCUMENTATION
+    {
+      url: `${baseUrl}/llms.txt`,
+      lastModified: new Date(),
+      changeFrequency: 'weekly',
+      priority: 0.8,
+    },
+    {
+      url: `${baseUrl}/llms-full.txt`,
+      lastModified: new Date(),
+      changeFrequency: 'weekly',
+      priority: 0.7,
+    },
+
     // HIGHEST PRIORITY - Landing & Discovery Pages
     {
       url: baseUrl,
@@ -52,9 +66,21 @@ export default function sitemap(): MetadataRoute.Sitemap {
       priority: 0.9,
     },
     {
-      url: `${baseUrl}/performance/vs-ros2`,
+      url: `${baseUrl}/learn/vs-ros2`,
       lastModified: new Date(),
       changeFrequency: 'monthly',
+      priority: 0.95,
+    },
+    {
+      url: `${baseUrl}/learn/why-horus`,
+      lastModified: new Date(),
+      changeFrequency: 'monthly',
+      priority: 0.95,
+    },
+    {
+      url: `${baseUrl}/getting-started/quick-start-python`,
+      lastModified: new Date(),
+      changeFrequency: 'weekly',
       priority: 0.9,
     },
 

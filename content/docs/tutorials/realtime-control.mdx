@@ -1,0 +1,293 @@
+---
+title: "Tutorial: Real-Time Control"
+description: Build a multi-rate robot controller with real-time scheduling, deadline enforcement, and safety policies
+order: 3
+---
+
+# Tutorial: Real-Time Control
+
+This tutorial walks through building a multi-rate robot controller with hard real-time guarantees. Estimated time: 20 minutes.
+
+## What You'll Build
+
+A robot controller with three nodes running at different rates:
+
+1. **Motor Controller** at 1kHz — real-time, safety-critical
+2. **LiDAR Driver** at 100Hz — real-time sensor processing
+3. **Path Planner** at 10Hz — compute-heavy, runs on a thread pool
+
+## What You'll Learn
+
+- `.rate()` — set node tick frequency (auto-detects RT)
+- `.budget()` and `.deadline()` — execution time constraints
+- `.on_miss()` — what happens when a deadline is missed
+- `.failure_policy()` — how the system degrades gracefully
+- `.compute()` — offload work to a parallel thread pool
+- `.prefer_rt()` — request real-time scheduling when available
+- `.cores()` — pin nodes to specific CPU cores
+
+## Prerequisites
+
+- A working HORUS project (see [Quick Start](/getting-started/quick-start))
+- Basic familiarity with the `Node` trait
+
+---
+
+## Step 1: Define Three Nodes
+
+Start with three basic nodes. All run as `BestEffort` on the main thread — no real-time yet.
+
+```rust
+use horus::prelude::*;
+
+struct MotorController {
+    cmd_sub: Topic<CmdVel>,
+}
+
+impl Node for MotorController {
+    fn name(&self) -> &str { "motor_ctrl" }
+
+    fn tick(&mut self) {
+        if let Some(cmd) = self.cmd_sub.recv() {
+            // Apply velocity command to motors
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        // Zero velocity, engage brakes
+    }
+}
+
+struct LidarDriver {
+    scan_pub: Topic<LaserScan>,
+}
+
+impl Node for LidarDriver {
+    fn name(&self) -> &str { "lidar" }
+
+    fn tick(&mut self) {
+        // Read from hardware, publish scan
+        let scan = LaserScan::default();
+        self.scan_pub.send(scan);
+    }
+}
+
+struct PathPlanner {
+    scan_sub: Topic<LaserScan>,
+    cmd_pub: Topic<CmdVel>,
+}
+
+impl Node for PathPlanner {
+    fn name(&self) -> &str { "planner" }
+
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_sub.recv() {
+            // Compute path, publish velocity command
+            let cmd = CmdVel::default();
+            self.cmd_pub.send(cmd);
+        }
+    }
+}
+```
+
+At this point every node runs once per scheduler tick with no timing guarantees. That is fine for prototyping, but a real robot needs deterministic timing.
+
+## Step 2: Add Rates
+
+Adding `.rate()` does three things automatically:
+
+1. Sets the tick frequency
+2. Derives a default budget (80% of the period)
+3. Derives a default deadline (95% of the period)
+4. Automatically marks the node as real-time
+
+```rust
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new();
+
+scheduler.add(MotorController::new())
+    .order(0)
+    .rate(1000_u64.hz())  // 1kHz -> budget=800us, deadline=950us, Rt
+    .build()?;
+
+scheduler.add(LidarDriver::new())
+    .order(10)
+    .rate(100_u64.hz())   // 100Hz -> budget=8ms, deadline=9.5ms, Rt
+    .build()?;
+
+scheduler.add(PathPlanner::new())
+    .order(50)
+    .rate(10_u64.hz())    // 10Hz -> budget=80ms, deadline=95ms, Rt
+    .build()?;
+```
+
+The `.order()` value controls execution priority within a single tick. Lower values run first, so the motor controller always executes before the planner.
+
+Notice that all three nodes are now `Rt`. That is correct for the motor and LiDAR, but the path planner does not need hard real-time. We will fix that in Step 4.
+
+## Step 3: Add Safety Policies
+
+Real-time without safety policies is dangerous. If the motor controller misses a deadline, the arm could overshoot its target and collide with something.
+
+### Deadline miss behavior
+
+The `Miss` enum controls what happens when a node exceeds its deadline:
+
+| Variant | Behavior |
+|---------|----------|
+| `Miss::Warn` | Log a warning, continue |
+| `Miss::Skip` | Drop the late tick, run next on schedule |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node |
+| `Miss::Stop` | Shut down the node entirely |
+
+### Applying safety to the motor controller
+
+```rust
+use horus::prelude::*;
+
+scheduler.add(MotorController::new())
+    .order(0)
+    .rate(1000_u64.hz())
+    .budget(800.us())
+    .deadline(950.us())
+    .on_miss(Miss::SafeMode)
+    .failure_policy(FailurePolicy::Isolate)
+    .max_deadline_misses(3)
+    .build()?;
+```
+
+This means: if the motor controller misses its 950us deadline, call `enter_safe_state()` (which zeros velocity and engages brakes). After 3 consecutive misses, isolate the node from the rest of the system.
+
+### Applying safety to the LiDAR
+
+The LiDAR is less critical — a missed scan is not dangerous, just suboptimal:
+
+```rust
+use horus::prelude::*;
+
+scheduler.add(LidarDriver::new())
+    .order(10)
+    .rate(100_u64.hz())
+    .on_miss(Miss::Skip)
+    .build()?;
+```
+
+Skipping a single 100Hz LiDAR scan is acceptable. The planner will use the previous scan data.
+
+## Step 4: Move the Planner to Compute
+
+The path planner does not need hard real-time. It runs complex algorithms that benefit from parallel execution on a thread pool. Use `.compute()` to move it off the RT thread:
+
+```rust
+use horus::prelude::*;
+
+scheduler.add(PathPlanner::new())
+    .order(50)
+    .rate(10_u64.hz())
+    .compute()           // Runs on parallel thread pool, not RT thread
+    .on_miss(Miss::Warn) // Planning delays are logged, not critical
+    .build()?;
+```
+
+With `.compute()`, the planner runs on a worker thread instead of the real-time thread. This prevents a slow planning cycle from blocking the 1kHz motor loop.
+
+## Step 5: Add RT Scheduling and CPU Pinning
+
+For production deployments, you want real-time OS scheduling and CPU isolation. These features require appropriate OS permissions (e.g., `CAP_SYS_NICE` on Linux).
+
+```rust
+use horus::prelude::*;
+
+scheduler.add(MotorController::new())
+    .order(0)
+    .rate(1000_u64.hz())
+    .budget(800.us())
+    .deadline(950.us())
+    .on_miss(Miss::SafeMode)
+    .failure_policy(FailurePolicy::Isolate)
+    .max_deadline_misses(3)
+    .prefer_rt()          // Request SCHED_FIFO if available
+    .cores(&[0])          // Pin to CPU 0
+    .build()?;
+```
+
+- `.prefer_rt()` requests real-time OS scheduling (SCHED_FIFO on Linux). If the system lacks permissions, it falls back gracefully instead of failing.
+- `.cores(&[0])` pins the node to CPU 0, preventing the OS from migrating it across cores (which causes cache misses and jitter).
+
+For the LiDAR, pin it to a different core to avoid contention:
+
+```rust
+use horus::prelude::*;
+
+scheduler.add(LidarDriver::new())
+    .order(10)
+    .rate(100_u64.hz())
+    .on_miss(Miss::Skip)
+    .prefer_rt()
+    .cores(&[1])          // Separate core from motor controller
+    .build()?;
+```
+
+## Step 6: Complete System
+
+Here is the full program with all nodes configured:
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scheduler = Scheduler::new();
+
+    // 1kHz motor controller — safety-critical, RT, pinned to core 0
+    scheduler.add(MotorController::new())
+        .order(0)
+        .rate(1000_u64.hz())
+        .budget(800.us())
+        .deadline(950.us())
+        .on_miss(Miss::SafeMode)
+        .failure_policy(FailurePolicy::Isolate)
+        .max_deadline_misses(3)
+        .prefer_rt()
+        .cores(&[0])
+        .build()?;
+
+    // 100Hz LiDAR — RT, pinned to core 1
+    scheduler.add(LidarDriver::new())
+        .order(10)
+        .rate(100_u64.hz())
+        .on_miss(Miss::Skip)
+        .prefer_rt()
+        .cores(&[1])
+        .build()?;
+
+    // 10Hz path planner — compute thread pool, best-effort timing
+    scheduler.add(PathPlanner::new())
+        .order(50)
+        .rate(10_u64.hz())
+        .compute()
+        .on_miss(Miss::Warn)
+        .build()?;
+
+    // Enable verbose timing output
+    scheduler.verbose(true);
+
+    // Run until Ctrl+C
+    scheduler.build()?.run()?;
+
+    Ok(())
+}
+```
+
+## Key Takeaways
+
+- **Rate implies RT.** Calling `.rate()` automatically sets budget, deadline, and marks the node as real-time. Override with `.compute()` or `.budget()`/`.deadline()` as needed.
+- **Safety is explicit.** Always set `.on_miss()` and `.failure_policy()` for safety-critical nodes. The defaults (`Miss::Warn`, no isolation) are intentionally permissive for development.
+- **Separate concerns by execution class.** Keep fast control loops on the RT thread, move heavy computation to `.compute()`, and use `.cores()` to prevent contention.
+- **Use `.prefer_rt()` not `.require_rt()`.** During development you rarely have RT permissions. `.prefer_rt()` degrades gracefully; `.require_rt()` fails hard.
+
+## Next Steps
+
+- [Deterministic mode](/advanced/deterministic-mode) — reproducible simulations with fixed timesteps
+- [Safety monitor](/advanced/safety-monitor) — graduated watchdog and health states
+- [Scheduler configuration](/advanced/scheduler-configuration) — shared memory transport and node orchestration

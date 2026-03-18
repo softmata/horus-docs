@@ -215,9 +215,65 @@ jobs:
           echo "❌ Python verification failed"
           exit 1
 
+  verify-ai-readability:
+    name: Verify AI Readability Artifacts
+    needs: extract-blocks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout documentation
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build AI artifacts
+        run: npm run build:all-ai
+
+      - name: Verify llms.txt exists with required sections
+        run: |
+          test -f public/llms.txt || (echo "FAIL: llms.txt missing" && exit 1)
+          grep -q "Safety Rules" public/llms.txt || (echo "FAIL: llms.txt missing Safety Rules section" && exit 1)
+          grep -q "Core Concepts" public/llms.txt || (echo "FAIL: llms.txt missing Core Concepts section" && exit 1)
+          SIZE=$(wc -c < public/llms.txt)
+          echo "llms.txt: $SIZE bytes"
+          [ "$SIZE" -ge 5000 ] || (echo "FAIL: llms.txt too small ($SIZE bytes)" && exit 1)
+          echo "✅ llms.txt verified"
+
+      - name: Verify llms-full.txt exists with 100+ pages
+        run: |
+          test -f public/llms-full.txt || (echo "FAIL: llms-full.txt missing" && exit 1)
+          PAGE_COUNT=$(grep -c "^## " public/llms-full.txt || true)
+          echo "Found $PAGE_COUNT page sections in llms-full.txt"
+          [ "$PAGE_COUNT" -ge 100 ] || (echo "FAIL: llms-full.txt has only $PAGE_COUNT pages (need 100+)" && exit 1)
+          SIZE=$(wc -c < public/llms-full.txt)
+          echo "llms-full.txt: $SIZE bytes, $PAGE_COUNT pages"
+          echo "✅ llms-full.txt verified"
+
+      - name: Verify search index
+        run: |
+          test -f public/search-index.json || (echo "FAIL: search-index.json missing" && exit 1)
+          SIZE=$(wc -c < public/search-index.json)
+          echo "search-index.json: $SIZE bytes"
+          [ "$SIZE" -ge 100000 ] || (echo "FAIL: search-index.json too small ($SIZE bytes)" && exit 1)
+          echo "✅ search-index.json verified"
+
+      - name: Verify extracted code blocks
+        run: |
+          test -f extracted-code-blocks.json || (echo "FAIL: extracted-code-blocks.json missing" && exit 1)
+          TOTAL=$(node -e "const d=JSON.parse(require('fs').readFileSync('extracted-code-blocks.json','utf8')); console.log(d.totalBlocks)")
+          echo "extracted-code-blocks.json: $TOTAL blocks"
+          [ "$TOTAL" -ge 50 ] || (echo "FAIL: only $TOTAL code blocks found (need 50+)" && exit 1)
+          echo "✅ extracted-code-blocks.json verified ($TOTAL blocks)"
+
   report:
     name: Generate Report
-    needs: [extract-blocks, verify-rust, verify-python]
+    needs: [extract-blocks, verify-rust, verify-python, verify-ai-readability]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -238,6 +294,16 @@ jobs:
           echo "- **Verifiable Rust**: ${{ needs.extract-blocks.outputs.rust-count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Verifiable Python**: ${{ needs.extract-blocks.outputs.python-count }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # AI readability status
+          if [ "${{ needs.verify-ai-readability.result }}" == "success" ]; then
+            echo "## ✅ AI Readability: PASSED" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.verify-ai-readability.result }}" == "failure" ]; then
+            echo "## ❌ AI Readability: FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "llms.txt, llms-full.txt, or search-index.json failed validation." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.verify-ai-readability.result }}" == "skipped" ]; then
+            echo "## ⏭️ AI Readability: SKIPPED" >> $GITHUB_STEP_SUMMARY
+          fi
 
           # Rust status
           if [ "${{ needs.verify-rust.result }}" == "success" ]; then
@@ -326,7 +392,7 @@ jobs:
 
   final-status:
     name: Final Status
-    needs: [verify-rust, verify-python]
+    needs: [verify-rust, verify-python, verify-ai-readability]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -334,10 +400,14 @@ jobs:
         run: |
           RUST_RESULT="${{ needs.verify-rust.result }}"
           PYTHON_RESULT="${{ needs.verify-python.result }}"
+          AI_RESULT="${{ needs.verify-ai-readability.result }}"
 
-          if [ "$RUST_RESULT" == "failure" ] || [ "$PYTHON_RESULT" == "failure" ]; then
+          if [ "$RUST_RESULT" == "failure" ] || [ "$PYTHON_RESULT" == "failure" ] || [ "$AI_RESULT" == "failure" ]; then
             echo "❌ Documentation verification failed"
+            [ "$AI_RESULT" == "failure" ] && echo "  - AI readability artifacts failed"
+            [ "$RUST_RESULT" == "failure" ] && echo "  - Rust code blocks failed"
+            [ "$PYTHON_RESULT" == "failure" ] && echo "  - Python code blocks failed"
             exit 1
           fi
 
-          echo "✅ Documentation verification passed"
+          echo "✅ Documentation verification passed (code + AI readability)"

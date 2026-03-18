@@ -1,0 +1,213 @@
+---
+title: "Tutorial 1: Build an IMU Sensor Node"
+description: "Create a node that publishes IMU sensor data — accelerometer and gyroscope readings"
+order: 10
+---
+
+# Tutorial 1: Build an IMU Sensor Node
+
+In this tutorial, you'll build a node that simulates an IMU (Inertial Measurement Unit) sensor — the kind found in every drone, robot, and smartphone.
+
+**Prerequisites:** [Quick Start](/getting-started/quick-start) completed, HORUS installed.
+
+**What you'll learn:**
+- Custom data structures on topics
+- Publishing at a specific rate
+- Using `DurationExt` for ergonomic timing (`.hz()`, `.ms()`)
+
+**Time:** 15 minutes
+
+---
+
+## What We're Building
+
+An IMU sensor node that:
+1. Generates accelerometer data (x, y, z in m/s&sup2;)
+2. Generates gyroscope data (roll, pitch, yaw rates in rad/s)
+3. Publishes both on a topic at 100Hz
+4. A display node that prints the data
+
+## Step 1: Create the Project
+
+```bash
+horus new imu-demo -r
+cd imu-demo
+```
+
+## Step 2: Define the IMU Data Type
+
+First, we need a struct to hold IMU readings. In HORUS, any type that implements `Copy` can be sent over a topic.
+
+Replace `src/main.rs` with:
+
+```rust
+use horus::prelude::*;
+
+/// IMU sensor reading — accelerometer + gyroscope.
+///
+/// This struct is Copy, so HORUS can send it over shared memory
+/// without serialization overhead.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct ImuData {
+    // Accelerometer (m/s^2)
+    accel_x: f32,
+    accel_y: f32,
+    accel_z: f32,
+    // Gyroscope (rad/s)
+    gyro_roll: f32,
+    gyro_pitch: f32,
+    gyro_yaw: f32,
+    // Timestamp (seconds since start)
+    timestamp: f64,
+}
+```
+
+## Step 3: Build the Sensor Node
+
+```rust
+struct ImuSensor {
+    publisher: Topic<ImuData>,
+    tick_count: u64,
+}
+
+impl ImuSensor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            publisher: Topic::new("imu/data")?,
+            tick_count: 0,
+        })
+    }
+}
+
+impl Node for ImuSensor {
+    fn name(&self) -> &str { "ImuSensor" }
+
+    fn tick(&mut self) {
+        let t = self.tick_count as f64 * 0.01; // 100Hz → 0.01s per tick
+
+        // Simulate a robot turning slowly
+        let data = ImuData {
+            accel_x: 0.0,
+            accel_y: 0.0,
+            accel_z: 9.81,              // Gravity
+            gyro_roll: 0.0,
+            gyro_pitch: 0.0,
+            gyro_yaw: 0.1 * (t * 0.5).sin(),  // Gentle oscillation
+            timestamp: t,
+        };
+
+        self.publisher.send(data);
+        self.tick_count += 1;
+    }
+
+    // SAFETY: shutdown() ensures clean sensor lifecycle. Log final state
+    // so operators can verify the sensor was active until shutdown.
+    fn shutdown(&mut self) -> Result<()> {
+        eprintln!("ImuSensor shutting down after {} ticks", self.tick_count);
+        Ok(())
+    }
+}
+```
+
+Key points:
+- `Topic::new("imu/data")` creates a topic that carries `ImuData` structs
+- `tick()` runs at whatever rate the scheduler sets (we'll set 100Hz below)
+- The simulated data includes gravity on the Z-axis and a gentle yaw oscillation
+
+## Step 4: Build the Display Node
+
+```rust
+struct ImuDisplay {
+    subscriber: Topic<ImuData>,
+    sample_count: u64,
+}
+
+impl ImuDisplay {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            subscriber: Topic::new("imu/data")?,
+            sample_count: 0,
+        })
+    }
+}
+
+impl Node for ImuDisplay {
+    fn name(&self) -> &str { "ImuDisplay" }
+
+    fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the topic buffer.
+        // Skipping ticks causes stale data accumulation in shared memory.
+        if let Some(data) = self.subscriber.recv() {
+            self.sample_count += 1;
+
+            // Print every 100th sample (once per second at 100Hz)
+            if self.sample_count % 100 == 0 {
+                println!(
+                    "[{:.1}s] accel=({:.2}, {:.2}, {:.2}) gyro=({:.3}, {:.3}, {:.3})",
+                    data.timestamp,
+                    data.accel_x, data.accel_y, data.accel_z,
+                    data.gyro_roll, data.gyro_pitch, data.gyro_yaw,
+                );
+            }
+        }
+    }
+
+    // SAFETY: shutdown() logs final sample count for diagnostics.
+    fn shutdown(&mut self) -> Result<()> {
+        eprintln!("ImuDisplay shutting down after {} samples", self.sample_count);
+        Ok(())
+    }
+}
+```
+
+## Step 5: Wire It Together
+
+```rust
+fn main() -> Result<()> {
+    eprintln!("IMU demo starting...\n");
+
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: sensor publishes (0) before display subscribes (1).
+    scheduler.add(ImuSensor::new()?)
+        .order(0)
+        // NOTE: .rate(100.hz()) triggers auto-RT detection at finalize().
+        .rate(100.hz())  // 100Hz — typical IMU rate
+        .build()?;
+
+    scheduler.add(ImuDisplay::new()?)
+        .order(1)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+Notice `.rate(100.hz())` — this tells the scheduler to tick this node at 100Hz. The `.hz()` method comes from HORUS's `DurationExt` trait, which also gives you `.ms()`, `.us()`, and `.khz()`.
+
+## Step 6: Run It
+
+```bash
+horus run
+```
+
+Expected output (one line per second):
+```
+IMU demo starting...
+
+[1.0s] accel=(0.00, 0.00, 9.81) gyro=(0.000, 0.000, 0.048)
+[2.0s] accel=(0.00, 0.00, 9.81) gyro=(0.000, 0.000, 0.084)
+[3.0s] accel=(0.00, 0.00, 9.81) gyro=(0.000, 0.000, 0.097)
+```
+
+## What You Learned
+
+- **Custom data types** on topics (`ImuData` struct with `#[derive(Copy)]`)
+- **Per-node rates** with `.rate(100.hz())`
+- **Sampling** to display data at a readable rate (print every 100th sample)
+- **Topic naming** with namespaces (`"imu/data"`)
+
+## Next: [Tutorial 2: Build a Motor Controller](/tutorials/02-motor-controller)
+
+In the next tutorial, we'll build a motor controller that subscribes to velocity commands and publishes joint positions — the other half of a robot.

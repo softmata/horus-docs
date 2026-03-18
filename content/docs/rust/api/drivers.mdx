@@ -1,0 +1,358 @@
+---
+title: "Driver API"
+description: "Load hardware connections from config, typed Terra handles, local driver registration"
+weight: 6
+---
+
+# Driver API
+
+Load pre-configured hardware connections from `horus.toml` and use them in your nodes.
+
+```rust
+use horus::prelude::*;
+use horus::drivers;
+```
+
+## Two Paths
+
+**Config + Code** — config declares hardware, code controls scheduling:
+
+```rust
+// horus.toml provides port, baudrate, servo_ids
+let mut hw = drivers::load()?;
+let handle = hw.dynamixel("arm")?;
+
+scheduler.add(ArmDriver::new(handle))
+    .rate(500_u64.hz())
+    .on_miss(Miss::SafeMode)
+    .build()?;
+```
+
+**Pure Code** — no config, direct Terra usage:
+
+```rust
+use terra::dynamixel::DynamixelBus;
+
+let bus = DynamixelBus::open("/dev/ttyUSB0", 1_000_000)?;
+scheduler.add(ArmDriver::new(bus))
+    .rate(500_u64.hz())
+    .build()?;
+```
+
+Both produce the same node with the same scheduling API.
+
+## Loading Drivers
+
+### `drivers::load()`
+
+Reads `horus.toml` `[drivers]` section from the current directory (searches up to 10 parents).
+
+```rust
+let mut hw = drivers::load()?;
+```
+
+### `drivers::load_from(path)`
+
+Load from a specific config file. Useful for testing or multi-robot setups.
+
+```rust
+let mut hw = drivers::load_from("tests/test_drivers.toml")?;
+```
+
+## `HardwareSet`
+
+Returned by `drivers::load()`. Provides typed accessors for each driver category.
+
+### Terra Accessors
+
+Each returns a `DriverHandle` with the connection params from config:
+
+| Method | Config key | Hardware |
+|--------|-----------|----------|
+| `hw.dynamixel("name")` | `terra = "dynamixel"` | Dynamixel servo bus |
+| `hw.rplidar("name")` | `terra = "rplidar"` | RPLiDAR scanner |
+| `hw.realsense("name")` | `terra = "realsense"` | Intel RealSense camera |
+| `hw.i2c("name")` | `terra = "mpu6050"` etc. | I2C device |
+| `hw.serial("name")` | `terra = "vesc"` etc. | Serial/UART port |
+| `hw.can("name")` | `terra = "odrive"` etc. | CAN bus |
+| `hw.gpio("name")` | `terra = "gpio"` | GPIO pin |
+| `hw.pwm("name")` | `terra = "pwm"` | PWM output |
+| `hw.usb("name")` | `terra = "usb"` | USB device |
+| `hw.webcam("name")` | `terra = "webcam"` | V4L2 camera |
+| `hw.input("name")` | `terra = "input"` | Gamepad/joystick |
+| `hw.bluetooth("name")` | `terra = "bluetooth"` | BLE device |
+| `hw.net("name")` | `terra = "velodyne"` etc. | TCP/UDP device |
+| `hw.ethercat("name")` | `terra = "ethercat"` | EtherCAT bus |
+| `hw.spi("name")` | `terra = "spi"` | SPI device |
+| `hw.adc("name")` | `terra = "adc"` | ADC channel |
+| `hw.raw("name")` | any | Escape hatch |
+
+All error with a clear message listing available drivers if the name is not found.
+
+### Factory Accessors
+
+| Method | Config key | Returns |
+|--------|-----------|---------|
+| `hw.local("name")` | `node = "StructName"` | `Box&lt;dyn Node&gt;` |
+| `hw.package("name")` | `package = "crate-name"` | `Box&lt;dyn Node&gt;` |
+| `hw.node("name")` | any | `Box&lt;dyn Node&gt;` — works for all 3 sources |
+
+`.node()` is a generic accessor that dispatches based on driver type:
+- **Terra** → wraps in a stub node (use typed accessors for full hardware access)
+- **Package** → delegates to `.package()`
+- **Local** → delegates to `.local()`
+
+### Introspection
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `hw.list()` | `Vec&lt;&str&gt;` | Sorted list of configured driver names |
+| `hw.has("name")` | `bool` | Whether a driver is configured |
+| `hw.params("name")` | `Option&lt;&DriverParams&gt;` | Config params for a driver |
+| `hw.driver_type("name")` | `Option&lt;&DriverType&gt;` | Terra / Package / Local / Legacy |
+| `hw.topic_mapping("name")` | `Option&lt;&TopicMapping&gt;` | Topic config for auto-bridging |
+| `hw.len()` | `usize` | Number of configured drivers |
+| `hw.is_empty()` | `bool` | Whether no drivers are configured |
+
+## `DriverHandle`
+
+Wraps a Terra driver's connection params. Pass to your node constructor.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `handle.params()` | `&DriverParams` | Config params from `[drivers.NAME]` |
+| `handle.terra_name()` | `Option&lt;&str&gt;` | Terra shortname (e.g., `"dynamixel"`) |
+
+```rust
+let handle = hw.dynamixel("arm")?;
+let port: String = handle.params().get("port")?;
+let terra_name: Option&lt;&str&gt; = handle.terra_name(); // "dynamixel"
+```
+
+## `TopicMapping`
+
+Optional topic configuration for auto-bridging drivers to HORUS topics. Set via `topic`, `topic_state`, `topic_command` fields in `[drivers.NAME]`:
+
+```toml
+[drivers.imu]
+terra = "mpu6050"
+bus = "i2c-1"
+topic = "sensors/imu"           # sensor data output
+
+[drivers.arm]
+terra = "dynamixel"
+port = "/dev/ttyUSB0"
+topic_state = "arm/joint_states"     # state output
+topic_command = "arm/joint_commands"  # command input
+```
+
+| Field | Description |
+|-------|-------------|
+| `topic` | Sensor data output topic (e.g., `"sensors/imu"`) |
+| `topic_state` | Joint state output topic (e.g., `"arm/joint_states"`) |
+| `topic_command` | Command input topic (e.g., `"arm/joint_commands"`) |
+
+Access via `hw.topic_mapping("name")`:
+
+```rust
+if let Some(mapping) = hw.topic_mapping("arm") {
+    if let Some(state_topic) = &mapping.topic_state {
+        println!("State published on: {}", state_topic);
+    }
+}
+```
+
+Topic fields are **not** included in `DriverParams` — they're bridge configuration, not device params. Used by bridge layers (e.g., `terra-horus`) to auto-create sensor/actuator forwarding.
+
+## `DriverParams`
+
+Typed access to config values from a `[drivers.NAME]` table.
+
+| Method | Description |
+|--------|-------------|
+| `params.get::&lt;String&gt;("port")?` | Required param — errors if missing or wrong type |
+| `params.get::&lt;u32&gt;("baudrate")?` | Supports String, bool, i32, u32, u64, f32, f64, `Vec&lt;T&gt;` |
+| `params.get_or("timeout", 1000u32)` | Optional param — returns default if missing |
+| `params.has("key")` | Whether a key exists |
+| `params.keys()` | Iterator over param names |
+| `params.raw("key")` | Raw `toml::Value` for a key |
+
+## `register_driver!`
+
+Register a local driver factory so `hw.local("name")` can instantiate it.
+
+```rust
+use horus::prelude::*;
+use horus::drivers::{DriverParams, register_driver};
+
+struct ConveyorDriver {
+    port: Box&lt;dyn serialport::SerialPort&gt;,
+    belt_length: u32,
+    pub_state: Topic&lt;ConveyorState&gt;,
+}
+
+impl ConveyorDriver {
+    fn from_params(params: &DriverParams) -> HorusResult&lt;Self&gt; {
+        let port_name = params.get::&lt;String&gt;("port")?;
+        let baud = params.get_or("baudrate", 57600u32);
+        Ok(Self {
+            port: serialport::new(&port_name, baud).open()?,
+            belt_length: params.get_or("belt_length_mm", 2400),
+            pub_state: Topic::new("conveyor/state")?,
+        })
+    }
+}
+
+impl Node for ConveyorDriver {
+    fn tick(&mut self) {
+        let pos = self.read_encoder();
+        self.pub_state.send(&ConveyorState { position_mm: pos });
+    }
+    fn enter_safe_state(&mut self) {
+        self.write_speed(0.0);
+    }
+}
+
+// One line — registers the factory
+register_driver!(ConveyorDriver, ConveyorDriver::from_params);
+```
+
+Then in `horus.toml`:
+
+```toml
+[drivers.conveyor]
+node = "ConveyorDriver"
+port = "/dev/ttyACM0"
+baudrate = 57600
+belt_length_mm = 2400
+```
+
+And in `main.rs`:
+
+```rust
+let mut hw = drivers::load()?;
+scheduler.add(hw.local("conveyor")?)
+    .order(100)
+    .rate(50_u64.hz())
+    .build()?;
+```
+
+## `DriverType`
+
+Identifies where a driver comes from:
+
+```rust
+match hw.driver_type("arm") {
+    Some(DriverType::Terra(name))   => println!("Terra: {}", name),
+    Some(DriverType::Package(pkg))  => println!("Package: {}", pkg),
+    Some(DriverType::Local(node))   => println!("Local: {}", node),
+    Some(DriverType::Legacy)        => println!("Legacy feature flag"),
+    None                            => println!("Not configured"),
+}
+```
+
+## Adding to Scheduler
+
+`scheduler.add()` accepts both concrete types and `Box&lt;dyn Node&gt;`:
+
+```rust
+// Concrete type — most common
+scheduler.add(ArmDriver::new(handle)).build()?;
+
+// Box&lt;dyn Node&gt; — from hw.local() or hw.package()
+scheduler.add(hw.local("conveyor")?).build()?;
+
+// Both use the same .add() — full builder API available
+scheduler.add(hw.local("sensor")?)
+    .order(5)
+    .rate(500_u64.hz())
+    .on_miss(Miss::Skip)
+    .failure_policy(FailurePolicy::restart(3, 100_u64.ms()))
+    .build()?;
+```
+
+## Complete Example
+
+```toml
+# horus.toml
+[package]
+name = "my-robot"
+version = "0.1.0"
+
+[drivers.arm]
+terra = "dynamixel"
+port = "/dev/ttyUSB0"
+baudrate = 1000000
+servo_ids = [1, 2, 3, 4, 5, 6]
+
+[drivers.lidar]
+terra = "rplidar"
+port = "/dev/ttyUSB1"
+
+[drivers.imu]
+terra = "bno055"
+bus = "i2c-1"
+address = 0x28
+```
+
+```rust
+use horus::prelude::*;
+use horus::drivers;
+
+fn main() -> HorusResult&lt;()&gt; {
+    let mut hw = drivers::load()?;
+
+    let mut sched = Scheduler::new()
+        .tick_rate(1000_u64.hz())
+        .prefer_rt()
+        .watchdog(200_u64.ms());
+
+    sched.add(ArmDriver::new(hw.dynamixel("arm")?))
+        .order(0).rate(500_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    sched.add(LidarDriver::new(hw.rplidar("lidar")?))
+        .order(10).rate(40_u64.hz())
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    sched.add(ImuDriver::new(hw.i2c("imu")?))
+        .order(5).rate(100_u64.hz())
+        .build()?;
+
+    sched.add(Planner::new())
+        .order(50).rate(10_u64.hz()).compute()
+        .build()?;
+
+    sched.run()
+}
+```
+
+## Testing with Mock Drivers
+
+Use `terra = "virtual"` in a test config:
+
+```toml
+# tests/test_drivers.toml
+[drivers.arm]
+terra = "virtual"
+joints = 6
+
+[drivers.lidar]
+terra = "virtual"
+type = "lidar"
+```
+
+```rust
+#[test]
+fn robot_initializes() {
+    let mut hw = drivers::load_from("tests/test_drivers.toml").unwrap();
+    let mut sched = Scheduler::new().deterministic(true);
+
+    sched.add(ArmDriver::new(hw.dynamixel("arm").unwrap()))
+        .build().unwrap();
+
+    sched.tick_once().unwrap();
+}
+```

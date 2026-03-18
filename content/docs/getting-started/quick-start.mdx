@@ -6,6 +6,8 @@ order: 3
 
 # Quick Start
 
+> Prefer Python? See [Quick Start (Python)](/getting-started/quick-start-python)
+
 This tutorial demonstrates building a temperature monitoring system with HORUS. Estimated time: 10 minutes.
 
 ## What We're Building
@@ -30,16 +32,15 @@ cd temperature-monitor
 ```
 
 This creates:
-- `main.rs` - Your code (we'll customize this)
-- `horus.toml` - Project config (name, version, description)
-- `Cargo.toml` - Rust dependencies (managed by `cargo` / `horus add`)
-- `.horus/` - Build cache (target/, packages/)
+- `src/main.rs` - Your code (we'll customize this)
+- `horus.toml` - Project config (name, version, dependencies)
+- `.horus/` - Build cache (generated `Cargo.toml`, `target/`, packages/)
 
-> **Note**: `.horus/` is a build cache managed automatically. Your dependencies live in `Cargo.toml` (Rust) or `pyproject.toml` (Python), just like normal projects. See [Environment Management](/package-management/environment-management#solving-dependency-hell) for details.
+> **Note**: `.horus/` is managed automatically — it contains the generated `Cargo.toml` and build artifacts. Your dependencies live in `horus.toml` and are pinned in `horus.lock`. See [Configuration Reference](/package-management/configuration) for details.
 
 ## Step 2: Write the Code
 
-Replace the generated `main.rs` with this complete example:
+Replace the generated `src/main.rs` with this complete example:
 
 ```rust
 use horus::prelude::*;
@@ -75,8 +76,16 @@ impl Node for TemperatureSensor {
         // Send the reading
         self.publisher.send(self.temperature);
 
-        // Wait 1 second before next reading
+        // WARNING: sleep() in tick() blocks the entire scheduler thread.
+        // In production, use .rate(1.hz()) on the scheduler instead.
         std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // SAFETY: shutdown() ensures the sensor stops cleanly and logs final state.
+    // Always implement shutdown() — the scheduler calls it on Ctrl+C / signal.
+    fn shutdown(&mut self) -> Result<()> {
+        eprintln!("TemperatureSensor shutting down. Last reading: {:.1}°C", self.temperature);
+        Ok(())
     }
 }
 
@@ -102,10 +111,18 @@ impl Node for TemperatureMonitor {
     }
 
     fn tick(&mut self) {
-        // Check for new temperature readings
+        // IMPORTANT: call recv() every tick to drain the topic buffer.
+        // Skipping ticks causes stale data accumulation.
         if let Some(temp) = self.subscriber.recv() {
             println!("Temperature: {:.1}°C", temp);
         }
+    }
+
+    // SAFETY: shutdown() logs that the monitor is stopping.
+    // Even non-actuator nodes should implement shutdown() for clean lifecycle tracking.
+    fn shutdown(&mut self) -> Result<()> {
+        eprintln!("TemperatureMonitor shutting down.");
+        Ok(())
     }
 }
 
@@ -119,9 +136,8 @@ fn main() -> Result<()> {
     // Create the scheduler
     let mut scheduler = Scheduler::new();
 
-    // Add both nodes using the fluent API
-    // order(0) = sensor runs first (highest priority)
-    // order(1) = monitor runs second
+    // Execution order: sensor publishes (0) before monitor subscribes (1).
+    // This guarantees the monitor always sees the latest reading each tick.
     scheduler.add(TemperatureSensor::new()?)
         .order(0)
         .build()?;
@@ -191,6 +207,11 @@ impl Node for TemperatureSensor {
     fn tick(&mut self) {
         // Your logic here
     }
+
+    // SAFETY: always implement shutdown() for clean resource release.
+    fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 ```
 
@@ -208,6 +229,7 @@ node! {
         tick {
             self.temperature += 0.1;
             self.publisher.send(self.temperature);
+            // WARNING: sleep() blocks the scheduler. Use .rate(1.hz()) instead.
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
@@ -217,6 +239,7 @@ node! {
     TemperatureMonitor {
         sub { subscriber: f32 -> "temperature" }
         tick {
+            // IMPORTANT: call recv() every tick to consume messages.
             if let Some(temp) = self.subscriber.recv() {
                 println!("Temperature: {:.1}°C", temp);
             }
@@ -234,14 +257,13 @@ The scheduler runs your nodes in priority order:
 ```rust
 let mut scheduler = Scheduler::new();
 
-// order(0) = highest priority (runs first)
+// Execution order: sensor (0) publishes before monitor (1) subscribes.
 scheduler.add(SensorNode::new()?)
-    .order(0)
+    .order(0)    // Runs first each tick
     .build()?;
 
-// order(1) = lower priority (runs after 0)
 scheduler.add(MonitorNode::new()?)
-    .order(1)
+    .order(1)    // Runs second each tick
     .build()?;
 
 // Run forever
@@ -250,7 +272,7 @@ scheduler.run()?;
 
 The fluent API lets you chain configuration:
 - `.order(n)` - Set execution priority (lower = runs first)
-- `.rate(n.hz())` - Set node-specific tick rate
+- `.rate(n.hz())` - Set node-specific tick rate (auto-enables RT detection)
 - `.budget(n.us())` - Set execution time budget (auto-enables RT)
 - `.build()` - Finish and register the node
 
@@ -292,6 +314,7 @@ Try modifying the code:
 ```rust
 impl Node for TemperatureMonitor {
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the buffer.
         if let Some(temp) = self.subscriber.recv() {
             println!("Temperature: {:.1}°C", temp);
 
@@ -322,11 +345,13 @@ use std::io::Write;
 
 impl Node for TemperatureMonitor {
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the buffer.
         if let Some(temp) = self.subscriber.recv() {
             // Display
             println!("Temperature: {:.1}°C", temp);
 
-            // Save to file
+            // WARNING: file I/O in tick() blocks the scheduler. In production,
+            // use an async writer or buffer writes to avoid stalling the loop.
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -378,15 +403,7 @@ Press **Ctrl+C**. The scheduler handles graceful shutdown automatically.
 
 ### Where does the data go?
 
-Data is stored in platform-specific shared memory:
-- **Linux:** `/dev/shm/horus/`
-- **macOS:** `/tmp/horus/`
-- **Windows:** `%TEMP%\horus\`
-
-Check it out (Linux):
-```bash
-ls -lh /dev/shm/horus/
-```
+Data is stored in shared memory, managed automatically by HORUS. You never need to configure paths — `horus_sys` handles platform differences internally.
 
 ## Troubleshooting
 
@@ -400,13 +417,10 @@ Topic::new("temperature_sensor_1")?
 
 ### "Address already in use"
 
-The shared memory file exists from a previous run. Remove it:
+A shared memory region exists from a previous run. Clean it up:
 
 ```bash
-# Linux
-rm -f /dev/shm/horus/topic_temperature
-# macOS
-rm -f /tmp/horus/topic_temperature
+horus clean --shm
 ```
 
 Or use a different topic name.
@@ -441,3 +455,10 @@ Your next steps:
 3. **[Open the monitor](/development/monitor)** to monitor your system
 
 For issues, see the **[Troubleshooting Guide](/troubleshooting)**.
+
+## See Also
+
+- [Quick Start (Python)](/getting-started/quick-start-python) - Build the same app in Python
+- [Second Application](/getting-started/second-application) - Build a more advanced project
+- [Choosing a Language](/getting-started/choosing-language) - Rust vs Python comparison
+- [Tutorials](/tutorials) - Guided walkthroughs for common tasks

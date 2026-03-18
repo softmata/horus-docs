@@ -1,0 +1,141 @@
+---
+title: "Recipe: Multi-Sensor Fusion"
+description: "Combine IMU and wheel odometry into a fused state estimate using complementary filtering."
+order: 7
+---
+
+## Multi-Sensor Fusion
+
+Fuses IMU orientation with wheel odometry position using a complementary filter. Publishes a unified pose estimate. Demonstrates the multi-topic aggregation pattern — cache latest from each sensor, fuse when both available.
+
+### horus.toml
+
+```toml
+[package]
+name = "sensor-fusion"
+version = "0.1.0"
+description = "IMU + odometry complementary filter"
+```
+
+### Complete Code
+
+```rust
+use horus::prelude::*;
+
+/// Wheel odometry: position from encoder counts
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct WheelOdom {
+    x: f32,
+    y: f32,
+    theta: f32,
+    speed: f32,
+}
+
+/// IMU-derived heading
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct ImuHeading {
+    yaw: f32,
+    yaw_rate: f32,
+}
+
+/// Fused state estimate
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct FusedPose {
+    x: f32,
+    y: f32,
+    theta: f32,
+    speed: f32,
+    confidence: f32,
+}
+
+// ── Fusion Node ─────────────────────────────────────────────
+
+struct FusionNode {
+    odom_sub: Topic<WheelOdom>,
+    imu_sub: Topic<ImuHeading>,
+    pose_pub: Topic<FusedPose>,
+    last_odom: Option<WheelOdom>,
+    last_imu: Option<ImuHeading>,
+    alpha: f32,
+}
+
+impl FusionNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            odom_sub: Topic::new("odom.wheels")?,
+            imu_sub: Topic::new("imu.heading")?,
+            pose_pub: Topic::new("pose.fused")?,
+            last_odom: None,
+            last_imu: None,
+            alpha: 0.7, // favor IMU for heading (less drift than wheels on turns)
+        })
+    }
+}
+
+impl Node for FusionNode {
+    fn name(&self) -> &str { "Fusion" }
+
+    fn tick(&mut self) {
+        // IMPORTANT: always recv() ALL topics every tick to drain buffers
+        if let Some(odom) = self.odom_sub.recv() {
+            self.last_odom = Some(odom);
+        }
+        if let Some(imu) = self.imu_sub.recv() {
+            self.last_imu = Some(imu);
+        }
+
+        // Fuse only when both sources are available
+        let (odom, imu) = match (&self.last_odom, &self.last_imu) {
+            (Some(o), Some(i)) => (o, i),
+            _ => return,
+        };
+
+        // Complementary filter: blend odom heading with IMU heading
+        let fused_theta = (1.0 - self.alpha) * odom.theta + self.alpha * imu.yaw;
+
+        let confidence = if imu.yaw_rate.abs() > 0.5 { 0.6 } else { 0.9 };
+
+        self.pose_pub.send(FusedPose {
+            x: odom.x,
+            y: odom.y,
+            theta: fused_theta,
+            speed: odom.speed,
+            confidence,
+        });
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: fusion reads both sensors and publishes fused pose
+    scheduler.add(FusionNode::new()?)
+        .order(0)
+        .rate(50_u64.hz())
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 50 Hz
+[HORUS] Node "Fusion" started (Rt, 50 Hz, budget: 16.0ms, deadline: 19.0ms)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "Fusion" shutdown complete
+```
+
+### Key Points
+
+- **Multi-topic aggregation pattern**: `recv()` all topics, cache with `Option`, fuse when both are `Some`
+- **Complementary filter** is the simplest sensor fusion — for production, consider an Extended Kalman Filter (EKF)
+- **`alpha = 0.7`** favors IMU for heading — wheel odometry drifts on carpet/tile; tune per surface
+- **No `shutdown()` needed** — fusion nodes don't actuate anything
+- **50Hz output** from 100Hz IMU + 20Hz odometry is fine — fusion runs on cached values
+- **Confidence field** lets downstream nodes decide how much to trust the estimate

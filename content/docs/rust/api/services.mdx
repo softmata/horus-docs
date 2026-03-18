@@ -16,28 +16,6 @@ Use the `service!` macro to define request and response types:
 use horus::prelude::*;
 
 service! {
-    /// Add two integers together.
-    AddTwoInts {
-        request {
-            a: i64,
-            b: i64,
-        }
-        response {
-            sum: i64,
-        }
-    }
-}
-```
-
-This generates three types:
-- `AddTwoIntsRequest` — request struct with `pub a: i64, pub b: i64`
-- `AddTwoIntsResponse` — response struct with `pub sum: i64`
-- `AddTwoInts` — zero-sized marker implementing the `Service` trait
-
-The service name is auto-derived as snake_case from the CamelCase name (`add_two_ints`).
-
-```rust
-service! {
     /// Look up a robot's current pose by name.
     GetRobotPose {
         request {
@@ -77,8 +55,8 @@ Synchronous client that blocks until a response arrives or the timeout elapses.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `ServiceClient::<S>::new()` | `HorusResult<Self>` | Create a client with default 1ms poll interval |
-| `ServiceClient::<S>::with_poll_interval(interval)` | `HorusResult<Self>` | Create a client with custom poll interval |
+| `ServiceClient::<S>::new()` | `Result<Self>` | Create a client with default 1ms poll interval |
+| `ServiceClient::<S>::with_poll_interval(interval)` | `Result<Self>` | Create a client with custom poll interval |
 
 ### Calling
 
@@ -91,38 +69,81 @@ Synchronous client that blocks until a response arrives or the timeout elapses.
 
 Only transient errors (`Timeout`, `Transport`) are retried. Permanent errors (`ServiceFailed`, `NoServer`) propagate immediately.
 
+### Detailed Method Reference
+
+#### call
+
+```rust
+pub fn call(&self, request: S::Request, timeout: Duration) -> ServiceResult<S::Response>
+```
+
+Send a request and block until a response arrives or the timeout elapses.
+
+**Parameters:**
+- `request: S::Request` — The typed request message. `S` is the service type implementing `ServiceDef`.
+- `timeout: Duration` — Maximum time to wait for a response. Use `100_u64.ms()`, `1_u64.secs()`, etc.
+
+**Returns:** `ServiceResult<S::Response>` — `Ok(response)` or `Err(ServiceError)`.
+
+**Errors:**
+- `ServiceError::Timeout` — No response within timeout
+- `ServiceError::NoServer` — No server is registered for this service
+- `ServiceError::ServiceFailed(msg)` — Server returned an error
+
+**Example:**
+```rust
+let response = client.call(GetPose { frame: "base" }, 100.ms())?;
+println!("x={}, y={}", response.x, response.y);
+```
+
+#### call_resilient
+
+```rust
+pub fn call_resilient(&self, request: S::Request, timeout: Duration) -> ServiceResult<S::Response>
+```
+
+Like `call()`, but auto-retries on transient errors (timeout, transport). Uses default retry config: 3 retries, 10ms backoff, 2x multiplier.
+
+**Retry behavior:** Only `Timeout` and `Transport` errors trigger retries. `NoServer` and `ServiceFailed` propagate immediately. Total time can exceed `timeout` due to retries.
+
+#### call_optional
+
+```rust
+pub fn call_optional(&self, request: S::Request, timeout: Duration) -> ServiceResult<Option<S::Response>>
+```
+
+Like `call()`, but returns `Ok(None)` on timeout instead of `Err(Timeout)`. Useful for non-critical lookups where missing data is acceptable.
+
+**Returns:** `Ok(Some(response))` on success, `Ok(None)` on timeout, `Err(e)` on other errors.
+
 ### Example
 
 ```rust
 use horus::prelude::*;
 
-service! {
-    AddTwoInts {
-        request { a: i64, b: i64 }
-        response { sum: i64 }
-    }
-}
-
-// Create client
-let mut client = ServiceClient::<AddTwoInts>::new()?;
+// Create client for the GetRobotPose service
+let mut client = ServiceClient::<GetRobotPose>::new()?;
 
 // Blocking call with 1-second timeout
 let response = client.call(
-    AddTwoIntsRequest { a: 3, b: 5 },
+    GetRobotPoseRequest { robot_name: "arm_1".into() },
     1_u64.secs(),
 )?;
-println!("Sum: {}", response.sum); // 8
+println!("Robot at ({:.2}, {:.2})", response.x, response.y);
 
 // Resilient call — retries on transient failures
 let response = client.call_resilient(
-    AddTwoIntsRequest { a: 10, b: 20 },
+    GetRobotPoseRequest { robot_name: "arm_1".into() },
     2_u64.secs(),
 )?;
 
 // Optional call — Ok(None) on timeout
-match client.call_optional(AddTwoIntsRequest { a: 1, b: 2 }, 100_u64.ms())? {
-    Some(res) => println!("Got: {}", res.sum),
-    None => println!("Server not responding"),
+match client.call_optional(
+    GetRobotPoseRequest { robot_name: "arm_1".into() },
+    100_u64.ms(),
+)? {
+    Some(res) => println!("Pose: ({:.2}, {:.2})", res.x, res.y),
+    None => println!("Pose server not responding"),
 }
 ```
 
@@ -136,8 +157,8 @@ Non-blocking client that returns a `PendingServiceCall` handle. Check the handle
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `AsyncServiceClient::<S>::new()` | `HorusResult<Self>` | Create with default 1ms poll interval |
-| `AsyncServiceClient::<S>::with_poll_interval(interval)` | `HorusResult<Self>` | Create with custom poll interval |
+| `AsyncServiceClient::<S>::new()` | `Result<Self>` | Create with default 1ms poll interval |
+| `AsyncServiceClient::<S>::with_poll_interval(interval)` | `Result<Self>` | Create with custom poll interval |
 
 ### Calling
 
@@ -211,7 +232,7 @@ Fluent builder for creating a service server.
 | `ServiceServerBuilder::<S>::new()` | `Self` | Create a new builder |
 | `on_request(handler)` | `Self` | Register the request handler (`Fn(Req) -> Result<Res, String>`) |
 | `poll_interval(interval)` | `Self` | Override poll interval (default: 5ms) |
-| `build()` | `HorusResult<ServiceServer<S>>` | Build and start the server (spawns background thread) |
+| `build()` | `Result<ServiceServer<S>>` | Build and start the server (spawns background thread) |
 
 The handler receives the request payload and returns either a response (`Ok`) or an error message (`Err`).
 
@@ -227,27 +248,27 @@ The server runs in a background thread. Dropping the `ServiceServer` handle shut
 
 ```rust
 use horus::prelude::*;
-
-service! {
-    AddTwoInts {
-        request { a: i64, b: i64 }
-        response { sum: i64 }
-    }
-}
+use std::collections::HashMap;
 
 // Build and start server
-let server = ServiceServerBuilder::<AddTwoInts>::new()
-    .on_request(|req| {
-        Ok(AddTwoIntsResponse { sum: req.a + req.b })
+let poses: HashMap<String, (f64, f64, f64)> = HashMap::from([
+    ("arm_1".into(), (1.5, 2.0, 0.0)),
+    ("arm_2".into(), (3.0, 1.0, 1.57)),
+]);
+
+let server = ServiceServerBuilder::<GetRobotPose>::new()
+    .on_request(move |req| {
+        match poses.get(&req.robot_name) {
+            Some(&(x, y, theta)) => Ok(GetRobotPoseResponse {
+                x, y, theta, timestamp_ns: horus::timestamp_now(),
+            }),
+            None => Err(format!("Unknown robot: {}", req.robot_name)),
+        }
     })
     .poll_interval(1_u64.ms())
     .build()?;
 
-// Server runs in background thread until `server` is dropped
-// ... do other work ...
-
-// Explicit stop (optional — happens on drop)
-server.stop();
+// Server runs in background thread until dropped
 ```
 
 ---
@@ -330,7 +351,7 @@ service! {
     }
 }
 
-fn main() -> HorusResult<()> {
+fn main() -> Result<()> {
     let store = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     let store_clone = store.clone();
 

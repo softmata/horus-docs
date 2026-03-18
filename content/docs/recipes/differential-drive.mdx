@@ -1,0 +1,116 @@
+---
+title: "Recipe: Differential Drive"
+description: "Complete 2-wheel differential drive robot: CmdVel velocity commands to left/right motor outputs with safety shutdown."
+order: 2
+---
+
+## Differential Drive
+
+A 2-wheel robot that receives `CmdVel` velocity commands and converts them to left/right motor speeds. Implements safe shutdown — motors are always zeroed on exit.
+
+### horus.toml
+
+```toml
+[package]
+name = "differential-drive"
+version = "0.1.0"
+description = "2-wheel differential drive with safe shutdown"
+```
+
+### Complete Code
+
+```rust
+use horus::prelude::*;
+
+/// Robot physical parameters
+const WHEEL_BASE: f32 = 0.3;    // meters between wheels
+const WHEEL_RADIUS: f32 = 0.05; // meters
+const MAX_RPM: f32 = 200.0;     // safety limit
+
+/// Motor output for a single wheel
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct WheelCmd {
+    left_rpm: f32,
+    right_rpm: f32,
+}
+
+// ── Drive Node ──────────────────────────────────────────────
+
+struct DriveNode {
+    cmd_sub: Topic<CmdVel>,
+    wheel_pub: Topic<WheelCmd>,
+    last_cmd: CmdVel,
+}
+
+impl DriveNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd_sub: Topic::new("cmd_vel")?,
+            wheel_pub: Topic::new("wheel.cmd")?,
+            last_cmd: CmdVel::default(),
+        })
+    }
+}
+
+impl Node for DriveNode {
+    fn name(&self) -> &str { "Drive" }
+
+    fn tick(&mut self) {
+        // IMPORTANT: always recv() every tick to drain the buffer
+        if let Some(cmd) = self.cmd_sub.recv() {
+            self.last_cmd = cmd;
+        }
+
+        // Differential drive kinematics: convert (linear, angular) to (left, right)
+        let v = self.last_cmd.linear;
+        let w = self.last_cmd.angular;
+        let left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+        let right = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+
+        // Convert rad/s to RPM and clamp to safety limit
+        let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
+        let left_rpm = (left * to_rpm).clamp(-MAX_RPM, MAX_RPM);
+        let right_rpm = (right * to_rpm).clamp(-MAX_RPM, MAX_RPM);
+
+        self.wheel_pub.send(WheelCmd { left_rpm, right_rpm });
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // SAFETY: zero both motors before exiting — prevents runaway
+        self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: DriveNode reads cmd_vel and publishes wheel commands
+    scheduler.add(DriveNode::new()?)
+        .order(0)              // only node, runs first
+        .rate(50_u64.hz())     // 50Hz control loop — auto-enables RT
+        .on_miss(Miss::Warn)   // log if tick overruns
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 50 Hz
+[HORUS] Node "Drive" started (Rt, 50 Hz, budget: 16.0ms, deadline: 19.0ms)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "Drive" shutdown complete
+```
+
+### Key Points
+
+- **`#[repr(C)]` + `Copy`** on `WheelCmd` enables zero-copy shared memory (PodTopic path)
+- **`.rate(50_u64.hz())`** auto-enables RT with 80% budget and 95% deadline
+- **`shutdown()`** sends zero command — prevents wheels spinning if the program crashes mid-tick
+- **Kinematics**: `v - w*L/2` and `v + w*L/2` is the standard unicycle-to-differential conversion
+- **`clamp()`** enforces motor safety limits even if upstream sends dangerous velocities

@@ -22,6 +22,19 @@ const allPages: DocLink[] = [
   { title: "Troubleshooting", href: "/troubleshooting" },
   { title: "Advanced Examples", href: "/rust/examples/advanced-examples" },
 
+  // Recipes
+  { title: "Recipes", href: "/recipes" },
+  { title: "Differential Drive", href: "/recipes/differential-drive" },
+  { title: "IMU Reader", href: "/recipes/imu-reader" },
+  { title: "PID Controller", href: "/recipes/pid-controller" },
+  { title: "LiDAR Obstacle Avoidance", href: "/recipes/lidar-obstacle-avoidance" },
+  { title: "Servo Controller", href: "/recipes/servo-controller" },
+  { title: "Multi-Sensor Fusion", href: "/recipes/multi-sensor-fusion" },
+  { title: "Emergency Stop", href: "/recipes/emergency-stop" },
+  { title: "Telemetry Logger", href: "/recipes/telemetry-logger" },
+  { title: "Python CV Node", href: "/recipes/python-cv-node" },
+  { title: "ROS2 Bridge", href: "/recipes/ros2-bridge" },
+
   // Core Concepts
   { title: "Overview", href: "/concepts" },
   { title: "Nodes", href: "/concepts/core-concepts-nodes" },
@@ -73,6 +86,7 @@ const allPages: DocLink[] = [
   { title: "Static Analysis", href: "/development/static-analysis" },
   { title: "Error Handling", href: "/development/error-handling" },
   { title: "AI Integration", href: "/development/ai-integration" },
+  { title: "Telemetry Export", href: "/development/telemetry" },
 
   // Advanced Topics
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },
@@ -81,6 +95,7 @@ const allPages: DocLink[] = [
   { title: "Fault Tolerance", href: "/advanced/circuit-breaker" },
   { title: "Safety Monitor", href: "/advanced/safety-monitor" },
   { title: "Record & Replay", href: "/advanced/record-replay" },
+  { title: "Discovery (mDNS)", href: "/advanced/discovery" },
 
   // Plugins
   { title: "Plugins Overview", href: "/plugins" },
@@ -90,12 +105,33 @@ const allPages: DocLink[] = [
   // Package Management
   { title: "Package Management", href: "/package-management/package-management" },
   { title: "Using Prebuilt Nodes", href: "/package-management/using-prebuilt-nodes" },
-  { title: "Environment Management", href: "/package-management/environment-management" },
+  { title: "Lockfile & Reproducibility", href: "/package-management/lockfile" },
   { title: "Configuration Reference", href: "/package-management/configuration" },
+
+  // Standard Library
+  { title: "Standard Library", href: "/stdlib" },
+  { title: "Imu", href: "/stdlib/messages/imu" },
+  { title: "CmdVel", href: "/stdlib/messages/cmd-vel" },
+  { title: "Twist", href: "/stdlib/messages/twist" },
+  { title: "Odometry", href: "/stdlib/messages/odometry" },
+  { title: "Pose2D / Pose3D", href: "/stdlib/messages/pose" },
+  { title: "LaserScan", href: "/stdlib/messages/laser-scan" },
+  { title: "Image", href: "/stdlib/messages/image" },
+  { title: "Detection", href: "/stdlib/messages/detection" },
+  { title: "Segmentation", href: "/stdlib/messages/segmentation" },
+  { title: "OccupancyGrid", href: "/stdlib/messages/occupancy-grid" },
+  { title: "BatteryState", href: "/stdlib/messages/battery-state" },
+  { title: "Navigation", href: "/stdlib/messages/navigation" },
+  { title: "JointState", href: "/stdlib/messages/joint-state" },
 
   // Performance
   { title: "Optimization Guide", href: "/performance/performance" },
   { title: "Benchmarks", href: "/performance/benchmarks" },
+
+  // Reference
+  { title: "API Cheatsheet", href: "/reference/api-cheatsheet" },
+  { title: "AI Context", href: "/reference/ai-context" },
+  { title: "Internals", href: "/reference/internals" },
 ];
 
 export function PrevNextNav() {

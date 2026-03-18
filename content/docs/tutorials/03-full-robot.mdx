@@ -1,0 +1,376 @@
+---
+title: "Tutorial 3: Full Robot Integration"
+description: "Combine sensor and motor nodes into a complete robot system with TransformFrame and monitoring"
+order: 12
+---
+
+# Tutorial 3: Full Robot Integration
+
+In this tutorial, you'll combine the IMU sensor from Tutorial 1 and the motor controller from Tutorial 2 into a complete robot system. You'll add coordinate frame tracking with TransformFrame and use `horus monitor` to visualize the system.
+
+**Prerequisites:** [Tutorial 1](/tutorials/01-sensor-node) and [Tutorial 2](/tutorials/02-motor-controller) completed.
+
+**What you'll learn:**
+- Composing multiple node types into one system
+- TransformFrame for coordinate frame tracking
+- Multi-rate scheduling (sensors at 100Hz, control at 50Hz, display at 1Hz)
+- Using `horus monitor` for system visualization
+
+**Time:** 20 minutes
+
+---
+
+## What We're Building
+
+A robot system with 4 nodes:
+
+```
+ImuSensor (100Hz) ──→ "imu/data" ──→ StateEstimator (100Hz)
+                                              │
+Commander (10Hz) ──→ "motor/cmd" ──→ MotorController (50Hz)
+                                              │
+                                        "motor/state" ──→ StateEstimator
+                                              │
+                                    TransformFrame ("base_link" → "world")
+```
+
+## Step 1: Create the Project
+
+```bash
+horus new robot-integration -r
+cd robot-integration
+```
+
+## Step 2: Define Shared Types
+
+We'll reuse the types from Tutorials 1 and 2, plus add a robot pose:
+
+```rust
+use horus::prelude::*;
+
+// ── Data Types ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct ImuData {
+    accel_x: f32, accel_y: f32, accel_z: f32,
+    gyro_roll: f32, gyro_pitch: f32, gyro_yaw: f32,
+    timestamp: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct MotorCommand {
+    velocity: f32,
+    max_torque: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct MotorState {
+    position: f32,
+    velocity: f32,
+    torque: f32,
+    timestamp: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct RobotPose {
+    x: f32,
+    y: f32,
+    heading: f32,  // radians
+    timestamp: f64,
+}
+```
+
+## Step 3: The IMU Sensor (from Tutorial 1)
+
+```rust
+struct ImuSensor {
+    publisher: Topic<ImuData>,
+    tick_count: u64,
+}
+
+impl ImuSensor {
+    fn new() -> Result<Self> {
+        Ok(Self { publisher: Topic::new("imu/data")?, tick_count: 0 })
+    }
+}
+
+impl Node for ImuSensor {
+    fn name(&self) -> &str { "ImuSensor" }
+
+    fn tick(&mut self) {
+        let t = self.tick_count as f64 * 0.01;
+        self.publisher.send(ImuData {
+            accel_x: 0.0, accel_y: 0.0, accel_z: 9.81,
+            gyro_roll: 0.0, gyro_pitch: 0.0,
+            gyro_yaw: 0.1 * (t * 0.5).sin() as f32,
+            timestamp: t,
+        });
+        self.tick_count += 1;
+    }
+
+    // SAFETY: shutdown() ensures clean sensor lifecycle and logs tick count
+    // so operators can verify the sensor ran for the expected duration.
+    fn shutdown(&mut self) -> Result<()> {
+        eprintln!("ImuSensor shutting down after {} ticks", self.tick_count);
+        Ok(())
+    }
+}
+```
+
+## Step 4: The Motor Controller (from Tutorial 2)
+
+```rust
+struct MotorController {
+    commands: Topic<MotorCommand>,
+    state_pub: Topic<MotorState>,
+    position: f32,
+    velocity: f32,
+}
+
+impl MotorController {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            commands: Topic::new("motor/cmd")?,
+            state_pub: Topic::new("motor/state")?,
+            position: 0.0, velocity: 0.0,
+        })
+    }
+}
+
+impl Node for MotorController {
+    fn name(&self) -> &str { "MotorController" }
+
+    fn tick(&mut self) {
+        let dt = 0.02; // 50Hz
+        // IMPORTANT: call recv() every tick to consume the latest command.
+        if let Some(cmd) = self.commands.recv() {
+            let error = cmd.velocity - self.velocity;
+            self.velocity += error.clamp(-cmd.max_torque, cmd.max_torque) * dt;
+        }
+        self.position += self.velocity * dt;
+        self.state_pub.send(MotorState {
+            position: self.position, velocity: self.velocity,
+            torque: 0.0, timestamp: 0.0,
+        });
+    }
+
+    // SAFETY: shutdown() is CRITICAL for actuator nodes. Without it, the motor
+    // could continue at its last commanded velocity after the scheduler stops.
+    // Always zero velocity and publish the stopped state.
+    fn shutdown(&mut self) -> Result<()> {
+        // CRITICAL: zero velocity before returning.
+        self.velocity = 0.0;
+        self.state_pub.send(MotorState {
+            position: self.position, velocity: 0.0,
+            torque: 0.0, timestamp: 0.0,
+        });
+        eprintln!("Motor stopped at position {:.2} rad", self.position);
+        Ok(())
+    }
+}
+```
+
+## Step 5: The State Estimator (NEW)
+
+This node fuses IMU and motor data to estimate the robot's pose:
+
+```rust
+struct StateEstimator {
+    imu_sub: Topic<ImuData>,
+    motor_sub: Topic<MotorState>,
+    pose_pub: Topic<RobotPose>,
+    pose: RobotPose,
+}
+
+impl StateEstimator {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            imu_sub: Topic::new("imu/data")?,
+            motor_sub: Topic::new("motor/state")?,
+            pose_pub: Topic::new("robot/pose")?,
+            pose: RobotPose::default(),
+        })
+    }
+}
+
+impl Node for StateEstimator {
+    fn name(&self) -> &str { "StateEstimator" }
+
+    fn tick(&mut self) {
+        let dt = 0.01; // 100Hz
+
+        // IMPORTANT: call recv() on each subscription every tick.
+        // Read IMU for heading changes
+        if let Some(imu) = self.imu_sub.recv() {
+            self.pose.heading += imu.gyro_yaw * dt as f32;
+            self.pose.timestamp = imu.timestamp;
+        }
+
+        // IMPORTANT: call recv() on each subscription every tick.
+        // Read motor state for forward motion
+        if let Some(motor) = self.motor_sub.recv() {
+            // Simple differential drive: motor velocity → forward motion
+            let speed = motor.velocity * 0.1; // Scale to m/s
+            self.pose.x += speed * self.pose.heading.cos() * dt as f32;
+            self.pose.y += speed * self.pose.heading.sin() * dt as f32;
+        }
+
+        self.pose_pub.send(self.pose);
+    }
+
+    // SAFETY: shutdown() logs the final estimated pose for post-run analysis.
+    fn shutdown(&mut self) -> Result<()> {
+        eprintln!(
+            "StateEstimator shutting down. Final pose: ({:.2}, {:.2}) heading={:.2} rad",
+            self.pose.x, self.pose.y, self.pose.heading
+        );
+        Ok(())
+    }
+}
+```
+
+This is a simplified state estimator — in production you'd use an Extended Kalman Filter (EKF). The point is showing how nodes compose: the estimator subscribes to TWO topics and publishes ONE.
+
+## Step 6: The Commander
+
+```rust
+struct Commander {
+    publisher: Topic<MotorCommand>,
+    tick_count: u64,
+}
+
+impl Commander {
+    fn new() -> Result<Self> {
+        Ok(Self { publisher: Topic::new("motor/cmd")?, tick_count: 0 })
+    }
+}
+
+impl Node for Commander {
+    fn name(&self) -> &str { "Commander" }
+
+    fn tick(&mut self) {
+        let t = self.tick_count as f64 * 0.1; // 10Hz
+        self.publisher.send(MotorCommand {
+            velocity: 1.0 * (t * 0.3).sin() as f32,
+            max_torque: 10.0,
+        });
+        self.tick_count += 1;
+    }
+
+    // SAFETY: shutdown() sends a zero-velocity command so the motor stops
+    // even if the motor controller's own shutdown() hasn't run yet.
+    fn shutdown(&mut self) -> Result<()> {
+        self.publisher.send(MotorCommand { velocity: 0.0, max_torque: 0.0 });
+        eprintln!("Commander shutting down, sent zero-velocity command.");
+        Ok(())
+    }
+}
+```
+
+## Step 7: Wire the Complete System
+
+Here's where it all comes together — **multi-rate scheduling**:
+
+```rust
+fn main() -> Result<()> {
+    eprintln!("Robot integration demo starting...\n");
+    eprintln!("Open another terminal and run: horus monitor\n");
+
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: ImuSensor (0) → Commander (1) → MotorController (2) → StateEstimator (3).
+    // Sensors and commanders publish before the controller and estimator consume.
+
+    // Sensor: fastest rate (100Hz) — reads first
+    scheduler.add(ImuSensor::new()?)
+        .order(0)
+        // NOTE: .rate(100.hz()) triggers auto-RT detection at finalize().
+        .rate(100.hz())
+        .build()?;
+
+    // Commander: slow rate (10Hz) — sends high-level commands
+    scheduler.add(Commander::new()?)
+        .order(1)
+        // NOTE: .rate(10.hz()) triggers auto-RT detection at finalize().
+        .rate(10.hz())
+        .build()?;
+
+    // Motor: medium rate (50Hz) — processes commands
+    scheduler.add(MotorController::new()?)
+        .order(2)
+        // NOTE: .rate(50.hz()) triggers auto-RT detection at finalize().
+        .rate(50.hz())
+        .build()?;
+
+    // Estimator: fast rate (100Hz) — fuses all data
+    scheduler.add(StateEstimator::new()?)
+        .order(3)
+        // NOTE: .rate(100.hz()) triggers auto-RT detection at finalize().
+        .rate(100.hz())
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+Notice how different nodes run at different rates:
+- **IMU at 100Hz** — sensors need high frequency for accuracy
+- **Commander at 10Hz** — high-level commands change slowly
+- **Motor at 50Hz** — actuators need moderate update rate
+- **Estimator at 100Hz** — matches the fastest sensor
+
+## Step 8: Run and Monitor
+
+```bash
+# Terminal 1: Run the robot
+horus run
+
+# Terminal 2: Open the monitor dashboard
+horus monitor
+```
+
+The monitor shows:
+- All active nodes and their tick rates
+- All topics with message counts and rates
+- System health (CPU, memory, deadline misses)
+
+Expected output from the robot:
+
+```
+Robot integration demo starting...
+
+Open another terminal and run: horus monitor
+```
+
+The system runs silently (the estimator publishes pose but nothing prints it). Use `horus topic echo robot/pose` in another terminal to see the pose data:
+
+```bash
+# Terminal 3: See the robot's estimated pose
+horus topic echo robot/pose
+```
+
+## What You Learned
+
+- **Multi-node composition** — 4 nodes working together
+- **Multi-rate scheduling** — different rates for different responsibilities
+- **Data fusion** — state estimator subscribes to multiple topics
+- **System monitoring** — `horus monitor` and `horus topic echo`
+- **Execution order** — sensors before controllers before estimators
+
+## What's Next
+
+You've built a complete robot system! Here's where to go deeper:
+
+- **[TransformFrame](/concepts/transform-frame)** — track coordinate frames between sensors and actuators
+- **[Real-Time Control](/tutorials/realtime-control)** — add `.budget()`, `.deadline()`, and `.on_miss()` for hard real-time
+- **[Deterministic Mode](/advanced/deterministic-mode)** — make your system fully reproducible
+- **[Deployment](/advanced/deployment)** — deploy to a real robot over SSH
+- **[Safety Monitor](/advanced/safety-monitor)** — add watchdog and graceful degradation
+
+## Complete Code
+
+The full `main.rs` for this tutorial is all the code above combined into one file. Each struct and impl block goes in order: types → ImuSensor → MotorController → StateEstimator → Commander → main().

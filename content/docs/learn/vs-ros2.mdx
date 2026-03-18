@@ -1,0 +1,257 @@
+---
+title: "HORUS vs ROS2: A Practical Comparison"
+description: "Detailed comparison of HORUS and ROS2 for robotics development — performance, architecture, developer experience, and when to use each. 575x faster IPC, deterministic scheduling, single-file config."
+order: 2
+---
+
+# HORUS vs ROS2
+
+This page compares HORUS and ROS2 for robotics development. Both are frameworks for building robot software — but they make fundamentally different architectural choices. This guide helps you decide which fits your project.
+
+> Already using ROS2? See [Coming from ROS2](/learn/coming-from-ros2) for a migration guide with side-by-side code examples.
+
+---
+
+## Quick Summary
+
+| Aspect | HORUS | ROS2 |
+|--------|-------|------|
+| **IPC Latency** | 87 ns (shared memory) | 50-100 &mu;s (DDS) |
+| **Speedup** | **575x faster** for small messages | Baseline |
+| **Architecture** | Tick-based, single-process | Callback-based, multi-process |
+| **Execution Order** | Deterministic (priority + order) | Non-deterministic (callback queue) |
+| **Real-Time** | Auto-detected from `.rate()` / `.budget()` | Manual DDS QoS configuration |
+| **Config Files** | 1 file (`horus.toml`) | 3+ files (package.xml, CMakeLists.txt, launch.py) |
+| **Languages** | Rust, Python | C++, Python |
+| **Ecosystem** | Growing (core framework + package registry) | Massive (thousands of packages, 15+ years) |
+| **Multi-Machine** | Not yet (single-machine focus) | Native (DDS network transport) |
+| **Visualization** | `horus monitor` (web + TUI) | RViz2, Foxglove, rqt |
+| **License** | Apache 2.0 | Apache 2.0 |
+
+---
+
+## Performance
+
+### Message Passing Latency
+
+HORUS uses shared memory directly. ROS2 uses DDS middleware (FastDDS, CycloneDDS) which adds serialization, discovery, and network stack overhead — even for same-machine communication.
+
+| Message Type | Size | HORUS | ROS2 (FastDDS) | Speedup |
+|---|---|---|---|---|
+| CmdVel | 16 B | ~85 ns | ~50 &mu;s | **588x** |
+| IMU | 304 B | ~400 ns | ~55 &mu;s | **138x** |
+| Odometry | 736 B | ~600 ns | ~60 &mu;s | **100x** |
+| LaserScan | 1.5 KB | ~900 ns | ~70 &mu;s | **78x** |
+| PointCloud (1K pts) | 12 KB | ~12 &mu;s | ~150 &mu;s | **13x** |
+| PointCloud (10K pts) | 120 KB | ~360 &mu;s | ~800 &mu;s | **2.2x** |
+
+The speedup is most dramatic for small, frequent messages (CmdVel, IMU) — exactly the messages that matter for tight control loops.
+
+### Throughput
+
+| Metric | HORUS | ROS2 |
+|---|---|---|
+| Small messages (16B) | 2.7M msg/s | ~20K msg/s |
+| IMU messages (304B) | 1.8M msg/s | ~18K msg/s |
+| Mixed workload | 1.5M msg/s | ~15K msg/s |
+
+### Real-Time Metrics
+
+| Metric | HORUS | ROS2 |
+|---|---|---|
+| Timing jitter | &plusmn;10 &mu;s | &plusmn;100-500 &mu;s |
+| WCET overhead | &lt;5 &mu;s per node | ~50-200 &mu;s per callback |
+| Deadline enforcement | Built-in (`.budget()`, `.deadline()`) | Manual (rmw QoS) |
+| Emergency stop | &lt;100 &mu;s | Application-dependent |
+
+---
+
+## Architecture
+
+### HORUS: Tick-Based, Deterministic
+
+```
+Scheduler runs one tick cycle:
+  → Node 0 (order=0, safety monitor)
+  → Node 1 (order=1, sensor reader)
+  → Node 2 (order=2, controller)
+  → Node 3 (order=3, actuator)
+  → repeat
+```
+
+Every tick executes nodes in a guaranteed order. Node 2 always sees Node 1's latest data. No race conditions, no callback scheduling surprises.
+
+### ROS2: Callback-Based, Event-Driven
+
+```
+Executor spins:
+  → timer callback fires (sensor)
+  → subscription callback fires (controller)
+  → timer callback fires (actuator)
+  → order depends on event timing
+```
+
+Callbacks fire when events arrive. Execution order depends on timing, message arrival, and executor implementation. Two runs of the same code may execute callbacks in different orders.
+
+### Why This Matters
+
+For a motor controller that reads IMU data and sends actuator commands:
+
+- **HORUS**: IMU node ticks first (order=0), controller ticks second (order=1), actuator ticks third (order=2). Every cycle, guaranteed.
+- **ROS2**: IMU callback might fire before or after the controller callback. Under load, callbacks can be delayed or reordered.
+
+For safety-critical systems (surgical robots, industrial cobots), deterministic execution order is not optional.
+
+---
+
+## Developer Experience
+
+### Project Setup
+
+**HORUS** (1 file):
+```toml
+# horus.toml — single source of truth
+[package]
+name = "my-robot"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+nalgebra = "0.32"
+```
+
+**ROS2** (3+ files):
+```xml
+<!-- package.xml -->
+<package format="3">
+  <name>my_robot</name>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+</package>
+```
+```cmake
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.8)
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+```
+```python
+# launch/robot.launch.py
+from launch import LaunchDescription
+from launch_ros.actions import Node
+```
+
+### Node Definition
+
+**HORUS** (Rust):
+```rust
+struct MotorController {
+    commands: Topic<f32>,
+}
+
+impl Node for MotorController {
+    fn tick(&mut self) {
+        if let Some(cmd) = self.commands.recv() {
+            set_motor_velocity(cmd);
+        }
+    }
+}
+```
+
+**ROS2** (C++):
+```cpp
+class MotorController : public rclcpp::Node {
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_;
+  void callback(std_msgs::msg::Float32::SharedPtr msg) {
+    set_motor_velocity(msg->data);
+  }
+public:
+  MotorController() : Node("motor_controller") {
+    sub_ = create_subscription<std_msgs::msg::Float32>(
+      "commands", 10,
+      std::bind(&MotorController::callback, this, std::placeholders::_1)
+    );
+  }
+};
+```
+
+HORUS: 10 lines. ROS2: 15 lines + shared pointers + bind + QoS depth parameter.
+
+### CLI
+
+| Task | HORUS | ROS2 |
+|---|---|---|
+| Create project | `horus new my_robot` | `ros2 pkg create my_robot` + edit CMakeLists.txt |
+| Build | `horus build` | `colcon build` |
+| Run | `horus run` | `ros2 run my_robot my_node` |
+| List topics | `horus topic list` | `ros2 topic list` |
+| Echo topic | `horus topic echo velocity` | `ros2 topic echo /velocity` |
+| Monitor | `horus monitor` | `rqt` (separate install) |
+| Add dependency | `horus add serde` | Edit package.xml + CMakeLists.txt + rosdep install |
+
+---
+
+## When to Use HORUS
+
+**Choose HORUS when:**
+- You need sub-microsecond IPC latency (control loops &gt;100Hz)
+- Deterministic execution order matters (safety-critical systems)
+- You want a single-file project config
+- Your robot runs on a single machine
+- You prefer Rust's safety guarantees
+- You want integrated monitoring and CLI tooling
+- You're starting a new project (no ROS2 migration debt)
+
+**Choose ROS2 when:**
+- You need multi-machine communication (distributed robots, fleet management)
+- You need RViz2 for 3D visualization
+- You depend on specific ROS2 packages (MoveIt2, Nav2, SLAM Toolbox)
+- Your team already knows ROS2
+- You need the larger ecosystem (drivers, integrations, community support)
+- You need enterprise support options
+
+**Use both:**
+- HORUS for real-time control on the robot (sensors, actuators, safety)
+- ROS2 for high-level planning, visualization, fleet management on separate machines
+
+---
+
+## Feature Comparison
+
+| Feature | HORUS | ROS2 |
+|---|---|---|
+| **Pub/Sub Topics** | Yes (shared memory) | Yes (DDS) |
+| **Services (RPC)** | Beta | Yes |
+| **Actions (long-running)** | Beta | Yes |
+| **Parameters** | Yes (RuntimeParams) | Yes (Parameter Server) |
+| **Transform Frames** | Yes (TransformFrame) | Yes (tf2) |
+| **Recording/Replay** | Yes (Record/Replay) | Yes (rosbag2) |
+| **Monitoring** | Yes (web + TUI) | rqt, Foxglove (separate) |
+| **Launch System** | YAML launch files | Python/XML/YAML launch |
+| **Package Manager** | Yes (horus registry) | Yes (rosdep, bloom) |
+| **Deterministic Mode** | Yes (SimClock) | Partial (use_sim_time) |
+| **Safety Monitor** | Built-in (watchdog, degradation) | Application-level |
+| **Deadline Enforcement** | Built-in (`.budget()`, `.deadline()`) | Manual (rmw QoS) |
+| **Multi-Machine** | Not yet | Yes (DDS discovery) |
+| **3D Visualization** | Not yet | RViz2 |
+| **Simulation** | horus-sim3d (Bevy + Rapier) | Gazebo, Isaac Sim |
+| **Message IDL** | Rust structs (#[derive(Copy)]) | .msg/.srv/.action files |
+
+---
+
+## Migration Path
+
+HORUS and ROS2 can coexist. Common migration strategies:
+
+1. **Start new subsystems in HORUS** — Keep existing ROS2 for high-level, add HORUS for real-time control
+2. **Bridge approach** — Run a ROS2 bridge node that translates between DDS topics and HORUS topics
+3. **Full migration** — Replace ROS2 nodes one-by-one with HORUS equivalents
+
+See [Coming from ROS2](/learn/coming-from-ros2) for detailed migration guidance with side-by-side code examples.
+
+---
+
+## Summary
+
+HORUS is **faster, simpler, and more deterministic** for single-machine robotics. ROS2 has a **larger ecosystem and multi-machine networking**. The right choice depends on your specific requirements — many production robots benefit from using both.

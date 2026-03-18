@@ -25,6 +25,8 @@ let topic = Topic::<LaserScan>::with_capacity("scan", 8, 4096);
 | `Topic::<T>::new(name)` | `Topic<T>` | Create with default capacity and slot size |
 | `Topic::<T>::with_capacity(name, capacity, slot_size)` | `Topic<T>` | Create with explicit capacity and slot size |
 
+> Most users only need `Topic::new(name)`. Use `with_capacity` only if you need to tune buffer sizes for very large or very small messages.
+
 The `name` string identifies the shared-memory channel. Two `Topic` instances with the same name and type connect automatically — one publishes, the other subscribes. Backend selection (in-process ring buffer vs cross-process SHM) is automatic based on whether publisher and subscriber live in the same process.
 
 ---
@@ -81,12 +83,13 @@ match topic.send_blocking(CmdVel { linear: 1.0, angular: 0.0 }, 10_u64.ms()) {
 ```rust
 let topic = Topic::<Imu>::new("imu");
 
+// IMPORTANT: call recv() every tick to drain the buffer and avoid stale data accumulation
 // Process all pending messages
 while let Some(msg) = topic.recv() {
     println!("Accel: ({}, {}, {})", msg.linear_accel.x, msg.linear_accel.y, msg.linear_accel.z);
 }
 
-// Or just get the latest reading
+// NOTE: read_latest() requires T: Copy — skips older messages and returns only the newest
 if let Some(latest) = topic.read_latest() {
     println!("Latest orientation: {:?}", latest.orientation);
 }
@@ -101,7 +104,7 @@ if let Some(latest) = topic.read_latest() {
 | `name()` | `&str` | The topic name |
 | `has_message()` | `bool` | Whether there is at least one unread message |
 | `pending_count()` | `usize` | Number of unread messages in the buffer |
-| `dropped_count()` | `u64` | Total messages dropped due to full buffer |
+| `dropped_count()` | `u64` | Total failed send attempts (includes buffer-full overwrites) |
 | `metrics()` | `TopicMetrics` | Aggregate send/receive statistics |
 
 ### TopicMetrics
@@ -153,7 +156,7 @@ match topic.try_send(image) {
     Err(img) => { /* buffer full */ }
 }
 
-// Receive
+// IMPORTANT: call recv() every tick to drain the buffer — images are large and stale frames waste pool slots
 if let Some(img) = topic.recv() {
     println!("{}x{} image received", img.width(), img.height());
 }
@@ -166,6 +169,7 @@ let topic = Topic::<PointCloud>::new("lidar/points");
 
 topic.send(cloud);
 
+// IMPORTANT: call recv() every tick to avoid stale point clouds filling the pool
 if let Some(cloud) = topic.recv() {
     println!("{} points received", cloud.len());
 }
@@ -178,6 +182,7 @@ let topic = Topic::<DepthImage>::new("camera/depth");
 
 topic.send(depth);
 
+// IMPORTANT: call recv() every tick to drain depth frames
 if let Some(depth) = topic.recv() {
     println!("{}x{} depth image", depth.width(), depth.height());
 }
@@ -193,12 +198,127 @@ let topic = Topic::<Tensor>::new("model/output");
 // Send and receive work the same as any other topic type
 topic.send(tensor);
 
+// IMPORTANT: call recv() every tick to avoid stale tensor data in the pool
 if let Some(t) = topic.recv() {
     println!("Tensor shape: {:?}", t.shape());
 }
 ```
 
 For most use cases, prefer the domain types above (`Image`, `PointCloud`, `DepthImage`) — they provide convenience methods like `pixel()`, `point_at()`, and `get_depth()` while using the same zero-copy path internally.
+
+---
+
+## Detailed Method Reference
+
+---
+
+### new
+
+```rust
+pub fn new(name: &str) -> Topic<T>
+```
+
+Create a topic with default capacity and slot size.
+
+**Parameters:**
+- `name: &str` — Topic identifier. Two `Topic` instances with the same name and matching type `T` connect automatically. Names are case-sensitive. Use `/`-delimited hierarchical names: `"sensors/lidar/scan"`.
+
+**Returns:** `Topic<T>` connected to the named shared memory channel.
+
+**Defaults:**
+- Capacity: 4 slots (ring buffer)
+- Slot size: `size_of::<T>()` rounded up to page alignment
+
+**Backend auto-selection:** If publisher and subscriber are in the same process, uses an in-process ring buffer (no SHM overhead). Cross-process uses SHM.
+
+**Example:**
+```rust
+let pub_topic = Topic::<CmdVel>::new("cmd_vel");
+let sub_topic = Topic::<CmdVel>::new("cmd_vel"); // connects to same channel
+```
+
+---
+
+### send
+
+```rust
+pub fn send(&self, msg: T)
+```
+
+Publish a message. **Non-blocking. Overwrites oldest if buffer is full.**
+
+**Parameters:**
+- `msg: T` — The message to publish. Moved into the ring buffer.
+
+**Buffer full behavior:** If all slots are occupied, the oldest unread message is silently overwritten. No error is returned. Use `dropped_count()` to detect this.
+
+**When to use:** Default for most real-time robotics — you always want the latest data, and blocking is unacceptable in a control loop.
+
+**Example:**
+```rust
+topic.send(CmdVel::new(1.0, 0.0));
+
+// Check if messages were dropped
+if topic.dropped_count() > 0 {
+    hlog!(warn, "{} messages dropped — subscriber too slow", topic.dropped_count());
+}
+```
+
+---
+
+### recv
+
+```rust
+pub fn recv(&self) -> Option<T>
+```
+
+Take the next unread message in FIFO order.
+
+**Returns:**
+- `Some(T)` — The oldest unread message (removed from buffer)
+- `None` — No unread messages available
+
+**Important:** Call `recv()` every tick in your node to drain the buffer. Failing to drain causes stale data accumulation and eventually message drops.
+
+**Delivery guarantee:** Each message is delivered to each subscriber exactly once. After `recv()` returns it, the message is consumed.
+
+**Example:**
+```rust
+// Process ALL pending messages each tick
+while let Some(scan) = self.scan_topic.recv() {
+    self.process(scan);
+}
+```
+
+---
+
+### read_latest
+
+```rust
+pub fn read_latest(&self) -> Option<T>
+where T: Copy
+```
+
+Read the most recent message, skipping all older ones.
+
+**Returns:**
+- `Some(T)` — Copy of the newest message
+- `None` — No messages available
+
+**Type constraint:** Requires `T: Copy` because it reads without consuming — multiple calls return the same value until a new message arrives.
+
+**When to use:** State-like data where you only care about the current value: poses, sensor readings, configuration. NOT for command streams where every message matters.
+
+**Example:**
+```rust
+// Good: pose is state — only the latest matters
+if let Some(pose) = self.odom_topic.read_latest() {
+    self.current_position = pose;
+}
+
+// Bad: cmd_vel is a command — you'd miss intermediate commands
+// Use recv() instead for command streams
+```
 
 ---
 
@@ -227,6 +347,7 @@ impl Node for LidarProcessor {
     fn name(&self) -> &str { "LidarProcessor" }
 
     fn tick(&mut self) {
+        // IMPORTANT: call recv() every tick to drain the scan buffer
         if let Some(scan) = self.scan_in.recv() {
             // Find closest obstacle
             let min_range = scan.ranges.iter()
@@ -234,16 +355,23 @@ impl Node for LidarProcessor {
                 .filter(|r| *r > scan.range_min && *r < scan.range_max)
                 .fold(f32::MAX, f32::min);
 
-            // Stop if too close
+            // SAFETY: send zero velocity when obstacle is too close
             let speed = if min_range < 0.5 { 0.0 } else { 1.0 };
             self.cmd_out.send(CmdVel { linear: speed, angular: 0.0 });
         }
+    }
+
+    // SAFETY: stop sending velocity commands on shutdown
+    fn shutdown(&mut self) -> Result<()> {
+        self.cmd_out.send(CmdVel { linear: 0.0, angular: 0.0 });
+        Ok(())
     }
 }
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
     scheduler.add(LidarProcessor::new())
+        // NOTE: .rate() auto-enables RT scheduling with 80% budget and 95% deadline
         .rate(50.hz())
         .build()?;
     scheduler.run()

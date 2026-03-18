@@ -1,0 +1,177 @@
+---
+title: "Recipe: PID Controller"
+description: "Generic PID control loop with configurable gains, anti-windup, and derivative filtering."
+order: 4
+---
+
+## PID Controller
+
+A reusable PID controller node that reads a setpoint and measured value, then publishes a control output. Includes integral anti-windup and derivative low-pass filtering.
+
+### horus.toml
+
+```toml
+[package]
+name = "pid-controller"
+version = "0.1.0"
+description = "Generic PID with anti-windup and derivative filtering"
+```
+
+### Complete Code
+
+```rust
+use horus::prelude::*;
+
+/// Setpoint command: what we want
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct Setpoint {
+    target: f32,
+}
+
+/// Measured feedback: what we have
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct Measurement {
+    value: f32,
+}
+
+/// PID output: what to do
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct ControlOutput {
+    command: f32,
+    error: f32,
+    p_term: f32,
+    i_term: f32,
+    d_term: f32,
+}
+
+// ── PID Node ────────────────────────────────────────────────
+
+struct PidNode {
+    setpoint_sub: Topic<Setpoint>,
+    measurement_sub: Topic<Measurement>,
+    output_pub: Topic<ControlOutput>,
+    // PID gains
+    kp: f32,
+    ki: f32,
+    kd: f32,
+    // State
+    integral: f32,
+    prev_error: f32,
+    prev_derivative: f32,
+    // Limits
+    output_min: f32,
+    output_max: f32,
+    integral_max: f32,
+    // Derivative filter coefficient (0.0 = no filter, 0.9 = heavy filter)
+    alpha: f32,
+    // Cached inputs
+    target: f32,
+    measured: f32,
+}
+
+impl PidNode {
+    fn new(kp: f32, ki: f32, kd: f32) -> Result<Self> {
+        Ok(Self {
+            setpoint_sub: Topic::new("pid.setpoint")?,
+            measurement_sub: Topic::new("pid.measurement")?,
+            output_pub: Topic::new("pid.output")?,
+            kp, ki, kd,
+            integral: 0.0,
+            prev_error: 0.0,
+            prev_derivative: 0.0,
+            output_min: -1.0,
+            output_max: 1.0,
+            integral_max: 0.5,   // anti-windup limit
+            alpha: 0.8,          // derivative low-pass filter
+            target: 0.0,
+            measured: 0.0,
+        })
+    }
+}
+
+impl Node for PidNode {
+    fn name(&self) -> &str { "PID" }
+
+    fn tick(&mut self) {
+        // IMPORTANT: always recv() every tick to drain buffers
+        if let Some(sp) = self.setpoint_sub.recv() {
+            self.target = sp.target;
+        }
+        if let Some(m) = self.measurement_sub.recv() {
+            self.measured = m.value;
+        }
+
+        let dt = 1.0 / 200.0; // 200Hz control rate
+        let error = self.target - self.measured;
+
+        // P term
+        let p_term = self.kp * error;
+
+        // I term with anti-windup clamping
+        self.integral += error * dt;
+        self.integral = self.integral.clamp(-self.integral_max, self.integral_max);
+        let i_term = self.ki * self.integral;
+
+        // D term with low-pass filter to reduce noise
+        let raw_derivative = (error - self.prev_error) / dt;
+        let filtered = self.alpha * self.prev_derivative + (1.0 - self.alpha) * raw_derivative;
+        let d_term = self.kd * filtered;
+        self.prev_derivative = filtered;
+        self.prev_error = error;
+
+        // Total output with saturation
+        let command = (p_term + i_term + d_term).clamp(self.output_min, self.output_max);
+
+        self.output_pub.send(ControlOutput {
+            command,
+            error,
+            p_term,
+            i_term,
+            d_term,
+        });
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // SAFETY: zero the control output on shutdown
+        self.output_pub.send(ControlOutput::default());
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // PID gains: tune for your plant
+    // Execution order: PID reads setpoint + measurement, publishes output
+    scheduler.add(PidNode::new(2.0, 0.5, 0.1)?)
+        .order(0)
+        .rate(200_u64.hz())       // 200Hz control loop — auto-enables RT
+        .budget(400.us())         // 400μs budget (tight for control)
+        .on_miss(Miss::Warn)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 200 Hz
+[HORUS] Node "PID" started (Rt, 200 Hz, budget: 400μs, deadline: 4.75ms)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "PID" shutdown complete
+```
+
+### Key Points
+
+- **Anti-windup**: Integral term is clamped to `integral_max` — prevents windup during saturation
+- **Derivative filter**: Low-pass filter (alpha=0.8) smooths noisy sensor feedback
+- **`ControlOutput` includes debug fields** (`error`, `p_term`, `i_term`, `d_term`) for tuning
+- **`shutdown()` zeros output** — prevents actuator from holding last command
+- **200Hz is typical** for position/velocity PID; use 1kHz+ for current/torque loops
+- **Gains (kp, ki, kd)** are constructor parameters — wire from config or topic for online tuning

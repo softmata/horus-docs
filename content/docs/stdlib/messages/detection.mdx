@@ -1,0 +1,151 @@
+---
+title: "Detection & Detection3D"
+description: "ML object detection results for 2D bounding boxes and 3D oriented bounding boxes"
+order: 5
+---
+
+# Detection & Detection3D
+
+Fixed-size object detection messages for zero-copy IPC. `Detection` holds a 2D bounding box result from models like YOLO or SSD. `Detection3D` holds a 3D oriented bounding box from point cloud detectors or depth-aware models. Both are fixed-size types — transferred via zero-copy shared memory (72 and 104 bytes respectively).
+
+## When to Use
+
+Use `Detection` when your robot runs a 2D object detection model on camera images and needs to publish results to downstream nodes (tracking, planning, visualization). Use `Detection3D` when you have 3D detections from LiDAR-based or depth-aware models.
+
+## ROS2 Equivalent
+
+- `Detection` maps to `vision_msgs/Detection2D`
+- `Detection3D` maps to `vision_msgs/Detection3D`
+
+## Rust Example
+
+```rust
+use horus::prelude::*;
+
+// 2D detection from YOLO
+let det = Detection::new("person", 0.92, 100.0, 50.0, 200.0, 400.0);
+//                       class     conf  x      y      width   height
+
+// Check confidence threshold
+if det.is_confident(0.5) {
+    println!("Found {} at ({}, {})", det.class_name(), det.bbox.x, det.bbox.y);
+}
+
+// 3D detection from point cloud
+let bbox3d = BoundingBox3D::new(5.0, 2.0, 0.5, 4.5, 2.0, 1.5, 0.1);
+//                              cx   cy   cz   len  wid  hgt  yaw
+let det3d = Detection3D::new("car", 0.88, bbox3d)
+    .with_velocity(10.0, 5.0, 0.0);
+
+// Publish detections
+let topic: Topic<Detection> = Topic::new("detections.2d")?;
+topic.send(&det);
+```
+
+## Python Example
+
+```python
+from horus import Detection, Topic
+
+# Create a detection
+det = Detection("person", 0.92, 100.0, 50.0, 200.0, 400.0)
+#               class    conf  x      y      width   height
+
+# Access properties
+print(f"Class: {det.class_name}, Confidence: {det.confidence}")
+print(f"BBox: ({det.bbox.x}, {det.bbox.y}, {det.bbox.width}, {det.bbox.height})")
+print(f"Area: {det.bbox.area}")
+
+# Confidence filtering
+if det.is_confident(0.5):
+    topic = Topic(Detection)
+    topic.send(det)
+```
+
+## Detection Fields
+
+| Field | Type | Unit | Size | Description |
+|-------|------|------|------|-------------|
+| `bbox` | `BoundingBox2D` | px | 16 B | Bounding box `(x, y, width, height)` |
+| `confidence` | `f32` | 0--1 | 4 B | Detection confidence |
+| `class_id` | `u32` | -- | 4 B | Numeric class identifier |
+| `class_name` | `[u8; 32]` | -- | 32 B | UTF-8 class label, null-padded (max 31 chars) |
+| `instance_id` | `u32` | -- | 4 B | Instance ID for instance segmentation |
+
+**Total size: 72 bytes (fixed-size, zero-copy)**
+
+## Detection Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new(name, conf, x, y, w, h)` | `(&str, f32, f32, f32, f32, f32) -> Self` | Create with class name and bounding box |
+| `with_class_id(id, conf, bbox)` | `(u32, f32, BoundingBox2D) -> Self` | Create with numeric class ID |
+| `class_name()` | `-> &str` | Get class name as string |
+| `set_class_name(name)` | `(&str) -> ()` | Set class name (truncates to 31 chars) |
+| `is_confident(threshold)` | `(f32) -> bool` | True if confidence >= threshold |
+
+## BoundingBox2D Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new(x, y, w, h)` | `(f32, f32, f32, f32) -> Self` | Create from top-left corner |
+| `from_center(cx, cy, w, h)` | `(f32, f32, f32, f32) -> Self` | Create from center (YOLO format) |
+| `center_x()`, `center_y()` | `-> f32` | Center coordinates |
+| `area()` | `-> f32` | Box area in pixels |
+| `iou(other)` | `(&BoundingBox2D) -> f32` | Intersection over Union |
+
+## Detection3D Fields
+
+| Field | Type | Unit | Size | Description |
+|-------|------|------|------|-------------|
+| `bbox` | `BoundingBox3D` | m, rad | 48 B | 3D box: center, dimensions, rotation (roll/pitch/yaw) |
+| `confidence` | `f32` | 0--1 | 4 B | Detection confidence |
+| `class_id` | `u32` | -- | 4 B | Numeric class identifier |
+| `class_name` | `[u8; 32]` | -- | 32 B | UTF-8 class label |
+| `velocity_x/y/z` | `f32` | m/s | 12 B | Object velocity (for tracking-enabled detectors) |
+| `instance_id` | `u32` | -- | 4 B | Tracking/instance ID |
+
+**Total size: 104 bytes (fixed-size, zero-copy)**
+
+## Common Patterns
+
+**Camera-to-tracking pipeline:**
+
+```
+Camera --> Image --> YOLO model --> Detection --> tracker --> TrackedObject
+                                              \-> filter by confidence
+                                              \-> filter by class
+```
+
+**Confidence filtering pattern:**
+
+```rust
+use horus::prelude::*;
+
+fn filter_detections(detections: &[Detection], min_conf: f32) -> Vec<&Detection> {
+    detections.iter()
+        .filter(|d| d.is_confident(min_conf))
+        .collect()
+}
+```
+
+**NMS (Non-Maximum Suppression):**
+
+```rust
+use horus::prelude::*;
+
+fn nms(dets: &mut Vec<Detection>, iou_threshold: f32) {
+    dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    let mut keep = vec![true; dets.len()];
+    for i in 0..dets.len() {
+        if !keep[i] { continue; }
+        for j in (i + 1)..dets.len() {
+            if keep[j] && dets[i].bbox.iou(&dets[j].bbox) > iou_threshold {
+                keep[j] = false;
+            }
+        }
+    }
+    let mut idx = 0;
+    dets.retain(|_| { let k = keep[idx]; idx += 1; k });
+}
+```

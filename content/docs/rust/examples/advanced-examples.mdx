@@ -367,25 +367,18 @@ mkdir nodes
 **nodes/sensor.py:**
 ```python
 #!/usr/bin/env python3
-from horus import Node, Topic, Scheduler
+import horus
 import random
 
-class SensorNode(Node):
-    def __init__(self):
-        super().__init__("SensorNode")
+def sensor_tick(node):
+    # Generate realistic temperature with noise
+    temperature = 20.0 + random.random() * 10.0
+    node.send("temperature", temperature)
+    print(f"Sensor: {temperature:.1f}°C")
 
-    def init(self):
-        self.temp_pub = Topic("temperature")
-
-    def tick(self):
-        # Generate realistic temperature with noise
-        temperature = 20.0 + random.random() * 10.0
-        self.temp_pub.send(temperature)
-        print(f"Sensor: {temperature:.1f}°C")
-
-scheduler = Scheduler()
-scheduler.node(SensorNode()).order(0).rate(2).build()
-scheduler.run()
+sensor = horus.Node(name="SensorNode", tick=sensor_tick, order=0, rate=2,
+                    pubs=["temperature"])
+horus.run(sensor)
 ```
 
 ### Controller Node
@@ -393,30 +386,23 @@ scheduler.run()
 **nodes/controller.py:**
 ```python
 #!/usr/bin/env python3
-from horus import Node, Topic, Scheduler
+import horus
 
-class ControllerNode(Node):
-    def __init__(self):
-        super().__init__("ControllerNode")
+def controller_tick(node):
+    temp = node.recv("temperature")
+    if temp is not None:
+        if temp > 25.0:
+            fan_speed = min(100, int((temp - 20) * 10))
+            node.send("fan_control", fan_speed)
+            print(f"Controller: Fan at {fan_speed}%")
+        else:
+            node.send("fan_control", 0)
+            print(f"Controller: Temperature normal, fan off")
 
-    def init(self):
-        self.temp_sub = Topic("temperature")
-        self.fan_pub = Topic("fan_control")
-
-    def tick(self):
-        temp = self.temp_sub.recv()
-        if temp is not None:
-            if temp > 25.0:
-                fan_speed = min(100, int((temp - 20) * 10))
-                self.fan_pub.send(fan_speed)
-                print(f"Controller: Fan at {fan_speed}%")
-            else:
-                self.fan_pub.send(0)
-                print(f"Controller: Temperature normal, fan off")
-
-scheduler = Scheduler()
-scheduler.node(ControllerNode()).order(1).rate(2).build()
-scheduler.run()
+controller = horus.Node(name="ControllerNode", tick=controller_tick,
+                        order=1, rate=2,
+                        subs=["temperature"], pubs=["fan_control"])
+horus.run(controller)
 ```
 
 ### Logger Node
@@ -424,28 +410,20 @@ scheduler.run()
 **nodes/logger.py:**
 ```python
 #!/usr/bin/env python3
-from horus import Node, Topic, Scheduler
+import horus
 import datetime
 
-class LoggerNode(Node):
-    def __init__(self):
-        super().__init__("LoggerNode")
+def logger_tick(node):
+    temp = node.recv("temperature")
+    fan = node.recv("fan_control")
+    if temp is not None and fan is not None:
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        status = "COOLING" if fan > 0 else "NORMAL"
+        print(f"Logger [{timestamp}]: {temp:.1f}°C | Fan {fan}% | {status}")
 
-    def init(self):
-        self.temp_sub = Topic("temperature")
-        self.fan_sub = Topic("fan_control")
-
-    def tick(self):
-        temp = self.temp_sub.recv()
-        fan = self.fan_sub.recv()
-        if temp is not None and fan is not None:
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            status = "COOLING" if fan > 0 else "NORMAL"
-            print(f"Logger [{timestamp}]: {temp:.1f}°C | Fan {fan}% | {status}")
-
-scheduler = Scheduler()
-scheduler.node(LoggerNode()).order(2).rate(1).build()
-scheduler.run()
+logger = horus.Node(name="LoggerNode", tick=logger_tick, order=2, rate=1,
+                    subs=["temperature", "fan_control"])
+horus.run(logger)
 ```
 
 ### Run All Nodes Concurrently
@@ -484,7 +462,7 @@ All processes running. Press Ctrl+C to stop.
 
 **Key Features**:
 - **Independent Processes**: Each node runs in its own process
-- **Shared Memory IPC**: Nodes communicate via HORUS topics (`/dev/shm/horus/`)
+- **Shared Memory IPC**: Nodes communicate via HORUS shared memory topics
 - **Color-Coded Output**: Each node has a unique color
 - **Graceful Shutdown**: Ctrl+C stops all processes cleanly
 - **Zero Configuration**: No launch files needed
@@ -551,28 +529,21 @@ fn main() -> Result<()> {
 **nodes/py_controller.py:**
 ```python
 #!/usr/bin/env python3
-from horus import Node, Topic, Scheduler
+import horus
 
-class PyController(Node):
-    def __init__(self):
-        super().__init__("PyController")
+def py_controller_tick(node):
+    temp = node.recv("temperature")
+    if temp is not None:
+        status = "HOT" if temp > 22.0 else "NORMAL"
+        print(f"Python controller: {temp:.2f}°C - {status}")
 
-    def init(self):
-        self.temp_sub = Topic("temperature")
-        self.cmd_pub = Topic("actuator_cmd")
+        command = 1.0 if temp > 22.0 else 0.0
+        node.send("actuator_cmd", command)
 
-    def tick(self):
-        temp = self.temp_sub.recv()
-        if temp is not None:
-            status = "HOT" if temp > 22.0 else "NORMAL"
-            print(f"Python controller: {temp:.2f}°C - {status}")
-
-            command = 1.0 if temp > 22.0 else 0.0
-            self.cmd_pub.send(command)
-
-scheduler = Scheduler()
-scheduler.node(PyController()).order(0).rate(10).build()
-scheduler.run()
+controller = horus.Node(name="PyController", tick=py_controller_tick,
+                        order=0, rate=10,
+                        subs=["temperature"], pubs=["actuator_cmd"])
+horus.run(controller)
 ```
 
 ### Rust Actuator Node
@@ -635,68 +606,49 @@ Per-node rates, timestamp checking, and staleness detection.
 
 ```python
 #!/usr/bin/env python3
-from horus import Node, Topic, Scheduler, Imu
-import time
+import horus
+from horus import Imu
 
-class HighFreqSensor(Node):
-    """100Hz IMU sensor"""
-    def __init__(self):
-        super().__init__("HighFreqSensor")
+# 100Hz IMU sensor
+def imu_tick(node):
+    imu = Imu(
+        accel_x=1.0, accel_y=0.0, accel_z=9.8,
+        gyro_x=0.0, gyro_y=0.0, gyro_z=0.0
+    )
+    node.send("imu", imu)
 
-    def init(self):
-        self.imu_pub = Topic(Imu)
+# 50Hz controller
+def controller_tick(node):
+    imu = node.recv("imu")
+    if imu is not None:
+        # Process IMU data
+        accel_magnitude = (
+            imu.accel_x**2 +
+            imu.accel_y**2 +
+            imu.accel_z**2
+        ) ** 0.5
 
-    def tick(self):
-        imu = Imu(
-            accel_x=1.0, accel_y=0.0, accel_z=9.8,
-            gyro_x=0.0, gyro_y=0.0, gyro_z=0.0
-        )
-        self.imu_pub.send(imu)
+        print(f"Control: IMU magnitude = {accel_magnitude:.2f} m/s²")
 
-class Controller(Node):
-    """50Hz controller"""
-    def __init__(self):
-        super().__init__("Controller")
+        # Send command
+        cmd = {"linear": 1.0, "angular": 0.5}
+        node.send("cmd_vel", cmd)
 
-    def init(self):
-        self.imu_sub = Topic(Imu)
-        self.cmd_pub = Topic("cmd_vel")
+# 10Hz logger
+def logger_tick(node):
+    msg = node.recv("cmd_vel")
+    if msg is not None:
+        print(f"Logger: Received command: {msg}")
 
-    def tick(self):
-        imu = self.imu_sub.recv()
-        if imu is not None:
-            # Process IMU data
-            accel_magnitude = (
-                imu.accel_x**2 +
-                imu.accel_y**2 +
-                imu.accel_z**2
-            ) ** 0.5
+# Create nodes with per-node rates and run
+sensor = horus.Node(name="HighFreqSensor", tick=imu_tick, order=0, rate=100,
+                    pubs=["imu"])
+ctrl = horus.Node(name="Controller", tick=controller_tick, order=1, rate=50,
+                  subs=["imu"], pubs=["cmd_vel"])
+logger = horus.Node(name="Logger", tick=logger_tick, order=2, rate=10,
+                    subs=["cmd_vel"])
 
-            print(f"Control: IMU magnitude = {accel_magnitude:.2f} m/s²")
-
-            # Send command
-            cmd = {"linear": 1.0, "angular": 0.5}
-            self.cmd_pub.send(cmd)
-
-class Logger(Node):
-    """10Hz logger"""
-    def __init__(self):
-        super().__init__("Logger")
-
-    def init(self):
-        self.cmd_sub = Topic("cmd_vel")
-
-    def tick(self):
-        msg = self.cmd_sub.recv()
-        if msg is not None:
-            print(f"Logger: Received command: {msg}")
-
-# Create scheduler with per-node rates
-scheduler = Scheduler()
-scheduler.node(HighFreqSensor()).order(0).rate(100).build()
-scheduler.node(Controller()).order(1).rate(50).build()
-scheduler.node(Logger()).order(2).rate(10).build()
-scheduler.run()
+horus.run(sensor, ctrl, logger)
 ```
 
 **Run it**:
@@ -768,47 +720,35 @@ horus run main.rs
 
 ```python
 #!/usr/bin/env python3
-from horus import Node, Topic, Scheduler
+import horus
 
-class MockSensor(Node):
-    def __init__(self):
-        super().__init__("MockSensor")
+# Shared test state
+fan_commands = []
 
-    def init(self):
-        self.temp_pub = Topic("temperature")
+def mock_sensor_tick(node):
+    node.send("temperature", 30.0)  # Hot!
 
-    def tick(self):
-        self.temp_pub.send(30.0)  # Hot!
+def test_controller_tick(node):
+    temp = node.recv("temperature")
+    if temp is not None and temp > 25.0:
+        fan_speed = min(100, int((temp - 20) * 10))
+        fan_commands.append(fan_speed)
+        node.send("fan_control", fan_speed)
 
-class TestController(Node):
-    def __init__(self):
-        super().__init__("TestController")
-        self.fan_commands = []
-
-    def init(self):
-        self.temp_sub = Topic("temperature")
-        self.fan_pub = Topic("fan_control")
-
-    def tick(self):
-        temp = self.temp_sub.recv()
-        if temp is not None and temp > 25.0:
-            fan_speed = min(100, int((temp - 20) * 10))
-            self.fan_commands.append(fan_speed)
-            self.fan_pub.send(fan_speed)
-
-# Run test
-scheduler = Scheduler()
-sensor = MockSensor()
-controller = TestController()
-scheduler.node(sensor).order(0).build()
-scheduler.node(controller).order(1).build()
+sensor = horus.Node(name="MockSensor", tick=mock_sensor_tick,
+                    pubs=["temperature"])
+controller = horus.Node(name="TestController", tick=test_controller_tick,
+                        subs=["temperature"], pubs=["fan_control"])
 
 # Use tick_once for testing (runs one tick cycle)
+scheduler = horus.Scheduler()
+scheduler.add(sensor)
+scheduler.add(controller)
 scheduler.tick_once()
 
 # Verify
-assert len(controller.fan_commands) > 0, "Controller should have sent fan commands"
-assert controller.fan_commands[0] == 100, f"Expected fan at 100%, got {controller.fan_commands[0]}%"
+assert len(fan_commands) > 0, "Controller should have sent fan commands"
+assert fan_commands[0] == 100, f"Expected fan at 100%, got {fan_commands[0]}%"
 print("Test passed!")
 ```
 

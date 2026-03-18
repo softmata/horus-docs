@@ -1,0 +1,135 @@
+---
+title: "Recipe: LiDAR Obstacle Avoidance"
+description: "Reactive obstacle avoidance using LaserScan data to generate safe velocity commands."
+order: 5
+---
+
+## LiDAR Obstacle Avoidance
+
+Reads `LaserScan` data from a 2D LiDAR, identifies obstacles in three zones (left, center, right), and publishes reactive `CmdVel` commands to avoid collisions. Stops if an obstacle is too close.
+
+### horus.toml
+
+```toml
+[package]
+name = "lidar-avoidance"
+version = "0.1.0"
+description = "Reactive obstacle avoidance from LaserScan"
+```
+
+### Complete Code
+
+```rust
+use horus::prelude::*;
+
+/// Safety zones (meters)
+const STOP_DISTANCE: f32 = 0.3;    // emergency stop
+const SLOW_DISTANCE: f32 = 0.8;    // reduce speed
+const CRUISE_SPEED: f32 = 0.5;     // m/s forward
+const TURN_SPEED: f32 = 0.8;       // rad/s turning
+
+// ── Avoidance Node ──────────────────────────────────────────
+
+struct AvoidanceNode {
+    scan_sub: Topic<LaserScan>,
+    cmd_pub: Topic<CmdVel>,
+}
+
+impl AvoidanceNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan_sub: Topic::new("lidar.scan")?,
+            cmd_pub: Topic::new("cmd_vel")?,
+        })
+    }
+
+    /// Find minimum range in a slice of the scan
+    fn min_range(ranges: &[f32], start: usize, end: usize) -> f32 {
+        ranges[start..end]
+            .iter()
+            .copied()
+            .filter(|r| r.is_finite() && *r > 0.01)
+            .fold(f32::MAX, f32::min)
+    }
+}
+
+impl Node for AvoidanceNode {
+    fn name(&self) -> &str { "Avoidance" }
+
+    fn tick(&mut self) {
+        // IMPORTANT: always recv() every tick to drain the buffer
+        let scan = match self.scan_sub.recv() {
+            Some(s) => s,
+            None => return, // no data yet — skip this tick
+        };
+
+        let n = scan.ranges.len();
+        if n == 0 { return; }
+
+        // Split scan into three zones: left (0..n/3), center (n/3..2n/3), right (2n/3..n)
+        let third = n / 3;
+        let left_min = Self::min_range(&scan.ranges, 0, third);
+        let center_min = Self::min_range(&scan.ranges, third, 2 * third);
+        let right_min = Self::min_range(&scan.ranges, 2 * third, n);
+
+        // Reactive behavior
+        let cmd = if center_min < STOP_DISTANCE {
+            // WARNING: obstacle dead ahead — emergency stop
+            CmdVel { linear: 0.0, angular: 0.0 }
+        } else if center_min < SLOW_DISTANCE {
+            // Obstacle ahead — turn toward the more open side
+            let angular = if left_min > right_min { TURN_SPEED } else { -TURN_SPEED };
+            CmdVel { linear: 0.1, angular }
+        } else if left_min < SLOW_DISTANCE {
+            // Obstacle on left — veer right
+            CmdVel { linear: CRUISE_SPEED * 0.7, angular: -TURN_SPEED * 0.5 }
+        } else if right_min < SLOW_DISTANCE {
+            // Obstacle on right — veer left
+            CmdVel { linear: CRUISE_SPEED * 0.7, angular: TURN_SPEED * 0.5 }
+        } else {
+            // Clear — cruise forward
+            CmdVel { linear: CRUISE_SPEED, angular: 0.0 }
+        };
+
+        self.cmd_pub.send(cmd);
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // SAFETY: stop the robot on exit
+        self.cmd_pub.send(CmdVel { linear: 0.0, angular: 0.0 });
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: reads lidar scan, publishes velocity
+    scheduler.add(AvoidanceNode::new()?)
+        .order(0)
+        .rate(20_u64.hz())     // 20Hz — match typical LiDAR rate
+        .on_miss(Miss::Warn)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 20 Hz
+[HORUS] Node "Avoidance" started (Rt, 20 Hz, budget: 40.0ms, deadline: 47.5ms)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "Avoidance" shutdown complete
+```
+
+### Key Points
+
+- **Three-zone split** (left/center/right) is the simplest reactive architecture — extend to N zones for smoother behavior
+- **`min_range()` filters** invalid readings (`NaN`, `Inf`, near-zero) before comparison
+- **`STOP_DISTANCE`** is the hard safety limit — tune to your robot's stopping distance at cruise speed
+- **`shutdown()` sends zero velocity** — robot stops even if killed mid-avoidance-maneuver
+- **20Hz matches most 2D LiDARs** (RPLiDAR A1/A2, Hokuyo URG) — no benefit running faster than sensor
+- **Pair with differential-drive recipe** — this publishes `cmd_vel`, the drive recipe subscribes to it

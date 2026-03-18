@@ -1,0 +1,283 @@
+---
+title: "Multi-Process Architecture"
+description: "Run HORUS nodes across separate processes — shared memory auto-discovery, mixed languages, process isolation"
+order: 14
+---
+
+# Multi-Process Architecture
+
+HORUS topics work transparently across process boundaries. Two nodes in separate processes communicate the same way as two nodes in the same process — through shared memory. No broker, no serialization layer, no configuration.
+
+```rust
+// Process 1: sensor.rs
+let topic: Topic<Imu> = Topic::new("imu")?;
+topic.send(imu_reading);
+
+// Process 2: controller.rs
+let topic: Topic<Imu> = Topic::new("imu")?;  // same name = same topic
+if let Some(reading) = topic.recv() {
+    // Got it — zero-config, sub-microsecond
+}
+```
+
+---
+
+## How It Works
+
+When you call `Topic::new("imu")`, HORUS creates (or opens) a shared memory region. Any process on the same machine that calls `Topic::new("imu")` with the same type connects to the same underlying ring buffer. The shared memory backend is managed by `horus_sys` — you never configure paths manually.
+
+HORUS auto-detects whether a topic is same-process or cross-process and picks the fastest backend:
+
+| Backend | Latency | When Used |
+|---------|---------|-----------|
+| DirectChannel | ~3ns | Same thread |
+| SpscIntra | ~18ns | Same process, 1 publisher, 1 subscriber |
+| SpmcIntra | ~24ns | Same process, 1 publisher, many subscribers |
+| MpscIntra | ~26ns | Same process, many publishers, 1 subscriber |
+| MpmcIntra | ~36ns | Same process, many publishers, many subscribers |
+| PodShm | ~50ns | **Cross-process**, POD type (zero-copy) |
+| MpscShm | ~65ns | **Cross-process**, many publishers, 1 subscriber |
+| SpmcShm | ~70ns | **Cross-process**, 1 publisher, many subscribers |
+| SpscShm | ~85ns | **Cross-process**, 1 pub, 1 sub, non-POD |
+| MpmcShm | ~167ns | **Cross-process**, many pubs, many subs |
+
+Cross-process adds ~30-130ns vs intra-process — still sub-microsecond. You don't configure any of this. The detection is automatic.
+
+---
+
+## Running Multiple Processes
+
+### Option 1: `horus run` with Multiple Files
+
+```bash
+# Builds and runs both files as separate processes
+horus run sensor.rs controller.rs
+
+# Mixed languages work too
+horus run sensor.py controller.rs
+
+# With release optimizations
+horus run -r sensor.rs controller.rs
+```
+
+`horus run` compiles each file, then launches all processes and manages their lifecycle (SIGTERM on Ctrl+C, etc.).
+
+### Option 2: Separate Terminals
+
+Run each node in its own terminal:
+
+```bash
+# Terminal 1
+horus run sensor.rs
+
+# Terminal 2
+horus run controller.rs
+```
+
+Topics auto-discover via shared memory. No coordination needed.
+
+### Option 3: `horus launch` (YAML)
+
+For production, declare your multi-process layout in a launch file:
+
+```yaml
+# launch.yaml
+nodes:
+  - name: sensor
+    cmd: horus run sensor.rs
+
+  - name: controller
+    cmd: horus run controller.rs
+
+  - name: monitor
+    cmd: horus run monitor.py
+```
+
+```bash
+horus launch launch.yaml
+```
+
+---
+
+## Example: Two-Process Sensor Pipeline
+
+**Process 1** — `sensor.rs`:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    WheelEncoder {
+        left_ticks: i64,
+        right_ticks: i64,
+        timestamp_ns: u64,
+    }
+}
+
+struct EncoderNode {
+    publisher: Topic<WheelEncoder>,
+    ticks: i64,
+}
+
+impl EncoderNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            publisher: Topic::new("wheel.encoders")?,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for EncoderNode {
+    fn name(&self) -> &str { "Encoder" }
+
+    fn tick(&mut self) {
+        self.ticks += 10;
+        self.publisher.send(WheelEncoder {
+            left_ticks: self.ticks,
+            right_ticks: self.ticks + 2,
+            timestamp_ns: horus::now_ns(),
+        });
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz());
+    sched.add(EncoderNode::new()?).order(0).build()?;
+    sched.run()?;
+    Ok(())
+}
+```
+
+**Process 2** — `odometry.rs`:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    WheelEncoder {
+        left_ticks: i64,
+        right_ticks: i64,
+        timestamp_ns: u64,
+    }
+}
+
+struct OdometryNode {
+    encoder_sub: Topic<WheelEncoder>,
+    odom_pub: Topic<Odometry>,
+    last_left: i64,
+    last_right: i64,
+}
+
+impl OdometryNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            encoder_sub: Topic::new("wheel.encoders")?,
+            odom_pub: Topic::new("odom")?,
+            last_left: 0,
+            last_right: 0,
+        })
+    }
+}
+
+impl Node for OdometryNode {
+    fn name(&self) -> &str { "Odometry" }
+
+    fn tick(&mut self) {
+        if let Some(enc) = self.encoder_sub.recv() {
+            let dl = enc.left_ticks - self.last_left;
+            let dr = enc.right_ticks - self.last_right;
+            self.last_left = enc.left_ticks;
+            self.last_right = enc.right_ticks;
+
+            println!("[Odom] delta L={} R={}", dl, dr);
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz());
+    sched.add(OdometryNode::new()?).order(0).build()?;
+    sched.run()?;
+    Ok(())
+}
+```
+
+Run them:
+
+```bash
+# Terminal 1
+horus run sensor.rs
+
+# Terminal 2
+horus run odometry.rs
+```
+
+The `WheelEncoder` messages flow through shared memory at ~50ns latency, with zero configuration.
+
+---
+
+## When to Use Multi-Process
+
+| Factor | Single Process | Multi-Process |
+|--------|----------------|---------------|
+| **Latency** | ~3-36ns (intra-process) | ~50-167ns (cross-process) |
+| **Determinism** | Full control via scheduler ordering | Each process has its own scheduler |
+| **Isolation** | A crash takes down everything | A crash is contained to one process |
+| **Languages** | Single language per binary | Mix Rust + Python freely |
+| **Restart** | Must restart everything | Restart one process independently |
+| **Debugging** | Single debugger session | Attach debugger to one process |
+| **Deployment** | One binary to deploy | Multiple binaries |
+| **Complexity** | Simpler | More moving parts |
+
+**Use single-process when:**
+- All nodes are the same language
+- You need deterministic ordering between nodes (e.g., sensor &rarr; controller &rarr; actuator)
+- Latency matters at the nanosecond level
+- Simpler deployment is preferred
+
+**Use multi-process when:**
+- Mixing Rust and Python (e.g., Rust motor control + Python ML inference)
+- Process isolation is needed (safety-critical separation)
+- Independent restart required (update one node without stopping others)
+- Different update rates or lifecycle requirements
+
+---
+
+## Introspection
+
+HORUS CLI tools work across processes automatically:
+
+```bash
+# See all topics (from any process)
+horus topic list
+
+# Monitor a topic published by another process
+horus topic echo wheel.encoders
+
+# See all running nodes across processes
+horus node list
+
+# Check bandwidth across processes
+horus topic bw wheel.encoders
+```
+
+---
+
+## Cleaning Up
+
+Shared memory files persist after processes exit. Clean them with:
+
+```bash
+horus clean --shm    # Remove stale shared memory regions
+```
+
+Or they are automatically cleaned on the next `horus run`.
+
+---
+
+## See Also
+
+- [Topics (Full Reference)](/concepts/core-concepts-topic) — topic API and backend details
+- [Message Performance](/concepts/core-concepts-podtopic) — POD types and zero-copy transport
+- [Multi-Language](/concepts/multi-language) — Rust + Python interop patterns

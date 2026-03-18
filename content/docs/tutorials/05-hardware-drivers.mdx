@@ -1,0 +1,326 @@
+---
+title: "Tutorial 5: Hardware Drivers"
+description: "Connect your robot's hardware — configure drivers in horus.toml, load them, and use them in nodes"
+order: 50
+---
+
+# Tutorial 5: Hardware Drivers
+
+Every robot needs to talk to hardware — servos, LiDARs, cameras, IMUs. HORUS separates *what hardware you have* (config) from *how you use it* (code). This tutorial walks through the complete workflow.
+
+**Prerequisites:** [Tutorial 1](/tutorials/01-sensor-node) completed.
+
+**What you'll learn:**
+- Configure drivers in `horus.toml`
+- Load hardware with `drivers::load()`
+- Use `DriverHandle` and `DriverParams` in nodes
+- Register custom drivers with `register_driver!`
+- Test without hardware using `drivers::load_from()`
+
+**Time:** 20 minutes
+
+---
+
+## Step 1: Configure Drivers in horus.toml
+
+Add a `[drivers]` section to your `horus.toml`. Each driver has a name and a source (`terra`, `package`, or `node`):
+
+```toml
+[package]
+name = "my-robot"
+version = "0.1.0"
+language = "rust"
+
+[drivers.arm]
+terra = "dynamixel"
+port = "/dev/ttyUSB0"
+baudrate = 1000000
+servo_ids = [1, 2, 3, 4, 5]
+
+[drivers.lidar]
+terra = "rplidar"
+port = "/dev/ttyUSB1"
+baudrate = 256000
+
+[drivers.imu]
+terra = "i2c"
+bus = 1
+address = 104
+
+[drivers.force_sensor]
+package = "horus-driver-ati-netft"
+address = "192.168.1.100"
+
+[drivers.conveyor]
+node = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+Three driver sources:
+
+| Key | Source | Example |
+|-----|--------|---------|
+| `terra = "..."` | Terra HAL driver (Dynamixel, RPLidar, I2C, etc.) | `terra = "dynamixel"` |
+| `package = "..."` | Registry package (installed via `horus add`) | `package = "horus-driver-ati-netft"` |
+| `node = "..."` | Local code (registered with `register_driver!`) | `node = "ConveyorDriver"` |
+
+All other keys in the table become typed parameters accessible via `DriverParams`.
+
+---
+
+## Step 2: Load Drivers
+
+In your code, call `drivers::load()` to parse the `[drivers]` section and get a `HardwareSet`:
+
+```rust
+use horus::prelude::*;
+use horus::drivers;
+
+fn main() -> Result<()> {
+    // Loads from horus.toml (searches current dir and parents)
+    let mut hw = drivers::load()?;
+
+    // See what's configured
+    println!("Drivers: {:?}", hw.list());
+    // → ["arm", "conveyor", "force_sensor", "imu", "lidar"]
+
+    Ok(())
+}
+```
+
+---
+
+## Step 3: Get Driver Handles
+
+Use typed accessors to get handles for Terra drivers:
+
+```rust
+use horus::prelude::*;
+use horus::drivers;
+
+fn main() -> Result<()> {
+    let mut hw = drivers::load()?;
+
+    // Typed Terra accessors — validates the driver source matches
+    let arm = hw.dynamixel("arm")?;
+    let lidar = hw.rplidar("lidar")?;
+    let imu = hw.i2c("imu")?;
+
+    // Access config params from the handle
+    let port: String = arm.params().get("port")?;
+    let baud: u32 = arm.params().get("baudrate")?;
+    let ids: Vec<u8> = arm.params().get("servo_ids")?;
+
+    println!("Arm on {} @ {} baud, servos: {:?}", port, baud, ids);
+
+    Ok(())
+}
+```
+
+Available typed accessors:
+
+| Accessor | Hardware |
+|----------|----------|
+| `hw.dynamixel(name)` | Dynamixel servo bus |
+| `hw.rplidar(name)` | RPLidar scanner |
+| `hw.realsense(name)` | Intel RealSense camera |
+| `hw.i2c(name)` | I2C device |
+| `hw.serial(name)` | Serial/UART port |
+| `hw.can(name)` | CAN bus |
+| `hw.gpio(name)` | GPIO pin |
+| `hw.pwm(name)` | PWM output |
+| `hw.webcam(name)` | V4L2 camera |
+| `hw.input(name)` | Gamepad/input device |
+| `hw.bluetooth(name)` | Bluetooth LE device |
+| `hw.net(name)` | Network device (TCP/UDP) |
+| `hw.ethercat(name)` | EtherCAT bus |
+| `hw.raw(name)` | Any driver (escape hatch) |
+
+---
+
+## Step 4: Use Handles in Nodes
+
+Pass the `DriverHandle` to your node and read params in the constructor:
+
+```rust
+use horus::prelude::*;
+use horus::drivers::{self, DriverHandle};
+
+struct ArmController {
+    servo_ids: Vec<u8>,
+    port: String,
+    cmd_topic: Topic<JointCommand>,
+    tick_count: u32,
+}
+
+impl ArmController {
+    fn new(handle: DriverHandle) -> Result<Self> {
+        let servo_ids: Vec<u8> = handle.params().get("servo_ids")?;
+        let port: String = handle.params().get("port")?;
+
+        println!("ArmController: {} servos on {}", servo_ids.len(), port);
+
+        Ok(Self {
+            servo_ids,
+            port,
+            cmd_topic: Topic::new("arm.command")?,
+            tick_count: 0,
+        })
+    }
+}
+
+impl Node for ArmController {
+    fn name(&self) -> &str { "ArmController" }
+
+    fn tick(&mut self) {
+        self.tick_count += 1;
+
+        // In a real driver, you'd read/write hardware here
+        // using the port and servo_ids from config
+        if let Some(cmd) = self.cmd_topic.recv() {
+            println!("[Arm] Moving {} servos to target positions", self.servo_ids.len());
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut hw = drivers::load()?;
+    let arm_handle = hw.dynamixel("arm")?;
+
+    let mut scheduler = Scheduler::new().tick_rate(100_u64.hz());
+    scheduler.add(ArmController::new(arm_handle)?)
+        .order(0)
+        .rate(500_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+---
+
+## Step 5: Custom Drivers with register_driver!
+
+For local code drivers (the `node = "..."` source), register your type so `HardwareSet::local()` can instantiate it from config:
+
+```rust
+use horus::prelude::*;
+use horus::drivers::DriverParams;
+use horus::register_driver;
+
+struct ConveyorDriver {
+    port: String,
+    speed: f64,
+    publisher: Topic<CmdVel>,
+}
+
+impl ConveyorDriver {
+    fn from_params(params: &DriverParams) -> Result<Self> {
+        let port: String = params.get("port")?;
+        let speed: f64 = params.get_or("speed", 1.0);
+
+        Ok(Self {
+            port,
+            speed,
+            publisher: Topic::new("conveyor.velocity")?,
+        })
+    }
+}
+
+impl Node for ConveyorDriver {
+    fn name(&self) -> &str { "ConveyorDriver" }
+
+    fn tick(&mut self) {
+        // Drive the conveyor at configured speed
+        self.publisher.send(CmdVel::new(self.speed as f32, 0.0));
+    }
+}
+
+// Register so [drivers.conveyor] node = "ConveyorDriver" works
+register_driver!(ConveyorDriver, ConveyorDriver::from_params);
+```
+
+Then in `main.rs`:
+
+```rust
+fn main() -> Result<()> {
+    let mut hw = drivers::load()?;
+
+    // local() looks up "ConveyorDriver" in the registry
+    // and calls from_params() with the config params
+    let conveyor_node = hw.local("conveyor")?;
+
+    let mut scheduler = Scheduler::new().tick_rate(50_u64.hz());
+    // local() returns Box<dyn Node> — no extra wrapping needed
+    scheduler.add(conveyor_node).order(0).build()?;
+
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+The corresponding config:
+
+```toml
+[drivers.conveyor]
+node = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+---
+
+## Step 6: Testing Without Hardware
+
+Use `drivers::load_from()` to load from a test config file instead of the project's `horus.toml`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horus::drivers;
+
+    #[test]
+    fn arm_controller_from_config() {
+        // Create a test config
+        std::fs::write("test_drivers.toml", r#"
+            [drivers.arm]
+            terra = "dynamixel"
+            port = "/dev/null"
+            baudrate = 1000000
+            servo_ids = [1, 2, 3]
+        "#).unwrap();
+
+        let mut hw = drivers::load_from("test_drivers.toml").unwrap();
+        let handle = hw.dynamixel("arm").unwrap();
+        let controller = ArmController::new(handle).unwrap();
+
+        assert_eq!(controller.servo_ids, vec![1, 2, 3]);
+
+        std::fs::remove_file("test_drivers.toml").ok();
+    }
+}
+```
+
+### DriverParams API Quick Reference
+
+| Method | Returns | Use |
+|--------|---------|-----|
+| `params.get::&lt;T&gt;(key)` | `Result&lt;T&gt;` | Required param (errors if missing) |
+| `params.get_or(key, default)` | `T` | Optional param with fallback |
+| `params.has(key)` | `bool` | Check if key exists |
+| `params.keys()` | `Iterator&lt;&amp;str&gt;` | List all param names |
+| `params.raw(key)` | `Option&lt;&amp;toml::Value&gt;` | Raw TOML value |
+
+Supported types for `get::&lt;T&gt;`: `String`, `bool`, `i32`, `i64`, `u8`, `u32`, `u64`, `f32`, `f64`, `Vec&lt;T&gt;`.
+
+---
+
+## Next Steps
+
+- [Driver API Reference](/rust/api/drivers) — full API documentation
+- [Real-Time Control](/tutorials/realtime-control) — scheduling drivers with RT guarantees
+- [Deployment](/operations) — deploying driver configs to a robot

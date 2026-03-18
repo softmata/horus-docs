@@ -1,0 +1,157 @@
+---
+title: "Recipe: Emergency Stop"
+description: "Safety-critical E-stop monitor that forces all actuators to safe state when triggered."
+order: 8
+---
+
+## Emergency Stop
+
+Monitors an E-stop signal (hardware button, software watchdog, or remote command). When triggered, publishes a zero-velocity command and enters safe state. Uses `Miss::SafeMode` — if the E-stop node itself misses a deadline, the scheduler forces safe state automatically.
+
+### horus.toml
+
+```toml
+[package]
+name = "emergency-stop"
+version = "0.1.0"
+description = "E-stop monitor with safety state handling"
+```
+
+### Complete Code
+
+```rust
+use horus::prelude::*;
+
+/// E-stop trigger from hardware or software
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct EStopSignal {
+    triggered: u8,   // 0 = clear, 1 = triggered (u8 for repr(C) compat)
+    source: u8,      // 0 = hardware, 1 = software, 2 = remote
+}
+
+/// Status published by the E-stop monitor
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct SafetyStatus {
+    estop_active: u8,
+    consecutive_clears: u32,
+    uptime_ticks: u64,
+}
+
+// ── E-Stop Monitor ──────────────────────────────────────────
+
+struct EStopNode {
+    estop_sub: Topic<EStopSignal>,
+    cmd_pub: Topic<CmdVel>,
+    status_pub: Topic<SafetyStatus>,
+    estop_active: bool,
+    consecutive_clears: u32,
+    ticks: u64,
+}
+
+impl EStopNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            estop_sub: Topic::new("safety.estop")?,
+            cmd_pub: Topic::new("cmd_vel")?,
+            status_pub: Topic::new("safety.status")?,
+            estop_active: false,
+            consecutive_clears: 0,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for EStopNode {
+    fn name(&self) -> &str { "EStop" }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+
+        // IMPORTANT: always recv() every tick
+        if let Some(signal) = self.estop_sub.recv() {
+            if signal.triggered != 0 {
+                // SAFETY: immediately stop all motion
+                self.estop_active = true;
+                self.consecutive_clears = 0;
+            } else {
+                self.consecutive_clears += 1;
+            }
+        } else {
+            // WARNING: no signal received — treat as potential fault
+            // In safety-critical systems, loss of heartbeat = stop
+            self.consecutive_clears = 0;
+        }
+
+        // Require N consecutive clear signals before releasing E-stop
+        const CLEAR_THRESHOLD: u32 = 50; // 50 ticks at 100Hz = 0.5 seconds
+        if self.estop_active && self.consecutive_clears >= CLEAR_THRESHOLD {
+            self.estop_active = false;
+        }
+
+        if self.estop_active {
+            // SAFETY: override cmd_vel with zero — stops all motion
+            self.cmd_pub.send(CmdVel { linear: 0.0, angular: 0.0 });
+        }
+
+        self.status_pub.send(SafetyStatus {
+            estop_active: self.estop_active as u8,
+            consecutive_clears: self.consecutive_clears,
+            uptime_ticks: self.ticks,
+        });
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // SAFETY: zero velocity on shutdown
+        self.cmd_pub.send(CmdVel { linear: 0.0, angular: 0.0 });
+        Ok(())
+    }
+
+    fn enter_safe_state(&mut self) {
+        // Called by scheduler if this node misses its deadline
+        self.estop_active = true;
+        self.cmd_pub.send(CmdVel { linear: 0.0, angular: 0.0 });
+    }
+
+    fn is_safe_state(&self) -> bool {
+        self.estop_active
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: E-stop runs LAST — overrides any cmd_vel from other nodes
+    scheduler.add(EStopNode::new()?)
+        .order(100)                // high order = runs after drive/planner nodes
+        .rate(100_u64.hz())        // 100Hz safety monitoring — auto-enables RT
+        .budget(200.us())          // tight budget for safety-critical code
+        .deadline(500.us())        // tight deadline
+        .on_miss(Miss::SafeMode)   // CRITICAL: if this node misses, force safe state
+        .max_deadline_misses(0)    // zero tolerance for misses
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 100 Hz
+[HORUS] Node "EStop" started (Rt, 100 Hz, budget: 200μs, deadline: 500μs)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "EStop" shutdown complete
+```
+
+### Key Points
+
+- **`enter_safe_state()`** is called by the scheduler if this node misses its deadline — the robot stops automatically
+- **`Miss::SafeMode`** is the strictest miss policy — any deadline overrun triggers safe state
+- **`max_deadline_misses(0)`** means zero tolerance — first miss triggers degradation
+- **High `.order(100)`** ensures E-stop runs AFTER drive/planning nodes — it overrides their `cmd_vel`
+- **Debounce with `CLEAR_THRESHOLD`** prevents flickering E-stop from bouncing
+- **No signal = fault** — if the E-stop topic stops publishing, treat it as triggered (fail-safe)
+- **200μs budget** is generous for this simple node — keeps safety checks deterministic

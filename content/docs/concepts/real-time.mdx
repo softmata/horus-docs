@@ -1,0 +1,200 @@
+---
+title: "Real-Time Systems"
+description: "What real-time means for robotics, why it matters, and how Horus handles it"
+order: 2
+---
+
+# Real-Time Systems
+
+## Key Takeaways
+
+After reading this guide, you will understand:
+- What "real-time" actually means (predictable, not fast)
+- Why robots need real-time guarantees for safety and stability
+- The difference between hard, soft, and firm real-time
+- Where Horus fits in the real-time stack
+- Which Horus features give you real-time behavior
+- When you do NOT need real-time at all
+
+## What is Real-Time?
+
+Real-time does not mean "fast." It means **predictable**.
+
+A real-time system guarantees that work finishes within a **bounded time**, every single time. A 10ms deadline means every tick must complete in 10ms — not just the average, not 99% of them, but *every one*.
+
+```
+Regular system:  "Process this as fast as you can"
+Real-time system: "Process this, and you MUST finish within 10ms"
+```
+
+A regular program that finishes in 1ms on average but occasionally takes 500ms is **faster** than a real-time program that always takes 9ms. But the real-time program is **more reliable** — and for robots, reliability beats speed.
+
+## Why Robots Need Real-Time
+
+Three things break when timing is unpredictable:
+
+**Motor control loops.** A controller sends velocity commands at 100Hz. If one command arrives 50ms late, the motor runs at the old speed for 5x too long. The result: overshoot, oscillation, or a robot arm slamming into a table.
+
+**Sensor fusion.** An IMU reports acceleration at 200Hz. If the fusion algorithm processes a sample late, it integrates stale data and the pose estimate drifts. Late by 10ms at 1m/s means 1cm of position error — per missed sample.
+
+**Safety systems.** A watchdog must detect a frozen node and trigger a stop within a bounded time. If the watchdog itself is delayed by a garbage collection pause, the robot keeps moving when it should have stopped.
+
+## Hard vs Soft vs Firm Real-Time
+
+| Type | If you miss a deadline... | Example |
+|------|--------------------------|---------|
+| **Hard** | System failure. People get hurt. | Pacemaker, ABS brakes, airbag |
+| **Firm** | Result is worthless, but system survives | Sensor fusion with stale data, dropped video frame |
+| **Soft** | Quality degrades gracefully | Video streaming, audio playback |
+
+**Horus is a soft real-time framework.** It runs in Linux userspace, so it cannot make hard real-time guarantees — the kernel can always preempt you. But it provides the tools to get consistent, low-latency execution that is good enough for most robotics applications.
+
+For hard real-time (sub-microsecond PWM, current loops, safety-critical interlocks), you need firmware or an RTOS running on a dedicated microcontroller.
+
+## Where Horus Fits
+
+```
+┌─────────────────────────────────────────────┐
+│  Application Layer                          │
+│  Planning, behavior trees, mission logic    │
+│  Timing: 1-10 Hz, best-effort              │
+├─────────────────────────────────────────────┤
+│  Horus (soft RT, Linux userspace)           │
+│  Perception, control loops, sensor fusion   │
+│  Timing: 50-1000 Hz, ms-level deadlines     │
+├─────────────────────────────────────────────┤
+│  Firmware / RTOS (hard RT)                  │
+│  PWM generation, current loops, IMU sampling│
+│  Timing: 1-50 kHz, μs-level deadlines       │
+├─────────────────────────────────────────────┤
+│  Hardware                                   │
+│  Motors, sensors, encoders, batteries       │
+└─────────────────────────────────────────────┘
+```
+
+Horus sits in the middle. It is fast enough to close control loops at hundreds of Hz, but it delegates microsecond-level work to firmware. This is the right tradeoff for most robots — you get the full power of Linux (networking, file I/O, ML inference) while still meeting timing constraints.
+
+## Horus RT Features
+
+Horus gives you six tools for real-time behavior. You can use as many or as few as you need.
+
+### Auto-derived timing from `.rate()`
+
+Set a tick rate and Horus calculates safe defaults:
+
+```rust
+scheduler.add(controller)
+    .rate(100.hz())  // 10ms period → 8ms budget (80%), 9.5ms deadline (95%)
+    .build()?;
+```
+
+This is the easiest way to get RT behavior. See [Scheduler](/concepts/core-concepts-scheduler) for details.
+
+### Explicit `.budget()` and `.deadline()`
+
+For fine-grained control, set them directly:
+
+```rust
+scheduler.add(controller)
+    .rate(100.hz())
+    .budget(5.ms())      // Must finish compute in 5ms
+    .deadline(8.ms())    // Must complete full cycle in 8ms
+    .build()?;
+```
+
+If you set `.budget()` without `.deadline()`, the deadline is automatically set equal to the budget — your budget IS your hard deadline:
+
+```rust
+scheduler.add(controller)
+    .budget(500.us())         // budget=500μs, deadline=500μs (auto-derived)
+    .on_miss(Miss::Stop)      // Fires when tick exceeds 500μs
+    .build()?;
+```
+
+### `.on_miss()` — Deadline miss handling
+
+Tell Horus what to do when a tick takes too long:
+
+```rust
+use horus::prelude::*;
+
+scheduler.add(controller)
+    .rate(100.hz())
+    .on_miss(Miss::Warn)     // Log a warning (default)
+    .on_miss(Miss::Skip)     // Drop this tick, move on
+    .on_miss(Miss::SafeMode) // Enter safe state
+    .on_miss(Miss::Stop)     // Shut down the scheduler
+    .build()?;
+```
+
+### `.prefer_rt()` — OS-level scheduling
+
+Requests `SCHED_FIFO` from the Linux kernel, giving your process priority over all normal processes:
+
+```rust
+let mut scheduler = Scheduler::new();
+scheduler.prefer_rt();  // Request SCHED_FIFO (needs root or CAP_SYS_NICE)
+```
+
+### `.cores()` — CPU pinning
+
+Pin a node to specific CPU cores for cache locality and reduced jitter:
+
+```rust
+scheduler.add(controller)
+    .rate(100.hz())
+    .cores(&[2, 3])  // Run only on cores 2 and 3
+    .build()?;
+```
+
+### Watchdog — Frozen node detection
+
+The scheduler's watchdog detects nodes that stop responding and triggers graduated degradation (warn, reduce rate, isolate, safe state):
+
+```rust
+let mut scheduler = Scheduler::new();
+scheduler.watchdog(500.ms());        // Fire if any node is silent for 500ms
+scheduler.max_deadline_misses(3);    // Enter safe mode after 3 consecutive misses
+```
+
+## When You Do NOT Need Real-Time
+
+Not every node needs RT. Using it where you do not need it wastes CPU and adds complexity.
+
+**Prototyping.** Just get it working first. Add timing constraints later.
+
+**Simulation.** Simulated time does not care about wall-clock deadlines.
+
+**Logging and recording.** A blackbox recorder can buffer and flush at its own pace.
+
+**Visualization.** Rendering at 30fps does not need deadline enforcement.
+
+**Planning and decision-making.** A path planner that runs at 1Hz is fine as best-effort.
+
+For these, use `.compute()` (CPU-heavy work without deadlines) or just the default `BestEffort`:
+
+```rust
+// No RT needed — just run when there's time
+scheduler.add(logger).build()?;
+
+// CPU-heavy but no deadline
+scheduler.add(path_planner).compute().build()?;
+```
+
+## Quick Reference
+
+| Your node does... | Use this | Why |
+|---|---|---|
+| Motor control at 100Hz+ | `.rate(100.hz())` | Auto-derives budget and deadline |
+| Sensor fusion with strict timing | `.rate(200.hz()).budget(3.ms())` | Explicit budget for tight loops |
+| Safety-critical stop logic | `.rate(100.hz()).on_miss(Miss::SafeMode)` | Degrades safely on overrun |
+| ML inference (variable latency) | `.compute()` | No deadline — just use available CPU |
+| Event-driven message handling | `.on("topic_name")` | Runs only when data arrives |
+| Background logging | default (no config) | BestEffort is fine |
+| Visualization / UI | default or `.rate(30.hz())` | Low rate, no deadline needed |
+
+## Next Steps
+
+- [Choosing Your Configuration](/concepts/choosing-configuration) — Practical guide to picking the right settings
+- [Scheduler](/concepts/core-concepts-scheduler) — Full scheduler API reference
+- [Nodes](/concepts/core-concepts-nodes) — Node trait and lifecycle

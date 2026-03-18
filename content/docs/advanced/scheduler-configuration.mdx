@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 | Method | Description | Default |
 |--------|-------------|---------|
 | `.tick_rate(freq)` | Global scheduler tick rate | `100 Hz` |
-| `.deterministic(bool)` | Deterministic mode — SimClock, dependency ordering, seeded RNG. See [Deterministic Mode](/docs/advanced/deterministic-mode) | `false` |
+| `.deterministic(bool)` | Deterministic mode — SimClock, dependency ordering, seeded RNG. See [Deterministic Mode](/advanced/deterministic-mode) | `false` |
 | `.watchdog(Duration)` | Frozen node detection — auto-creates safety monitor | disabled |
 | `.blackbox(size_mb)` | BlackBox flight recorder (n MB ring buffer) | disabled |
 | `.max_deadline_misses(n)` | Emergency stop after n deadline misses | `100` |
@@ -109,6 +109,13 @@ If no execution class is specified, the node defaults to **BestEffort**. A node 
 - **`.on(topic)`** — Collision detection, event handlers, reactive behaviors. Only runs when there is new data, saving CPU when idle.
 - **`.async_io()`** — Telemetry upload, log shipping, cloud API calls. Never blocks any real-time or compute work.
 
+**What each class means for your robot:**
+- **RT** — Your motor controller sends PWM commands every millisecond. Missing one cycle causes the motor to overshoot. This node needs a dedicated RT thread.
+- **Compute** — Your SLAM algorithm takes 50ms to process a lidar scan. If it runs on the RT thread, the motor controller misses 50 deadlines. Compute nodes run on a separate thread pool.
+- **Event** — Your collision detector only needs to run when new lidar data arrives, not every cycle. Event nodes sleep until their topic gets a message.
+- **AsyncIo** — Your telemetry node uploads data to a cloud server. Network calls can take seconds. AsyncIo nodes run on a tokio thread pool so they never block anything.
+- **BestEffort** — Your debug logger. Runs on the main thread when there's time, no timing guarantees.
+
 ## Per-Node Configuration
 
 ### Ordering and Timing
@@ -155,7 +162,7 @@ scheduler.add(Logger::new())
 | Method | Description |
 |--------|-------------|
 | `.failure_policy(policy)` | Per-node failure handling (see [Fault Tolerance](/advanced/circuit-breaker)) |
-| `.build()` | Finalize and register the node (returns `HorusResult`) |
+| `.build()` | Finalize and register the node (returns `Result`) |
 
 ### Order Guidelines
 
@@ -198,57 +205,44 @@ let mut scheduler = Scheduler::new()
 
 ## Python API
 
-The Python API mirrors the Rust fluent builder:
+The Python API uses the unified Node + run() pattern. All scheduling config goes on the Node:
 
 ```python
-from horus import Scheduler
+from horus import Node, run, us
 
-# Fluent API — configure nodes inline with chained calls
-scheduler = Scheduler(tick_rate=1000.0)
-scheduler.add(motor_ctrl, order=0, rate=1000.0)
-scheduler.add(planner, order=5)
-scheduler.add(telemetry, order=10, rate=1.0)
+# All config on Node — run() handles the scheduler
+motor = Node(tick=motor_fn, rate=1000, order=0, budget=300*us, on_miss="skip")
+planner = Node(tick=planner_fn, order=5)
+telemetry = Node(tick=telemetry_fn, rate=1, order=10)
+
+run(motor, planner, telemetry, rt=True, verbose=True)
 ```
 
-You can also use keyword arguments with `add()`:
+Or with explicit Scheduler for dynamic control:
 
 ```python
-scheduler.add(sensor, order=0, rate=100.0)
-scheduler.add(controller, order=1, on_miss="safe_mode")
-scheduler.add(logger, order=2, rate=10.0)
-scheduler.add(monitor, order=3, failure_policy="skip")
-```
+from horus import Node, Scheduler
 
-Create a scheduler with a `SchedulerConfig`:
-
-```python
-from horus._horus import SchedulerConfig
-
-# Create scheduler with watchdog config
-cfg = SchedulerConfig.with_watchdog()
-cfg.tick_rate = 1000.0
-scheduler = Scheduler(config=cfg)
+scheduler = Scheduler(tick_rate=1000, rt=True, cores=[0, 1], verbose=True)
+scheduler.add(Node(tick=sensor_fn, rate=100, order=0))
+scheduler.add(Node(tick=ctrl_fn, rate=100, order=1, on_miss="safe_mode"))
+scheduler.add(Node(tick=logger_fn, rate=10, order=2, failure_policy="skip"))
+scheduler.run()
 ```
 
 Composable config for different deployment stages:
 
 ```python
 from horus import Scheduler
-from horus._horus import SchedulerConfig
 
 # Development — lightweight
 scheduler = Scheduler()
 
-# Production — watchdog
-cfg = SchedulerConfig.with_watchdog()
-cfg.tick_rate = 1000.0
-scheduler = Scheduler(config=cfg)
+# Production — watchdog + RT
+scheduler = Scheduler(tick_rate=1000, rt=True, watchdog_ms=500)
 
-# With blackbox
-cfg = SchedulerConfig.with_watchdog()
-cfg.tick_rate = 1000.0
-cfg = cfg.blackbox_mb(64)
-scheduler = Scheduler(config=cfg)
+# With blackbox + telemetry
+scheduler = Scheduler(tick_rate=1000, watchdog_ms=500, blackbox_mb=64, verbose=True)
 ```
 
 ## Execution Modes

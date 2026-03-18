@@ -111,6 +111,35 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   };
 }
 
+/** Map a slug segment to a human-readable breadcrumb label. */
+function segmentLabel(segment: string): string {
+  const labels: Record<string, string> = {
+    'getting-started': 'Getting Started',
+    'concepts': 'Core Concepts',
+    'rust': 'Rust',
+    'python': 'Python',
+    'tutorials': 'Tutorials',
+    'advanced': 'Advanced',
+    'development': 'Development',
+    'performance': 'Performance',
+    'plugins': 'Plugins',
+    'package-management': 'Packages',
+    'stdlib': 'Standard Library',
+    'learn': 'Learn',
+    'reference': 'Reference',
+    'operations': 'Operations',
+    'api': 'API Reference',
+    'examples': 'Examples',
+    'library': 'Library',
+    'messages': 'Messages',
+    'python-guide': 'Python Guide',
+    'rust-guide': 'Rust Guide',
+  };
+  return labels[segment] || segment
+    .replace(/-/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
 export default async function DocPage({ params }: PageProps) {
   const { slug } = await params;
 
@@ -123,8 +152,29 @@ export default async function DocPage({ params }: PageProps) {
     notFound();
   }
 
+  // Build BreadcrumbList JSON-LD
+  const breadcrumbItems = [
+    { '@type': 'ListItem', position: 1, name: 'HORUS Docs', item: 'https://docs.horusrobotics.dev' },
+    ...slug.map((segment: string, i: number) => ({
+      '@type': 'ListItem',
+      position: i + 2,
+      name: i === slug.length - 1 ? doc.frontmatter.title : segmentLabel(segment),
+      item: `https://docs.horusrobotics.dev/${slug.slice(0, i + 1).join('/')}`,
+    })),
+  ];
+
+  const breadcrumbJsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: breadcrumbItems,
+  };
+
   return (
     <DocsLayout>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+      />
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         <article className="prose max-w-none prose-headings:scroll-mt-20 prose-p:text-[var(--text-secondary)] prose-p:leading-relaxed prose-li:text-[var(--text-secondary)]">
           {doc.content}

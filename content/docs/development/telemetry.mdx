@@ -1,0 +1,215 @@
+---
+title: "Telemetry Export"
+description: "Export runtime metrics to HTTP, UDP, file, or stdout for external monitoring and dashboards"
+order: 9
+---
+
+# Telemetry Export
+
+HORUS can export runtime metrics (node tick durations, message counts, deadline misses, etc.) to external monitoring systems. Telemetry runs on the scheduler's export cycle — never blocks the real-time loop.
+
+```rust
+use horus::prelude::*;
+```
+
+---
+
+## Quick Start
+
+Enable telemetry with a single builder method:
+
+```rust
+let mut scheduler = Scheduler::new()
+    .tick_rate(100_u64.hz())
+    .telemetry("http://localhost:9090/metrics");  // HTTP POST endpoint
+
+scheduler.add(MyNode::new()?).order(0).rate(100_u64.hz()).build()?;
+scheduler.run()?;
+```
+
+The scheduler exports a JSON snapshot every 1 second (default interval).
+
+---
+
+## Endpoint Types
+
+The `.telemetry(endpoint)` method accepts a string that determines the export backend:
+
+| String Format | Endpoint | Behavior |
+|--------------|----------|----------|
+| `"http://host:port/path"` | HTTP POST | Non-blocking — background thread handles network I/O |
+| `"https://host:port/path"` | HTTPS POST | Same as HTTP with TLS |
+| `"udp://host:port"` | UDP datagram | Compact JSON, single packet per snapshot |
+| `"file:///path/to/metrics.json"` | Local file | Pretty-printed JSON, overwritten each export |
+| `"/path/to/metrics.json"` | Local file | Same as `file://` prefix |
+| `"stdout"` or `"local"` | Stdout | Pretty-printed to terminal (debugging) |
+| `"disabled"` or `""` | Disabled | No export (default) |
+
+### HTTP Endpoint (Recommended for Production)
+
+```rust
+let mut scheduler = Scheduler::new()
+    .telemetry("http://localhost:9090/metrics");
+```
+
+HTTP export is **fully non-blocking** for the scheduler:
+1. Scheduler calls `export()` on its cycle — posts a snapshot to a bounded channel (capacity 4)
+2. A dedicated background thread reads from the channel and performs the HTTP POST
+3. If the channel is full (receiver slow), the snapshot is silently dropped — the scheduler never blocks
+
+### UDP Endpoint (Low Overhead)
+
+```rust
+let mut scheduler = Scheduler::new()
+    .telemetry("udp://192.168.1.100:9999");
+```
+
+Sends compact single-line JSON per snapshot. Good for LAN monitoring where packet loss is acceptable.
+
+### File Endpoint (Debugging & Logging)
+
+```rust
+let mut scheduler = Scheduler::new()
+    .telemetry("/tmp/horus-metrics.json");
+```
+
+Overwrites the file on each export cycle. Useful for debugging or feeding into log aggregation pipelines.
+
+---
+
+## JSON Payload Format
+
+Every export produces a `TelemetrySnapshot`:
+
+```json
+{
+  "timestamp_secs": 1710547200,
+  "scheduler_name": "motor_control",
+  "uptime_secs": 42.5,
+  "metrics": [
+    {
+      "name": "node.tick_duration_us",
+      "value": { "Gauge": 145.2 },
+      "labels": { "node": "MotorCtrl" },
+      "timestamp_secs": 1710547200
+    },
+    {
+      "name": "node.total_ticks",
+      "value": { "Counter": 4250 },
+      "labels": { "node": "MotorCtrl" },
+      "timestamp_secs": 1710547200
+    },
+    {
+      "name": "scheduler.deadline_misses",
+      "value": { "Counter": 0 },
+      "labels": {},
+      "timestamp_secs": 1710547200
+    }
+  ]
+}
+```
+
+### Metric Value Types
+
+| Type | JSON | Description |
+|------|------|-------------|
+| Counter | `{ "Counter": 42 }` | Monotonically increasing (total ticks, messages sent) |
+| Gauge | `{ "Gauge": 3.14 }` | Current value (tick duration, CPU usage) |
+| Histogram | `{ "Histogram": [0.1, 0.2, 0.15] }` | Distribution of values |
+| Text | `{ "Text": "Healthy" }` | String status |
+
+---
+
+## Auto-Collected Metrics
+
+When telemetry is enabled, the scheduler automatically exports:
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `node.total_ticks` | Counter | `node` | Total ticks executed |
+| `node.tick_duration_us` | Gauge | `node` | Last tick duration in microseconds |
+| `node.errors` | Counter | `node` | Total tick errors |
+| `scheduler.deadline_misses` | Counter | — | Total deadline misses across all nodes |
+| `scheduler.uptime_secs` | Gauge | — | Scheduler uptime |
+
+---
+
+## Feature Flag
+
+Telemetry requires the `telemetry` feature on `horus_core` — **enabled by default**.
+
+To disable at compile time (saves binary size):
+
+```toml
+[dependencies]
+horus = { version = "0.1", default-features = false, features = ["macros", "blackbox"] }
+```
+
+---
+
+## Integration with External Tools
+
+### Grafana + Custom Receiver
+
+Write a small HTTP server that receives the JSON POST and forwards metrics to Prometheus/InfluxDB:
+
+```python
+# receiver.py — minimal Flask example
+from flask import Flask, request
+app = Flask(__name__)
+
+@app.route("/metrics", methods=["POST"])
+def metrics():
+    snapshot = request.json
+    for m in snapshot["metrics"]:
+        print(f"{m['name']} = {m['value']}")
+    return "ok", 200
+
+app.run(port=9090)
+```
+
+### horus monitor (Alternative)
+
+For local debugging, `horus monitor` provides a built-in TUI dashboard — no external setup needed. See [Monitor](/development/monitor) for details.
+
+---
+
+## Complete Example
+
+```rust
+use horus::prelude::*;
+
+struct SensorNode {
+    pub_topic: Topic<Imu>,
+}
+
+impl SensorNode {
+    fn new() -> Result<Self> {
+        Ok(Self { pub_topic: Topic::new("imu.raw")? })
+    }
+}
+
+impl Node for SensorNode {
+    fn name(&self) -> &str { "Sensor" }
+    fn tick(&mut self) {
+        self.pub_topic.send(Imu {
+            orientation: [1.0, 0.0, 0.0, 0.0],
+            angular_velocity: [0.0, 0.0, 0.0],
+            linear_acceleration: [0.0, 0.0, 9.81],
+        });
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .telemetry("http://localhost:9090/metrics");  // export every 1s
+
+    scheduler.add(SensorNode::new()?)
+        .order(0)
+        .rate(100_u64.hz())
+        .build()?;
+
+    scheduler.run()
+}
+```

@@ -8,10 +8,12 @@ order: 12
 
 > **Beta**: The Services API is functional in Rust but still maturing. Python bindings are not yet available. The API may change in future releases.
 
-Services provide **synchronous request/response** communication between nodes. A client sends a request and blocks (or polls) until the server responds.
+Your SLAM node needs a map region from the map server. It can't continue until it gets the data. Your arm planner needs to know joint limits before computing a trajectory. Your calibration routine needs to trigger sensor calibration and wait for the result.
+
+These are **request/response** problems. Topics can't solve them — they're fire-and-forget with no reply. Actions are overkill — these operations finish in milliseconds.
 
 **Use services when:**
-- You need a response before continuing (parameter queries, sensor calibration)
+- You need a response before continuing (parameter queries, map data, joint limits)
 - The operation completes quickly (within milliseconds)
 - You need guaranteed delivery with error reporting
 
@@ -24,27 +26,6 @@ Use the `service!` macro to define Request and Response types:
 ```rust
 use horus::prelude::*;
 
-service! {
-    AddTwoInts {
-        request {
-            a: i64,
-            b: i64,
-        }
-        response {
-            sum: i64,
-        }
-    }
-}
-```
-
-This generates:
-- `AddTwoIntsRequest` struct with fields `a` and `b`
-- `AddTwoIntsResponse` struct with field `sum`
-- `AddTwoInts` marker type implementing the `Service` trait
-
-More complex example:
-
-```rust
 service! {
     GetMapRegion {
         request {
@@ -64,26 +45,13 @@ service! {
 }
 ```
 
+This generates `GetMapRegionRequest` and `GetMapRegionResponse` structs, ready to use with clients and servers.
+
 ---
 
 ## Service Server
 
 The server listens for requests and returns responses. It runs in a background thread.
-
-```rust
-let server = ServiceServerBuilder::<AddTwoInts>::new()
-    .on_request(|req| {
-        Ok(AddTwoIntsResponse { sum: req.a + req.b })
-    })
-    .build()?;
-
-// Server runs in a background thread — it's active until dropped
-// Add it to your scheduler or keep it alive in main()
-```
-
-### Returning Errors
-
-Return `Err(String)` to signal failure to the client:
 
 ```rust
 let server = ServiceServerBuilder::<GetMapRegion>::new()
@@ -103,16 +71,10 @@ let server = ServiceServerBuilder::<GetMapRegion>::new()
             timestamp: horus::timestamp_now(),
         })
     })
-    .build()?;
-```
-
-### Server Configuration
-
-```rust
-let server = ServiceServerBuilder::<AddTwoInts>::new()
-    .on_request(|req| Ok(AddTwoIntsResponse { sum: req.a + req.b }))
     .poll_interval(Duration::from_millis(1))  // How often to check for requests (default: 5ms)
     .build()?;
+
+// Server runs in a background thread — it's active until dropped
 ```
 
 ### Stopping a Server
@@ -132,14 +94,18 @@ server.stop();
 The simplest way to call a service:
 
 ```rust
-let mut client = ServiceClient::<AddTwoInts>::new()?;
+let mut client = ServiceClient::<GetMapRegion>::new()?;
 
 let response = client.call(
-    AddTwoIntsRequest { a: 3, b: 5 },
-    Duration::from_secs(1),  // Timeout
+    GetMapRegionRequest {
+        x_min: 0.0, y_min: 0.0,
+        x_max: 10.0, y_max: 10.0,
+        resolution: 0.05,
+    },
+    Duration::from_secs(1),
 )?;
 
-println!("3 + 5 = {}", response.sum);
+println!("Map: {}x{} pixels", response.width, response.height);
 ```
 
 #### Resilient Calls (Auto-Retry)
@@ -148,16 +114,13 @@ Use `call_resilient` for production code that needs automatic retries on transie
 
 ```rust
 // Auto-retry with default settings (3 retries, exponential backoff from 10ms)
-let response = client.call_resilient(
-    AddTwoIntsRequest { a: 3, b: 5 },
-    Duration::from_secs(5),
-)?;
+let response = client.call_resilient(request, Duration::from_secs(5))?;
 
 // Custom retry configuration
 use horus::prelude::RetryConfig;
 
 let response = client.call_resilient_with(
-    AddTwoIntsRequest { a: 3, b: 5 },
+    request,
     Duration::from_secs(5),
     RetryConfig::new(5, Duration::from_millis(20)),  // 5 retries, 20ms initial backoff
 )?;
@@ -171,7 +134,7 @@ Use `call_optional` when the server may not be running:
 
 ```rust
 match client.call_optional(request, Duration::from_millis(100))? {
-    Some(response) => println!("Got response: {}", response.sum),
+    Some(response) => println!("Map: {}x{}", response.width, response.height),
     None => println!("No server available"),
 }
 ```
@@ -181,11 +144,11 @@ match client.call_optional(request, Duration::from_millis(100))? {
 For non-blocking calls, use `AsyncServiceClient`:
 
 ```rust
-let mut client = AsyncServiceClient::<AddTwoInts>::new()?;
+let mut client = AsyncServiceClient::<GetMapRegion>::new()?;
 
 // Start the call (non-blocking)
 let mut pending = client.call_async(
-    AddTwoIntsRequest { a: 3, b: 5 },
+    GetMapRegionRequest { x_min: 0.0, y_min: 0.0, x_max: 5.0, y_max: 5.0, resolution: 0.1 },
     Duration::from_secs(1),
 );
 
@@ -193,7 +156,7 @@ let mut pending = client.call_async(
 
 // Check if response is ready (non-blocking)
 match pending.check()? {
-    Some(response) => println!("Sum: {}", response.sum),
+    Some(response) => println!("Map: {}x{}", response.width, response.height),
     None => println!("Still waiting..."),
 }
 
@@ -210,7 +173,7 @@ let response = pending.wait()?;
 
 ```rust
 // Custom poll interval for faster response detection
-let mut client = ServiceClient::<AddTwoInts>::with_poll_interval(
+let mut client = ServiceClient::<GetMapRegion>::with_poll_interval(
     Duration::from_micros(500),  // Default: 1ms
 )?;
 ```

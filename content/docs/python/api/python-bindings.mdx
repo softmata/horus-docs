@@ -80,25 +80,62 @@ This minimal example demonstrates functional-style node creation without class b
 ### Creating a Node
 
 ```python
-node = horus.Node(
-    name="my_node",            # Optional: auto-generated if not provided
-    pubs=["topic1", "topic2"], # Topics to publish to
-    subs=["input1", "input2"], # Topics to subscribe to
-    tick=my_function,          # Function called repeatedly
-    rate=30,                   # Hz (default: 30)
-    init=setup_fn,             # Optional: called once at start
-    shutdown=cleanup_fn,       # Optional: called once at end
-    on_error=error_fn,         # Optional: called on tick errors
-    default_capacity=1024      # Optional: topic buffer capacity
+def Node(
+    name: str = "",              # Node name (auto-generated from tick function if empty)
+    subs: str | list = "",       # Topics to subscribe (string, list of strings, or list of message types)
+    pubs: str | list = "",       # Topics to publish (string, list of strings, or list of message types)
+    tick: Callable = None,       # Function called every tick: tick(node) -> None
+    init: Callable = None,       # Optional: called once on startup: init(node) -> None
+    shutdown: Callable = None,   # Optional: called on graceful shutdown: shutdown(node) -> None
+    rate: int = 30,              # Tick rate in Hz
+    order: int = 100,            # Execution priority (lower = earlier)
+    budget: float = None,        # Max tick duration in seconds (None = auto from rate)
+    deadline: float = None,      # Hard deadline in seconds (None = auto from rate)
+    on_miss: str = None,         # "warn", "skip", "safe_mode", "stop" (None = "warn")
+) -> Node
+```
+
+**Parameters:**
+- `name` — Node identifier. If empty, derived from tick function name.
+- `subs/pubs` — Topic declarations. Accepts: `"topic_name"`, `["topic1", "topic2"]`, or typed `[CmdVel, LaserScan]` (see formats below).
+- `tick` — Main loop function, called at `rate` Hz. Receives the node instance.
+- `rate` — Tick frequency in Hz. Default: 30. Setting rate auto-enables RT scheduling.
+- `order` — Priority within scheduler tick (0-9: critical, 10-49: sensors, 50-99: processing, 100+: background).
+
+**Example:**
+
+```python
+from horus import Node, CmdVel, LaserScan, Imu
+
+node = Node(
+    name="controller",
+    pubs=[CmdVel],             # Typed — fast Pod zero-copy (~1.5μs)
+    subs=[LaserScan, Imu],     # Auto-named: "scan", "imu"
+    tick=control_fn,
+    rate=100,
+    order=0,
 )
+```
+
+**Topic declaration formats** (determines performance path):
+
+```python
+# FAST — typed (Pod zero-copy, ~2.7μs send+recv)
+pubs=[CmdVel]                 # auto-name from type: "cmd_vel"
+pubs=[CmdVel, Pose2D]         # multiple typed topics
+pubs={"motor": CmdVel}        # custom name + type
+
+# GENERIC — string (MessagePack, ~10μs send+recv)
+pubs=["data"]                 # GenericMessage — for dicts and custom data
+pubs="single_topic"           # shorthand for single string topic
 ```
 
 **Parameters**:
 - `name` (str, optional): Node name (auto-generated if omitted)
-- `pubs` (str | list[str], optional): Topics to publish to
-- `subs` (str | list[str], optional): Topics to subscribe from
+- `pubs`: Topics to publish — `[CmdVel]` (typed, fast) or `["name"]` (generic)
+- `subs`: Topics to subscribe — same formats as pubs
 - `tick` (callable): Function called each cycle, receives `(node)` as argument
-- `rate` (int, optional): Execution rate in Hz (default: 30)
+- `rate` (float): Execution rate in Hz (default: 30)
 - `init` (callable, optional): Setup function, called once at start
 - `shutdown` (callable, optional): Cleanup function, called once at end
 - `on_error` (callable, optional): Error handler, called if tick raises an exception
@@ -153,17 +190,72 @@ def my_tick(node):
 
 **Node Methods**:
 
-| Method | Description |
-|--------|-------------|
-| `node.send(topic, data)` | Publish a message to a topic |
-| `node.recv(topic)` | Receive one message (returns `None` if empty) |
-| `node.recv_all(topic)` | Receive all available messages as a list |
-| `node.has_msg(topic)` | Check if messages are available |
-| `node.log_info(msg)` | Log an informational message |
-| `node.log_warning(msg)` | Log a warning message |
-| `node.log_error(msg)` | Log an error message |
-| `node.log_debug(msg)` | Log a debug message |
-| `node.request_stop()` | Request the scheduler to stop execution |
+#### send
+
+```python
+def send(topic: str, data: Any) -> None
+```
+
+Publish a message to a topic. Non-blocking. Overwrites oldest if buffer is full.
+
+**Parameters:**
+- `topic: str` — Topic name (must be in the node's `pubs` list)
+- `data: Any` — Message to send. Can be: a dict, a typed message (`CmdVel`, `Image`, etc.), or any serializable object
+
+```python
+node.send("cmd_vel", {"linear": 1.0, "angular": 0.0})  # dict
+node.send("cmd_vel", horus.CmdVel(1.0, 0.0))           # typed message
+```
+
+#### recv
+
+```python
+def recv(topic: str) -> Optional[Any]
+```
+
+Receive one message from a topic (FIFO order). Returns `None` if no messages available.
+
+**Parameters:**
+- `topic: str` — Topic name (must be in the node's `subs` list)
+
+**Returns:** The message, or `None` if buffer is empty.
+
+```python
+msg = node.recv("scan")
+if msg is not None:
+    print(f"Got {len(msg.ranges)} ranges")
+```
+
+#### recv_all
+
+```python
+def recv_all(topic: str) -> list
+```
+
+Receive ALL available messages as a list. Drains the buffer. Returns empty list if none available.
+
+#### has_msg
+
+```python
+def has_msg(topic: str) -> bool
+```
+
+Check if at least one unread message is available on the topic.
+
+#### request_stop
+
+```python
+def request_stop() -> None
+```
+
+Request the scheduler to shut down gracefully after the current tick completes.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `node.log_info(msg)` | `None` | Log an informational message |
+| `node.log_warning(msg)` | `None` | Log a warning message |
+| `node.log_error(msg)` | `None` | Log an error message |
+| `node.log_debug(msg)` | `None` | Log a debug message |
 
 **Node scheduling kwargs** (maps 1:1 to Rust NodeBuilder):
 
@@ -201,10 +293,20 @@ Node(tick=run_model, rate=30, budget=50 * ms)  # 50ms — triggers on_miss if ex
 ### Running Nodes
 
 ```python
-# Single node
+def run(*nodes: Node, duration: float = None) -> None
+```
+
+Convenience one-liner: creates a Scheduler, adds all nodes, and runs.
+
+**Parameters:**
+- `*nodes: Node` — One or more Node instances to run
+- `duration: float` — Optional. Run for this many seconds, then stop. `None` = run until Ctrl+C.
+
+```python
+# Single node — runs until Ctrl+C
 horus.run(node)
 
-# Multiple nodes
+# Multiple nodes for 10 seconds
 horus.run(node1, node2, node3, duration=10)
 ```
 
@@ -375,7 +477,24 @@ HORUS Python includes advanced features that match or exceed ROS2 capabilities w
 
 ### Scheduler
 
+```python
+def Scheduler(
+    tick_rate: int = 100,        # Global tick rate in Hz
+    rt: bool = False,            # Enable real-time scheduling (prefer_rt)
+    watchdog_ms: int = 0,        # Watchdog timeout in ms (0 = disabled)
+    deterministic: bool = False, # Deterministic execution mode
+    verbose: bool = True,        # Enable verbose logging
+) -> Scheduler
+```
+
 The Scheduler orchestrates node execution with priority ordering, per-node rate control, and real-time features.
+
+**Methods:**
+- `scheduler.add(node: Node) -> None` — Register a node
+- `scheduler.run() -> None` — Start the main loop (blocks until Ctrl+C)
+- `scheduler.run_for(seconds: float) -> None` — Run for a duration, then stop
+- `scheduler.tick_once() -> None` — Execute one tick cycle (for testing)
+- `scheduler.stop() -> None` — Request graceful shutdown
 
 **Creating a Scheduler:**
 

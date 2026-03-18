@@ -102,19 +102,40 @@ Example:
   Watchdog timeout:      50ms  (5× period)
 ```
 
-## Budget Enforcement
+## Budget and Deadline Enforcement
 
-Budget enforcement is implicit when nodes have `.rate()` set. The auto-derived budget (80% of the period from `.rate()`) ensures nodes complete within time limits:
+Budget and deadline are two levels of timing enforcement:
+
+- **Budget** is the expected computation time (soft limit). Budget violations are tracked in `RtStats` for monitoring.
+- **Deadline** is the hard limit. When exceeded, the `Miss` policy fires (`Warn`, `Skip`, `SafeMode`, or `Stop`).
+
+When you set `.rate()`, both are auto-derived: budget = 80% of period, deadline = 95% of period. When you set `.budget()` without `.deadline()`, the deadline equals the budget — your budget IS your hard limit:
 
 ```rust
+// Auto-derived from rate
 scheduler.add(motor_controller)
     .order(0)
-    .rate(1000_u64.hz())       // auto-derives budget=800us, deadline=950us
-    .on_miss(Miss::SafeMode)   // Enter safe state on budget/deadline miss
+    .rate(1000_u64.hz())       // budget=800us, deadline=950us
+    .on_miss(Miss::SafeMode)   // Fires on DEADLINE miss (>950us)
+    .build()?;
+
+// Explicit budget — deadline auto-derived to match
+scheduler.add(fast_loop)
+    .order(0)
+    .budget(500_u64.us())      // budget=500us, deadline=500us (auto)
+    .on_miss(Miss::Stop)       // Fires when tick exceeds 500us
+    .build()?;
+
+// Explicit budget + deadline — slack between them
+scheduler.add(with_slack)
+    .order(0)
+    .budget(500_u64.us())      // Soft: track violations above 500us
+    .deadline(900_u64.us())    // Hard: Miss policy fires above 900us
+    .on_miss(Miss::SafeMode)
     .build()?;
 ```
 
-When a node exceeds its budget, the configured `Miss` policy is applied. Violations are also recorded in the BlackBox when using `.blackbox(n)`.
+Violations are also recorded in the BlackBox when using `.blackbox(n)`.
 
 ## Node Health States
 
@@ -212,6 +233,35 @@ impl Node for MotorController {
 }
 ```
 
+## RT Node Isolation
+
+Each RT node runs on its own dedicated thread by default. If one RT node stalls (deadlock, infinite loop, hardware fault), other RT nodes keep ticking independently on their own threads.
+
+```
+Thread 1: [MotorLeft.tick()]  → sleep → repeat
+Thread 2: [MotorRight.tick()] → sleep → repeat    ← keeps running
+Thread 3: [ArmServo.tick()]   → sleep → repeat    ← keeps running
+
+If MotorLeft stalls, MotorRight and ArmServo are unaffected.
+```
+
+This is critical for robots where each actuator must be independently controllable. A stalled left wheel controller must not take down the right wheel.
+
+Use `.core(N)` to pin specific nodes to CPU cores for cache locality:
+
+```rust
+scheduler.add(left_motor).order(0).rate(1000_u64.hz()).core(2).build()?;
+scheduler.add(right_motor).order(1).rate(1000_u64.hz()).core(3).build()?;
+```
+
+> **Note:** The watchdog detects stalled nodes but cannot preempt a running `tick()` — cooperative scheduling means the node must return from `tick()` for the watchdog to take action. Thread isolation ensures the stall doesn't cascade to other nodes.
+
+## Shutdown Safety
+
+The scheduler guarantees that shutdown always completes, even if an RT node is stalled. Each RT thread gets 3 seconds to exit cleanly after `running` is set to `false`. If a thread doesn't exit within the timeout, it is detached and the scheduler continues shutting down other nodes.
+
+This prevents a single stalled node from blocking the entire process — critical for emergency stop scenarios where the robot must halt immediately.
+
 ## Emergency Stop
 
 Emergency stop is triggered automatically by:
@@ -223,6 +273,7 @@ When emergency stop triggers:
 1. All node execution is halted
 2. An emergency stop event is recorded in the BlackBox
 3. The scheduler transitions to emergency state
+4. RT threads are given 3 seconds to exit before being detached
 
 ### Inspecting After Emergency Stop
 
@@ -321,6 +372,51 @@ fn test_safety_critical_setup() {
         .build()
         .expect("should build node");
 }
+```
+
+## Graduated Watchdog Severity
+
+> **Note:** The watchdog and health states are managed automatically by the scheduler — you configure them via `.watchdog(Duration)` and `.on_miss(Miss)` on the node builder. The internal severity levels below explain the scheduler's behavior, not APIs you call directly.
+
+The watchdog doesn't just fire a binary "alive/dead" check. It uses **graduated severity** based on how many timeout multiples have elapsed since the last heartbeat:
+
+```text
+Time since last heartbeat:
+
+  0────────1x timeout────────2x timeout────────3x timeout────
+  │   Ok        │   Warning       │   Expired        │  Critical
+  │ (healthy)   │ (node is slow)  │ (skip this node) │ (safety response)
+```
+
+| Severity | Threshold | Scheduler Response |
+|----------|-----------|-------------------|
+| **Ok** | Within timeout | Normal execution |
+| **Warning** | 1x timeout elapsed | Log warning, node health → `Warning` |
+| **Expired** | 2x timeout elapsed | Skip node in tick loop, health → `Unhealthy` |
+| **Critical** | 3x timeout elapsed | Trigger safety response, health → `Isolated` |
+
+This prevents a brief jitter from triggering an emergency stop. The scheduler escalates gradually:
+1. **Warn** first (gives the node a chance to recover)
+2. **Skip** if still unresponsive (other nodes keep running)
+3. **Isolate** if critically stuck (enter safe state if configured)
+
+## Tick Timing Ring
+
+The scheduler tracks per-node timing statistics using a circular ring buffer:
+
+- **Min/Max/Avg** tick execution time per node
+- Used by the monitor TUI and web dashboard to display CPU load
+- Helps identify nodes that are close to their budget limits
+
+```rust
+use horus::prelude::*;
+
+// Timing stats are reported in the shutdown summary:
+// ┌─ Timing Report ─────────────────┐
+// │ lidar_driver:  avg=0.8ms  max=1.2ms  budget=2.0ms  ✓
+// │ planner:       avg=4.5ms  max=8.1ms  budget=5.0ms  ⚠ (max exceeds budget)
+// │ motor_ctrl:    avg=0.2ms  max=0.3ms  budget=1.0ms  ✓
+// └──────────────────────────────────┘
 ```
 
 ## See Also

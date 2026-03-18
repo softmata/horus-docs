@@ -1,0 +1,298 @@
+---
+title: "Recipe: Coordinate Transform Tree"
+description: "Set up a robot's coordinate frame tree with base_link, sensors, and end effector frames."
+order: 11
+---
+
+# Recipe: Coordinate Transform Tree
+
+Build a robot's coordinate frame tree with static sensor mounts and dynamic joint transforms. A `FramePublisher` node registers the frame hierarchy (world -> base_link -> camera_link -> end_effector) and updates dynamic transforms each tick to simulate a moving robot. A `FrameUser` node queries transforms between frames and converts sensor data from camera coordinates into the world frame.
+
+### horus.toml
+
+```toml
+[package]
+name = "transform_frames"
+version = "0.1.0"
+language = "rust"
+
+[dependencies]
+horus = "0.1"
+```
+
+### Complete Code
+
+```rust
+use horus::prelude::*;
+use std::sync::Arc;
+
+// ============================================================================
+// Node: FramePublisher — registers and updates the coordinate frame tree
+// ============================================================================
+
+struct FramePublisher {
+    tf: Arc<TransformFrame>,
+    base_id: Option<FrameId>,
+    ee_id: Option<FrameId>,
+    tick_count: u64,
+}
+
+impl FramePublisher {
+    fn new(tf: Arc<TransformFrame>) -> Self {
+        Self {
+            tf,
+            base_id: None,
+            ee_id: None,
+            tick_count: 0,
+        }
+    }
+}
+
+impl Node for FramePublisher {
+    fn name(&self) -> &str { "frame_publisher" }
+
+    fn init(&mut self) -> Result<()> {
+        // Register the frame hierarchy:
+        //
+        //   world (root)
+        //     └── base_link (dynamic — robot moves in world)
+        //           ├── camera_link (static — bolted to chassis)
+        //           ├── lidar_link (static — mounted on top)
+        //           └── arm_link (dynamic — joint rotates)
+        //                 └── end_effector (dynamic — tool tip)
+
+        // Root frame
+        self.tf.add_frame("world").build()?;
+
+        // Robot base — dynamic, position changes as robot drives
+        self.tf.add_frame("base_link").parent("world").build()?;
+
+        // Camera — static mount, 10cm forward and 30cm up from base, tilted down 15 degrees
+        self.tf.add_frame("camera_link")
+            .parent("base_link")
+            .static_transform(&Transform::xyz(0.1, 0.0, 0.3).with_rpy(0.0, 0.26, 0.0))
+            .build()?;
+
+        // LiDAR — static mount, centered on top of robot, 40cm up
+        self.tf.add_frame("lidar_link")
+            .parent("base_link")
+            .static_transform(&Transform::xyz(0.0, 0.0, 0.4))
+            .build()?;
+
+        // Arm link — dynamic, rotates around Z axis
+        self.tf.add_frame("arm_link").parent("base_link").build()?;
+
+        // End effector — dynamic, extends from arm
+        self.tf.add_frame("end_effector").parent("arm_link").build()?;
+
+        // Cache frame IDs for fast updates in tick()
+        self.base_id = self.tf.frame_id("base_link");
+        self.ee_id = self.tf.frame_id("end_effector");
+
+        // Print the frame tree for verification
+        self.tf.print_tree();
+
+        hlog!(info, "Frame tree registered — {} frames", self.tf.frame_count());
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        self.tick_count += 1;
+        let t = self.tick_count as f64 * 0.01; // 100Hz -> 10ms per tick
+        let now = timestamp_now();
+
+        // Update base_link: robot drives in a circle
+        let radius = 2.0;
+        let speed = 0.2; // rad/s
+        let base_x = radius * (speed * t).cos();
+        let base_y = radius * (speed * t).sin();
+        let base_yaw = speed * t + std::f64::consts::FRAC_PI_2; // Face tangent direction
+
+        let base_tf = Transform::xyz(base_x, base_y, 0.0).with_yaw(base_yaw);
+        if let Some(id) = self.base_id {
+            let _ = self.tf.update_transform_by_id(id, &base_tf, now);
+        }
+
+        // Update arm_link: joint sweeps back and forth
+        let arm_angle = 0.8 * (t * 0.5).sin(); // +/- 0.8 rad
+        let arm_tf = Transform::xyz(0.15, 0.0, 0.2).with_yaw(arm_angle);
+        let _ = self.tf.update_transform("arm_link", &arm_tf, now);
+
+        // Update end_effector: extends from arm tip
+        let ee_extension = 0.3; // 30cm arm length
+        let ee_tf = Transform::xyz(ee_extension, 0.0, 0.0);
+        if let Some(id) = self.ee_id {
+            let _ = self.tf.update_transform_by_id(id, &ee_tf, now);
+        }
+
+        if self.tick_count % 100 == 0 {
+            hlog!(info, "[FRAMES] base=({:.2}, {:.2}), arm_angle={:.2} rad",
+                base_x, base_y, arm_angle);
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // SAFETY: Log final frame tree statistics for post-run diagnostics.
+        let stats = self.tf.stats();
+        hlog!(info, "Frame publisher shutdown — {}", stats.summary());
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Node: FrameUser — queries transforms and converts sensor data
+// ============================================================================
+
+struct FrameUser {
+    tf: Arc<TransformFrame>,
+    detection_pub: Topic<[f64; 3]>,
+    tick_count: u64,
+}
+
+impl FrameUser {
+    fn new(tf: Arc<TransformFrame>) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            tf,
+            detection_pub: Topic::new("detection_world")?,
+            tick_count: 0,
+        })
+    }
+}
+
+impl Node for FrameUser {
+    fn name(&self) -> &str { "frame_user" }
+
+    fn init(&mut self) -> Result<()> {
+        hlog!(info, "Frame user ready — will transform detections from camera to world");
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        self.tick_count += 1;
+
+        // Simulate a detection at a fixed point in camera frame
+        // (1.5m forward, 0.2m left, 0m up from camera)
+        let detection_in_camera = [1.5, 0.2, 0.0];
+
+        // Transform the detection from camera_link to world frame
+        match self.tf.query("camera_link").to("world").point(detection_in_camera) {
+            Ok(world_point) => {
+                self.detection_pub.send(world_point);
+
+                if self.tick_count % 100 == 0 {
+                    hlog!(info,
+                        "[USER] Detection in camera: ({:.2}, {:.2}, {:.2}) -> world: ({:.2}, {:.2}, {:.2})",
+                        detection_in_camera[0], detection_in_camera[1], detection_in_camera[2],
+                        world_point[0], world_point[1], world_point[2]
+                    );
+                }
+            }
+            Err(e) => {
+                if self.tick_count % 500 == 0 {
+                    hlog!(warn, "Transform camera->world not available: {}", e);
+                }
+            }
+        }
+
+        // Query end effector position in world frame
+        if self.tick_count % 100 == 0 {
+            if let Ok(ee_tf) = self.tf.query("end_effector").to("world").lookup() {
+                hlog!(info, "[USER] End effector in world: ({:.2}, {:.2}, {:.2})",
+                    ee_tf.translation[0], ee_tf.translation[1], ee_tf.translation[2]);
+            }
+
+            // Check if any frames are stale (sensor disconnect detection)
+            if self.tf.is_stale_now("base_link", 500_000_000) { // 500ms
+                hlog!(warn, "base_link transform is stale — odometry may be disconnected");
+            }
+
+            // Demonstrate the frame chain
+            if let Ok(chain) = self.tf.query("end_effector").to("world").chain() {
+                hlog!(info, "[USER] Frame chain: {}", chain.join(" -> "));
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // SAFETY: Log the frame tree on shutdown for debugging spatial relationships.
+        hlog!(info, "Frame user shutdown after {} ticks", self.tick_count);
+        self.tf.print_tree();
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Main — shared TransformFrame instance across nodes
+// ============================================================================
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a shared TransformFrame — both nodes read/write the same tree
+    let tf = Arc::new(TransformFrame::new());
+
+    let mut scheduler = Scheduler::new();
+
+    // Frame publisher at 100Hz — updates dynamic transforms
+    scheduler.add(FramePublisher::new(Arc::clone(&tf)))
+        .order(0)
+        // NOTE: .rate(100Hz) auto-derives budget=8ms, deadline=9.5ms and marks
+        // this node as real-time. Transform updates must be deterministic so
+        // downstream nodes always see fresh spatial data.
+        .rate(100_u64.hz())
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    // Frame user at 50Hz — queries transforms and converts data
+    scheduler.add(FrameUser::new(Arc::clone(&tf))?)
+        .order(1)
+        // NOTE: .rate(50Hz) auto-derives RT scheduling. The user runs at half the
+        // publisher rate, which is typical — transform queries do not need to run
+        // as fast as transform updates.
+        .rate(50_u64.hz())
+        .on_miss(Miss::Warn)
+        .build()?;
+
+    hlog!(info, "Transform frame system running — Ctrl+C to stop");
+    scheduler.build()?.run()?;
+
+    Ok(())
+}
+```
+
+### Expected Output
+
+```
+world
+  └── base_link
+        ├── camera_link [static]
+        ├── lidar_link [static]
+        └── arm_link
+              └── end_effector
+[INFO] Frame tree registered — 6 frames
+[INFO] Frame user ready — will transform detections from camera to world
+[INFO] Transform frame system running — Ctrl+C to stop
+[INFO] [FRAMES] base=(2.00, 0.00), arm_angle=0.00 rad
+[INFO] [USER] Detection in camera: (1.50, 0.20, 0.00) -> world: (2.07, 0.22, 0.30)
+[INFO] [USER] End effector in world: (2.43, 0.03, 0.20)
+[INFO] [USER] Frame chain: end_effector -> arm_link -> base_link -> world
+[INFO] [FRAMES] base=(1.96, 0.39), arm_angle=0.39 rad
+[INFO] [USER] Detection in camera: (1.50, 0.20, 0.00) -> world: (1.89, 0.65, 0.30)
+[INFO] [USER] End effector in world: (2.18, 0.57, 0.20)
+[INFO] [USER] Frame chain: end_effector -> arm_link -> base_link -> world
+^C
+[INFO] Frame publisher shutdown — 6 total, 2 static, 4 dynamic, depth 4
+[INFO] Frame user shutdown after 500 ticks
+world
+  └── base_link
+        ├── camera_link [static]
+        ├── lidar_link [static]
+        └── arm_link
+              └── end_effector
+```
+
+### Key Points
+
+- **`Arc<TransformFrame>`** shared across nodes: Both the publisher and user hold a reference to the same tree. `TransformFrame` is lock-free internally, so concurrent reads and writes are safe without mutexes.
+- **Static vs dynamic frames**: `camera_link` and `lidar_link` use `.static_transform()` because they are bolted to the chassis. `base_link`, `arm_link`, and `end_effector` are dynamic and updated every tick.
+- **`FrameId` caching**: The publisher caches `FrameId` values at init and uses `update_transform_by_id()` in the hot loop. This avoids string-based name resolution (~200ns) and uses the faster ID path (~50ns).
+- **No `sleep()` calls**: All timing is managed by `.rate()`. The publisher runs at 100Hz and the user at 50Hz. The scheduler handles rate differences.
+- **Staleness detection**: `is_stale_now()` checks whether a frame's transform data is older than a threshold, which catches disconnected sensors or frozen publishers without polling.

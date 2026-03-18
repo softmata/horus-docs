@@ -1,6 +1,6 @@
 ---
 title: "Scheduler API"
-description: "Complete API reference for the HORUS Scheduler, NodeBuilder, and NodeMetrics"
+description: "Complete API reference for the HORUS Scheduler and node configuration"
 weight: 5
 ---
 
@@ -46,7 +46,7 @@ let mut scheduler = Scheduler::new()
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `.name(name)` | `"horus"` | Set the scheduler name |
+| `.name(name)` | `"Scheduler"` | Set the scheduler name |
 | `.tick_rate(freq)` | 100 Hz | Global scheduler tick rate |
 | `.prefer_rt()` | — | Try RT features (mlockall, SCHED_FIFO), warn on failure |
 | `.require_rt()` | — | Enable RT features, **panic** if unavailable |
@@ -59,27 +59,268 @@ let mut scheduler = Scheduler::new()
 | `.with_recording()` | disabled | Enable session record/replay |
 | `.telemetry(endpoint)` | disabled | Export metrics to HTTP endpoint |
 
-### Node Registration
+### Detailed Method Reference
+
+---
+
+#### new
 
 ```rust
-scheduler.add(my_node)         // Returns NodeBuilder for fluent configuration
+pub fn new() -> Self
+```
+
+Creates a scheduler with auto-detected platform capabilities.
+
+**What happens on construction:**
+1. Detects RT capabilities: `SCHED_FIFO` support, `mlockall` permission, CPU topology (~30-100us)
+2. Cleans up stale SHM namespaces from previously crashed processes (< 1ms)
+3. Sets default tick rate to 100 Hz
+
+**Returns:** `Scheduler` with default configuration. No nodes registered.
+
+**Example:**
+```rust
+let mut scheduler = Scheduler::new();
+// Scheduler is ready — add nodes and call .run()
+```
+
+---
+
+#### tick_rate
+
+```rust
+pub fn tick_rate(self, freq: Frequency) -> Self
+```
+
+Sets the global scheduler loop frequency.
+
+**Parameters:**
+- `freq: Frequency` — Target tick rate. Create with `.hz()` extension: `100_u64.hz()`, `1000_u64.hz()`. The `Frequency` type validates at construction — panics on 0, NaN, infinite, or negative values.
+
+**Returns:** `Self` (chainable).
+
+**Panics:** Indirectly — the `Frequency` constructor panics on invalid values:
+```rust
+0_u64.hz();    // PANICS: zero frequency
+```
+
+**Relationship to node rates:** Node `.rate(freq)` can differ from the global tick rate. The scheduler runs at its rate; nodes with different rates are tick-divided.
+
+**Examples:**
+```rust
+// 100 Hz default control loop
+let s = Scheduler::new().tick_rate(100.hz());
+
+// 1 kHz high-frequency servo control
+let s = Scheduler::new().tick_rate(1000.hz());
+```
+
+---
+
+#### prefer_rt
+
+```rust
+pub fn prefer_rt(self) -> Self
+```
+
+Try to enable OS-level RT features. Degrades gracefully if unavailable.
+
+**What it enables:** `mlockall` (prevent page faults) + `SCHED_FIFO` (real-time scheduling class).
+
+**Behavior:** If the system lacks RT capabilities (no `SCHED_FIFO` or `mlockall`), logs a warning and continues without them. Your code still runs — just without RT guarantees.
+
+**When to use:** Production robots where RT is desired but the system might not support it (e.g., development on a non-RT kernel).
+
+**Example:**
+```rust
+let s = Scheduler::new().prefer_rt();
+// On RT kernel: mlockall + SCHED_FIFO enabled
+// On non-RT kernel: warning logged, runs normally
+```
+
+---
+
+#### require_rt
+
+```rust
+pub fn require_rt(self) -> Self
+```
+
+Enable OS-level RT features. **Panics** if unavailable.
+
+**Panics:** If the system has neither `SCHED_FIFO` nor `mlockall` support.
+
+**When to use:** Safety-critical deployments where running without RT is unacceptable. Forces the developer to fix the deployment environment rather than silently degrading.
+
+**Example:**
+```rust
+let s = Scheduler::new().require_rt();
+// On non-RT kernel: PANICS with "RT capabilities required but not available"
+```
+
+---
+
+#### deterministic
+
+```rust
+pub fn deterministic(self, enabled: bool) -> Self
+```
+
+Enable deterministic execution mode.
+
+**Parameters:**
+- `enabled: bool` — `true` to enable, `false` to disable (default).
+
+**What changes:**
+- Clock switches from `WallClock` to `SimClock` (virtual time, advances by exact `dt` per tick)
+- Execution is sequential (no parallelism) to ensure deterministic ordering
+- Two runs with same inputs produce identical results regardless of CPU speed
+
+**When to use:** Simulation, reproducible testing, CI pipelines.
+
+**Example:**
+```rust
+let s = Scheduler::new()
+    .tick_rate(100.hz())
+    .deterministic(true);
+// Time advances exactly 10ms per tick, regardless of actual CPU time
+```
+
+**See Also:** [Clock API](/rust/api/clock-api), [Deterministic Mode](/advanced/deterministic-mode)
+
+---
+
+#### build (NodeBuilder)
+
+```rust
+pub fn build(self) -> Result<&mut Scheduler>
+```
+
+Validate the node configuration and register it with the scheduler.
+
+**Returns:** `Result<&mut Scheduler>` — the scheduler for further `.add()` calls.
+
+**Errors (rejects):**
+- Budget or deadline set on non-RT execution class → `Error`
+- Zero budget or deadline → `Error`
+- Empty topic name in `.on("")` → `Error`
+- Budget > deadline → `Error`
+
+**Warnings (allows but warns):**
+- `.priority()` on non-RT node → logged warning
+- `.core()` on non-RT node → logged warning
+- `.on_miss()` on node without deadline → logged warning
+
+**What happens internally:**
+1. `finalize()` runs RT auto-derivation: if `.rate()` was set on a BestEffort node, promotes to RT with 80% budget and 95% deadline
+2. Validates all constraints
+3. Registers node with the scheduler
+
+**Example:**
+```rust
+// This succeeds:
+scheduler.add(my_node).rate(100.hz()).build()?;
+
+// This fails (budget > deadline):
+scheduler.add(my_node)
+    .budget(10.ms())
+    .deadline(5.ms())
+    .build()?;  // Err: budget exceeds deadline
+```
+
+---
+
+#### run
+
+```rust
+pub fn run(&mut self) -> Result<()>
+```
+
+Start the main scheduler loop. **Blocks** until `Ctrl+C` or `.stop()` is called.
+
+**Returns:** `Result<()>` — `Ok` on graceful shutdown, `Err` on fatal error.
+
+**Behavior:**
+1. Installs `SIGINT`/`SIGTERM` signal handler
+2. Calls `init()` on all nodes (lazy init on first run)
+3. Loops: tick all nodes → sleep until next period → repeat
+4. On shutdown: calls `shutdown()` on all nodes, prints timing report
+
+**Example:**
+```rust
+scheduler.run()?; // Blocks until Ctrl+C
+```
+
+---
+
+#### tick_once
+
+```rust
+pub fn tick_once(&mut self) -> Result<()>
+```
+
+Execute exactly one tick cycle, then return. No loop, no sleep.
+
+**Behavior:**
+- Calls `init()` on all nodes if not yet initialized (lazy init)
+- Ticks every registered node once in order
+- Returns immediately after all nodes have ticked
+
+**When to use:** Testing, simulation stepping, integration tests.
+
+**Example:**
+```rust
+let mut scheduler = Scheduler::new();
+scheduler.add(my_node).build()?;
+
+// Step through 100 ticks manually
+for _ in 0..100 {
+    scheduler.tick_once()?;
+}
+```
+
+---
+
+### Adding Nodes
+
+```rust
+scheduler.add(my_node)
     .order(10)
+    // NOTE: .rate() auto-enables RT scheduling with 80% budget and 95% deadline
     .rate(500_u64.hz())
     .build()?;
 ```
 
-| Method | Returns | Description |
+`.add(node)` accepts any node — your own structs, driver handles, or factory results. Chain configuration, then `.build()` to register.
+
+**Node configuration chain:**
+
+| Method | Default | Description |
 |--------|---------|-------------|
-| `.add(node)` | `NodeBuilder` | Register a node and configure it via fluent builder |
+| `.order(u32)` | 100 | Execution priority (lower = earlier). 0-9: critical, 10-49: sensors, 50-99: processing, 100+: background |
+| `.rate(Frequency)` | global | Per-node tick rate. Auto-enables RT scheduling with 80% budget, 95% deadline |
+| `.budget(Duration)` | 80% of period | Max execution time per tick. If deadline is not set, deadline = budget (auto-derived) |
+| `.deadline(Duration)` | 95% of period | Hard deadline per tick. When exceeded, the `Miss` policy fires |
+| `.on_miss(Miss)` | `Warn` | What to do on deadline miss: `Warn`, `Skip`, `SafeMode`, `Stop` |
+| `.failure_policy(FailurePolicy)` | none | Recovery on tick failure: `Fatal`, `restart(n, backoff)`, `skip(n, cooldown)`, `Ignore` |
+| `.compute()` | — | Run on parallel thread pool (CPU-bound work) |
+| `.on(topic)` | — | Event-triggered: tick when topic receives data (empty topic rejected) |
+| `.async_io()` | — | Run on tokio blocking pool (I/O-bound work) |
+| `.priority(i32)` | none | OS `SCHED_FIFO` priority (1-99, RT only — warned if non-RT) |
+| `.core(usize)` | none | Pin to CPU core (RT only — warned if non-RT) |
+| `.watchdog(Duration)` | global | Per-node watchdog timeout override |
+| `.build()` | — | Validate configuration and register. Rejects conflicts, warns misuse |
+
+> **What `.build()` validates:** Rejects budget/deadline on non-RT classes, zero budget/deadline, empty `.on("")` topics. Warns (but allows) `.priority()`, `.core()`, and `.on_miss()` on nodes without RT/deadline. See [Validation & Conflicts](/concepts/execution-classes#validation--conflicts) for the full matrix.
 
 ### Execution Control
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `.run()` | `HorusResult<()>` | Main loop — runs until Ctrl+C or `.stop()` |
-| `.run_for(duration)` | `HorusResult<()>` | Run for specific duration, then shut down |
-| `.tick_once()` | `HorusResult<()>` | Execute exactly one tick cycle (no loop, no sleep) |
-| `.tick_once_nodes(&[names])` | `HorusResult<()>` | One tick for specific nodes only |
+| `.run()` | `Result<()>` | Main loop — runs until Ctrl+C or `.stop()` |
+| `.run_for(duration)` | `Result<()>` | Run for specific duration, then shut down |
+| `.tick_once()` | `Result<()>` | Execute exactly one tick cycle (no loop, no sleep) |
+| `.tick(&[names])` | `Result<()>` | One tick for specific nodes only |
 | `.set_node_rate(name, freq)` | `&mut Self` | Change a node's tick rate at runtime |
 | `.stop()` | `()` | Signal graceful shutdown |
 | `.is_running()` | `bool` | Check if scheduler is actively ticking |
@@ -103,11 +344,13 @@ fn main() -> Result<()> {
         .prefer_rt()
         .watchdog(500_u64.ms());
 
+    // NOTE: .rate() auto-promotes this node to RT with budget=1.6ms (80%) and deadline=1.9ms (95%)
     scheduler.add(SensorNode::new())
         .order(0)
         .rate(500_u64.hz())
         .build()?;
 
+    // NOTE: .compute() runs on a worker thread pool — no RT scheduling applied
     scheduler.add(PlannerNode::new())
         .order(50)
         .compute()
@@ -115,6 +358,7 @@ fn main() -> Result<()> {
 
     scheduler.add(ControlNode::new())
         .order(10)
+        // NOTE: .rate() auto-promotes to RT; .on_miss(SafeMode) calls enter_safe_state() on deadline miss
         .rate(1000_u64.hz())
         .on_miss(Miss::SafeMode)
         .build()?;
@@ -126,9 +370,9 @@ fn main() -> Result<()> {
 
 ---
 
-## NodeBuilder
+## Node Configuration
 
-Returned by `scheduler.add(node)`. Configure execution class, timing, ordering, and failure handling with method chaining.
+After `.add(node)`, chain these methods to configure the node before `.build()`.
 
 ### Timing & Ordering
 
@@ -155,7 +399,7 @@ Returned by `scheduler.add(node)`. Configure execution class, timing, ordering, 
 | Method | Description |
 |--------|-------------|
 | `.failure_policy(policy)` | Per-node failure handling (`Fatal`, `Restart`, `Skip`, `Ignore`) |
-| `.build()` | Finalize and register — returns `HorusResult<&mut Scheduler>` |
+| `.build()` | Finalize and register — returns `Result<&mut Scheduler>` |
 
 ### Order Guidelines
 
@@ -166,6 +410,83 @@ Returned by `scheduler.add(node)`. Configure execution class, timing, ordering, 
 | 50-99 | Normal (processing, planning) |
 | 100-199 | Low (logging, diagnostics) |
 | 200+ | Background (telemetry) |
+
+### Node Builder Detailed Reference
+
+---
+
+#### rate (NodeBuilder)
+
+```rust
+pub fn rate(self, freq: Frequency) -> Self
+```
+
+Set a per-node tick rate. **Automatically promotes the node to RT execution class** with derived budget (80% of period) and deadline (95% of period).
+
+**Parameters:**
+- `freq: Frequency` — Node-specific tick rate. Created with `.hz()`: `500_u64.hz()`.
+
+**Auto-derivation:** When `.rate()` is called on a BestEffort node:
+- `budget = period * 0.80` (e.g., 500 Hz → period 2ms → budget 1.6ms)
+- `deadline = period * 0.95` (e.g., 500 Hz → period 2ms → deadline 1.9ms)
+- Execution class → `Rt`
+
+**Interaction with `.budget()` and `.deadline()`:** Explicit `.budget()` or `.deadline()` override the auto-derived values. Order doesn't matter — derivation happens at `finalize()`.
+
+**Example:**
+```rust
+scheduler.add(sensor)
+    .rate(500.hz())     // RT: budget=1.6ms, deadline=1.9ms
+    .build()?;
+
+scheduler.add(motor)
+    .rate(1000.hz())
+    .budget(500.us())   // Override: budget=0.5ms instead of 0.8ms
+    .build()?;
+```
+
+---
+
+#### budget (NodeBuilder)
+
+```rust
+pub fn budget(self, duration: Duration) -> Self
+```
+
+Set the maximum CPU time allowed per tick.
+
+**Parameters:**
+- `duration: Duration` — Maximum execution time. Created with `.us()` or `.ms()`: `200_u64.us()`, `1_u64.ms()`.
+
+**Errors:** `.build()` rejects if:
+- `budget` is zero
+- `budget > deadline`
+- `budget` is set on a non-RT node (no `.rate()` or explicit RT class)
+
+**Example:**
+```rust
+scheduler.add(planner)
+    .rate(100.hz())
+    .budget(5.ms())     // Must complete tick within 5ms
+    .deadline(8.ms())   // Hard deadline at 8ms
+    .on_miss(Miss::Skip)
+    .build()?;
+```
+
+---
+
+#### on_miss (NodeBuilder)
+
+```rust
+pub fn on_miss(self, policy: Miss) -> Self
+```
+
+Set the policy for when a node exceeds its deadline.
+
+**Parameters:**
+- `policy: Miss` — One of `Warn`, `Skip`, `SafeMode`, `Stop`.
+
+**Default:** `Miss::Warn`.
 
 ### Miss Enum
 
@@ -243,7 +564,9 @@ let mut scheduler = Scheduler::new()
 
 scheduler.add(MotorController::new())
     .order(0)
+    // NOTE: .rate(1000.hz()) auto-derives budget=0.8ms and deadline=0.95ms
     .rate(1000_u64.hz())
+    // NOTE: Miss::SafeMode calls enter_safe_state() on the node when a deadline is missed
     .on_miss(Miss::SafeMode)
     .build()?;
 
@@ -271,4 +594,5 @@ for metric in scheduler.metrics() {
 - [Node API](/concepts/core-concepts-nodes) — The Node trait and lifecycle
 - [HealthStatus](/rust/api/health-status) — Node health states (Healthy, Warning, Unhealthy, Isolated)
 - [NodeState](/rust/api/node-state) — Node lifecycle states and transitions
-- [Python Bindings](/python/api/python-bindings) — Python Scheduler and NodeBuilder API
+- [Python Bindings](/python/api/python-bindings) — Python Scheduler API
+- [Driver API](/rust/api/drivers) — Load hardware from config

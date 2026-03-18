@@ -1,0 +1,158 @@
+---
+title: "Recipe: ROS2 Bridge"
+description: "Bridge pattern for connecting horus topics to ROS2 topics in a multi-process architecture."
+order: 11
+---
+
+## ROS2 Bridge
+
+Bridges horus topics to ROS2 topics using a multi-process architecture. The horus side runs a bridge node that reads from horus shared memory and forwards to a ROS2 process via a shared topic. This enables gradual migration — run horus for real-time control while keeping ROS2 for visualization (RViz) and navigation (Nav2).
+
+### horus.toml
+
+```toml
+[package]
+name = "ros2-bridge"
+version = "0.1.0"
+description = "Bridge horus topics to ROS2"
+```
+
+### Architecture
+
+```text
+┌─────────────────────┐     shared memory      ┌─────────────────────┐
+│   horus process     │ ◄──────────────────────►│   bridge process    │
+│                     │    Topic<CmdVel>         │                     │
+│  MotorCtrl (1kHz)   │    Topic<Imu>            │  BridgeNode (50Hz)  │
+│  Planner (10Hz)     │    Topic<LaserScan>      │  → writes to ROS2   │
+│  EStop (100Hz)      │                          │    via DDS           │
+└─────────────────────┘                          └──────────┬──────────┘
+                                                            │ DDS
+                                                 ┌──────────▼──────────┐
+                                                 │   ROS2 process      │
+                                                 │  RViz, Nav2, etc.   │
+                                                 └─────────────────────┘
+```
+
+### Horus-Side Bridge Node
+
+```rust
+use horus::prelude::*;
+
+/// Lightweight bridge payload — serialized for cross-framework transport
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct BridgePacket {
+    topic_id: u32,       // which topic this came from
+    timestamp_ns: u64,
+    linear: f32,         // for cmd_vel
+    angular: f32,
+}
+
+// ── Bridge Node ─────────────────────────────────────────────
+
+struct BridgeOutNode {
+    cmd_sub: Topic<CmdVel>,
+    imu_sub: Topic<Imu>,
+    bridge_pub: Topic<BridgePacket>,
+    tick_count: u64,
+}
+
+impl BridgeOutNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd_sub: Topic::new("cmd_vel")?,
+            imu_sub: Topic::new("imu.raw")?,
+            bridge_pub: Topic::new("bridge.out")?,
+            tick_count: 0,
+        })
+    }
+}
+
+impl Node for BridgeOutNode {
+    fn name(&self) -> &str { "BridgeOut" }
+
+    fn tick(&mut self) {
+        self.tick_count += 1;
+
+        // IMPORTANT: always recv() every tick to drain buffers
+        if let Some(cmd) = self.cmd_sub.recv() {
+            self.bridge_pub.send(BridgePacket {
+                topic_id: 1, // cmd_vel
+                timestamp_ns: self.tick_count * 20_000_000, // 50Hz
+                linear: cmd.linear,
+                angular: cmd.angular,
+            });
+        }
+
+        // Drain IMU even if we don't bridge every reading
+        if let Some(_imu) = self.imu_sub.recv() {
+            // Bridge IMU at lower rate if needed
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Execution order: bridge reads horus topics and publishes bridge packets
+    scheduler.add(BridgeOutNode::new()?)
+        .order(90)              // runs after all horus nodes
+        .rate(50_u64.hz())      // 50Hz bridge rate — RViz doesn't need 1kHz
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+### ROS2-Side Bridge (Conceptual Python)
+
+```python
+#!/usr/bin/env python3
+"""
+ROS2 node that reads horus bridge packets and republishes as ROS2 messages.
+Run this in a separate process with ROS2 sourced.
+"""
+import horus
+# import rclpy
+# from geometry_msgs.msg import Twist
+
+# ros_pub = create_publisher(Twist, '/cmd_vel', 10)
+
+def bridge_in_tick(node):
+    # IMPORTANT: always call recv() every tick
+    packet = node.recv("bridge.out")
+    if packet is None:
+        return
+
+    # Convert horus BridgePacket to ROS2 Twist
+    # twist = Twist()
+    # twist.linear.x = packet.linear
+    # twist.angular.z = packet.angular
+    # ros_pub.publish(twist)
+    pass
+
+if __name__ == "__main__":
+    bridge_in = horus.Node(name="BridgeIn", tick=bridge_in_tick,
+                           subs=["bridge.out"], rate=50)
+    horus.run(bridge_in)
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 50 Hz
+[HORUS] Node "BridgeOut" started (Rt, 50 Hz, budget: 16.0ms, deadline: 19.0ms)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "BridgeOut" shutdown complete
+```
+
+### Key Points
+
+- **Multi-process**: horus and ROS2 run in separate processes — horus topics use shared memory across processes automatically
+- **Rate decimation**: horus control runs at 1kHz, bridge forwards at 50Hz — RViz doesn't need full rate
+- **`BridgePacket`** is a simplified carrier — in production, serialize full message types
+- **Gradual migration**: keep ROS2 for visualization/navigation, move real-time control to horus
+- **No ROS2 dependency in horus**: the bridge node is pure horus — the ROS2 side handles DDS
+- **Cross-process topics**: `Topic::new("bridge.out")` works across processes via shared memory — no special config needed

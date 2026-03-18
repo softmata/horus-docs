@@ -57,7 +57,7 @@ const segmentLabels: Record<string, string> = {
 
   // Package management files
   "using-prebuilt-nodes": "Using Prebuilt Nodes",
-  "environment-management": "Environment Management",
+  "lockfile": "Lockfile & Reproducibility",
   "configuration": "Configuration",
 
   // Multi-language files
