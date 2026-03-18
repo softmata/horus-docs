@@ -226,36 +226,85 @@ if msg is not None:
     print(f"Got {len(msg.ranges)} ranges")
 ```
 
-#### recv_all
+#### `node.recv_all(topic) -> list`
+
+Receive ALL available messages as a list. Drains the buffer completely. Returns an empty list if none available.
+
+Use this for batch processing when you need to handle every message, not just the latest:
 
 ```python
-def recv_all(topic: str) -> list
+def tick(node):
+    # Process all queued commands (don't drop any)
+    commands = node.recv_all("commands")
+    for cmd in commands:
+        execute_command(cmd)
+    node.log_debug(f"Processed {len(commands)} commands this tick")
 ```
 
-Receive ALL available messages as a list. Drains the buffer. Returns empty list if none available.
+#### `node.has_msg(topic) -> bool`
 
-#### has_msg
+Check if at least one unread message is available on the topic without consuming it. The message is buffered internally and returned by the next `recv()` call.
 
 ```python
-def has_msg(topic: str) -> bool
+def tick(node):
+    if node.has_msg("emergency_stop"):
+        stop = node.recv("emergency_stop")
+        node.log_warning("Emergency stop received!")
+        node.request_stop()
 ```
 
-Check if at least one unread message is available on the topic.
+#### `node.request_stop()`
 
-#### request_stop
+Request the scheduler to shut down gracefully after the current tick completes. Use this to stop execution programmatically from within a node.
 
 ```python
-def request_stop() -> None
+def tick(node):
+    if horus.tick() >= 1000:
+        node.log_info("Reached 1000 ticks, stopping")
+        node.request_stop()
+
+    error = check_safety()
+    if error:
+        node.log_error(f"Safety violation: {error}")
+        node.request_stop()
 ```
 
-Request the scheduler to shut down gracefully after the current tick completes.
+#### `node.publishers() -> List[str]`
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `node.log_info(msg)` | `None` | Log an informational message |
-| `node.log_warning(msg)` | `None` | Log a warning message |
-| `node.log_error(msg)` | `None` | Log an error message |
-| `node.log_debug(msg)` | `None` | Log a debug message |
+Returns the list of topic names this node publishes to.
+
+```python
+def init(node):
+    node.log_info(f"Publishing to: {node.publishers()}")
+    node.log_info(f"Subscribing to: {node.subscribers()}")
+```
+
+#### `node.subscribers() -> List[str]`
+
+Returns the list of topic names this node subscribes to.
+
+#### Logging Methods
+
+| Method | Description |
+|--------|-------------|
+| `node.log_info(msg)` | Log an informational message |
+| `node.log_warning(msg)` | Log a warning message |
+| `node.log_error(msg)` | Log an error message |
+| `node.log_debug(msg)` | Log a debug message |
+
+**Important:** Logging only works during `init()`, `tick()`, or `shutdown()` callbacks. Calling outside the scheduler raises a `RuntimeWarning` and the message is silently dropped.
+
+```python
+def tick(node):
+    node.log_info("Processing sensor data")
+    node.log_warning("Sensor reading is stale")
+    node.log_error("Failed to process data")
+    node.log_debug(f"Raw value: {value}")
+
+# Outside scheduler — message is dropped with RuntimeWarning:
+node = horus.Node(name="test", tick=tick)
+node.log_info("This will be dropped!")  # RuntimeWarning
+```
 
 **Node scheduling kwargs** (maps 1:1 to Rust NodeBuilder):
 
@@ -475,6 +524,28 @@ horus.run(node, duration=5)
 
 HORUS Python includes advanced features that match or exceed ROS2 capabilities while maintaining simplicity.
 
+### NodeState
+
+The `NodeState` enum tracks which lifecycle phase a node is in:
+
+```python
+from horus import NodeState
+
+# Values:
+NodeState.IDLE       # Created but not yet running
+NodeState.RUNNING    # Actively ticking
+NodeState.PAUSED     # Temporarily suspended
+NodeState.STOPPED    # Clean shutdown complete
+NodeState.ERROR      # Error state
+```
+
+NodeState values are strings — you can compare directly:
+
+```python
+if node_state == "running":
+    print("Node is active")
+```
+
 ### Scheduler
 
 ```python
@@ -569,6 +640,53 @@ scheduler.add(logger)
 | `scheduler.stop_recording()` | Stop recording, returns list of saved file paths |
 | `Scheduler.list_recordings()` | List available recordings (static method) |
 | `Scheduler.delete_recording(name)` | Delete a recording (static method) |
+
+**Context Manager:**
+
+The Scheduler supports the `with` statement for automatic cleanup:
+
+```python
+with horus.Scheduler(tick_rate=100) as sched:
+    sched.add(horus.Node(tick=sensor_fn, rate=100, order=0))
+    sched.add(horus.Node(tick=ctrl_fn, rate=100, order=1))
+    sched.run(duration=10.0)
+# stop() called automatically on exit, even if an exception occurs
+```
+
+**Expanded Method Details:**
+
+#### `scheduler.get_node_stats(name) -> dict`
+
+Returns a dictionary with detailed statistics for the named node:
+
+```python
+stats = scheduler.get_node_stats("motor_ctrl")
+print(f"Total ticks: {stats['total_ticks']}")
+print(f"Avg tick: {stats.get('avg_tick_duration_ms', 0):.2f} ms")
+print(f"Errors: {stats['errors_count']}")
+```
+
+Keys include: `name`, `priority`, `total_ticks`, `successful_ticks`, `failed_ticks`, `avg_tick_duration_ms`, `max_tick_duration_ms`, `errors_count`, `uptime_seconds`.
+
+#### `scheduler.status() -> str`
+
+Returns the current scheduler state: `"idle"`, `"running"`, or `"stopped"`.
+
+#### `scheduler.current_tick() -> int`
+
+Returns the current tick count (0-indexed).
+
+#### `scheduler.set_node_rate(name, rate)`
+
+Change a node's tick rate at runtime. Useful for adaptive control:
+
+```python
+# Slow down logging when battery is low
+if battery_low:
+    scheduler.set_node_rate("logger", 1)  # 1 Hz
+else:
+    scheduler.set_node_rate("logger", 10)  # 10 Hz
+```
 
 **`horus.run()` — The ONE way to run nodes:**
 
@@ -1387,108 +1505,293 @@ See [Python Message Library](/python/library/python-message-library) for details
 
 ## Time API
 
-Framework clock functions — work in both normal and deterministic mode:
+Framework-aware time functions. Use these instead of `time.time()` — they integrate with deterministic mode and SimClock.
+
+**Quick reference:**
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `horus.now()` | `float` | Current time in seconds |
+| `horus.dt()` | `float` | Timestep for this tick in seconds |
+| `horus.elapsed()` | `float` | Time since scheduler start |
+| `horus.tick()` | `int` | Current tick number |
+| `horus.budget_remaining()` | `float` | Time left in tick budget |
+| `horus.rng_float()` | `float` | Random float in [0, 1) |
+| `horus.timestamp_ns()` | `int` | Nanosecond timestamp |
+
+### `horus.now() -> float`
+
+Current framework time in seconds.
+
+- **Normal mode**: Wall clock (`time.time()` equivalent)
+- **Deterministic mode**: Virtual SimClock that advances by fixed `dt` each tick
 
 ```python
-import horus
-
-horus.now()               # Current time in seconds (wall clock or SimClock)
-horus.dt()                # Timestep for this tick in seconds
-horus.elapsed()           # Time since scheduler start in seconds
-horus.tick()              # Current tick number (int)
-horus.budget_remaining()  # Time left in tick budget (float('inf') if no budget)
-horus.rng_float()         # Random float [0, 1) — deterministic if deterministic=True
-horus.timestamp_ns()      # Nanosecond timestamp for TF queries (int)
+def tick(node):
+    t = horus.now()
+    node.send("timestamp", t)
 ```
 
-In deterministic mode (`run(..., deterministic=True)`), `now()` returns SimClock time, `dt()` is fixed `1/rate`, and `rng_float()` is tick-seeded — identical results across runs.
+### `horus.dt() -> float`
+
+Timestep for this tick in seconds. Use this for physics integration instead of measuring elapsed time manually.
+
+- **Normal mode**: Actual elapsed time since last tick
+- **Deterministic mode**: Fixed `1.0 / rate` — identical across runs
+
+```python
+def tick(node):
+    # PID controller using dt() for correct integration
+    error = target - current
+    integral += error * horus.dt()
+    derivative = (error - prev_error) / horus.dt()
+    output = kp * error + ki * integral + kd * derivative
+```
+
+### `horus.elapsed() -> float`
+
+Time elapsed since the scheduler started, in seconds.
+
+```python
+def tick(node):
+    if horus.elapsed() > 30.0:
+        node.log_info("Running for 30+ seconds, stabilized")
+```
+
+### `horus.tick() -> int`
+
+Current tick number (0-indexed, increments each scheduler cycle).
+
+```python
+def tick(node):
+    if horus.tick() % 100 == 0:
+        node.log_info(f"Tick {horus.tick()}: system healthy")
+```
+
+### `horus.budget_remaining() -> float`
+
+Time remaining in this tick's budget, in seconds. Returns `float('inf')` if no budget is configured.
+
+Use this for adaptive quality — do more work when time permits, skip expensive operations when tight.
+
+```python
+def tick(node):
+    # Always do critical work
+    process_sensor_data()
+
+    # Only do expensive work if budget allows
+    if horus.budget_remaining() > 0.001:  # >1ms remaining
+        run_expensive_optimization()
+```
+
+### `horus.rng_float() -> float`
+
+Random float in `[0.0, 1.0)`.
+
+- **Normal mode**: System entropy (non-deterministic)
+- **Deterministic mode**: Tick-seeded RNG — produces identical sequences across runs
+
+```python
+def tick(node):
+    # Simulated sensor noise (reproducible in deterministic mode)
+    noise = (horus.rng_float() - 0.5) * 0.1
+    reading = true_value + noise
+```
+
+### `horus.timestamp_ns() -> int`
+
+Current timestamp in nanoseconds. Use for TransformFrame queries and message timestamping.
+
+```python
+def tick(node):
+    ts = horus.timestamp_ns()
+    transform = tf.lookup("camera", "base_link", ts)
+```
+
+### Deterministic Mode
+
+When using `horus.run(..., deterministic=True)`, the time functions switch from wall clock to SimClock:
+
+| Function | Normal Mode | Deterministic Mode |
+|----------|-------------|-------------------|
+| `now()` | Wall clock | SimClock (virtual) |
+| `dt()` | Actual elapsed | Fixed `1/rate` |
+| `elapsed()` | Real elapsed | Virtual elapsed |
+| `rng_float()` | System entropy | Tick-seeded (reproducible) |
+| `tick()` | Same | Same |
+| `budget_remaining()` | Same | Same |
+| `timestamp_ns()` | Real nanoseconds | Virtual nanoseconds |
+
+This ensures identical behavior across runs — critical for simulation, testing, and replay.
 
 ---
 
 ## Runtime Parameters
 
-`horus.Params` — dict-like access to runtime configuration from `.horus/config/params.yaml`:
+`horus.Params` provides dict-like access to runtime configuration stored in `.horus/config/params.yaml`. Change PID gains, speed limits, and thresholds without recompiling.
+
+### `Params(path=None)`
+
+Create a parameter store.
+
+- `Params()` — loads from `.horus/config/params.yaml` (default)
+- `Params("path/to/file.yaml")` — loads from explicit path
+
+### Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `get(key, default=None)` | `Any` | Get value, return default if missing |
+| `params[key]` | `Any` | Get value, raise `KeyError` if missing |
+| `params[key] = value` | — | Set value |
+| `has(key)` | `bool` | Check if key exists |
+| `key in params` | `bool` | Same as `has(key)` |
+| `keys()` | `List[str]` | All parameter names |
+| `len(params)` | `int` | Number of parameters |
+| `save()` | — | Persist to disk |
+| `remove(key)` | `bool` | Remove a key, returns True if existed |
+| `reset()` | — | Reset all parameters to defaults |
+
+### Example: Live PID Tuning
 
 ```python
 import horus
 
-p = horus.Params()              # Load from default location
-p = horus.Params("path.yaml")  # Or explicit path
+params = horus.Params()
 
-# Dict-like access
-kp = p["pid_kp"]               # KeyError if missing
-kp = p.get("pid_kp", 1.0)     # Default if missing
-p["pid_kp"] = 2.5             # Set
-p.save()                       # Persist to disk
+def controller_tick(node):
+    # Read gains from params — change at runtime via CLI or monitor
+    kp = params.get("pid_kp", 1.0)
+    ki = params.get("pid_ki", 0.1)
+    kd = params.get("pid_kd", 0.01)
+    max_speed = params.get("max_speed", 1.5)
 
-# Iteration
-for key in p:
-    print(f"{key} = {p[key]}")
+    error = target - current
+    output = min(kp * error, max_speed)
+    node.send("cmd_vel", output)
 
-"pid_kp" in p   # True
-len(p)           # Number of params
-list(p.keys())   # All param names
-p.reset()        # Reset to defaults
+controller = horus.Node(name="PIDController", tick=controller_tick,
+                        rate=100, pubs=["cmd_vel"])
+horus.run(controller)
+```
+
+Set parameters at runtime:
+```bash
+horus param set pid_kp 2.5
+horus param set max_speed 0.8
+horus param list
 ```
 
 ---
 
 ## Rate Limiter
 
-`horus.Rate` — drift-compensated rate limiting for background threads (not for nodes — nodes use `rate=` kwarg):
+`horus.Rate` provides drift-compensated rate limiting for background threads and standalone loops. For nodes, use the `rate=` constructor kwarg instead.
+
+### `Rate(hz)`
+
+Create a rate limiter targeting `hz` iterations per second.
+
+### Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `sleep()` | — | Sleep until next cycle. Compensates for work time to maintain target rate |
+| `actual_hz()` | `float` | Measured frequency (smoothed average) |
+| `target_hz()` | `float` | Target frequency |
+| `period()` | `float` | Target period in seconds (1/hz) |
+| `is_late()` | `bool` | True if current cycle exceeded the target period |
+| `reset()` | — | Reset timing (call after a pause to avoid burst catch-up) |
+
+### Example: Camera Capture Thread
 
 ```python
-from horus import Rate
+import threading
+from horus import Rate, Topic, Image
 
-rate = Rate(30)  # 30 Hz target
+def camera_loop():
+    rate = Rate(30)  # 30 FPS target
+    topic = Topic(Image)
 
-while running:
-    do_work()
-    rate.sleep()  # Compensates for work time to maintain 30 Hz
+    while running:
+        frame = capture_camera()
+        topic.send(frame)
 
-rate.actual_hz()  # Measured frequency (smoothed)
-rate.target_hz()  # Target frequency (30.0)
-rate.period()     # Target period in seconds (0.033...)
-rate.is_late()    # True if current cycle exceeded period
-rate.reset()      # Reset after a pause
+        if rate.is_late():
+            print(f"Camera behind: {rate.actual_hz():.1f} Hz (target {rate.target_hz():.0f})")
+
+        rate.sleep()
+
+thread = threading.Thread(target=camera_loop, daemon=True)
+thread.start()
 ```
 
 ---
 
 ## Hardware Drivers
 
-`horus.drivers` — load hardware connections from `horus.toml` `[drivers]` section:
+`horus.drivers` loads hardware connections from `horus.toml`'s `[drivers]` section.
+
+### Module Functions
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `drivers.load()` | `HardwareSet` | Load drivers from `horus.toml` |
+| `drivers.load_from(path)` | `HardwareSet` | Load from explicit YAML path |
+| `drivers.register_driver(name, cls)` | — | Register a Python driver class |
+
+### HardwareSet
+
+Returned by `drivers.load()`. Provides typed accessors for each hardware type.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `hw.list()` | `List[str]` | All driver names |
+| `hw.has(name)` | `bool` | Check if driver exists |
+| `name in hw` | `bool` | Same as `has(name)` |
+| `len(hw)` | `int` | Number of drivers |
+| `hw.dynamixel(name)` | `DriverParams` | Dynamixel servo bus config |
+| `hw.serial(name)` | `DriverParams` | Serial port config |
+| `hw.i2c(name)` | `DriverParams` | I2C bus config |
+| `hw.can(name)` | `DriverParams` | CAN bus config |
+| `hw.gpio(name)` | `DriverParams` | GPIO pin config |
+
+All typed accessors: `dynamixel`, `rplidar`, `realsense`, `i2c`, `serial`, `can`, `gpio`, `pwm`, `usb`, `webcam`, `input`, `bluetooth`, `net`, `ethercat`, `spi`, `adc`, `raw`.
+
+### DriverParams
+
+Dict-like access to a driver's configuration values.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `params[key]` | `Any` | Get value (KeyError if missing) |
+| `params.get(key)` | `Any` | Get value (KeyError if missing) |
+| `params.get_or(key, default)` | `Any` | Get with default if missing |
+| `params.has(key)` | `bool` | Check if key exists |
+| `params.keys()` | `List[str]` | All parameter names |
+
+### Example
+
+```toml
+# horus.toml
+[drivers]
+arm = { type = "dynamixel", port = "/dev/ttyUSB0", baudrate = 1000000 }
+lidar = { type = "rplidar", port = "/dev/ttyUSB1" }
+```
 
 ```python
 import horus
 
-hw = horus.drivers.load()               # From horus.toml
-hw = horus.drivers.load_from("path")    # Explicit path
+hw = horus.drivers.load()
 
-# Typed accessors (return DriverParams)
-bus = hw.dynamixel("arm")
-lidar = hw.rplidar("lidar")
-cam = hw.realsense("camera")
-port = hw.serial("gps")
+if hw.has("arm"):
+    arm = hw.dynamixel("arm")
+    port = arm.get_or("port", "/dev/ttyUSB0")
+    baud = arm.get_or("baudrate", 115200)
+    print(f"Arm on {port} at {baud}")
 
-# DriverParams — dict-like config access
-bus["port"]                # "/dev/ttyUSB0"
-bus.get("baudrate", 115200)
-bus.has("servo_ids")
-list(bus.keys())
-
-# Introspection
-hw.list()          # ["arm", "lidar", "camera", ...]
-hw.has("arm")      # True
-len(hw)            # Number of drivers
-"arm" in hw        # True
-
-# Register Python driver class
-horus.drivers.register_driver("MyDriver", MyDriverClass)
-node = hw.local("my_device")  # Instantiates MyDriverClass(params)
+print(f"Available drivers: {hw.list()}")
 ```
-
-All 15 Terra accessors: `dynamixel`, `rplidar`, `realsense`, `i2c`, `serial`, `can`, `gpio`, `pwm`, `usb`, `webcam`, `input`, `bluetooth`, `net`, `ethercat`, `spi`, `adc`, `raw`.
 
 ---
 
@@ -1697,10 +2000,10 @@ print(f"Errors: {stats['errors_count']}")
 
 ### Future Improvements
 
-Monitor integration for Python nodes is planned for a future release. This will require:
-- Passing `NodeInfo` context through Python bindings
-- Implementing `LogSummary` for Python message types
-- Enabling monitor to read Python node logs from `shm_base_dir()/logs (namespaced)`
+Monitor integration for Python nodes is planned for a future release. This will include:
+- Full `NodeInfo` context in Python callbacks
+- `LogSummary` for Python message types
+- Python node logs visible in the monitor TUI and web dashboard
 
 ---
 

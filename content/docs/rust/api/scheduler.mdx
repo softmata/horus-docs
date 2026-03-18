@@ -585,6 +585,104 @@ for metric in scheduler.metrics() {
 
 ---
 
+## Advanced Runtime Methods
+
+These methods require elevated privileges (root or `CAP_SYS_NICE`) on Linux. They fail gracefully with an error on unsupported platforms.
+
+| Method | Description |
+|--------|-------------|
+| `set_os_priority(i32)` | Set OS-level SCHED_FIFO priority (1-99, higher = more priority) |
+| `pin_to_cpu(usize)` | Pin scheduler thread to a specific CPU core |
+| `lock_memory()` | Lock all memory pages to prevent swapping (`mlockall`) |
+| `prefault_stack(usize)` | Pre-allocate stack pages to avoid page faults during execution |
+
+```rust
+// Production RT setup — call before run()
+scheduler.set_os_priority(80)?;  // High SCHED_FIFO priority
+scheduler.pin_to_cpu(2)?;        // Isolated CPU core
+scheduler.lock_memory()?;        // Prevent page faults
+scheduler.prefault_stack(512 * 1024)?;  // 512KB stack
+
+scheduler.run()?;
+```
+
+These are automatically applied when using `.require_rt()` on the builder. Use these methods when you need manual control over which features to enable.
+
+## Monitoring & Metrics
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `rt_stats(node_name)` | `Option<&RtStats>` | RT timing stats for a specific node (deadline misses, worst execution, jitter) |
+| `safety_stats()` | `Option<SafetyStats>` | Aggregate safety stats (budget overruns, watchdog expirations) |
+| `metrics()` | `Vec<NodeMetrics>` | Per-node metrics (tick counts, durations, errors) |
+| `node_list()` | `Vec<String>` | Names of all registered nodes |
+| `running_flag()` | `Arc<AtomicBool>` | Shared flag for external stop control |
+
+```rust
+// Check RT performance after a test run
+if let Some(stats) = scheduler.rt_stats("motor_ctrl") {
+    println!("Deadline misses: {}", stats.deadline_misses());
+    println!("Worst execution: {:?}", stats.worst_execution());
+    println!("Jitter: {:.1} μs", stats.jitter_us());
+}
+```
+
+---
+
+## Production Patterns
+
+### Warehouse AGV
+
+Mobile robot with safety monitor, lidar SLAM, path planner, and motor control:
+
+```rust
+let mut sched = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(100.hz());
+
+// Safety runs first every tick — never skip
+sched.add(EmergencyStopMonitor::new()?).order(0).rate(100.hz()).on_miss(Miss::Stop).build()?;
+
+// Sensors at 50Hz
+sched.add(LidarDriver::new()?).order(10).rate(50.hz()).build()?;
+sched.add(WheelOdometry::new()?).order(11).rate(100.hz()).build()?;
+
+// SLAM is CPU-heavy — runs on thread pool
+sched.add(SlamNode::new()?).order(20).compute().build()?;
+
+// Planner at 10Hz — doesn't need to be fast
+sched.add(PathPlanner::new()?).order(30).rate(10.hz()).build()?;
+
+// Motor control at 100Hz with strict deadline
+sched.add(MotorController::new()?).order(40).rate(100.hz()).budget(5.ms()).on_miss(Miss::Skip).build()?;
+
+// Logger at 1Hz — background priority
+sched.add(TelemetryLogger::new()?).order(200).rate(1.hz()).build()?;
+
+sched.run()?;
+```
+
+### Drone Flight Controller
+
+High-frequency IMU processing with tight deadlines:
+
+```rust
+let mut sched = Scheduler::new()
+    .require_rt()
+    .watchdog(100_u64.ms())
+    .tick_rate(1000.hz());
+
+sched.add(ImuReader::new()?).order(0).rate(1000.hz()).budget(200.us()).build()?;
+sched.add(AttitudeController::new()?).order(1).rate(1000.hz()).budget(300.us()).on_miss(Miss::SafeMode).build()?;
+sched.add(PositionController::new()?).order(2).rate(200.hz()).budget(1.ms()).build()?;
+sched.add(MotorMixer::new()?).order(3).rate(1000.hz()).budget(100.us()).build()?;
+
+sched.run()?;
+```
+
+---
+
 ## See Also
 
 - [Scheduler Concepts](/concepts/core-concepts-scheduler) — Conceptual overview and architecture
