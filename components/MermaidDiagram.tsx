@@ -188,7 +188,7 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
       // Initialize mermaid with current theme
       mermaid.initialize({
         startOnLoad: false,
-        securityLevel: 'strict',
+        securityLevel: 'loose',
         flowchart: {
           htmlLabels: true,
           padding: 20,
