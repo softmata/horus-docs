@@ -629,6 +629,425 @@ if let Some(stats) = scheduler.rt_stats("motor_ctrl") {
 
 ---
 
+## Scheduler Method Reference
+
+### new
+
+```rust
+pub fn new() -> Self
+```
+
+Create a scheduler with default settings. Detects runtime capabilities (~30-100μs) but applies no OS-level features until builder methods opt in.
+
+**Returns:** `Scheduler` with default config (100Hz tick rate, no watchdog, no blackbox).
+
+**Example:**
+```rust
+let mut scheduler = Scheduler::new();
+```
+
+---
+
+### name
+
+```rust
+pub fn name(mut self, name: &str) -> Self
+```
+
+Set the scheduler's name (for logging and diagnostics). Default: `"Scheduler"`.
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().name("MainControl");
+```
+
+---
+
+### tick_rate
+
+```rust
+pub fn tick_rate(mut self, freq: Frequency) -> Self
+```
+
+Set the global tick rate. Default: 100 Hz. Individual nodes can override with `.rate()`.
+
+**Parameters:**
+- `freq: Frequency` — Target rate (e.g., `1000.hz()`)
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().tick_rate(1000.hz()); // 1kHz main loop
+```
+
+---
+
+### watchdog
+
+```rust
+pub fn watchdog(mut self, timeout: Duration) -> Self
+```
+
+Enable frozen node detection. Creates a safety monitor that checks node tick duration against the timeout. If a node doesn't complete within the timeout, graduated degradation triggers.
+
+**Parameters:**
+- `timeout: Duration` — Maximum allowed tick duration (e.g., `500.ms()`)
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().watchdog(500.ms());
+```
+
+---
+
+### blackbox
+
+```rust
+pub fn blackbox(mut self, size_mb: usize) -> Self
+```
+
+Enable the BlackBox flight recorder. Records node ticks, timing, and events in a circular buffer for post-mortem analysis.
+
+**Parameters:**
+- `size_mb: usize` — Buffer size in megabytes
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().blackbox(64); // 64MB flight recorder
+```
+
+---
+
+### require_rt
+
+```rust
+pub fn require_rt(mut self) -> Self
+```
+
+Require all RT features. **Panics** if RT capabilities are unavailable (no `CAP_SYS_NICE`, no PREEMPT_RT kernel). Applies: SCHED_FIFO priority, memory locking (`mlockall`), CPU affinity.
+
+**Panics:** If the system doesn't support real-time scheduling.
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().require_rt(); // panics without RT support
+```
+
+---
+
+### prefer_rt
+
+```rust
+pub fn prefer_rt(mut self) -> Self
+```
+
+Request RT features with graceful degradation. Applies what's available, records degradations for features that fail. Use `degradations()` to check what wasn't applied.
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().prefer_rt(); // best-effort RT
+```
+
+---
+
+### deterministic
+
+```rust
+pub fn deterministic(mut self, enabled: bool) -> Self
+```
+
+Enable deterministic execution mode. Uses SimClock (fixed dt), seeded RNG, and lockstep execution. Essential for simulation and replay.
+
+**Example:**
+```rust
+let mut sched = Scheduler::new().deterministic(true);
+```
+
+---
+
+### max_deadline_misses
+
+```rust
+pub fn max_deadline_misses(mut self, n: u64) -> Self
+```
+
+Set the threshold for consecutive deadline misses before a node is isolated. Default: 100.
+
+**Example:**
+```rust
+let mut sched = Scheduler::new()
+    .watchdog(500.ms())
+    .max_deadline_misses(5); // isolate after 5 consecutive misses
+```
+
+---
+
+### verbose
+
+```rust
+pub fn verbose(mut self, enabled: bool) -> Self
+```
+
+Enable/disable non-emergency logging. Default: `true`. Set `false` for quieter production logs.
+
+---
+
+### with_recording
+
+```rust
+pub fn with_recording(mut self) -> Self
+```
+
+Enable session recording for replay and debugging.
+
+---
+
+## NodeBuilder Method Reference
+
+Returned by `scheduler.add(node)`. Chain methods to configure the node, then call `.build()`.
+
+### order
+
+```rust
+pub fn order(mut self, order: u32) -> Self
+```
+
+Set execution priority. Lower = runs first. Typical: 0 (safety), 10 (control), 50 (sensors), 100+ (logging).
+
+**Example:**
+```rust
+scheduler.add(safety_node).order(0).build()?;
+scheduler.add(motor_ctrl).order(10).build()?;
+```
+
+---
+
+### rate
+
+```rust
+pub fn rate(mut self, freq: Frequency) -> Self
+```
+
+Set per-node tick rate. Auto-derives budget (80% of period) and deadline (95% of period). Auto-marks as RT execution class.
+
+**Parameters:**
+- `freq: Frequency` — Tick rate (e.g., `1000.hz()`)
+
+**Caveats:** Setting `.rate()` then `.compute()` produces Compute (not RT) due to deferred finalize. Last execution class setter wins.
+
+**Example:**
+```rust
+scheduler.add(imu_reader).order(0).rate(1000.hz()).build()?;
+```
+
+---
+
+### budget
+
+```rust
+pub fn budget(mut self, budget: Duration) -> Self
+```
+
+Set tick execution time budget. Overrides the auto-derived budget from `.rate()`. Auto-marks as RT.
+
+**Parameters:**
+- `budget: Duration` — Max tick execution time (e.g., `500.us()`)
+
+**Example:**
+```rust
+scheduler.add(motor)
+    .order(0)
+    .rate(1000.hz())
+    .budget(300.us())  // override auto-derived 800μs
+    .build()?;
+```
+
+---
+
+### deadline
+
+```rust
+pub fn deadline(mut self, deadline: Duration) -> Self
+```
+
+Set hard deadline. When exceeded, the `Miss` policy fires. Auto-marks as RT.
+
+**Parameters:**
+- `deadline: Duration` — Hard deadline (e.g., `950.us()`)
+
+---
+
+### on_miss
+
+```rust
+pub fn on_miss(mut self, policy: Miss) -> Self
+```
+
+Set the deadline miss policy.
+
+**Parameters:**
+- `policy: Miss` — `Miss::Warn`, `Miss::Skip`, `Miss::SafeMode`, or `Miss::Stop`
+
+**Example:**
+```rust
+scheduler.add(motor)
+    .rate(1000.hz())
+    .on_miss(Miss::SafeMode)  // enter safe state on deadline miss
+    .build()?;
+```
+
+---
+
+### compute
+
+```rust
+pub fn compute(mut self) -> Self
+```
+
+Mark as CPU-bound. Runs on a worker thread pool, not the main tick loop. Use for planning, ML inference, image processing.
+
+---
+
+### on
+
+```rust
+pub fn on(mut self, topic: &str) -> Self
+```
+
+Event-driven execution. Node ticks only when the named topic receives a new message.
+
+**Example:**
+```rust
+scheduler.add(handler).on("emergency_stop").build()?;
+```
+
+---
+
+### async_io
+
+```rust
+pub fn async_io(mut self) -> Self
+```
+
+Run on the tokio async runtime. Use for network I/O, file I/O, HTTP requests.
+
+---
+
+### failure_policy
+
+```rust
+pub fn failure_policy(mut self, policy: FailurePolicy) -> Self
+```
+
+Set error handling policy for this node.
+
+---
+
+### priority
+
+```rust
+pub fn priority(mut self, prio: i32) -> Self
+```
+
+Set OS-level thread priority (SCHED_FIFO, 1-99). Requires `CAP_SYS_NICE`.
+
+---
+
+### core
+
+```rust
+pub fn core(mut self, cpu_id: usize) -> Self
+```
+
+Pin this node's thread to a specific CPU core.
+
+**Example:**
+```rust
+scheduler.add(motor).order(0).rate(1000.hz()).core(2).build()?;
+```
+
+---
+
+### build
+
+```rust
+pub fn build(mut self) -> HorusResult<&'a mut Scheduler>
+```
+
+Finalize and register the node. Validates configuration, applies deferred finalize (RT auto-detection), and adds the node to the scheduler.
+
+**Returns:** `HorusResult<&mut Scheduler>` — the scheduler for chaining, or error if validation fails.
+
+**Panics:** Never panics — returns `Err` on invalid config.
+
+**Example:**
+```rust
+scheduler.add(my_node)
+    .order(0)
+    .rate(100.hz())
+    .build()?;  // registered and ready
+```
+
+---
+
+## Execution Method Reference
+
+### run
+
+```rust
+pub fn run(&mut self) -> HorusResult<()>
+```
+
+Start the tick loop. Blocks until Ctrl+C, `stop()`, or fatal error. Calls `init()` on all nodes (lazy, first call only), then ticks in priority order.
+
+**Example:**
+```rust
+scheduler.run()?; // blocks until Ctrl+C
+```
+
+---
+
+### run_for
+
+```rust
+pub fn run_for(&mut self, duration: Duration) -> HorusResult<()>
+```
+
+Run for a specific duration, then shut down.
+
+**Example:**
+```rust
+scheduler.run_for(30.secs())?; // run 30 seconds then stop
+```
+
+---
+
+### tick_once
+
+```rust
+pub fn tick_once(&mut self) -> HorusResult<()>
+```
+
+Execute exactly one tick cycle. Essential for deterministic testing — tick, verify, tick, verify.
+
+**Example:**
+```rust
+scheduler.tick_once()?;
+let stats = scheduler.metrics();
+// verify one tick executed
+```
+
+---
+
+### stop
+
+```rust
+pub fn stop(&self)
+```
+
+Signal graceful shutdown. The current tick completes, then `shutdown()` runs on all nodes in reverse order.
+
+---
+
 ## Production Patterns
 
 ### Warehouse AGV

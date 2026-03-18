@@ -322,6 +322,209 @@ if let Some(pose) = self.odom_topic.read_latest() {
 
 ---
 
+### try_send
+
+```rust
+pub fn try_send(&self, msg: T) -> Result<(), T>
+```
+
+Attempt to send without overwriting. If the buffer is full, the message is returned to the caller.
+
+**Parameters:**
+- `msg: T` — The message to send. Returned on failure.
+
+**Returns:**
+- `Ok(())` — Sent successfully
+- `Err(msg)` — Buffer full, message returned
+
+**When to use:** When you need to detect drops — implement backpressure, count losses, or log warnings. For fire-and-forget, use `send()` instead.
+
+**Example:**
+```rust
+match topic.try_send(cmd) {
+    Ok(()) => {}
+    Err(_returned) => {
+        self.drop_count += 1;
+        hlog!(warn, "Buffer full — {} drops total", self.drop_count);
+    }
+}
+```
+
+---
+
+### try_recv
+
+```rust
+pub fn try_recv(&self) -> Option<T>
+```
+
+Non-blocking receive. Functionally identical to `recv()` — both are non-blocking and return `Option<T>`. Provided for API symmetry with `try_send()`.
+
+**Returns:**
+- `Some(T)` — Next unread message
+- `None` — No messages available
+
+**Example:**
+```rust
+if let Some(msg) = topic.try_recv() {
+    self.process(msg);
+}
+```
+
+---
+
+### send_blocking
+
+```rust
+pub fn send_blocking(&self, msg: T, timeout: Duration) -> Result<(), SendBlockingError>
+```
+
+Send with guaranteed delivery. Blocks until buffer space is available or timeout expires. Uses a 3-phase strategy: immediate try, spin loop (sub-μs), then sleep in 100μs increments.
+
+**Parameters:**
+- `msg: T` — The message to send
+- `timeout: Duration` — Maximum time to wait
+
+**Returns:**
+- `Ok(())` — Delivered
+- `Err(SendBlockingError::Timeout)` — Buffer stayed full for the entire timeout
+
+**When to use:** Safety-critical commands (emergency stop, motor setpoints) where dropping a message is unacceptable. NOT for high-frequency data — use `send()` instead.
+
+**Example:**
+```rust
+use horus::prelude::*;
+
+// Critical: e-stop must be delivered
+match topic.send_blocking(stop_cmd, 1.ms()) {
+    Ok(()) => hlog!(info, "E-stop delivered"),
+    Err(_) => hlog!(error, "E-stop delivery FAILED — subscriber unresponsive"),
+}
+```
+
+---
+
+### with_capacity
+
+```rust
+pub fn with_capacity(name: &str, capacity: u32, slot_size: Option<usize>) -> HorusResult<Self>
+```
+
+Create a topic with custom ring buffer capacity.
+
+**Parameters:**
+- `name: &str` — Topic identifier
+- `capacity: u32` — Number of slots (rounded up to next power of 2)
+- `slot_size: Option<usize>` — Bytes per slot. `None` = auto-sized from `size_of::<T>()`
+
+**Returns:** `HorusResult<Topic<T>>`
+
+**When to use:** Bursty producers that need more buffering, or memory-constrained systems that need smaller buffers.
+
+**Example:**
+```rust
+// 256-slot buffer for a high-frequency sensor
+let topic = Topic::<Imu>::with_capacity("imu", 256, None)?;
+
+// Small buffer to save memory on a constrained device
+let topic = Topic::<Pose2D>::with_capacity("pose", 4, None)?;
+```
+
+---
+
+### name
+
+```rust
+pub fn name(&self) -> &str
+```
+
+Returns the topic name string.
+
+**Example:**
+```rust
+let topic = Topic::<f32>::new("sensor.temperature")?;
+assert_eq!(topic.name(), "sensor.temperature");
+```
+
+---
+
+### has_message
+
+```rust
+pub fn has_message(&self) -> bool
+```
+
+Check if at least one unread message is available without consuming it.
+
+**Example:**
+```rust
+if topic.has_message() {
+    let msg = topic.recv().unwrap();  // guaranteed Some
+}
+```
+
+---
+
+### pending_count
+
+```rust
+pub fn pending_count(&self) -> u64
+```
+
+Number of unread messages in the buffer.
+
+**Example:**
+```rust
+if topic.pending_count() > 10 {
+    hlog!(warn, "Topic '{}' has {} pending — subscriber may be too slow",
+        topic.name(), topic.pending_count());
+}
+```
+
+---
+
+### dropped_count
+
+```rust
+pub fn dropped_count(&self) -> u64
+```
+
+Total messages dropped due to buffer overflow (oldest overwritten by `send()`). Resets to 0 on topic creation.
+
+**Example:**
+```rust
+if topic.dropped_count() > 0 {
+    hlog!(warn, "{} messages dropped on '{}' — consider increasing capacity or subscriber rate",
+        topic.dropped_count(), topic.name());
+}
+```
+
+---
+
+### metrics
+
+```rust
+pub fn metrics(&self) -> TopicMetrics
+```
+
+Aggregated send/receive statistics.
+
+**Returns:** `TopicMetrics` with methods:
+- `messages_sent() -> u64`
+- `messages_received() -> u64`
+- `send_failures() -> u64`
+- `recv_failures() -> u64`
+
+**Example:**
+```rust
+let m = topic.metrics();
+println!("Sent: {}, Received: {}, Failures: send={} recv={}",
+    m.messages_sent(), m.messages_received(),
+    m.send_failures(), m.recv_failures());
+```
+
+---
+
 ## Using Topics in Nodes
 
 Topics are typically used inside `Node` implementations registered with a `Scheduler`:
