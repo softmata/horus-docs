@@ -257,11 +257,35 @@ cargo run --release -p horus_benchmarks --bin robotics_messages_benchmark
 | Binary | Description |
 |--------|-------------|
 | `robotics_messages_benchmark` | IPC latency with real robotics message types |
-| `all_paths_latency` | AdaptiveTopic latency across all backend routes |
+| `all_paths_latency` | All 10 backend paths with RDTSC cycle precision |
 | `cross_process_benchmark` | Cross-process shared memory IPC |
 | `scalability_benchmark` | Scaling with producer/consumer thread counts |
 | `determinism_benchmark` | Execution determinism and jitter |
 | `dds_comparison_benchmark` | Comparison with DDS middleware (requires `--features dds`) |
+
+#### Research-Grade Benchmarks
+
+For publication-quality measurements with sustained runs, size sweeps, histograms, and competitor comparison:
+
+| Binary | Description |
+|--------|-------------|
+| `raw_baselines` | Hardware floor (memcpy, atomic, mmap) — no HORUS overhead |
+| `research_latency` | Sustained measurement + message size sweep (8B-4KB), CSV output |
+| `research_throughput` | Per-second throughput timeseries over 60s+ |
+| `research_jitter` | RT tick jitter histogram + IPC latency under CPU contention |
+| `research_scalability` | Node scaling (1-100) + topic scaling (1-1000) |
+| `competitor_comparison` | HORUS vs raw UDP (+ Zenoh with `--features zenoh`) |
+
+```bash
+# Run full research suite (~30 minutes)
+./benchmarks/research/run_all.sh
+
+# Quick validation (~3 minutes)
+./benchmarks/research/run_all.sh --quick
+
+# Individual benchmark with CSV output
+cargo run --release -p horus_benchmarks --bin research_latency -- --duration 60 --csv results.csv
+```
 
 Run any benchmark with:
 
@@ -347,6 +371,70 @@ cargo bench -p horus_benchmarks
 
 - **Complex structs** (IMU with 27-element covariances): Still sub-microsecond
 - **Variable-size messages** (PointCloud with Vec): Linear scaling
+
+---
+
+## Overhead Attribution
+
+How much latency does HORUS add over raw memory operations? Measured via `raw_baselines` benchmark:
+
+| Operation | 8B Latency | What it measures |
+|-----------|-----------|------------------|
+| Raw `memcpy` | ~11ns | Hardware floor (cache-to-cache copy) |
+| Raw `AtomicU64` store+load | ~11ns | Signaling floor |
+| **HORUS DirectChannel** | **~23ns** | +12ns (ring buffer header + dispatch) |
+| **HORUS SpscIntra** | **~155ns** | +144ns (cross-thread atomic coordination) |
+| Raw UDP loopback | ~1,158ns | Kernel network stack |
+
+**HORUS adds 12ns** over raw memory for same-thread IPC — roughly 2 cache line accesses of overhead. Cross-thread adds atomic coordination cost but stays under 200ns.
+
+**HORUS is 50x faster than raw UDP** on the same machine — the kernel network stack adds ~1,100ns of overhead that shared memory eliminates entirely.
+
+---
+
+## Scalability
+
+### Node Scaling
+
+Scheduler tick overhead with increasing node count (measured via `research_scalability`):
+
+| Nodes | Tick Duration | Overhead vs 1 Node |
+|-------|--------------|-------------------|
+| 1 | 1,058 μs | baseline |
+| 10 | 1,072 μs | +1.3% |
+| 20 | 1,139 μs | +7.7% |
+| 50 | 1,178 μs | +11% |
+| 100 | 1,209 μs | **+14%** |
+
+**Near-linear scaling**: 100 nodes adds only 14% overhead. Each additional node costs approximately 1.5μs.
+
+### Topic Scaling
+
+IPC latency with increasing topic count (all topics created simultaneously):
+
+| Topics | p50 Latency | Degradation |
+|--------|-------------|-------------|
+| 1 | 23ns | baseline |
+| 10 | 24ns | 0% |
+| 100 | 23ns | 0% |
+| 500 | 23ns | 0% |
+| 1,000 | 23ns | **0%** |
+
+**O(1) topic lookup**: Latency is constant regardless of how many topics exist in the system. Users can add sensors, monitors, and debug topics without affecting performance.
+
+### Latency by Message Size
+
+IPC latency scales linearly with message size (measured via `research_latency`):
+
+| Size | DirectChannel | SpscIntra |
+|------|--------------|-----------|
+| 8B | 23ns | 155ns |
+| 64B | 24ns | 161ns |
+| 256B | 30ns | 175ns |
+| 1KB | 53ns | 213ns |
+| 4KB | 155ns | 316ns |
+
+**Linear scaling**: Latency grows proportionally with message size (memcpy-dominated). No sudden jumps or allocation spikes.
 
 ---
 
