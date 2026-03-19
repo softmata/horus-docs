@@ -6,7 +6,22 @@ weight: 46
 
 # Linux RT Setup
 
-Real-time scheduling requires kernel and permission configuration. This guide walks through every step, from checking your current capabilities to verifying Horus runs with RT scheduling.
+You need to configure your Linux system so that HORUS can use real-time scheduling (SCHED_FIFO) for timing-critical nodes. This guide walks through every step, from checking your current capabilities to verifying HORUS runs with RT scheduling.
+
+## When To Use This
+
+- Your robot has motor controllers, safety monitors, or sensor fusion nodes that need bounded latency
+- You are using `.require_rt()` or `.prefer_rt()` on the scheduler
+- You see "Operation not permitted" or "cannot set SCHED_FIFO" errors at startup
+- You need sub-millisecond worst-case jitter for hard real-time applications
+
+**Skip this if** you are prototyping or running in simulation. The default scheduler works without RT configuration, and `.prefer_rt()` degrades gracefully when RT is unavailable.
+
+## Prerequisites
+
+- A Linux system (Ubuntu, Debian, Arch, or any distro with kernel source access)
+- `sudo` access for kernel and permission changes
+- Familiarity with [Real-Time Concepts](/concepts/real-time) and [Execution Classes](/concepts/execution-classes)
 
 ## Check Current RT Capabilities
 
@@ -171,10 +186,46 @@ Jetson runs a custom L4T kernel. PREEMPT_RT patches are available from NVIDIA fo
 
 Use the `linux-image-rt` package from the Raspberry Pi OS repo, or apply the PREEMPT_RT patch to the `rpi-6.x.y` kernel branch. The Pi 4/5 have 4 cores — isolating cores 2-3 for RT while leaving 0-1 for the OS works well. Set `arm_freq` in `config.txt` to a fixed value to avoid frequency scaling jitter.
 
+## Design Decisions
+
+**Why `.prefer_rt()` and `.require_rt()` instead of always using RT?**
+
+RT scheduling requires kernel support and permissions that are not always available -- especially during development, CI, or in containers. `.prefer_rt()` lets you develop on any Linux system and only enforce RT in production. `.require_rt()` fails fast at startup so you know immediately if your deployment target is misconfigured.
+
+**Why CPU isolation with `isolcpus` instead of just thread affinity?**
+
+Thread affinity (`.core(N)`) pins your node to a specific core, but other processes can still be scheduled on that core. `isolcpus` removes the core from the Linux scheduler entirely, so only your pinned threads run there. This eliminates scheduling jitter from kernel threads, interrupts, and other userspace processes.
+
+**Why `CAP_SYS_NICE` instead of running as root?**
+
+Running a robot as root is a security risk. `setcap cap_sys_nice=eip` grants RT scheduling to a specific binary without root access. This follows the principle of least privilege -- the binary can set thread priorities but cannot modify the filesystem or network configuration.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| PREEMPT_RT gives microsecond worst-case latency | Must install and maintain a separate kernel |
+| CPU isolation eliminates scheduling jitter | Isolated cores are unavailable for other processes |
+| `setcap` avoids running as root | Must re-apply after recompiling the binary |
+| `.prefer_rt()` degrades gracefully | Timing guarantees silently degrade if RT is unavailable |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "Operation not permitted" on startup | Missing RT permissions | Add `rtprio 99` to `/etc/security/limits.conf` and re-login |
+| `ulimit -r` still returns 0 after editing limits.conf | Did not log out and back in | Log out completely (not just close terminal) and log back in |
+| RT works but latency spikes above 1ms | No PREEMPT_RT kernel | Install `linux-image-rt-amd64` (Debian) or `linux-image-realtime` (Ubuntu) |
+| Latency spikes on specific cores | CPU frequency scaling or SMT interference | Set `cpupower frequency-set -g performance` and disable hyperthreading in BIOS |
+| `.require_rt()` panics in Docker | Missing `CAP_SYS_NICE` capability | Add `--cap-add SYS_NICE` to `docker run` |
+| `setcap` has no effect | Binary was recompiled after `setcap` | Re-run `setcap` after every `cargo build --release` |
+| Isolated cores show 0% usage in `htop` | Expected -- `isolcpus` removes them from the general scheduler | Use `htop` with per-thread view to see your pinned RT threads |
+
 ---
 
 ## See Also
 
-- [Real-Time Concepts](/concepts/real-time) — Why real-time matters
-- [Execution Classes](/concepts/execution-classes) — RT auto-detection
-- [Scheduler Configuration](/advanced/scheduler-configuration) — Tick rate tuning
+- [Real-Time Concepts](/concepts/real-time) — Why real-time matters for robotics
+- [Execution Classes](/concepts/execution-classes) — RT auto-detection from `.rate()`, `.budget()`, `.deadline()`
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Tick rate tuning and per-node RT options
+- [Safety Monitor](/advanced/safety-monitor) — Deadline enforcement and watchdog timers
