@@ -1,39 +1,40 @@
 ---
 title: "Execution Classes"
 description: "The 5 execution classes — Rt, Compute, Event, AsyncIo, BestEffort — and when to use each"
-order: 5
+order: 8
 ---
 
 # Execution Classes
 
-Every node in HORUS runs in one of 5 **execution classes**. Each class has a different executor optimized for its workload. The scheduler auto-selects the class based on how you configure the node.
+A motor controller that misses its deadline by even a millisecond can cause a robot arm to overshoot and collide with a person. A path planner that takes 50 ms of CPU time is completely normal — but if it runs on the same thread as the motor controller, it blocks 50 ticks. A logging node that takes an extra 10 ms is harmless. A cloud uploader that blocks on a network request shouldn't hold up anything.
 
-```rust
-use horus::prelude::*;
+These are fundamentally different workloads. Running them all the same way — in a single sequential loop — forces every node to compromise. The fast ones wait for the slow ones. The critical ones share a thread with the optional ones. A single slow node can cascade timing failures across the entire system.
 
-let mut sched = Scheduler::new().tick_rate(100_u64.hz());
+HORUS solves this with **execution classes**: five different executors, each optimized for a specific workload type. The scheduler automatically selects the right class based on how you configure the node — you describe what your node needs, and the scheduler figures out how to run it.
 
-// BestEffort (default) — main tick loop
-sched.add(logger).order(100).build()?;
+## The Five Classes
 
-// Rt (auto-detected) — dedicated RT thread
-sched.add(motor).order(0).rate(1000_u64.hz()).budget(300_u64.us()).build()?;
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart TD
+    A["Node Builder"] -->|default — no special config| F["BestEffort<br/>Main loop, sequential"]
+    A -->|".rate() or .budget() or .deadline()"| B["Rt<br/>Dedicated thread, timing enforced"]
+    A -->|".compute()"| C["Compute<br/>Thread pool, parallel"]
+    A -->|".on(topic)"| D["Event<br/>Sleeps until message"]
+    A -->|".async_io()"| E["AsyncIo<br/>Tokio runtime, non-blocking"]
 
-// Compute — parallel thread pool
-sched.add(planner).order(5).compute().build()?;
+    style F fill:#6b7280,stroke:#4b5563,color:#fff
+    style B fill:#ef4444,stroke:#dc2626,color:#fff
+    style C fill:#3b82f6,stroke:#2563eb,color:#fff
+    style D fill:#22c55e,stroke:#16a34a,color:#000
+    style E fill:#a855f7,stroke:#9333ea,color:#fff
+`}
+  caption="The scheduler selects the execution class from your node configuration"
+/>
 
-// Event — triggered by topic
-sched.add(handler).order(10).on("emergency_stop").build()?;
+### BestEffort (Default)
 
-// AsyncIo — tokio runtime
-sched.add(uploader).order(50).async_io().build()?;
-```
-
----
-
-## BestEffort (Default)
-
-The default class. Nodes tick sequentially in the main loop, ordered by `.order()`.
+Nodes tick sequentially in the main loop, ordered by `.order()`. This is the simplest and lowest-overhead class.
 
 ```rust
 sched.add(display_node)
@@ -41,61 +42,43 @@ sched.add(display_node)
     .build()?;  // No .rate(), .compute(), .on(), or .async_io() → BestEffort
 ```
 
-**Executor:** Main thread, sequential, round-robin.
+**How it works**: The main scheduler thread calls `tick()` on each BestEffort node in sequence, once per scheduler cycle. No threads are spawned. No synchronization is needed.
 
-**Use for:**
-- Logging, telemetry, display
-- Simple nodes with no timing requirements
-- Anything that doesn't need parallelism or real-time guarantees
+**Use for**: Logging, telemetry, display, diagnostic reporting — anything without timing requirements or heavy computation.
 
-**Characteristics:**
+**Characteristics**:
 - Runs at the scheduler's global `tick_rate()`
-- Sequential ordering is deterministic
-- Lowest overhead (no thread spawn, no synchronization)
+- Deterministic ordering (same sequence every cycle)
+- Lowest overhead — no thread spawn, no atomics, no synchronization
 
----
+### Rt (Real-Time)
 
-## Rt (Real-Time)
-
-Nodes that need guaranteed timing. **Auto-detected** when you set `.rate()`, `.budget()`, or `.deadline()` on the node builder.
+Each RT node gets a **dedicated thread** with optional OS-level priority scheduling. The scheduler enforces timing budgets and deadlines, and takes action when a node runs too long.
 
 ```rust
 // Auto-derived: budget = 80% of period, deadline = 95% of period
 sched.add(motor_ctrl)
     .order(0)
-    .rate(1000_u64.hz())
+    .rate(1000_u64.hz())       // 1 kHz → budget=800µs, deadline=950µs
+    .on_miss(Miss::SafeMode)   // Enter safe state on deadline miss
     .build()?;
 
 // Explicit budget and deadline
 sched.add(safety_monitor)
-    .order(1)
-    .rate(500_u64.hz())
-    .budget(800_u64.us())
-    .deadline(1800_u64.us())
-    .on_miss(Miss::Skip)
+    .order(0)
+    .budget(100_u64.us())
+    .deadline(200_u64.us())
+    .on_miss(Miss::Stop)
     .build()?;
 ```
 
-**Executor:** Dedicated RT thread per node. If the OS supports it (Linux with `CAP_SYS_NICE`), uses `SCHED_FIFO` real-time scheduling.
+<Callout type="info">
+**There is no `.rt()` method.** RT is always auto-detected from timing constraints. Setting `.rate()`, `.budget()`, or `.deadline()` — any of them — automatically assigns the Rt class. This maps developer intent ("this node needs to run at 1 kHz") directly to the right executor.
+</Callout>
 
-**Auto-detection rules:**
-- `.rate(freq)` alone → RT with auto-derived budget (80% of period) and deadline (95% of period)
-- `.budget(duration)` → RT
-- `.deadline(duration)` → RT
-- Any combination of the above → RT
+**How it works**: Each RT node runs on its own dedicated thread. If `.require_rt()` or `.prefer_rt()` is set on the scheduler and the OS supports it, the thread gets `SCHED_FIFO` real-time priority. The scheduler measures every `tick()` call and applies the `Miss` policy when budget or deadline is exceeded.
 
-**You do NOT call `.rt()`** — there is no such method. RT is always implicit from timing constraints.
-
-**Miss policies** (what happens when a tick exceeds its deadline):
-
-| Policy | Behavior |
-|--------|----------|
-| `Miss::Warn` | Log a warning, continue normally |
-| `Miss::Skip` | Skip the next tick to catch up |
-| `Miss::SafeMode` | Reduce rate and isolate the node |
-| `Miss::Stop` | Emergency shutdown |
-
-**Additional RT configuration:**
+**Additional RT configuration**:
 
 ```rust
 sched.add(critical_node)
@@ -104,72 +87,56 @@ sched.add(critical_node)
     .budget(300_u64.us())
     .deadline(900_u64.us())
     .on_miss(Miss::Skip)
-    .priority(90)           // OS-level priority (1-99, higher = more urgent)
+    .priority(90)           // OS-level thread priority (1-99, higher = more urgent)
     .core(0)                // Pin to CPU core 0
     .watchdog(500_u64.ms()) // Per-node freeze detection
     .build()?;
 ```
 
-**Use for:**
-- Motor control loops (500-1000 Hz)
-- Safety monitoring
-- Any node that needs timing guarantees
+**Use for**: Motor control, safety monitoring, sensor fusion — anything where missing a deadline has physical consequences.
 
----
+### Compute
 
-## Compute
-
-For CPU-heavy work that benefits from parallelism. Runs on a shared thread pool.
+For CPU-heavy work that benefits from parallelism. Multiple Compute nodes run simultaneously on a shared thread pool.
 
 ```rust
 sched.add(path_planner)
     .order(5)
     .compute()
-    .rate(10_u64.hz())  // Optional: limit compute rate
+    .rate(10_u64.hz())  // Optional: limit how often the node ticks
     .build()?;
 ```
 
-**Executor:** `rayon`-style parallel thread pool. Multiple compute nodes can run simultaneously on different cores.
+**How it works**: Compute nodes are dispatched to a thread pool (similar to `rayon`). Multiple compute nodes can run in parallel on different CPU cores. They don't block the main tick loop or RT threads.
 
-**Use for:**
-- Path planning
-- Point cloud processing
-- Image processing / ML inference (CPU)
-- Any CPU-bound work that takes >1ms per tick
+**Use for**: Path planning, SLAM, point cloud processing, ML inference on CPU, image processing — any CPU-bound work that takes more than ~1 ms per tick.
 
-**Characteristics:**
-- Runs in parallel with other compute nodes
-- Does not block the main tick loop
-- Optional `.rate()` limits how often the node ticks (otherwise ticks every scheduler cycle)
+<Callout type="warning">
+`.rate()` on a Compute node does **not** make it RT — it only limits how often the node ticks. A `.rate(10_u64.hz()).compute()` node ticks at most 10 times per second but has no budget or deadline enforcement.
+</Callout>
 
----
+### Event
 
-## Event
-
-Nodes that only tick when a specific topic receives new data. Zero CPU usage when idle.
+Nodes that sleep until a specific topic receives new data. Zero CPU usage when idle.
 
 ```rust
 sched.add(estop_handler)
     .order(0)
-    .on("emergency_stop")
+    .on("emergency.stop")
     .build()?;
 ```
 
-**Executor:** Wakes on topic update, runs on a dedicated thread.
+**How it works**: The node's thread sleeps. When any publisher calls `send()` on the named topic, the Event node wakes and `tick()` is called. If multiple messages arrive between wakes, the node ticks once — call `recv()` in a loop inside `tick()` to drain all pending messages.
 
-**Use for:**
-- Emergency stop handlers
-- Command receivers (tick only when a command arrives)
-- Sparse events (collision detected, goal reached)
+**Use for**: Emergency stop handlers, command receivers, sparse event processors — anything where the node should be completely idle until something specific happens.
 
-**Characteristics:**
+**Characteristics**:
 - Zero CPU when no messages arrive
-- Immediate wake-up on topic update (~microseconds)
+- Wake latency: ~microseconds from `send()` to `tick()`
+- `.order()` still applies: if two event nodes wake simultaneously, lower order runs first
 - The topic name in `.on("name")` must match a `Topic::new("name")` in another node
 
----
-
-## AsyncIo
+### AsyncIo
 
 For network, file I/O, or GPU operations that would block a real-time thread. Runs on a tokio runtime.
 
@@ -177,60 +144,108 @@ For network, file I/O, or GPU operations that would block a real-time thread. Ru
 sched.add(cloud_uploader)
     .order(50)
     .async_io()
-    .rate(1_u64.hz())
+    .rate(1_u64.hz())  // Upload once per second
     .build()?;
 ```
 
-**Executor:** `tokio::task::spawn_blocking`. The node's `tick()` runs in a blocking thread managed by tokio.
+**How it works**: The node's `tick()` runs via `tokio::task::spawn_blocking` on a tokio-managed thread pool. The node can safely block on network requests, file I/O, or database queries without affecting any other node.
 
-**Use for:**
-- HTTP/REST API calls
-- Database writes
-- File I/O (logging to disk)
-- GPU inference (if the API blocks)
-- Network communication
-
-**Characteristics:**
-- Never blocks the main tick loop or RT threads
-- tokio manages the thread pool
-- Optional `.rate()` limits tick frequency
-
----
+**Use for**: HTTP/REST API calls, database writes, file logging, cloud telemetry, GPU inference with blocking APIs.
 
 ## How Classes Are Selected
 
 The scheduler selects the execution class based on **which builder methods you call**:
 
-| Builder Methods | Resulting Class |
-|----------------|-----------------|
-| (none) | BestEffort |
-| `.rate()` | Rt |
+| Configuration | Resulting Class |
+|--------------|-----------------|
+| (nothing special) | BestEffort |
+| `.rate()` | Rt (auto-derived budget/deadline) |
 | `.budget()` | Rt |
 | `.deadline()` | Rt |
-| `.rate()` + `.budget()` + `.deadline()` | Rt |
+| `.rate()` + `.budget()` + `.deadline()` | Rt (explicit overrides) |
 | `.compute()` | Compute |
+| `.compute().rate()` | Compute (rate-limited, not RT) |
 | `.on("topic")` | Event |
 | `.async_io()` | AsyncIo |
+| `.async_io().rate()` | AsyncIo (rate-limited, not RT) |
 
-**Important:** `.rate()` on a `compute()` or `async_io()` node does NOT make it RT — it just limits how often the node ticks. RT is only auto-detected when `.rate()` is used without `.compute()` or `.async_io()`.
+**Key rule**: `.rate()` only auto-enables RT when no explicit execution class (`.compute()`, `.on()`, `.async_io()`) is set. When combined with an explicit class, `.rate()` just limits tick frequency.
 
----
+### Deferred Finalization
+
+Class selection happens at `.build()` time, not when individual methods are called. This means:
+- `.rate(100_u64.hz()).compute()` → **Compute** (`.compute()` overrides auto-RT)
+- `.compute().rate(100_u64.hz())` → **Compute** (same result regardless of order)
+- `.compute().async_io()` → **AsyncIo** (last explicit class wins, warning logged)
 
 ## Decision Guide
 
-| Your Node Does... | Use |
-|-------------------|-----|
-| Motor control at 500+ Hz | **Rt** — `.rate(500_u64.hz())` |
-| Safety monitoring with deadlines | **Rt** — `.rate().budget().deadline().on_miss()` |
-| Path planning (takes 10-50ms) | **Compute** — `.compute()` |
-| ML inference on CPU | **Compute** — `.compute()` |
-| React to emergency stop | **Event** — `.on("emergency_stop")` |
-| Upload telemetry to cloud | **AsyncIo** — `.async_io()` |
-| Write logs to disk | **AsyncIo** — `.async_io()` |
-| Display dashboard updates | **BestEffort** — default |
-| Simple sensor reading | **BestEffort** or **Rt** (if timing matters) |
+| Your node does... | Use | Builder |
+|-------------------|-----|---------|
+| Motor control at 500+ Hz | **Rt** | `.rate(500_u64.hz())` |
+| Safety monitoring with deadlines | **Rt** | `.rate().budget().deadline().on_miss()` |
+| Path planning (takes 10-50 ms) | **Compute** | `.compute()` |
+| ML inference on CPU | **Compute** | `.compute()` |
+| React to emergency stop | **Event** | `.on("emergency.stop")` |
+| Process commands as they arrive | **Event** | `.on("command")` |
+| Upload telemetry to cloud | **AsyncIo** | `.async_io()` |
+| Write logs to disk | **AsyncIo** | `.async_io()` |
+| Display dashboard updates | **BestEffort** | (default) |
+| Simple sensor reading | **BestEffort** or **Rt** | `.rate()` if timing matters |
 
----
+## Validation and Common Mistakes
+
+`.build()` validates your configuration and catches mistakes:
+
+### What's Rejected
+
+| Configuration | Error |
+|--------------|-------|
+| `.compute().budget()` | Budget only meaningful for RT nodes |
+| `.on("topic").deadline()` | Deadline only meaningful for RT nodes |
+| `.async_io().budget()` | Budget only meaningful for RT nodes |
+| `.budget(Duration::ZERO)` | Budget must be > 0 |
+| `.on("")` | Empty topic — node can never trigger |
+
+### What's Warned
+
+| Configuration | Warning |
+|--------------|---------|
+| `.compute().async_io()` | Last class wins (AsyncIo), first silently overridden |
+| `.compute().priority(99)` | Priority ignored on non-RT nodes |
+| `.on_miss(Miss::Stop)` without deadline | No deadline to miss — policy has no effect |
+
+### Common Mistakes
+
+**1. Thinking `.priority()` works on Compute nodes**
+
+```rust
+// Priority is silently ignored — only RT nodes get SCHED_FIFO threads
+sched.add(planner).compute().priority(99).build()?;
+
+// Make it RT if you need OS-level priority
+sched.add(planner).rate(100_u64.hz()).priority(99).build()?;
+```
+
+**2. Setting `.on_miss()` without a deadline**
+
+```rust
+// No deadline means Miss::Stop can never trigger
+sched.add(ctrl).compute().on_miss(Miss::Stop).build()?;
+
+// Add .rate() so a deadline exists to miss
+sched.add(ctrl).rate(100_u64.hz()).on_miss(Miss::Stop).build()?;
+```
+
+**3. Chaining multiple execution classes**
+
+```rust
+// Only the LAST class applies — compute() is silently overridden
+sched.add(node).compute().async_io().build()?;  // → AsyncIo, NOT Compute
+
+// Pick one
+sched.add(node).async_io().build()?;
+```
 
 ## Complete Example: Mixed Execution Classes
 
@@ -242,7 +257,7 @@ fn main() -> Result<()> {
         .tick_rate(100_u64.hz())
         .prefer_rt();
 
-    // Rt — 1kHz motor control with strict timing
+    // Rt — 1 kHz motor control with strict timing
     sched.add(MotorController::new()?)
         .order(0)
         .rate(1000_u64.hz())
@@ -250,7 +265,13 @@ fn main() -> Result<()> {
         .on_miss(Miss::Skip)
         .build()?;
 
-    // Rt — 100Hz sensor reading
+    // Event — only runs when emergency_stop topic updates
+    sched.add(EmergencyHandler::new()?)
+        .order(0)
+        .on("emergency.stop")
+        .build()?;
+
+    // Rt — 100 Hz sensor reading
     sched.add(ImuReader::new()?)
         .order(1)
         .rate(100_u64.hz())
@@ -261,12 +282,6 @@ fn main() -> Result<()> {
         .order(5)
         .compute()
         .rate(10_u64.hz())
-        .build()?;
-
-    // Event — only runs when emergency_stop topic updates
-    sched.add(EmergencyHandler::new()?)
-        .order(0)
-        .on("emergency_stop")
         .build()?;
 
     // AsyncIo — telemetry upload every 5 seconds
@@ -281,132 +296,35 @@ fn main() -> Result<()> {
         .order(100)
         .build()?;
 
-    sched.run()?;
-    Ok(())
+    sched.run()
 }
 ```
 
----
+## Design Decisions
 
-## Validation & Conflicts
+**Why 5 classes instead of just RT and non-RT?**
+A thread-per-node model (RT) is wasteful for logging nodes — dedicating OS threads and SCHED_FIFO slots to telemetry is overkill. A single-threaded model (BestEffort) can't handle 50 ms path planning without stalling the control loop. A two-class split (RT vs non-RT) doesn't distinguish between CPU-bound work (Compute), event-driven reactions (Event), and I/O-bound operations (AsyncIo) — each of which has a fundamentally different optimal executor. The five-class model matches the five common robotics workload patterns.
 
-`.build()` validates your configuration and catches mistakes. Here's what's **rejected**, what's **warned**, and what's **valid**.
+**Why auto-detection instead of explicit class selection?**
+Most developers don't think in terms of "execution classes" — they think "this node needs to run at 1 kHz" or "this node does heavy computation." Auto-detection from `.rate()`, `.compute()`, `.on()`, and `.async_io()` maps intent to the right executor without requiring framework knowledge. If you set `.rate(1000_u64.hz())`, the scheduler knows you need a dedicated real-time thread. You don't have to explicitly request one.
 
-### Validity Matrix
+**Why does `.rate()` + `.compute()` not become RT?**
+Because rate-limiting and real-time are different things. A path planner at 10 Hz means "tick at most 10 times per second" — not "this node has a 100 ms deadline that must be enforced." Mixing the two concepts would force compute nodes to pay RT overhead (dedicated threads, timing measurement) for no benefit. The rule is clear: `.rate()` only triggers RT when no explicit class is set.
 
-| Configuration | Result | Behavior |
-|---|---|---|
-| `.rate()` alone | **Valid** | Auto-RT with budget (80%) and deadline (95%) |
-| `.rate().budget()` | **Valid** | RT with explicit budget override |
-| `.rate().deadline()` | **Valid** | RT with explicit deadline override |
-| `.budget()` alone | **Valid** | Auto-RT (no rate, explicit budget) |
-| `.rate().compute()` | **Valid** | Compute with rate-limiting, **not** RT |
-| `.rate().async_io()` | **Valid** | AsyncIo with rate-limiting, **not** RT |
-| `.rate().on("topic")` | **Valid** | Event with rate as poll interval hint |
-| `.compute().budget()` | **Rejected** | Budget only meaningful for RT nodes |
-| `.on("topic").deadline()` | **Rejected** | Deadline only meaningful for RT nodes |
-| `.async_io().budget()` | **Rejected** | Budget only meaningful for RT nodes |
-| `.budget(Duration::ZERO)` | **Rejected** | Must be > 0 |
-| `.deadline(Duration::ZERO)` | **Rejected** | Must be > 0 |
-| `.on("")` | **Rejected** | Empty topic — node can never trigger |
-| `.compute().async_io()` | **Warned** | Last class wins (AsyncIo), first silently overridden |
-| `.compute().priority(99)` | **Warned** | Priority ignored on non-RT nodes |
-| `.compute().core(2)` | **Warned** | Core pinning ignored on non-RT nodes |
-| `.on_miss(Miss::Stop)` (no deadline) | **Warned** | No deadline to miss — policy has no effect |
+## Trade-offs
 
-### What Rejection Looks Like
-
-Rejected configurations return `Err` from `.build()`:
-
-```rust
-// Budget on a non-RT node — REJECTED
-scheduler.add(planner)
-    .compute()
-    .budget(500_u64.us())
-    .build()?;
-// Error: node 'planner' has budget/deadline set but uses a non-RT execution class.
-//        Budget/deadline are only meaningful for RT nodes. Either remove
-//        .compute()/.async_io()/.on() or remove .budget()/.deadline().
-```
-
-```rust
-// Empty topic name — REJECTED
-scheduler.add(handler)
-    .on("")
-    .build()?;
-// Error: node 'handler': event topic name must not be empty —
-//        .on("") creates a node that can never trigger.
-```
-
-```rust
-// Zero deadline — REJECTED
-scheduler.add(motor)
-    .rate(1000_u64.hz())
-    .deadline(Duration::ZERO)
-    .build()?;
-// Error: deadline must be > 0 (a zero deadline is meaningless for RT guarantees)
-```
-
-### Common Mistakes
-
-**1. Thinking `.priority()` works on Compute nodes**
-
-```rust
-// ✗ Priority is silently ignored — only RT nodes get SCHED_FIFO threads
-scheduler.add(planner).compute().priority(99).build()?;
-
-// ✓ Make it RT if you need OS-level priority
-scheduler.add(planner).rate(100_u64.hz()).priority(99).build()?;
-```
-
-**2. Setting `.on_miss()` without a deadline**
-
-```rust
-// ✗ No deadline means Miss::Stop can never trigger
-scheduler.add(controller).compute().on_miss(Miss::Stop).build()?;
-
-// ✓ Add .rate() so a deadline exists to miss
-scheduler.add(controller).rate(100_u64.hz()).on_miss(Miss::Stop).build()?;
-```
-
-**3. Empty topic name in `.on()`**
-
-```rust
-// ✗ Empty topic — node will never trigger
-scheduler.add(handler).on("").build()?;
-
-// ✓ Use the actual topic name
-scheduler.add(handler).on("emergency_stop").build()?;
-```
-
-**4. Chaining multiple execution classes**
-
-```rust
-// ✗ Only the LAST class applies — compute() is silently overridden
-scheduler.add(node).compute().async_io().build()?;  // → AsyncIo, NOT Compute
-
-// ✓ Pick one
-scheduler.add(node).async_io().build()?;
-```
-
-### What `.rate()` Actually Does
-
-The behavior of `.rate()` depends on whether you also set an execution class:
-
-| You Write | Result |
-|---|---|
-| `.rate(100.hz())` | **RT node** — auto-derives budget (80%) and deadline (95%) |
-| `.rate(100.hz()).compute()` | **Compute node** — rate limits ticks, no RT |
-| `.rate(100.hz()).async_io()` | **AsyncIo node** — rate limits ticks, no RT |
-| `.rate(100.hz()).on("topic")` | **Event node** — rate stored as poll interval hint |
-
-`.rate()` only auto-enables RT when no explicit execution class is set. This is intentional — you often want rate-limited compute nodes (e.g., a path planner at 10Hz) without RT overhead.
-
----
+| Gain | Cost |
+|------|------|
+| **Right executor per workload** — each node runs optimally | Must understand which class fits your node |
+| **Auto-detection** — `.rate()` infers RT without explicit configuration | Less explicit — must know the `.rate()` + `.compute()` interaction |
+| **RT isolation** — a slow Compute node can't block an RT motor controller | RT nodes consume one OS thread each |
+| **Event nodes** — zero CPU when idle | Must match `.on("topic")` name exactly to a `Topic::new("topic")` |
+| **AsyncIo** — I/O never blocks the tick loop | tokio runtime overhead for simple file writes |
 
 ## See Also
 
-- [Scheduler (Full Reference)](/concepts/core-concepts-scheduler) — complete scheduler API
-- [Scheduler Configuration](/advanced/scheduler-configuration) — advanced tuning
-- [Real-Time Control Tutorial](/tutorials/realtime-control) — hands-on RT tutorial
-- [Choosing Configuration](/concepts/choosing-configuration) — progressive complexity guide
+- [Scheduler — Full Reference](/concepts/core-concepts-scheduler) — How the scheduler manages all execution classes
+- [Scheduler API](/rust/api/scheduler) — Complete builder method reference
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Advanced tuning and RT setup
+- [Choosing Configuration](/concepts/choosing-configuration) — Progressive complexity guide
+- [Real-Time Control Tutorial](/tutorials/realtime-control) — Hands-on RT tutorial
