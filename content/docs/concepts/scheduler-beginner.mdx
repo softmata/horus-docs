@@ -1,24 +1,47 @@
 ---
 title: "Scheduler: Running Your Nodes"
-description: "How the HORUS scheduler executes your nodes — a 5-minute introduction"
+description: "How the HORUS scheduler executes your nodes — a beginner's guide from first principles"
 order: 3
 ---
 
 # Scheduler: Running Your Nodes
 
-> For the full reference with real-time configuration, watchdog, deadline monitoring, and composable builders, see [Scheduler — Full Reference](/concepts/core-concepts-scheduler).
+A robot has a camera reading frames, a controller computing motor commands, a safety system watching for collisions, and a logger recording everything. Each of these is a separate node. But who decides which one runs first? Who makes sure the safety check happens before the motor command? Who handles it when the camera takes too long? And who stops all the motors cleanly when you press Ctrl+C?
 
-## What is the Scheduler?
+You could write all of this coordination yourself — loops, threads, timers, signal handlers — but you'd be writing a scheduler. Every robotics team eventually builds one, and most get it wrong. Race conditions, priority inversions, missed deadlines, and unclean shutdowns are the norm.
 
-The **scheduler** is the engine that runs your nodes. It:
+HORUS gives you a **scheduler** that handles all of this. You tell it which nodes to run, in what order, and at what speed. It handles the rest: timing, ordering, monitoring, and shutdown.
 
-1. Calls `init()` on every node (once)
-2. Calls `tick()` on every node (repeatedly, in order)
-3. Calls `shutdown()` on every node when you press Ctrl+C
+> For the full reference with real-time configuration, watchdog, deadline monitoring, composable builders, and deterministic mode, see [Scheduler — Full Reference](/concepts/core-concepts-scheduler).
 
-You don't write loops or manage threads. You add nodes, set their order, and let the scheduler handle the rest.
+## How It Works
 
-## Basic Usage
+### What Is the Scheduler?
+
+The **scheduler** is the engine that runs your nodes. It does three things:
+
+1. **Calls `init()` on every node** — once, at startup. This is where nodes connect to hardware, open files, or set up state.
+2. **Calls `tick()` on every node** — repeatedly, in order, at a configurable speed. This is your main logic.
+3. **Calls `shutdown()` on every node** — once, when the program exits. This is where nodes stop motors, close connections, and clean up.
+
+You don't write loops or manage threads. You add nodes, configure their order and timing, and let the scheduler handle everything.
+
+<MermaidDiagram
+  chart={`%%{init: {'stateDiagram': {'padding': 15}}}%%
+stateDiagram-v2
+    [*] --> init: Scheduler starts
+    init --> tick: All nodes initialized
+    tick --> tick: Repeat at configured rate
+    tick --> shutdown: Ctrl+C or error
+    shutdown --> [*]: All nodes cleaned up
+`}
+  caption="The scheduler lifecycle: initialize once, tick repeatedly, shut down once"
+/>
+
+### Basic Usage
+
+<Tabs items={["Rust", "Python"]}>
+<Tab value="Rust">
 
 ```rust
 use horus::prelude::*;
@@ -28,7 +51,7 @@ fn main() -> Result<()> {
 
     // Add nodes with execution order
     scheduler.add(SensorNode::new()?)
-        .order(0)       // Runs first
+        .order(0)       // Runs first every tick
         .build()?;
 
     scheduler.add(ControlNode::new()?)
@@ -45,7 +68,8 @@ fn main() -> Result<()> {
 }
 ```
 
-**In Python:**
+</Tab>
+<Tab value="Python">
 
 ```python
 import horus
@@ -56,7 +80,10 @@ logger = horus.Node(name="Logger", tick=logger_tick, order=2)
 horus.run(sensor, control, logger)
 ```
 
-## Execution Order
+</Tab>
+</Tabs>
+
+### Execution Order
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
@@ -74,115 +101,365 @@ flowchart LR
   caption="Nodes execute in order every tick, then the cycle repeats"
 />
 
-**Lower order number = runs first.** This is how you ensure data flows correctly:
+**Lower order number = runs first.** This is how you ensure data flows correctly through your system:
 
 | Order | Node | Why This Order |
 |-------|------|----------------|
-| 0 | SensorNode | Read data first |
-| 1 | ControlNode | Process the data |
-| 2 | LoggerNode | Log the results |
+| 0 | SensorNode | Reads data from hardware first |
+| 1 | ControlNode | Processes sensor data and computes commands |
+| 2 | LoggerNode | Records everything that happened this tick |
 
-If two nodes have the same order, they run in the order they were added.
+If two nodes have the same order, they run in the order they were added to the scheduler. The scheduler provides order-range guidelines:
 
-## Setting Tick Rate
+| Range | Category | Examples |
+|-------|----------|----------|
+| 0–9 | Critical | Emergency stop, safety monitor |
+| 10–49 | High priority | Sensor readers, actuator controllers |
+| 50–99 | Normal | Processing, planning, fusion |
+| 100–199 | Low priority | Logging, telemetry, visualization |
+| 200+ | Background | Diagnostics, statistics |
 
-The default tick rate is **100 Hz**. You can change it:
+### Setting the Tick Rate
+
+The **tick rate** is how many times per second the scheduler runs through all nodes. It's measured in **Hertz (Hz)** — a unit that means "times per second."
+
+<Callout type="info">
+**What is a Hertz?** 1 Hz means once per second. 100 Hz means 100 times per second. 1000 Hz (also written as 1 kHz) means 1000 times per second. A motor controller typically runs at 100–1000 Hz because it needs to adjust the motor thousands of times per second for smooth motion. A logger might only need 1–10 Hz.
+</Callout>
+
+The default tick rate is **100 Hz** (100 times per second). Change it with `.tick_rate()`:
 
 ```rust
-scheduler.tick_rate(100.hz());  // 100 ticks per second
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .tick_rate(100_u64.hz());  // 100 times per second
 ```
 
-Or set per-node rates:
+The `.hz()` syntax is HORUS's `DurationExt` trait — it converts a number into a frequency. Similarly, `.ms()` creates milliseconds and `.us()` creates microseconds:
+
+```rust
+100_u64.hz()    // 100 Hz (frequency)
+5_u64.ms()      // 5 milliseconds (duration)
+200_u64.us()    // 200 microseconds (duration)
+1_u64.secs()    // 1 second (duration)
+```
+
+### Per-Node Rates
+
+Not every node needs to run at the same speed. A fast sensor might need 1000 Hz while a logger only needs 10 Hz. Set per-node rates:
 
 ```rust
 scheduler.add(FastSensor::new()?)
     .order(0)
-    .rate(1000.hz())  // This node ticks at 1kHz
+    .rate(1000_u64.hz())  // This node ticks at 1 kHz
     .build()?;
 
 scheduler.add(SlowLogger::new()?)
     .order(1)
-    .rate(10.hz())    // This node ticks at 10Hz
+    .rate(10_u64.hz())    // This node ticks at 10 Hz
     .build()?;
 ```
 
-The `.hz()` syntax comes from HORUS's `DurationExt` trait — `1000.hz()` means 1000 times per second.
+The scheduler automatically skips ticks for slower nodes — `SlowLogger` only has its `tick()` called every 100th cycle (at 1 kHz global rate, 10 Hz node rate = called every 100 ticks).
 
-## Graceful Shutdown
+<Callout type="tip">
+Setting `.rate()` on a node has a side effect: it automatically marks the node as **real-time** and derives a budget (80% of the period) and deadline (95% of the period). A 1000 Hz node gets a 0.8 ms budget and a 0.95 ms deadline. You can override these with `.budget()` and `.deadline()`.
+</Callout>
 
-When you press **Ctrl+C**, the scheduler:
+### Graceful Shutdown
 
-1. Stops calling `tick()`
-2. Calls `shutdown()` on every node (in reverse order)
+When you press **Ctrl+C**, the scheduler doesn't just kill everything. It:
+
+1. Stops calling `tick()` on all nodes
+2. Calls `shutdown()` on every node **in reverse order** — the last-added node shuts down first
 3. Exits cleanly
 
-This is critical for robots — you want motors to stop and connections to close properly, even if the program is interrupted.
+This reverse order is critical for safety. Consider: your motor controller (order 1) depends on sensor data from the sensor node (order 0). During shutdown, you want the motor controller to stop the motors *before* the sensor node disconnects — otherwise the motor controller loses its data source while motors are still spinning.
 
 ```rust
 impl Node for MotorController {
+    fn name(&self) -> &str { "Motor" }
+
+    fn tick(&mut self) {
+        if let Some(cmd) = self.commands.recv() {
+            self.motor.set_velocity(cmd.linear);
+        }
+    }
+
+    // SAFETY: always stop motors in shutdown — a spinning motor
+    // with no controller is a safety hazard
     fn shutdown(&mut self) -> Result<()> {
-        self.motor.set_velocity(0.0);  // Stop the motor!
+        self.motor.set_velocity(0.0);
         println!("Motor safely stopped");
         Ok(())
     }
 }
 ```
 
+<Callout type="danger">
+**Always implement `shutdown()` for nodes that control physical hardware.** Without it, motors keep spinning, grippers stay clamped, and heaters stay on when your program exits. The scheduler guarantees `shutdown()` is called even on Ctrl+C — but only if you implement it.
+</Callout>
+
+## Timing: Budgets, Deadlines, and Misses
+
+Robots operate in the real world. A motor controller that takes 5 ms instead of 1 ms doesn't just "slow down" — it causes the robot to overshoot its target, potentially colliding with objects or people. The scheduler monitors timing and takes action when nodes run too long.
+
+### What Is a Budget?
+
+A **budget** is the maximum time a node's `tick()` should take. If you set a budget of 800 µs (microseconds), the scheduler expects `tick()` to finish within 800 µs. If it takes longer, that's a **deadline miss**.
+
+```rust
+scheduler.add(MotorController::new()?)
+    .order(1)
+    .rate(1000_u64.hz())        // 1 kHz → 1 ms per tick
+    .budget(800_u64.us())       // tick() should finish in 800 µs
+    .build()?;
+```
+
+<Callout type="info">
+If you set `.rate()` without an explicit `.budget()`, HORUS auto-derives the budget as **80% of the period**. A 1000 Hz node (1 ms period) gets a 0.8 ms (800 µs) budget. This leaves 20% headroom for scheduling overhead.
+</Callout>
+
+### What Is a Deadline?
+
+A **deadline** is the absolute latest a `tick()` can finish before the scheduler considers it a critical problem. The budget is a soft target; the deadline is a hard wall.
+
+```rust
+scheduler.add(MotorController::new()?)
+    .order(1)
+    .rate(1000_u64.hz())
+    .budget(800_u64.us())       // Soft target: finish in 800 µs
+    .deadline(950_u64.us())     // Hard wall: must finish by 950 µs
+    .build()?;
+```
+
+If you set `.rate()` without an explicit `.deadline()`, HORUS auto-derives it as **95% of the period**.
+
+### What Happens When a Node Takes Too Long?
+
+When a node exceeds its deadline, the scheduler reacts according to the **miss policy** you set with `.on_miss()`:
+
+| Policy | What happens | Use when |
+|--------|-------------|----------|
+| `Miss::Warn` | Log a warning, continue normally | Non-critical nodes (logging, display) |
+| `Miss::Skip` | Skip this node's next tick to recover | High-frequency nodes that can afford to skip one cycle |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node | Safety-critical nodes (motors slow to safe speed) |
+| `Miss::Stop` | Stop the entire scheduler | Last resort — whole system must halt |
+
+```rust
+scheduler.add(MotorController::new()?)
+    .order(1)
+    .rate(1000_u64.hz())
+    .budget(800_u64.us())
+    .on_miss(Miss::SafeMode)  // If tick takes too long, enter safe state
+    .build()?;
+```
+
+When `Miss::SafeMode` triggers, the scheduler calls `enter_safe_state()` on your node — a method you implement to bring the node to a known-safe condition:
+
+```rust
+impl Node for MotorController {
+    fn name(&self) -> &str { "Motor" }
+
+    fn tick(&mut self) {
+        if let Some(cmd) = self.commands.recv() {
+            self.motor.set_velocity(cmd.linear);
+        }
+    }
+
+    // Called by scheduler when a deadline miss triggers SafeMode
+    fn enter_safe_state(&mut self) {
+        // SAFETY: reduce to safe speed — don't stop completely,
+        // as that might cause a sudden jerk
+        self.motor.set_velocity(0.0);
+    }
+
+    fn is_safe_state(&self) -> bool {
+        // Tell the scheduler whether we've reached safe state
+        self.motor.velocity().abs() < 0.01
+    }
+}
+```
+
+<Callout type="warning">
+If you don't set `.on_miss()`, the default is `Miss::Warn` — the scheduler logs a warning but takes no action. For nodes that control physical hardware, always set an explicit miss policy.
+</Callout>
+
+## Execution Classes (How Nodes Run)
+
+Not all nodes have the same workload. A motor controller needs microsecond-precise timing. A path planner needs heavy CPU computation. A cloud uploader needs network I/O. Running them all the same way wastes resources and creates bottlenecks.
+
+The scheduler assigns each node an **execution class** that determines how it runs:
+
+| Class | How it runs | Auto-detected when you set | Use for |
+|-------|------------|---------------------------|---------|
+| **BestEffort** | Sequential in main loop | Default (no special config) | Logging, telemetry, display |
+| **Rt** | Dedicated thread | `.rate()`, `.budget()`, or `.deadline()` | Motor control, safety, sensor fusion |
+| **Compute** | Thread pool | `.compute()` | Path planning, SLAM, image processing |
+| **Event** | Wakes on topic message | `.on("topic_name")` | Emergency stop, command handlers |
+| **AsyncIo** | Tokio runtime | `.async_io()` | Cloud upload, HTTP, database |
+
+You don't pick a class directly — the scheduler infers it from how you configure the node:
+
+```rust
+// BestEffort (default) — no special config
+scheduler.add(logger).order(2).build()?;
+
+// Rt — auto-detected from .rate()
+scheduler.add(motor).order(1).rate(1000_u64.hz()).build()?;
+
+// Compute — explicitly marked
+scheduler.add(planner).order(1).compute().build()?;
+
+// Event — triggered by a topic message
+scheduler.add(estop).order(0).on("emergency.stop").build()?;
+```
+
+<Callout type="tip">
+You don't need to understand execution classes to get started. Just use `.order()` and `.rate()` and the scheduler picks the right class. Execution classes become important when you have nodes with very different workload patterns and need to optimize resource usage.
+</Callout>
+
 ## A Complete Example
 
-Putting it all together — a sensor that publishes data and a monitor that displays it:
+A temperature monitor with sensor, threshold checker, and logger — all coordinated by the scheduler:
+
+<Tabs items={["Rust", "Python"]}>
+<Tab value="Rust">
 
 ```rust
 use horus::prelude::*;
 
 struct Sensor {
-    publisher: Topic<f32>,
+    pub_temp: Topic<f32>,
     value: f32,
+}
+
+impl Sensor {
+    fn new() -> Result<Self> {
+        Ok(Self { pub_temp: Topic::new("sensor.temperature")?, value: 20.0 })
+    }
 }
 
 impl Node for Sensor {
     fn name(&self) -> &str { "Sensor" }
+
+    fn init(&mut self) -> Result<()> {
+        println!("Sensor initialized");
+        Ok(())
+    }
+
     fn tick(&mut self) {
         self.value += 0.1;
-        self.publisher.send(self.value);
+        self.pub_temp.send(self.value);
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        println!("Sensor shut down");
+        Ok(())
     }
 }
 
 struct Monitor {
-    subscriber: Topic<f32>,
+    sub_temp: Topic<f32>,
+    threshold: f32,
+}
+
+impl Monitor {
+    fn new(threshold: f32) -> Result<Self> {
+        Ok(Self { sub_temp: Topic::new("sensor.temperature")?, threshold })
+    }
 }
 
 impl Node for Monitor {
     fn name(&self) -> &str { "Monitor" }
+
     fn tick(&mut self) {
-        if let Some(v) = self.subscriber.recv() {
-            println!("Value: {:.1}", v);
+        if let Some(temp) = self.sub_temp.recv() {
+            if temp > self.threshold {
+                println!("ALERT: {:.1}°C exceeds {:.1}°C threshold!", temp, self.threshold);
+            } else {
+                println!("OK: {:.1}°C", temp);
+            }
         }
     }
 }
 
 fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new()
-        .tick_rate(1.hz());  // 1 Hz for readability
-    scheduler.add(Sensor { publisher: Topic::new("data")?, value: 0.0 })
-        .order(0).build()?;
-    scheduler.add(Monitor { subscriber: Topic::new("data")? })
-        .order(1).build()?;
-    scheduler.run()
+    let mut sched = Scheduler::new()
+        .tick_rate(1_u64.hz());  // 1 Hz — slow enough to observe
+
+    sched.add(Sensor::new()?)
+        .order(0)     // Reads data first
+        .build()?;
+
+    sched.add(Monitor::new(25.0)?)
+        .order(1)     // Processes data second
+        .build()?;
+
+    // Runs until Ctrl+C, then calls shutdown() on each node
+    sched.run()
 }
 ```
 
-## Key Takeaways
+</Tab>
+<Tab value="Python">
 
-- The **scheduler** runs your nodes — you don't write loops
-- `.order(n)` controls execution sequence (lower = first)
-- `.rate(n.hz())` sets tick frequency
-- **Ctrl+C** triggers graceful shutdown on all nodes
-- Shutdown runs in **reverse order** — dependent nodes stop first
+```python
+import horus
 
-## Next Steps
+value = 20.0
 
-- [Nodes: The Building Blocks](/concepts/nodes-beginner) — what nodes are and how they work
-- [Topics: How Nodes Talk](/concepts/topics-beginner) — pub/sub communication
-- [Quick Start](/getting-started/quick-start) — build a complete working example
-- [Scheduler — Full Reference](/concepts/core-concepts-scheduler) — real-time config, watchdog, deadline monitoring
+def sensor_tick(node):
+    global value
+    value += 0.1
+    node.send("sensor.temperature", value)
+
+def monitor_tick(node):
+    temp = node.recv("sensor.temperature")
+    if temp is not None:
+        if temp > 25.0:
+            print(f"ALERT: {temp:.1f}°C exceeds threshold!")
+        else:
+            print(f"OK: {temp:.1f}°C")
+
+sensor = horus.Node(name="Sensor", tick=sensor_tick, pubs=["sensor.temperature"], order=0)
+monitor = horus.Node(name="Monitor", tick=monitor_tick, subs=["sensor.temperature"], order=1)
+horus.run(sensor, monitor, tick_rate=1)  # 1 Hz
+```
+
+</Tab>
+</Tabs>
+
+## Design Decisions
+
+**Why a scheduler instead of writing your own loop?**
+A `while` loop that calls each node is simple — until you need timing, ordering, monitoring, and shutdown. A bare loop doesn't enforce execution order, doesn't measure how long each node takes, doesn't recover from deadline misses, and doesn't guarantee motors stop when the program exits. Every robotics team eventually builds these features. The scheduler gives them to you out of the box and has been tested across thousands of configurations.
+
+**Why tick() instead of run()?**
+A `run()` method gives each node full control — it can loop forever, block on I/O, or ignore shutdown signals. A `tick()` method gives the scheduler full control: it decides when to call each node, how long to allow, and when to force shutdown. This enables deterministic execution (same order every cycle), deadline monitoring (detect when a node takes too long), and coordinated shutdown (all nodes stop together, in the right order).
+
+**Why automatic execution class detection?**
+Most developers don't think in terms of "execution classes." They think "this node needs to run at 1 kHz" or "this node does heavy computation." The scheduler infers the right class from `.rate()`, `.compute()`, `.on()`, and `.async_io()`, mapping developer intent to the right executor. If you set `.rate(1000_u64.hz())`, the scheduler knows you need a dedicated real-time thread — you don't have to explicitly request one.
+
+**Why reverse-order shutdown?**
+Nodes are typically added in dependency order: sensors before controllers before loggers. Shutting down in reverse means controllers stop motors before sensors disconnect, and loggers record the shutdown events before they themselves stop. This prevents the dangerous situation where a sensor disconnects while a motor controller is still running (the controller would have no data and might hold the last velocity forever).
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| **Deterministic ordering** — nodes always run in the same sequence | Must manually specify `.order()` for each node |
+| **Automatic timing enforcement** — budget/deadline/miss monitoring | Adds ~microsecond of overhead per tick per monitored node |
+| **Coordinated shutdown** — all nodes stop cleanly on Ctrl+C | Nodes must implement `shutdown()` for hardware cleanup |
+| **Auto-detected execution classes** — right executor for each workload | Less explicit control (use `.compute()` or `.on()` to override) |
+| **tick_rate + per-node rates** — flexible frequency management | Nodes must finish `tick()` within their budget |
+
+## See Also
+
+- [Scheduler — Full Reference](/concepts/core-concepts-scheduler) — Watchdog, deterministic mode, blackbox, composable builders
+- [Execution Classes](/concepts/execution-classes) — Deep dive into the 5 execution classes
+- [Scheduler API](/rust/api/scheduler) — Complete API reference with every method signature
+- [Nodes: The Building Blocks](/concepts/nodes-beginner) — The components the scheduler runs
+- [Topics: How Nodes Talk](/concepts/topics-beginner) — How nodes communicate through the scheduler
+- [Python Scheduler API](/python/api/python-bindings) — Scheduler from Python

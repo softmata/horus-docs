@@ -6,22 +6,27 @@ order: 1
 
 # Nodes: The Building Blocks
 
-> For the full reference with all lifecycle methods, priority levels, and communication patterns, see [Nodes — Full Reference](/concepts/core-concepts-nodes).
+A robot arm picks parts off a conveyor belt. One piece of software reads the camera, another detects parts, another plans the arm's trajectory, and another sends motor commands. If any of these components shares memory or a call stack with the others, a bug in the camera driver can crash the motor controller — and the arm drops whatever it's holding.
 
-## What is a Node?
+HORUS solves this with **nodes**: isolated components that each do one job. A camera node reads frames. A detection node finds parts. A planner node computes trajectories. A motor node sends commands. They communicate through shared-memory channels, but they don't share state. If one crashes, the others keep running — and the safety monitor stops the arm cleanly.
 
-A **node** is one piece of your robot's software. Each node does **one job**:
+> For the complete Node trait reference with all methods, see [Nodes — Full Reference](/concepts/core-concepts-nodes).
+
+## How It Works
+
+### What is a Node?
+
+A **node** is one component doing one job:
 
 - A **SensorNode** reads the camera or IMU
 - A **ControlNode** moves the motors
 - A **SafetyNode** prevents collisions
 - A **PlannerNode** decides where to go
 
-Nodes are **independent** — if one crashes, the others keep running. This is critical for robots: a camera driver bug shouldn't stop your emergency brake.
-
-## Your First Node
-
 Every node implements the `Node` trait. The only required method is `tick()` — your main logic that runs every cycle:
+
+<Tabs items={["Rust", "Python"]}>
+<Tab value="Rust">
 
 ```rust
 use horus::prelude::*;
@@ -37,9 +42,8 @@ impl Node for Heartbeat {
 }
 ```
 
-That's it. The scheduler calls `tick()` repeatedly — you don't manage loops, threads, or timing.
-
-**In Python:**
+</Tab>
+<Tab value="Python">
 
 ```python
 import horus
@@ -50,15 +54,20 @@ def heartbeat_tick(node):
 heartbeat = horus.Node(name="Heartbeat", tick=heartbeat_tick)
 ```
 
-## How Nodes Communicate
+</Tab>
+</Tabs>
 
-Nodes don't call each other directly. They send data through **Topics** — named channels for specific data types:
+The scheduler calls `tick()` repeatedly — you don't manage loops, threads, or timing.
+
+### How Nodes Communicate
+
+Nodes don't call each other directly. They send data through **Topics** — named channels:
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
 flowchart LR
-    S["SensorNode"] -->|send temperature| T(("temperature"))
-    T -->|recv temperature| M["MonitorNode"]
+    S["SensorNode"] -->|send| T(("temperature"))
+    T -->|recv| M["MonitorNode"]
 
     style T fill:#f59e0b,stroke:#d97706,color:#000
 `}
@@ -67,7 +76,7 @@ flowchart LR
 
 The sensor doesn't know the monitor exists. It just publishes data. Any number of subscribers can listen — zero coupling between components.
 
-## Node Lifecycle
+### Node Lifecycle
 
 Every node has three phases:
 
@@ -83,69 +92,86 @@ stateDiagram-v2
   caption="Node lifecycle: init once, tick repeatedly, shutdown once"
 />
 
-| Phase | Method | When | Use For |
+| Phase | Method | When | Use for |
 |-------|--------|------|---------|
-| **Startup** | `init()` | Once, before first tick | Open files, connect to hardware, create topics |
+| **Startup** | `init()` | Once, before first tick | Open files, connect to hardware |
 | **Running** | `tick()` | Every scheduler cycle | Read sensors, compute, send commands |
-| **Cleanup** | `shutdown()` | Once, on exit | Stop motors, close connections, save state |
+| **Cleanup** | `shutdown()` | Once, on exit | Stop motors, close connections |
 
 ```rust
+use horus::prelude::*;
+
 impl Node for MotorController {
+    fn name(&self) -> &str { "Motor" }
+
     fn init(&mut self) -> Result<()> {
-        self.motor.connect()?;     // Open hardware connection
+        self.motor.connect()?;
         Ok(())
     }
 
     fn tick(&mut self) {
         if let Some(cmd) = self.commands.recv() {
-            self.motor.set_velocity(cmd);  // Move motor
+            self.motor.set_velocity(cmd);
         }
     }
 
+    // SAFETY: always stop motors in shutdown
     fn shutdown(&mut self) -> Result<()> {
-        self.motor.set_velocity(0.0);  // STOP the motor!
+        self.motor.set_velocity(0.0);
         self.motor.disconnect()?;
         Ok(())
     }
 }
 ```
 
-The shutdown method is especially important for robotics — you always want to stop motors and release hardware safely.
+### Running Nodes
 
-## Running a Node
-
-Nodes run inside a **Scheduler**. You create one, add your nodes, and run:
+Nodes run inside a **Scheduler**. Add nodes, set their execution order, and run:
 
 ```rust
+use horus::prelude::*;
+
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
 
     scheduler.add(SensorNode::new()?)
-        .order(0)      // Runs first
+        .order(0)      // runs first
         .build()?;
 
     scheduler.add(ControlNode::new()?)
-        .order(1)      // Runs second
+        .order(1)      // runs second
         .build()?;
 
-    scheduler.run()?;  // Runs until Ctrl+C
-    Ok(())
+    scheduler.run()    // runs until Ctrl+C
 }
 ```
 
-The `order` parameter controls execution sequence: lower numbers run first. This is how you ensure the sensor reads data before the controller processes it.
+`.order()` controls execution sequence — lower numbers run first. This ensures the sensor publishes data before the controller consumes it.
 
-## Key Takeaways
+## Design Decisions
 
-- A **node** = one component doing one job
-- Implement `tick()` for your main logic
-- Use `init()` for setup, `shutdown()` for cleanup
-- Nodes communicate through **Topics**, not direct calls
-- The **Scheduler** runs your nodes in order
+**Why isolated nodes instead of a single program?**
+A monolithic program shares one call stack. A panic in the camera driver kills everything — including the motor controller, which may leave the robot arm in a dangerous position. Nodes provide fault boundaries: the scheduler can isolate a crashing node while the rest of the system continues and the safety monitor stops actuators cleanly.
 
-## Next Steps
+**Why tick() instead of run()?**
+A `run()` method gives the node full control — it can loop forever, block on I/O, or forget to check for shutdown signals. A `tick()` method gives the scheduler full control: it decides when to call each node, how long to allow, and when to force shutdown. This enables deterministic execution, deadline monitoring, and coordinated shutdown across all nodes.
 
-- [Topics: How Nodes Talk](/concepts/topics-beginner) — learn about the pub/sub system
-- [Scheduler: Running Your Nodes](/concepts/scheduler-beginner) — learn execution and timing
-- [Quick Start](/getting-started/quick-start) — build a complete working example
-- [Nodes — Full Reference](/concepts/core-concepts-nodes) — all lifecycle methods, priority levels, and patterns
+**Why communicate through Topics instead of direct calls?**
+Direct calls create tight coupling — the sensor must know the controller's API, and adding a logger means modifying the sensor. Topics decouple: the sensor publishes to `"temperature"` and doesn't know who reads it. Adding a logger is zero changes to existing code.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| Fault isolation — one crash doesn't kill the system | Communication through Topics is indirect (nanoseconds, not zero) |
+| Testable in isolation — tick a node once and assert | More boilerplate than a function call |
+| Composable — mix and match nodes across projects | Nodes must agree on topic names and message types |
+| Deterministic execution order via scheduler | No direct function calls between nodes |
+
+## See Also
+
+- [Nodes — Full Reference](/concepts/core-concepts-nodes) — All lifecycle methods, execution classes, safety features
+- [Topics: How Nodes Talk](/concepts/topics-beginner) — The pub/sub communication system
+- [Scheduler: Running Your Nodes](/concepts/scheduler-beginner) — Execution and timing
+- [Scheduler API](/rust/api/scheduler) — Node configuration reference
+- [Sensor Node Tutorial](/tutorials/01-sensor-node) — Build your first node step by step
