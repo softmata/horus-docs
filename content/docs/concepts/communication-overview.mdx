@@ -1,92 +1,258 @@
 ---
-title: Communication Patterns Overview
-description: Understanding HORUS communication primitives — Topics and Actions
+title: "Communication Overview"
+description: "When to use Topics, Services, and Actions — the three HORUS communication primitives"
 order: 20
 ---
 
-# Communication Patterns Overview
+# Communication Overview
 
-HORUS provides three communication primitives that cover all robotics messaging needs:
+Think about how people communicate at work. Sometimes you leave a note on a shared whiteboard for anyone who walks by to read — you do not care who reads it or when, you just put the information out there. Other times, you pick up the phone and ask a colleague a direct question: "What is the status of order 4217?" You need an answer before you can continue. And sometimes you delegate an entire task: "Ship this package to Berlin, and let me know when it arrives." You want updates along the way, and you want the ability to say "actually, cancel that" if plans change.
 
-| Pattern | Purpose | Example |
-|---------|---------|---------|
-| **Topic** | Streaming data (pub/sub) | Sensor readings, motor commands, video frames |
-| **Service** | Request/response RPC | Parameter queries, configuration, one-shot commands |
-| **Action** | Long-running tasks (goal/feedback/result) | Navigation, arm motion, calibration |
+Robots have exactly the same three communication needs. A LiDAR sensor continuously publishes scan data for anyone who wants it — the path planner, the obstacle detector, the logger. A calibration routine needs to ask the map server for a specific region of the map and wait for the response before it can proceed. A navigation system needs to send the robot to a destination, receive progress updates ("3 meters remaining"), and cancel the trip if a higher-priority task arrives.
 
-Both work locally (shared memory) and across machines (network transport via configuration).
+HORUS gives you one communication primitive for each of these patterns: **Topics** for continuous data streams, **Services** for quick request/response exchanges, and **Actions** for long-running tasks with feedback and cancellation. Every robotics communication problem maps to one of these three. The rest of this page helps you understand what each one does and when to pick which.
 
-## Topic: Streaming Pub/Sub
+## The Three Primitives
 
-`Topic<T>` is the primary communication primitive. It provides ultra-fast pub/sub with automatic optimization — **~3ns to ~167ns** latency depending on topology.
+### Topics — Continuous Data Streams
 
+A topic is like a radio station. The broadcaster transmits whether anyone is listening or not. Listeners tune in when they want and tune out when they are done. The broadcaster does not know or care how many listeners exist — zero, one, or fifty.
+
+In HORUS, a topic is a named channel that carries a specific type of data. Publishers call `send()` to put data on the channel. Subscribers call `recv()` to read the latest value. The publisher and subscriber do not need to know about each other. They just agree on a topic name and a data type.
+
+<Tabs items={["Rust", "Python"]}>
+<Tab value="Rust">
 ```rust
 use horus::prelude::*;
 
+// Publisher
 let pub_topic: Topic<f32> = Topic::new("sensor.temperature")?;
 pub_topic.send(25.3);
 
+// Subscriber (can be in a different node, process, or machine)
 let sub_topic: Topic<f32> = Topic::new("sensor.temperature")?;
 if let Some(temp) = sub_topic.recv() {
     hlog!(info, "Temperature: {}", temp);
 }
 ```
+</Tab>
+<Tab value="Python">
+```python
+import horus
 
-| Scenario | Latency |
-|----------|---------|
-| Same thread | ~3ns |
-| Same process | ~18-36ns |
-| Cross-process | ~50-167ns |
+# In a node's tick function
+node.send("sensor.temperature", 25.3)
 
-The backend is auto-selected based on topology and participant count. Communication paths upgrade transparently at runtime as participants join.
+# In another node
+temp = node.recv("sensor.temperature")
+if temp is not None:
+    print(f"Temperature: {temp}")
+```
+</Tab>
+</Tabs>
 
-For full Topic API details, see [Topic Communication](/concepts/core-concepts-topic).
+Topics are the workhorse of robotics communication. Sensor data, motor commands, camera frames, diagnostic status, emergency stops — all flow through topics. They are fire-and-forget: the publisher sends and moves on. There is no acknowledgment, no reply, no waiting.
 
-## Action: Long-Running Tasks
+**Latency**: ~3 ns (same thread) to ~167 ns (cross-process), depending on topology. See [Topics — Full Reference](/concepts/core-concepts-topic) for the 10 automatic backend paths.
 
-Actions handle tasks that take time to complete and benefit from progress feedback and cancellation. They follow the **Goal / Feedback / Result** pattern.
+**Use topics when**:
+- Data is produced continuously (sensor readings, motor commands, video frames)
+- Multiple consumers might want the same data (logger + planner + display)
+- You care about the *latest* value, not every historical value
+- Speed matters more than guaranteed delivery
 
-For full Action API details, see [Actions](/concepts/actions).
+### Services — Request/Response
 
-## When to Use What
+A service is like a phone call. You dial, ask a question, wait for an answer, and hang up. It is synchronous — the caller blocks until the response arrives (or a timeout fires). There is exactly one server and one or more clients.
+
+```rust
+use horus::prelude::*;
+
+// Client asks for map data — blocks until response arrives
+let mut client = ServiceClient::<GetMapRegion>::new()?;
+let response = client.call(
+    GetMapRegionRequest { x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0, resolution: 0.05 },
+    Duration::from_secs(1),
+)?;
+println!("Map: {}x{} pixels", response.width, response.height);
+```
+
+Services are for operations that complete quickly (milliseconds) and where the caller cannot continue without the result. Parameter queries, configuration lookups, one-shot commands, joint limit checks — these are all service calls.
+
+**Use services when**:
+- You need a response before you can continue
+- The operation finishes quickly (milliseconds, not seconds)
+- You need error reporting back to the caller
+- There is a clear question-and-answer pattern
+
+<Callout type="info">
+The Services API is currently Rust-only. Python bindings are not yet available. Under the hood, services use two topics (`{name}.request` and `{name}.response`) for bidirectional communication — they inherit all of topics' shared-memory performance.
+</Callout>
+
+### Actions — Long-Running Tasks
+
+An action is like delegating a task to a colleague. You say "navigate to shelf B3," and they go do it. While they work, they send you progress updates: "12 meters remaining... 8 meters remaining... arrived." If plans change, you can say "cancel, new priority" and they stop what they are doing.
+
+```
+Operator                          Robot
+  |                                 |
+  |--- "Go to shelf B3" -------->  |
+  |                                 | starts navigating...
+  |<-- "12m remaining, 20%" -----  |
+  |<-- "8m remaining, 45%" ------  |
+  |<-- "3m remaining, 78%" ------  |
+  |                                 |
+  |--- "Cancel! New priority" -->  | stops safely
+  |<-- "Canceled at (4.2, 1.1)" -  |
+```
+
+Actions follow the **Goal / Feedback / Result** pattern. The client sends a goal, the server sends periodic feedback, and eventually delivers a final result (succeeded, failed, or canceled). Actions support cancellation, preemption (a higher-priority goal interrupts the current one), and timeout.
+
+**Use actions when**:
+- The task takes more than one tick to complete (navigation, arm motion, calibration)
+- You need progress updates while the task runs
+- You need to cancel or preempt in-flight tasks
+- You need to know whether the task succeeded, failed, or was interrupted
+
+<Callout type="info">
+The Actions API is currently Rust-only. Python bindings are not yet available. Like services, actions use topics internally for goal submission, feedback streaming, and result delivery.
+</Callout>
+
+## Choosing the Right Primitive
+
+When you are not sure which primitive to use, walk through this decision flowchart:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 20}}}%%
+flowchart TD
+    START["You need to communicate<br/>between nodes"] --> Q1{"Is it continuous<br/>streaming data?"}
+    Q1 -->|Yes| TOPIC["Use <b>Topic</b><br/>sensor data, commands,<br/>video, diagnostics"]
+    Q1 -->|No| Q2{"Does it finish<br/>in milliseconds?"}
+    Q2 -->|Yes| Q3{"Do you need a<br/>response back?"}
+    Q3 -->|Yes| SERVICE["Use <b>Service</b><br/>parameter queries,<br/>config lookups, one-shot RPC"]
+    Q3 -->|No| TOPIC
+    Q2 -->|No| Q4{"Do you need progress<br/>updates or cancellation?"}
+    Q4 -->|Yes| ACTION["Use <b>Action</b><br/>navigation, arm motion,<br/>calibration, docking"]
+    Q4 -->|No| Q5{"Do you need to know<br/>when it finishes?"}
+    Q5 -->|Yes| ACTION
+    Q5 -->|No| TOPIC
+
+    style TOPIC fill:#3b82f6,stroke:#2563eb,color:#fff
+    style SERVICE fill:#22c55e,stroke:#16a34a,color:#000
+    style ACTION fill:#a855f7,stroke:#9333ea,color:#fff
+`}
+  caption="Decision flowchart: continuous data goes to Topics, quick Q&A goes to Services, long tasks go to Actions"
+/>
+
+### Decision Table
 
 | Scenario | Use | Why |
 |----------|-----|-----|
-| Sensor data streaming | **Topic** | Continuous data, latest value matters |
-| Motor commands | **Topic** | High frequency, low latency |
-| Camera frames | **Topic** | Streaming, multiple consumers |
-| Navigate to position | **Action** | Long-running, needs progress feedback |
-| Pick-and-place | **Action** | Multi-step, cancellable |
-| Calibration routine | **Action** | Takes time, reports progress |
-| Emergency stop | **Topic** | Must be instantaneous, no handshake |
+| Sensor data streaming (IMU, LiDAR, encoders) | **Topic** | Continuous, latest value matters, multiple consumers |
+| Motor velocity commands | **Topic** | High frequency, low latency, fire-and-forget |
+| Camera frames at 30 FPS | **Topic** | Streaming, pool-backed zero-copy for large data |
+| Emergency stop signal | **Topic** | Must be instantaneous, no handshake overhead |
 | Diagnostics broadcast | **Topic** | Many publishers, flexible topology |
+| Query joint limits before planning | **Service** | Need response before continuing, completes in ms |
+| Fetch a map region for SLAM | **Service** | Need specific data, cannot proceed without it |
+| Trigger a one-shot sensor calibration | **Service** | Quick operation, need success/failure result |
+| Get current parameter values | **Service** | Direct question, direct answer |
+| Navigate to a waypoint | **Action** | Takes seconds, needs progress updates, cancellable |
+| Pick-and-place an object | **Action** | Multi-phase, needs feedback per phase |
+| Calibration routine (full sequence) | **Action** | Takes time, reports progress, might fail |
+| Dock at a charging station | **Action** | Long-running, needs alignment feedback |
 
-**Rule of thumb**: If it's a continuous stream of data, use **Topic**. If it's a task you'd want to start, monitor, and potentially cancel, use **Action**.
+### Quick Rules of Thumb
 
-## Composing Patterns
+- **If it is a stream** of data flowing continuously, use a **Topic**.
+- **If it is a question** you need answered before you can continue, use a **Service**.
+- **If it is a task** you would start, monitor, and potentially cancel, use an **Action**.
+- **When in doubt**, start with a Topic. It is the simplest primitive and covers the vast majority of robotics communication.
 
-A typical robot system combines both patterns:
+## How They Work Together
+
+Real robot systems use all three primitives together. A navigation system subscribes to sensor topics (LiDAR, odometry), exposes an action server for goal-based navigation, and calls a service to fetch map data on demand:
 
 ```rust
 struct NavigationSystem {
-    // Topics for streaming sensor data
+    // Topics for streaming sensor data (pub/sub)
     lidar_sub: Topic<LaserScan>,
     odom_sub: Topic<Odometry>,
 
-    // Topics for publishing commands
-    cmd_vel_pub: Topic<Twist>,
+    // Topics for publishing commands (pub/sub)
+    cmd_vel_pub: Topic<CmdVel>,
     status_pub: Topic<DiagnosticStatus>,
 
-    // Action server for goal-based navigation
+    // Action server for goal-based navigation (goal/feedback/result)
     nav_server: ActionServerNode<NavigateToGoal>,
+
+    // Service client for on-demand map queries (request/response)
+    map_client: ServiceClient<GetMapRegion>,
 }
 ```
 
-The navigation action server subscribes to sensor topics internally, computes a path, publishes velocity commands via topics, and reports progress back to the action client — all using the same underlying shared memory infrastructure.
+The navigation action server subscribes to sensor topics internally, calls the map service when it needs terrain data, computes a path, publishes velocity commands via topics, and reports progress back to the action client. All three primitives use the same underlying shared-memory infrastructure, so mixing them has zero additional overhead.
 
-## Next Steps
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    subgraph Topics
+        LIDAR["LiDAR<br/>Topic"]
+        ODOM["Odometry<br/>Topic"]
+        CMD["CmdVel<br/>Topic"]
+    end
+    subgraph Services
+        MAP["Map Server<br/>Service"]
+    end
+    subgraph Actions
+        NAV["Navigate<br/>Action"]
+    end
 
-- [Topic Details](/concepts/core-concepts-topic) - Architecture and design patterns
-- [Topic API Reference](/rust/api/topic) - Full method documentation
-- [Actions](/concepts/actions) - Goal/feedback/result pattern
-- [Services](/concepts/services) - Synchronous request/response RPC
+    LIDAR -->|"subscribe"| NAV
+    ODOM -->|"subscribe"| NAV
+    NAV -->|"publish"| CMD
+    NAV -->|"call"| MAP
+    OP["Operator"] -->|"send goal"| NAV
+    NAV -->|"feedback"| OP
+
+    style LIDAR fill:#3b82f6,stroke:#2563eb,color:#fff
+    style ODOM fill:#3b82f6,stroke:#2563eb,color:#fff
+    style CMD fill:#3b82f6,stroke:#2563eb,color:#fff
+    style MAP fill:#22c55e,stroke:#16a34a,color:#000
+    style NAV fill:#a855f7,stroke:#9333ea,color:#fff
+`}
+  caption="A typical navigation system combines Topics (sensor data, motor commands), Services (map queries), and Actions (goal-based navigation)"
+/>
+
+## Design Decisions
+
+**Why three primitives and not just one?**
+You could theoretically build everything with topics alone — request/response by publishing a request on one topic and listening for a response on another, long-running tasks by publishing goals and feedback on separate topics. ROS1 actually started with mostly topics and bolted on services and actions later. The problem is that reimplementing request correlation, timeout handling, cancellation, and progress tracking on top of raw pub/sub is error-prone and duplicated across every project. Three distinct primitives with clear semantics eliminate that boilerplate and make the developer's intent explicit in the code.
+
+**Why not more primitives?**
+Some frameworks add parameter servers, shared blackboards, or distributed state stores as separate communication channels. HORUS keeps it to three because every additional primitive adds cognitive load — developers must learn when to use each one. Parameters can be modeled as services (`GetParameter` / `SetParameter`). Shared state can be modeled as topics with the latest-value semantic. Three covers the full space without redundancy.
+
+**Why are Services and Actions built on Topics internally?**
+Services use two internal topics (`{name}.request` and `{name}.response`). Actions use topics for goal submission, feedback, and results. This is not an implementation shortcut — it is a deliberate design choice. Topics already handle all the hard problems: cross-process shared memory, automatic backend selection, live migration, zero-copy for large data. Building services and actions on top means they inherit all of that infrastructure for free. It also means a single debugging tool (`horus topic list`) shows all communication in the system, including service and action traffic.
+
+**Why poll-based services instead of callback-based?**
+The service server polls for incoming requests on a configurable interval (default: 5 ms). An alternative would be to wake the server thread immediately when a request arrives (interrupt-driven). HORUS uses polling because it is simpler to reason about in a real-time context: the server thread wakes at predictable intervals, does bounded work, and sleeps. Interrupt-driven wakeups create unpredictable timing spikes. The 5 ms default poll interval means worst-case service latency is 5 ms — fast enough for the configuration-query use cases services are designed for. If you need sub-millisecond response, use a topic.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| **Three clear primitives** — every communication pattern maps to exactly one | Developers must learn which primitive to use (this page helps) |
+| **Topics are fire-and-forget** — zero overhead, no waiting for consumers | No delivery guarantee; slow subscribers lose messages |
+| **Services give guaranteed responses** — caller blocks until answer arrives | Blocking means the caller's tick stalls if the server is slow or down |
+| **Actions support cancellation and feedback** — full task lifecycle management | More complex API surface than topics or services |
+| **All built on shared memory** — same zero-copy infrastructure everywhere | Services and actions inherit topic limitations (e.g., ring buffer overflow on extreme load) |
+| **Services are poll-based** — predictable timing, no interrupt spikes | Worst-case 5 ms latency on default poll interval (configurable) |
+
+## See Also
+
+- [Topics — Full Reference](/concepts/core-concepts-topic) — Automatic backend selection, naming, memory model
+- [Topics: How Nodes Talk](/concepts/topics-beginner) — Beginner introduction to pub/sub
+- [Services](/concepts/services) — Request/response API, error handling, resilient calls
+- [Actions](/concepts/actions) — Goal/feedback/result pattern, preemption, lifecycle
+- [Multi-Process Communication](/concepts/multi-process) — Cross-process and cross-machine topics

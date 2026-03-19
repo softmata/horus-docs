@@ -19,6 +19,31 @@ These are **request/response** problems. Topics can't solve them — they're fir
 
 **Use topics instead** for continuous data streams. **Use actions instead** for long-running tasks with feedback.
 
+## How It Works
+
+A service is a named RPC channel with a defined request type and response type. One server listens for requests and produces responses. One or more clients send requests and wait for responses.
+
+Under the hood, every service creates two internal topics:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    C["Client"] -->|"ServiceRequest"| REQ["{name}.request<br/>Topic"]
+    REQ --> S["Server"]
+    S -->|"ServiceResponse"| RES["{name}.response<br/>Topic"]
+    RES --> C
+
+    style REQ fill:#3b82f6,stroke:#2563eb,color:#fff
+    style RES fill:#22c55e,stroke:#16a34a,color:#000
+`}
+  caption="Services use two topics internally — one for requests, one for responses. All shared-memory optimizations apply."
+/>
+
+- Requests include a monotonically-increasing `request_id` for correlation
+- Multiple clients can call the same server concurrently
+- Each client filters responses by matching its `request_id`
+- Communication uses shared memory (zero-copy IPC)
+
 ## Defining a Service
 
 Use the `service!` macro to define Request and Response types:
@@ -180,26 +205,6 @@ let mut client = ServiceClient::<GetMapRegion>::with_poll_interval(
 
 ---
 
-## Architecture
-
-Services use two internal topics for bidirectional communication:
-
-```
-Client                          Server
-  |                                |
-  |-- {name}.request ---------->   |  ServiceRequest<Req>
-  |                                |  handler processes request
-  |<---------- {name}.response --  |  ServiceResponse<Res>
-  |                                |
-```
-
-- Requests include a monotonically-increasing `request_id` for correlation
-- Multiple clients can call the same server concurrently
-- Each client filters responses by matching its `request_id`
-- Communication uses shared memory (zero-copy IPC)
-
----
-
 ## Error Handling
 
 ```rust
@@ -212,12 +217,12 @@ match client.call(request, Duration::from_secs(1)) {
 }
 ```
 
-| Error | Cause |
-|-------|-------|
-| `Timeout` | Server didn't respond within the timeout duration |
-| `ServiceFailed(msg)` | Server handler returned `Err(msg)` |
-| `NoServer` | No service server is running |
-| `Transport(msg)` | IPC/shared memory communication failure |
+| Error | Cause | Retried by `call_resilient`? |
+|-------|-------|------------------------------|
+| `Timeout` | Server didn't respond within the timeout duration | Yes |
+| `ServiceFailed(msg)` | Server handler returned `Err(msg)` | No (permanent) |
+| `NoServer` | No service server is running | No (permanent) |
+| `Transport(msg)` | IPC/shared memory communication failure | Yes |
 
 ---
 
@@ -292,9 +297,39 @@ horus service list
 
 ---
 
-## Next Steps
+## Design Decisions
 
-- **[Services API Reference](/rust/api/services)** — Full method tables for ServiceClient, AsyncServiceClient, ServiceServerBuilder
-- **[Communication Overview](/concepts/communication-overview)** — When to use topics vs services vs actions
-- **[Actions](/concepts/actions)** — Long-running tasks with feedback
-- **[Topic](/concepts/core-concepts-topic)** — Pub/sub messaging
+**Why build services on top of topics instead of a separate IPC mechanism?**
+Topics already solve all the hard shared-memory problems: cross-process communication, automatic backend selection based on topology, live migration when processes split or join, and zero-copy for large data. Building a separate RPC transport would mean reimplementing all of that infrastructure — and maintaining two code paths. By using topics internally (`{name}.request` and `{name}.response`), services inherit every topic optimization for free. It also means `horus topic list` shows service traffic alongside regular topic traffic, giving you a single debugging tool for all communication.
+
+**Why poll-based servers instead of interrupt-driven wakeups?**
+The server thread checks for new requests at a configurable interval (default: 5 ms). An alternative would be to use OS-level signaling (futex, eventfd) to wake the server immediately when a request arrives. HORUS uses polling because it produces predictable, bounded CPU usage — the server wakes at known intervals, does bounded work, and sleeps. Interrupt-driven wakeups create unpredictable timing spikes that interfere with real-time nodes sharing the same system. The 5 ms default means worst-case response latency is 5 ms plus handler execution time, which is fast enough for the configuration-query and data-lookup use cases services are designed for.
+
+**Why both sync and async clients?**
+`ServiceClient` blocks the calling thread until a response arrives — simple but it stalls your node's `tick()` for the duration of the call. `AsyncServiceClient` returns immediately with a `PendingResponse` handle that you check later. Two clients because two usage patterns: inside a scheduler node, use async to avoid blocking the tick loop. In a standalone script or initialization code, use sync for simplicity. Providing only async would force unnecessary complexity on simple scripts. Providing only sync would make services unusable inside real-time scheduler nodes.
+
+**Why `call_resilient` as a separate method instead of building retries into `call`?**
+Retrying a failed request is not always the right thing to do. If the caller has a tight deadline, spending time on retries could cause a deadline miss. If the request has side effects (triggering a calibration), retrying could trigger it twice. Making retries explicit via `call_resilient` means the developer consciously opts in, and the default `call` method has the simplest possible behavior: try once, succeed or fail.
+
+**Why `call_optional` for missing servers?**
+During system startup, nodes initialize in order but the server might not be ready when a client starts. `call_optional` returns `None` instead of an error when no server exists, making it trivial to write startup-tolerant code without `match` on error variants. This is a common enough pattern (especially in tests and gradual-startup deployments) that it deserved a dedicated method rather than requiring error-handling boilerplate.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| **Built on topics** — inherits all shared-memory optimizations and debugging tools | Service traffic mixes with topic traffic in `horus topic list` (distinguishable by `.request`/`.response` suffix) |
+| **Poll-based server** — predictable timing, no interrupt spikes | Worst-case 5 ms added latency (configurable via `poll_interval`) |
+| **Blocking `call()`** — simple, no callbacks, no futures | Stalls the caller's thread; do not use inside tight RT loops |
+| **Async client** — non-blocking, works inside scheduler nodes | More complex API (`call_async` + `pending.check()` loop) |
+| **Auto-retry via `call_resilient`** — handles transient failures automatically | Retries add latency; not suitable for side-effecting or time-critical calls |
+| **Request ID correlation** — multiple clients can share one server | Small overhead per request (monotonic counter + ID matching on response) |
+| **Rust-only** — full type safety, compile-time request/response checking | Python bindings not yet available |
+
+## See Also
+
+- [Services API](/rust/api/services) — Full Rust API reference with per-method documentation
+- [Communication Overview](/concepts/communication-overview) — When to use topics vs services vs actions
+- [Actions](/concepts/actions) — Long-running tasks with feedback and cancellation
+- [Topics — Full Reference](/concepts/core-concepts-topic) — The pub/sub primitive that services are built on
+- [Topic API](/rust/api/topic) — Topic method reference (services use topics internally)
