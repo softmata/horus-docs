@@ -206,40 +206,64 @@ Range:            ~500-1200 ns
 
 ## Python Performance
 
-The HORUS Python bindings (PyO3) call directly into the Rust shared memory layer, avoiding pickle serialization overhead. Python nodes and Rust nodes communicate through the same shared memory, enabling cross-language interoperability with minimal overhead.
+The HORUS Python bindings (PyO3) call directly into the Rust shared memory layer. The cost of crossing the Python/Rust boundary is constant (~1.5μs) regardless of message size — large data (images, point clouds) uses zero-copy shared memory and bypasses this overhead entirely.
 
-**Why Python HORUS is Fast:**
+### FFI Overhead (Rust vs Python)
 
-1. **Zero-copy via Rust core**: Python bindings call directly into Rust shared memory
-2. **No pickle overhead**: Messages use efficient binary serialization
-3. **PyO3 efficiency**: Minimal FFI overhead between Python and Rust
+The key question: **what does Python cost you over pure Rust?**
 
-### TensorPool
+| Operation | Rust | Python | Overhead | Factor |
+|-----------|------|--------|----------|--------|
+| CmdVel send+recv (typed) | ~22ns | ~1,500ns | ~1,478ns | ~68x |
+| Imu send+recv (typed) | ~30ns | ~1,700ns | ~1,670ns | ~57x |
+| dict send+recv (generic) | ~22ns | ~5,400ns | ~5,378ns | ~245x |
 
-HORUS TensorPool provides shared memory tensors optimized for ML/AI workloads. Pre-mapped shared memory means no `malloc()` or zero-initialization on the hot path.
+The ~1.5μs Python overhead comes from: PyO3 boundary crossing (~500ns), GIL acquisition (~500ns), and Python object allocation (~500ns). This is **constant** — a 1KB typed message has the same overhead as an 8B one.
 
-```python
-from horus import TensorPool
-import numpy as np
+**When to use Python vs Rust:**
+- **Python**: AI inference (PyTorch, YOLO), prototyping, data science nodes — the ~1.5μs overhead is negligible compared to 10-200ms inference time
+- **Rust**: Motor controllers, safety monitors, sensor fusion at 1kHz — where 22ns matters
 
-# Create pool
-pool = TensorPool(12345)  # pool_id
+### Python IPC Latency
 
-# Allocate tensor (pre-mapped shared memory)
-h = pool.alloc([1024, 1024], 'float32')
+Measured with sustained runs (10s+, 100K+ samples) via `research_bench_python.py`:
 
-# Zero-copy NumPy view
-arr = h.numpy()  # No data copied
+| Message Type | Path | p50 | p99 | p999 |
+|---|---|---|---|---|
+| CmdVel (typed) | Zero-copy | ~1.5μs | ~2.2μs | ~5.0μs |
+| Pose2D (typed) | Zero-copy | ~1.6μs | ~2.4μs | ~5.5μs |
+| Imu (typed) | Zero-copy | ~1.7μs | ~2.6μs | ~6.0μs |
+| dict small | MessagePack | ~5.4μs | ~8μs | ~15μs |
+| dict medium | MessagePack | ~9.1μs | ~14μs | ~25μs |
+| dict ~1KB | MessagePack | ~52μs | ~65μs | ~90μs |
 
-# Cross-process sharing via shared memory
-descriptor = h.to_descriptor()
+**Typed messages are 3-30x faster than dicts** because they bypass MessagePack serialization and use direct Pod memcpy through the Rust layer.
+
+### Image Zero-Copy
+
+`to_numpy()` returns a view into shared memory — O(1) regardless of image size:
+
+| Resolution | `to_numpy()` | `np.copy()` | Speedup |
+|---|---|---|---|
+| 320x240 (225KB) | ~3μs | ~3μs | 1x |
+| 640x480 (900KB) | ~3μs | ~13μs | 4x |
+| 1280x720 (2.7MB) | ~3μs | ~75μs | 25x |
+| 1920x1080 (6MB) | ~3μs | ~178μs | **59x** |
+
+At 1080p, zero-copy is **59x faster** than copying. For 4K frames, the speedup is even larger.
+
+### Running Python Benchmarks
+
+```bash
+# Quick validation (2s per test)
+python3 horus_py/benchmarks/research_bench_python.py --duration 2
+
+# Full research run (10s per test, CSV output)
+python3 horus_py/benchmarks/research_bench_python.py --duration 10 --csv python_results.csv
+
+# JSON summary
+python3 horus_py/benchmarks/research_bench_python.py --json python_summary.json
 ```
-
-**Key Advantages:**
-- **Cross-process sharing** via shared memory
-- **Pre-allocated pool** — no malloc on hot path
-- **Refcounted handles** — safe concurrent access
-- **Zero-copy NumPy** — `.numpy()` returns view
 
 ---
 
@@ -263,9 +287,9 @@ cargo run --release -p horus_benchmarks --bin robotics_messages_benchmark
 | `determinism_benchmark` | Execution determinism and jitter |
 | `dds_comparison_benchmark` | Comparison with DDS middleware (requires `--features dds`) |
 
-#### Research-Grade Benchmarks
+#### Extended Benchmarks
 
-For publication-quality measurements with sustained runs, size sweeps, histograms, and competitor comparison:
+Sustained runs, size sweeps, histograms, and competitor comparison:
 
 | Binary | Description |
 |--------|-------------|
@@ -277,7 +301,7 @@ For publication-quality measurements with sustained runs, size sweeps, histogram
 | `competitor_comparison` | HORUS vs raw UDP (+ Zenoh with `--features zenoh`) |
 
 ```bash
-# Run full research suite (~30 minutes)
+# Run full benchmark suite (~30 minutes)
 ./benchmarks/research/run_all.sh
 
 # Quick validation (~3 minutes)

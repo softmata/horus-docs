@@ -87,6 +87,8 @@ const allPages: DocLink[] = [
   { title: "Error Handling", href: "/development/error-handling" },
   { title: "AI Integration", href: "/development/ai-integration" },
   { title: "Telemetry Export", href: "/development/telemetry" },
+  { title: "Native Tool Integration", href: "/development/native-tools" },
+  { title: "Multi-Crate Workspaces", href: "/development/workspaces" },
 
   // Advanced Topics
   { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration" },

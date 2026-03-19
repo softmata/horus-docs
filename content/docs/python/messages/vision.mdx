@@ -1,0 +1,211 @@
+---
+title: "Vision Messages"
+description: "Images, point clouds, depth maps, camera calibration, and stereo vision for Python robotics — every method explained"
+order: 8
+---
+
+# Vision Messages
+
+Vision messages carry image data, point clouds, depth maps, and camera calibration. The pool-backed types (`Image`, `PointCloud`, `DepthImage`) use zero-copy shared memory for maximum throughput — no serialization overhead when passing images between nodes.
+
+```python
+from horus import (
+    Image, PointCloud, DepthImage,
+    CameraInfo, CompressedImage,
+    RegionOfInterest, StereoInfo,
+)
+```
+
+---
+
+## Image (Pool-Backed)
+
+Zero-copy image with numpy and PyTorch interop. Memory lives in shared memory — passing an Image between nodes costs ~3μs regardless of resolution.
+
+### Constructor
+
+```python
+img = Image(height=480, width=640, encoding=0)  # RGB8
+```
+
+### Numpy Integration
+
+```python
+import numpy as np
+
+# Create from numpy array
+pixels = np.zeros((480, 640, 3), dtype=np.uint8)
+img = Image.from_numpy(pixels)
+
+# Convert to numpy (zero-copy view when possible)
+arr = img.to_numpy()
+arr[100, 200] = [255, 0, 0]  # Set a red pixel
+```
+
+### PyTorch Integration
+
+```python
+tensor = img.to_torch()  # CHW format for PyTorch models
+```
+
+> **Common mistake:** Holding references to Image across ticks. Pool-backed images are recycled — the same memory slot may be reused on the next tick. Process the image within the current tick, or copy the data with `img.to_numpy().copy()`.
+
+---
+
+## PointCloud (Pool-Backed)
+
+Zero-copy 3D point cloud with field descriptors.
+
+```python
+cloud = PointCloud(num_points=1000)
+
+# From numpy XYZ array
+import numpy as np
+xyz = np.random.randn(1000, 3).astype(np.float32)
+cloud = PointCloud.from_xyz(xyz)
+
+print(cloud.point_count())  # 1000
+```
+
+---
+
+## DepthImage (Pool-Backed)
+
+Depth map from a depth camera (RealSense, Kinect, stereo).
+
+```python
+depth = DepthImage(height=480, width=640)
+
+# Per-pixel access
+d = depth.get_depth(320, 240)  # Depth at image center (meters)
+depth.set_depth(320, 240, 1.5)  # Set depth to 1.5m
+
+# Statistics
+stats = depth.depth_statistics()  # min, max, mean, valid_count
+```
+
+---
+
+## CameraInfo
+
+Camera intrinsic calibration parameters — the link between 2D pixel coordinates and 3D world coordinates.
+
+### Constructor
+
+```python
+cam = CameraInfo(width=640, height=480, fx=525.0, fy=525.0, cx=320.0, cy=240.0)
+```
+
+### `.focal_lengths()` — Camera Focal Length
+
+```python
+fx, fy = cam.focal_lengths()
+print(f"Focal length: ({fx:.0f}, {fy:.0f}) pixels")
+```
+
+Returns (fx, fy) in pixels. The focal length determines how "zoomed in" the camera is — higher values = narrower field of view. In the pinhole camera model, a 3D point (X, Y, Z) projects to pixel (fx*X/Z + cx, fy*Y/Z + cy).
+
+### `.principal_point()` — Optical Center
+
+```python
+cx, cy = cam.principal_point()
+print(f"Principal point: ({cx:.0f}, {cy:.0f})")
+```
+
+Returns (cx, cy) — the pixel where the optical axis hits the image sensor. Usually near the image center, but not exactly — calibration corrects for manufacturing imprecision.
+
+### `.with_distortion_model(model)` — Set Lens Distortion Type
+
+```python
+cam = cam.with_distortion_model("plumb_bob")
+```
+
+Returns a new CameraInfo with the distortion model name. Common models:
+- `"plumb_bob"`: Standard radial + tangential (5 coefficients)
+- `"equidistant"`: Fisheye cameras
+- `"none"`: Synthetic cameras (no distortion)
+
+**Example — 3D Projection from Depth:**
+
+```python
+from horus import CameraInfo, DepthImage, Point3
+
+cam = CameraInfo(width=640, height=480, fx=525.0, fy=525.0, cx=320.0, cy=240.0)
+
+def pixel_to_3d(cam, depth, u, v):
+    """Convert pixel (u,v) + depth to 3D point."""
+    fx, fy = cam.focal_lengths()
+    cx, cy = cam.principal_point()
+    z = depth.get_depth(u, v)
+    if z is None or z <= 0:
+        return None
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    return Point3(x=x, y=y, z=z)
+```
+
+---
+
+## CompressedImage
+
+JPEG/PNG compressed image for network transmission. Smaller than raw Image but requires decompression.
+
+```python
+img = CompressedImage(format="jpeg", data=jpeg_bytes, width=640, height=480)
+print(img.format_str())  # "jpeg"
+```
+
+Use `CompressedImage` for network topics or when bandwidth is limited. Use `Image` for local processing (zero-copy, no decompression needed).
+
+---
+
+## RegionOfInterest
+
+Rectangular region in an image — for cropping detections or specifying areas of interest.
+
+### `.contains(x, y)` — Is a Pixel Inside?
+
+```python
+roi = RegionOfInterest(x=100, y=200, width=50, height=60)
+if roi.contains(120, 220):
+    print("Pixel is inside the ROI")
+```
+
+### `.area()` — Region Size
+
+```python
+print(f"ROI area: {roi.area()} pixels")  # 3000
+```
+
+---
+
+## StereoInfo
+
+Stereo camera pair calibration with depth↔disparity conversion.
+
+### `.depth_from_disparity(disparity)` — Convert Disparity to Depth
+
+```python
+stereo = StereoInfo(baseline=0.12)  # 12cm between cameras
+depth = stereo.depth_from_disparity(disparity=30.0)
+# depth = baseline × fx / disparity
+```
+
+The fundamental stereo vision equation: Z = B × f / d. Given disparity (pixel offset between left and right images), compute real-world depth. Larger baseline = better depth accuracy at long range.
+
+### `.disparity_from_depth(depth)` — Convert Depth to Disparity
+
+```python
+disp = stereo.disparity_from_depth(depth=2.0)
+# Expected disparity for an object at 2 meters
+```
+
+The inverse — useful for setting depth range limits in stereo matching algorithms.
+
+---
+
+## See Also
+
+- [Perception Messages](/python/messages/perception) — Detection, SegmentationMask
+- [Geometry Messages](/python/messages/geometry) — Point3 for 3D positions
+- [Rust Vision Messages](/rust/api/vision-messages) — Rust API reference

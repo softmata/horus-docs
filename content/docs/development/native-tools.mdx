@@ -1,0 +1,291 @@
+---
+title: "Native Tool Integration"
+description: "Use cargo, pip, and cmake directly in HORUS projects — transparent proxy with automatic horus.toml sync"
+order: 12
+---
+
+# Native Tool Integration
+
+HORUS transparently proxies `cargo`, `pip`, and `cmake` so they work inside HORUS projects without any changes to your workflow. When you run these tools inside a HORUS project directory, commands are routed through the HORUS build pipeline: native build files are generated from `horus.toml`, the real tool runs against those files, and any dependency changes sync back to `horus.toml`. Outside a HORUS project, the tools behave exactly as they normally would.
+
+This means you never have to choose between HORUS and native tooling. Use `cargo add`, `pip install`, or `cmake` the way you always have, and HORUS keeps everything in sync.
+
+---
+
+## How It Works
+
+When you run a proxied command, here is what happens under the hood:
+
+1. **You type a command** — for example, `cargo build`.
+2. **Shell function intercepts it** — the HORUS installer adds thin shell functions that shadow the real `cargo`, `pip`, and `cmake` binaries.
+3. **Project detection** — the shell function calls `horus _is-project` to check whether the current directory (or any parent) contains a `horus.toml`.
+4. **Delegation** — if a HORUS project is detected, the command is delegated to `horus cargo build` (or `horus pip ...`, `horus cmake ...`).
+5. **Build file generation** — the proxy generates `.horus/Cargo.toml` (or `.horus/pyproject.toml`, `.horus/CMakeLists.txt`) from `horus.toml`.
+6. **Real tool execution** — the real `cargo` runs with `--manifest-path .horus/Cargo.toml`, pointing it at the generated build file.
+7. **Sync back** — if the command modified dependencies (e.g., `cargo add serde`), the proxy detects the change and syncs it back to `horus.toml`.
+
+If no HORUS project is detected in step 3, the shell function passes the command straight to the real binary with no interception.
+
+```
+┌──────────────┐     ┌────────────────┐     ┌──────────────────┐
+│  cargo build │────▶│ shell function │────▶│ horus _is-project│
+└──────────────┘     └────────────────┘     └──────────────────┘
+                                                     │
+                              ┌───────────────────────┤
+                              ▼                       ▼
+                     ┌────────────────┐     ┌────────────────┐
+                     │ horus project  │     │ not a project  │
+                     │ horus cargo ..│     │ real cargo     │
+                     └────────────────┘     └────────────────┘
+                              │
+                              ▼
+                     ┌────────────────┐
+                     │ generate       │
+                     │ .horus/        │
+                     │ Cargo.toml     │
+                     └────────────────┘
+                              │
+                              ▼
+                     ┌────────────────┐
+                     │ run real cargo │
+                     │ --manifest-path│
+                     │ .horus/...     │
+                     └────────────────┘
+                              │
+                              ▼
+                     ┌────────────────┐
+                     │ sync changes   │
+                     │ back to        │
+                     │ horus.toml     │
+                     └────────────────┘
+```
+
+---
+
+## Setup
+
+### Automatic (recommended)
+
+The HORUS installer sets up native tool proxying automatically. After installing HORUS, open a new terminal and verify:
+
+```bash
+type cargo
+# Should show: cargo is a function
+```
+
+If you see `cargo is a function`, the proxy is active.
+
+### Manual Setup
+
+If you installed HORUS without the installer, or need to re-initialize:
+
+```bash
+# Write shell environment and register proxies
+horus env --init
+```
+
+This does two things:
+
+1. Writes `~/.horus/env.sh` containing the shell functions for `cargo`, `pip`, and `cmake`.
+2. Adds a `source ~/.horus/env.sh` line to your `~/.bashrc` and/or `~/.zshrc`.
+
+Restart your shell (or `source ~/.horus/env.sh`) to activate.
+
+### Removing Proxies
+
+To uninstall the shell proxies and restore the original tool behavior:
+
+```bash
+horus env --uninstall
+```
+
+This removes the source line from your shell config and deletes `~/.horus/env.sh`. The original `cargo`, `pip`, and `cmake` binaries are untouched.
+
+---
+
+## Cargo
+
+All standard `cargo` commands work transparently inside a HORUS project:
+
+```bash
+# Building
+cargo build                # builds from .horus/Cargo.toml
+cargo build --release      # release build
+cargo build -p member      # workspace member selection
+
+# Dependencies
+cargo add serde            # adds to .horus/Cargo.toml, syncs to horus.toml
+cargo add tokio -F full    # features work too
+cargo remove serde         # removes from both
+
+# Testing and quality
+cargo test                 # runs tests
+cargo clippy               # linting
+cargo fmt                  # formatting
+cargo bench                # benchmarks
+
+# Documentation
+cargo doc                  # generate docs
+cargo doc --open           # generate and open in browser
+
+# Third-party subcommands
+cargo audit                # security audit (if installed)
+cargo nextest run          # alternative test runner
+cargo llvm-cov             # code coverage
+```
+
+### Workspace Members
+
+If your `horus.toml` defines workspace members, the `-p` flag works as expected:
+
+```bash
+cargo build -p my_driver   # build only the driver crate
+cargo test -p my_algorithm # test only the algorithm crate
+```
+
+---
+
+## Pip
+
+Python dependency management syncs bidirectionally with `horus.toml`:
+
+```bash
+# Installing packages
+pip install numpy          # installs + syncs to horus.toml [dependencies]
+pip install "requests>=2"  # version constraints preserved
+pip install -e .           # editable install (rewrites paths to .horus/)
+
+# Removing packages
+pip uninstall numpy        # removes package + syncs removal from horus.toml
+
+# Read-only commands (no sync needed)
+pip list                   # pass-through, no sync
+pip freeze                 # pass-through
+pip show numpy             # pass-through
+```
+
+### Editable Installs
+
+When you run `pip install -e .`, the proxy rewrites the path to point at `.horus/pyproject.toml` so the editable install references the correct generated build file.
+
+---
+
+## CMake
+
+CMake integration rewrites build paths to keep generated files inside `.horus/`:
+
+```bash
+# Configure — source dir is rewritten to .horus/
+cmake .                    # configures with -B .horus/cpp-build
+
+# Build
+cmake --build .horus/cpp-build
+
+# Install
+cmake --install .horus/cpp-build
+
+# Common options pass through
+cmake . -DCMAKE_BUILD_TYPE=Release
+cmake . -G Ninja
+```
+
+The proxy ensures that `CMakeLists.txt` in `.horus/` is generated from the `[cmake]` section of your `horus.toml` before running the real `cmake`.
+
+---
+
+## How Sync Works
+
+The proxy uses fingerprinting to detect and merge changes between `horus.toml` and native build files.
+
+### Fingerprinting
+
+Each time the proxy generates a `.horus/Cargo.toml` (or other native file), it computes a SHA-256 hash of the generated content and stores it in `.horus/.fingerprints`. On the next invocation, it compares:
+
+- **Current `horus.toml`** against the last-generated fingerprint.
+- **Current native file** against the last-generated fingerprint.
+
+### Detecting External Changes
+
+If the native file changed but `horus.toml` did not, the proxy knows the native tool modified the file (e.g., `cargo add` wrote to `.horus/Cargo.toml`). It parses the diff and applies matching changes to `horus.toml`.
+
+If `horus.toml` changed but the native file did not, the proxy regenerates the native file from `horus.toml`.
+
+If both changed, `horus.toml` wins and the native file is regenerated.
+
+### Internal Dependencies
+
+Dependencies on HORUS workspace crates (`horus_core`, `horus_library`, `horus_macros`, etc.) are never synced back to `horus.toml`. These are injected by the build pipeline based on your project configuration and should not appear in user-facing dependency lists.
+
+---
+
+## Bypassing the Proxy
+
+If you ever need to run the real tool directly, bypassing the HORUS proxy:
+
+```bash
+# Use the full path
+/usr/bin/cargo build
+$(which -a cargo | tail -1) build
+
+# Or use command to skip the shell function
+command cargo build
+
+# Or temporarily disable
+HORUS_NO_PROXY=1 cargo build
+```
+
+---
+
+## Troubleshooting
+
+### Cargo command not being proxied
+
+If `cargo` is not being intercepted by HORUS:
+
+```bash
+# Check if the proxy is active
+type cargo
+# Expected: "cargo is a function"
+# Problem:  "cargo is /home/user/.cargo/bin/cargo"
+
+# Fix: re-initialize the shell environment
+horus env --init
+source ~/.horus/env.sh
+```
+
+### Changes not syncing back to horus.toml
+
+If you run `cargo add` but the dependency does not appear in `horus.toml`:
+
+```bash
+# Force a full regeneration and sync
+horus build
+
+# Check fingerprint state
+ls -la .horus/.fingerprints
+```
+
+### Conflicts between horus.toml and native file
+
+If the native build file gets out of sync:
+
+```bash
+# horus.toml is always the source of truth
+# Regenerate native files from it
+horus build
+```
+
+The rule is simple: **`horus.toml` always wins**. If there is a conflict, the `.horus/` build files are regenerated from `horus.toml` and any conflicting native-side changes are discarded.
+
+### Proxy not detecting HORUS project
+
+The proxy walks up the directory tree looking for `horus.toml`. If your project root is not being detected:
+
+```bash
+# Verify project detection
+horus _is-project
+# Prints the project root, or exits non-zero if not found
+
+# Ensure horus.toml exists in your project root
+ls horus.toml
+```

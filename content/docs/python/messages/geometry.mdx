@@ -1,0 +1,604 @@
+---
+title: "Geometry Messages"
+description: "3D math, poses, transforms, and velocity types for Python robotics — every method explained"
+order: 1
+---
+
+# Geometry Messages
+
+Geometry types are the foundation of all robotics code. They represent positions, orientations, velocities, and coordinate transforms — the language your robot uses to understand where it is and where it needs to go.
+
+**When you need these:** Every robotics project uses at least `Pose2D` (mobile robots) or `Pose3D` (arms, drones). If you're doing any spatial math — distances, rotations, velocity commands — you need `Vector3`, `Quaternion`, and `Twist`.
+
+```python
+from horus import (
+    Vector3, Point3, Quaternion,
+    Pose2D, Pose3D,
+    Twist, CmdVel,
+    TransformStamped,
+    PoseStamped, PoseWithCovariance, TwistWithCovariance,
+    Accel, AccelStamped,
+)
+```
+
+---
+
+## Vector3
+
+A 3D vector representing directions, forces, velocities, or any three-component quantity. Includes built-in math operations so you don't need numpy for basic 3D math.
+
+### Constructor
+
+```python
+v = Vector3(x=1.0, y=2.0, z=3.0)
+```
+
+All fields default to `0.0`.
+
+### `.zero()` — Zero Vector
+
+```python
+v = Vector3.zero()  # Vector3(0, 0, 0)
+```
+
+Creates a zero vector. Use this instead of `Vector3(x=0.0, y=0.0, z=0.0)` for clarity — it signals intent ("I want no force/velocity/displacement") rather than just default values.
+
+### `.magnitude()` — Vector Length
+
+```python
+v = Vector3(x=3.0, y=4.0, z=0.0)
+print(v.magnitude())  # 5.0
+```
+
+Returns the Euclidean length (L2 norm): `sqrt(x² + y² + z²)`. The physical meaning depends on what the vector represents — if it's a force, magnitude is in Newtons; if it's a velocity, magnitude is in m/s.
+
+Use this to check if a vector is "significant" before processing it:
+
+```python
+if force_vec.magnitude() < 0.01:
+    return  # Ignore negligible force readings
+```
+
+### `.normalize()` — Normalize In-Place
+
+```python
+v = Vector3(x=3.0, y=4.0, z=0.0)
+v.normalize()
+print(v.magnitude())  # 1.0
+```
+
+Mutates the vector to unit length (magnitude = 1.0). The direction is preserved, only the length changes. Use this when you need a pure direction vector — for example, computing a repulsive force direction away from an obstacle.
+
+> **Common mistake:** Normalizing a zero vector. If `magnitude() == 0`, normalizing produces NaN. Always check magnitude first.
+
+### `.normalized()` — Unit-Length Copy
+
+```python
+v = Vector3(x=3.0, y=4.0, z=0.0)
+unit = v.normalized()
+print(v.magnitude())     # 5.0 (original unchanged)
+print(unit.magnitude())  # 1.0 (new copy)
+```
+
+Returns a **new** unit-length vector without modifying the original. Use this when you need both the original vector and its direction:
+
+```python
+direction = force.normalized()
+scaled_force = Vector3(
+    x=direction.x * desired_magnitude,
+    y=direction.y * desired_magnitude,
+    z=direction.z * desired_magnitude,
+)
+```
+
+### `.dot(other)` — Dot Product
+
+```python
+a = Vector3(x=1.0, y=0.0, z=0.0)  # Points right
+b = Vector3(x=0.0, y=1.0, z=0.0)  # Points up
+print(a.dot(b))  # 0.0 — perpendicular
+```
+
+Returns a scalar measuring alignment between two vectors:
+- **Positive** → vectors point in roughly the same direction
+- **Zero** → vectors are perpendicular (90°)
+- **Negative** → vectors point in roughly opposite directions
+
+The magnitude equals `|a| * |b| * cos(angle)`. For unit vectors, it's just `cos(angle)`.
+
+Common use: checking if a sensor is facing a target:
+
+```python
+sensor_dir = Vector3(x=1.0, y=0.0, z=0.0)  # Sensor faces forward
+to_target = Vector3(x=0.8, y=0.6, z=0.0).normalized()
+if sensor_dir.dot(to_target) > 0.5:  # Within ~60° cone
+    print("Target is in sensor's field of view")
+```
+
+### `.cross(other)` — Cross Product
+
+```python
+x_axis = Vector3(x=1.0, y=0.0, z=0.0)
+y_axis = Vector3(x=0.0, y=1.0, z=0.0)
+z_axis = x_axis.cross(y_axis)
+print(z_axis)  # Vector3(0, 0, 1) — right-hand rule
+```
+
+Returns a new vector perpendicular to both inputs, following the right-hand rule. The magnitude equals `|a| * |b| * sin(angle)`.
+
+Common use: computing surface normals from two edge vectors, or finding the rotation axis between two directions.
+
+> **Common mistake:** Cross product is order-dependent: `a.cross(b)` = `-b.cross(a)`. Swapping the order flips the direction.
+
+---
+
+## Point3
+
+A 3D point in space. Semantically different from Vector3 — a Point3 is a *location* (like a landmark or waypoint), while Vector3 is a *direction/displacement*.
+
+### Constructor
+
+```python
+p = Point3(x=1.0, y=2.0, z=3.0)
+```
+
+### `.origin()` — The Origin
+
+```python
+o = Point3.origin()  # Point3(0, 0, 0)
+```
+
+The world origin. Use this as a default reference point or to represent "no position set":
+
+```python
+target = Point3.origin()  # Will be updated when target is detected
+```
+
+### `.distance_to(other)` — Euclidean Distance
+
+```python
+p1 = Point3(x=1.0, y=0.0, z=0.0)
+p2 = Point3(x=4.0, y=4.0, z=0.0)
+print(p1.distance_to(p2))  # 5.0
+```
+
+Straight-line distance between two points in meters. This is the fundamental spatial query in robotics — "how far is the obstacle?", "how far to the goal?", "how close are these two landmarks?"
+
+> **Common mistake:** This is 3D Euclidean distance. If you're working in 2D (ground robots), the Z component still contributes. Set Z=0 for both points if you want 2D distance, or use `Pose2D.distance_to()` instead.
+
+---
+
+## Quaternion
+
+Quaternion orientation (x, y, z, w). Quaternions avoid the gimbal lock problem of Euler angles and compose cleanly. But you almost never need to work with raw quaternion components — use `from_euler()` to create them from human-readable angles.
+
+### Constructor
+
+```python
+q = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)  # Identity (no rotation)
+```
+
+Defaults to identity (w=1, rest=0). You rarely need to set raw xyzw values directly.
+
+### `.identity()` — No Rotation
+
+```python
+q = Quaternion.identity()  # (0, 0, 0, 1)
+```
+
+The identity quaternion represents zero rotation. Use this as a default orientation or to initialize a pose before setting the actual rotation:
+
+```python
+pose = Pose3D(x=1.0, y=2.0, z=0.0, qx=0.0, qy=0.0, qz=0.0, qw=1.0)
+# Equivalent to:
+pose = Pose3D.identity()
+pose.x = 1.0
+pose.y = 2.0
+```
+
+### `.from_euler(roll, pitch, yaw)` — From Euler Angles
+
+```python
+import math
+q = Quaternion.from_euler(roll=0.0, pitch=0.0, yaw=math.pi/2)  # 90° left turn
+```
+
+**This is the most important method in the geometry library.** In robotics, you think in Euler angles (roll/pitch/yaw), but the system stores quaternions. This method bridges the gap.
+
+- **roll**: rotation around the X axis (tilting left/right). Positive = right side down.
+- **pitch**: rotation around the Y axis (tilting forward/backward). Positive = nose down.
+- **yaw**: rotation around the Z axis (turning left/right). Positive = turn left (counterclockwise from above).
+
+Convention: ZYX (yaw applied first, then pitch, then roll). All angles in **radians**.
+
+Common values:
+| Angle | Radians | Description |
+|-------|---------|-------------|
+| 0° | `0.0` | No rotation |
+| 45° | `math.pi/4` ≈ `0.785` | Quarter turn |
+| 90° | `math.pi/2` ≈ `1.571` | Right angle |
+| 180° | `math.pi` ≈ `3.142` | Half turn |
+| -90° | `-math.pi/2` | Right turn |
+
+```python
+facing_north = Quaternion.from_euler(yaw=0.0)
+facing_east = Quaternion.from_euler(yaw=-math.pi/2)   # 90° right
+facing_south = Quaternion.from_euler(yaw=math.pi)      # 180°
+tilted_forward = Quaternion.from_euler(pitch=0.1)       # Slight nose-down
+```
+
+> **Common mistake:** Using degrees instead of radians. `from_euler(yaw=90)` is NOT 90° — it's 90 radians (≈ 14 full rotations). Always use `math.pi/2` for 90°, or convert: `math.radians(90)`.
+
+### `.normalize()` — Fix Quaternion Drift
+
+```python
+q.normalize()
+```
+
+After repeated quaternion operations (interpolation, composition), floating-point errors accumulate and the quaternion drifts from unit length. Normalizing snaps it back. Call this periodically in long-running systems:
+
+```python
+# In a sensor fusion loop
+orientation = update_orientation(orientation, gyro_reading, dt)
+orientation.normalize()  # Prevent drift every tick
+```
+
+### `.is_valid()` — Validation
+
+```python
+print(q.is_valid())  # True if all components are finite and quaternion is non-zero
+```
+
+Catches NaN and infinity from bad sensor data or division by zero. Use this before publishing orientation data:
+
+```python
+if not q.is_valid():
+    print("WARNING: Invalid orientation, skipping publish")
+    return
+```
+
+---
+
+## Pose2D
+
+2D robot pose — the workhorse of mobile robotics. Represents position (x, y) in meters and heading angle (theta) in radians.
+
+### Constructor
+
+```python
+pose = Pose2D(x=1.0, y=2.0, theta=0.5)
+```
+
+### `.origin()` — The Origin Pose
+
+```python
+start = Pose2D.origin()  # (0, 0, 0)
+```
+
+The origin with zero heading. Common as an initial pose or "home" position.
+
+### `.distance_to(other)` — How Far to the Goal?
+
+```python
+robot = Pose2D(x=1.0, y=2.0, theta=0.5)
+goal = Pose2D(x=10.0, y=5.0, theta=0.0)
+dist = robot.distance_to(goal)  # 9.487 meters
+```
+
+Euclidean distance between positions, **ignoring heading**. This is the straight-line distance — it doesn't account for obstacles or the robot's orientation.
+
+Use this in navigation loops to check "am I close enough?":
+
+```python
+if current.distance_to(goal) < 0.2:  # Within 20cm
+    print("Close enough — stop")
+```
+
+> **Common mistake:** `distance_to()` ignores theta. A robot can be at exactly the right position but facing the wrong direction. For full goal checking (position + heading), use `NavGoal.is_reached()` instead.
+
+### `.normalize_angle()` — Fix Theta Wrap-Around
+
+```python
+pose = Pose2D(x=0.0, y=0.0, theta=7.0)
+pose.normalize_angle()
+print(f"{pose.theta:.3f}")  # 0.717 (wrapped to [-pi, pi])
+```
+
+Wraps theta into the range [-π, π]. Without this, angular calculations break — for example, the difference between θ=359° and θ=1° is 2°, not 358°. Always normalize after adding angles:
+
+```python
+pose.theta += turn_rate * dt
+pose.normalize_angle()
+```
+
+> **Common mistake:** Comparing angles without normalizing. `theta=3.14` and `theta=-3.14` are almost the same heading (both ≈ 180°), but their numerical difference is 6.28.
+
+### `.is_valid()` — Validation
+
+```python
+print(pose.is_valid())  # True if x, y, theta are all finite
+```
+
+---
+
+## Pose3D
+
+3D pose with position and quaternion orientation. Used for arms, drones, and bridging 2D navigation with 3D visualization.
+
+### Constructor
+
+```python
+pose = Pose3D(x=1.0, y=2.0, z=0.5, qx=0.0, qy=0.0, qz=0.0, qw=1.0)
+```
+
+### `.identity()` — Default Pose
+
+```python
+pose = Pose3D.identity()  # Origin, no rotation
+```
+
+### `.from_pose_2d(pose2d)` — Bridge 2D to 3D
+
+```python
+nav_pose = Pose2D(x=5.0, y=3.0, theta=1.57)
+viz_pose = Pose3D.from_pose_2d(nav_pose)
+# x=5.0, y=3.0, z=0.0, quaternion = 90° yaw
+```
+
+Converts a 2D navigation pose to a 3D pose by setting z=0 and converting theta to a yaw quaternion. Essential when your navigation planner works in 2D but your visualization or transform system works in 3D.
+
+### `.distance_to(other)` — 3D Distance
+
+```python
+dist = pose_a.distance_to(pose_b)  # Euclidean distance, position only
+```
+
+Same as Point3.distance_to — measures straight-line 3D distance, ignoring orientation.
+
+### `.is_valid()` — Validation
+
+```python
+print(pose.is_valid())  # True if all position + quaternion fields are finite
+```
+
+---
+
+## CmdVel
+
+2D velocity command — the standard way to drive mobile robots. Simpler than Twist (only linear + angular for 2D).
+
+### Constructor
+
+```python
+cmd = CmdVel(linear=0.5, angular=0.3)  # Forward at 0.5 m/s, turning left
+```
+
+### `.zero()` — Stop Command
+
+```python
+stop = CmdVel.zero()  # linear=0, angular=0
+```
+
+The emergency stop / halt command. Use this when the robot needs to stop immediately:
+
+```python
+if obstacle_too_close:
+    cmd_topic.send(CmdVel.zero())
+```
+
+> **Common mistake:** Using `CmdVel(linear=0.0, angular=0.0)` instead of `CmdVel.zero()`. Both work, but `zero()` is clearer and less error-prone (no risk of typos in field names).
+
+---
+
+## Twist
+
+Full 6-DOF velocity (linear xyz + angular xyz). Used for 3D robots — drones, manipulators, holonomic bases.
+
+### Constructor
+
+```python
+twist = Twist(linear_x=1.0, linear_y=0.0, linear_z=0.0,
+              angular_x=0.0, angular_y=0.0, angular_z=0.5)
+```
+
+### `.stop()` — Zero Velocity
+
+```python
+halt = Twist.stop()  # All zeros
+```
+
+Emergency halt for any robot type. Published on a velocity topic to command immediate stop.
+
+### `.new_2d(linear_x, angular_z)` — 2D Shorthand
+
+```python
+twist = Twist.new_2d(linear_x=0.5, angular_z=0.3)
+# Sets only linear_x and angular_z, rest are zero
+```
+
+Most mobile robots only use 2 of the 6 DOF. This shorthand avoids filling in 4 zeros:
+
+```python
+# Instead of:
+twist = Twist(linear_x=0.5, linear_y=0.0, linear_z=0.0,
+              angular_x=0.0, angular_y=0.0, angular_z=0.3)
+# Just:
+twist = Twist.new_2d(linear_x=0.5, angular_z=0.3)
+```
+
+### `.is_valid()` — Validation
+
+```python
+print(twist.is_valid())  # True if all 6 components are finite
+```
+
+---
+
+## TransformStamped
+
+A 3D coordinate frame transformation (translation + rotation). Used with the TransformFrame system to describe how different parts of the robot relate spatially.
+
+### Constructor
+
+```python
+tf = TransformStamped(tx=1.0, ty=0.0, tz=0.5, rx=0.0, ry=0.0, rz=0.0, rw=1.0)
+```
+
+### `.identity()` — No Transform
+
+```python
+tf = TransformStamped.identity()  # Zero translation, identity rotation
+```
+
+### `.from_pose_2d(pose)` — Convert 2D Pose
+
+```python
+pose = Pose2D(x=1.0, y=2.0, theta=0.5)
+tf = TransformStamped.from_pose_2d(pose)
+```
+
+Creates a 3D transform from a 2D pose. Common for publishing the odom→base_link transform from wheel odometry.
+
+### `.is_valid()` — Validation
+
+```python
+print(tf.is_valid())  # True if all fields are finite
+```
+
+### `.normalize_rotation()` — Fix Quaternion Drift
+
+```python
+tf.normalize_rotation()
+```
+
+Same as `Quaternion.normalize()` but applied to the transform's rotation component. Call this periodically when composing transforms over time.
+
+---
+
+## PoseWithCovariance, TwistWithCovariance
+
+Pose and velocity with uncertainty estimates. Used in sensor fusion (EKF, particle filters) where you need to track not just the value but how confident you are.
+
+### `.position_variance()` — Position Uncertainty
+
+```python
+pwc = PoseWithCovariance(x=1.0, y=2.0, z=0.0)
+pwc.covariance = [0.1, 0,0,0,0,0, 0,0.1,0,0,0,0, 0,0,0.01,0,0,0,
+                  0,0,0,0.01,0,0, 0,0,0,0,0.01,0, 0,0,0,0,0,0.01]
+var = pwc.position_variance()  # [0.1, 0.1, 0.01] — diagonal of position block
+```
+
+Extracts [var_x, var_y, var_z] from the 6x6 covariance matrix diagonal. Larger values mean less certainty about the position.
+
+### `.orientation_variance()` — Orientation Uncertainty
+
+```python
+var = pwc.orientation_variance()  # [var_roll, var_pitch, var_yaw]
+```
+
+### `.linear_variance()` / `.angular_variance()`
+
+Same pattern for TwistWithCovariance — extract velocity uncertainty:
+
+```python
+twc = TwistWithCovariance(linear_x=0.5, angular_z=1.0)
+lin_var = twc.linear_variance()   # [var_vx, var_vy, var_vz]
+ang_var = twc.angular_variance()  # [var_wx, var_wy, var_wz]
+```
+
+---
+
+## Accel, AccelStamped
+
+Linear and angular acceleration.
+
+### `.is_valid()` — Validation
+
+```python
+accel = Accel(linear_x=9.81, angular_z=0.1)
+print(accel.is_valid())  # True if all fields are finite
+```
+
+---
+
+## Complete Examples
+
+### Example: Obstacle Avoidance with Vector Math
+
+```python
+from horus import Vector3, Point3
+
+robot_pos = Point3(x=0.0, y=0.0, z=0.0)
+obstacle_pos = Point3(x=2.0, y=1.0, z=0.0)
+
+dist = robot_pos.distance_to(obstacle_pos)
+if dist < 3.0:
+    # Compute direction away from obstacle
+    dx = robot_pos.x - obstacle_pos.x
+    dy = robot_pos.y - obstacle_pos.y
+    repulse = Vector3(x=dx, y=dy, z=0.0)
+    repulse.normalize()  # Pure direction
+
+    # Scale by inverse distance (closer = stronger repulsion)
+    strength = 1.0 / max(dist, 0.1)
+    escape = Vector3(
+        x=repulse.x * strength,
+        y=repulse.y * strength,
+        z=0.0,
+    )
+    print(f"Escape force: {escape.magnitude():.2f} (dir: {repulse})")
+```
+
+### Example: Navigation Goal Check
+
+```python
+from horus import Node, run, Pose2D, CmdVel, Topic
+
+odom_topic = Topic(Pose2D)
+cmd_topic = Topic(CmdVel)
+goal = Pose2D(x=5.0, y=3.0, theta=0.0)
+
+def navigate(node):
+    current = odom_topic.recv(node)
+    if current is None:
+        return
+    dist = current.distance_to(goal)
+    if dist < 0.2:
+        cmd_topic.send(CmdVel.zero(), node)  # Arrived
+    else:
+        cmd_topic.send(CmdVel(linear=0.3, angular=0.0), node)
+
+run(Node(tick=navigate, rate=10, pubs=["cmd_vel"], subs=["pose"]))
+```
+
+### Example: Setting Up Coordinate Frames
+
+```python
+from horus import TransformStamped, Pose2D, Quaternion
+import math
+
+# Base link to camera: camera is 0.3m forward, 0.2m up, tilted down 15°
+camera_tf = TransformStamped(
+    tx=0.3, ty=0.0, tz=0.2,
+    rx=0.0, ry=0.0, rz=0.0, rw=1.0,
+)
+# Set the pitch rotation (15° down)
+q = Quaternion.from_euler(roll=0.0, pitch=math.radians(-15), yaw=0.0)
+camera_tf.rx = q.x
+camera_tf.ry = q.y
+camera_tf.rz = q.z
+camera_tf.rw = q.w
+
+# Odom to base_link from 2D odometry
+odom_pose = Pose2D(x=1.5, y=0.3, theta=0.2)
+odom_tf = TransformStamped.from_pose_2d(odom_pose)
+```
+
+---
+
+## See Also
+
+- [Rust Geometry Messages](/rust/api/geometry-messages) — Rust API reference
+- [Sensor Messages](/python/messages/sensor) — LaserScan, Imu, Odometry
+- [Navigation Messages](/python/messages/navigation) — NavGoal, OccupancyGrid
+- [TransformFrame API](/python/api/transform-frame) — Coordinate frame management

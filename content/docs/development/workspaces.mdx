@@ -1,0 +1,415 @@
+---
+title: "Multi-Crate Workspaces"
+description: "Organize robotics projects with multiple crates — shared libraries, drivers, and binary targets in one workspace"
+order: 13
+---
+
+# Multi-Crate Workspaces
+
+Real robotics projects outgrow a single crate quickly. You need shared message types that your driver, controller, and main binary all depend on. You need a hardware abstraction layer that multiple nodes consume. You need algorithm libraries that evolve independently from your application logic.
+
+Workspaces let you split your project into multiple crates that compile together, share dependencies, and reference each other directly — without publishing anything to a registry.
+
+## Why Workspaces
+
+A single-crate project works fine for prototypes, but production robotics code benefits from separation:
+
+- **Shared message types** — Define sensor readings, commands, and state once. Every crate imports them
+- **Driver abstraction** — Isolate hardware-specific code behind traits. Swap real hardware for simulation without touching application logic
+- **Algorithm libraries** — PID controllers, path planners, and SLAM modules become reusable across projects
+- **Faster compilation** — Only changed crates recompile. Your message types crate rarely changes, so it compiles once
+- **Clear ownership** — Each crate has a focused purpose. Code review and testing stay manageable
+
+## Creating a Workspace
+
+```bash
+horus new my-robot --workspace -r
+```
+
+This generates a workspace scaffold with a single binary member:
+
+```
+my-robot/
+├── horus.toml              # [workspace] members = ["crates/*"]
+├── .horus/
+│   ├── Cargo.toml          # Generated workspace Cargo.toml
+│   └── my-robot/
+│       └── Cargo.toml      # Generated member Cargo.toml
+└── crates/
+    └── my-robot/
+        ├── horus.toml      # [package] name = "my-robot"
+        └── src/
+            └── main.rs
+```
+
+The root `horus.toml` defines workspace-level settings. Each member under `crates/` has its own `horus.toml` for package-specific configuration.
+
+## Adding Library Members
+
+Add library crates alongside your binary:
+
+```bash
+cd my-robot
+horus new messages --lib -r -o crates
+horus new driver --lib -r -o crates
+```
+
+Your workspace now looks like this:
+
+```
+my-robot/
+├── horus.toml
+├── .horus/
+└── crates/
+    ├── messages/
+    │   ├── horus.toml
+    │   └── src/
+    │       └── lib.rs
+    ├── driver/
+    │   ├── horus.toml
+    │   └── src/
+    │       └── lib.rs
+    └── my-robot/
+        ├── horus.toml
+        └── src/
+            └── main.rs
+```
+
+## Workspace horus.toml Format
+
+The root `horus.toml` defines workspace membership and shared dependencies:
+
+```toml
+# Root horus.toml
+[workspace]
+members = ["crates/*"]
+exclude = ["crates/experimental"]
+
+[workspace.dependencies]
+horus_library = "0.1.9"
+serde = { version = "1.0", source = "crates.io", features = ["derive"] }
+nalgebra = { version = "0.33", source = "crates.io" }
+```
+
+**`members`** accepts glob patterns. `"crates/*"` includes every directory under `crates/`.
+
+**`exclude`** removes specific directories from the glob match. Useful for in-progress crates that should not build with the rest of the workspace.
+
+**`[workspace.dependencies]`** centralizes version and source declarations. Members inherit these without repeating version numbers.
+
+## Member horus.toml Format
+
+Each member declares its own package metadata and dependencies:
+
+```toml
+# crates/messages/horus.toml
+[package]
+name = "my-robot-messages"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+serde = { workspace = true }
+```
+
+The `workspace = true` marker tells horus to pull the version, source, and features from the root `[workspace.dependencies]` table.
+
+## Target Types
+
+The `type` field in a member's `[package]` table controls what gets built:
+
+| Type | What it produces | Use case |
+|------|-----------------|----------|
+| `"bin"` | Executable binary (default) | Main application, CLI tools |
+| `"lib"` | Library crate | Shared types, drivers, algorithms |
+| `"both"` | Library + binary in same crate | Library with a companion CLI |
+
+```toml
+# A crate that is both a library and a binary
+[package]
+name = "my-robot-driver"
+version = "0.1.0"
+type = "both"
+```
+
+## Dependency Inheritance
+
+When a member uses `workspace = true`, it inherits the version, source, and features from the root `[workspace.dependencies]`:
+
+```toml
+# Root horus.toml
+[workspace.dependencies]
+serde = { version = "1.0", source = "crates.io", features = ["derive"] }
+```
+
+```toml
+# crates/messages/horus.toml
+[dependencies]
+serde = { workspace = true }
+# Inherits: version = "1.0", source = "crates.io", features = ["derive"]
+```
+
+Members can add extra features on top of the inherited ones:
+
+```toml
+# crates/driver/horus.toml
+[dependencies]
+serde = { workspace = true, features = ["alloc"] }
+# Gets "derive" from workspace + "alloc" from this member
+```
+
+This keeps version management in one place. Bump `serde` once in the root, and every member picks up the change.
+
+## Inter-Member Dependencies
+
+Members reference each other with path dependencies:
+
+```toml
+# crates/controller/horus.toml
+[package]
+name = "my-robot-controller"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+my-robot-messages = { path = "../messages" }
+my-robot-driver = { path = "../driver" }
+horus_library = { workspace = true }
+```
+
+Path dependencies resolve relative to the member's directory. The build system handles everything — no publishing or installation required.
+
+## Building and Running
+
+Workspace-level commands operate on all members:
+
+```bash
+horus build                    # Build all members
+horus build -p messages        # Build specific member
+horus run -p my-robot          # Run specific binary
+horus test                     # Test all members
+horus test -p driver           # Test specific member
+```
+
+Native cargo commands also work through the generated build files:
+
+```bash
+cargo build --workspace        # Build everything via native toolchain
+cargo test --workspace         # Test everything
+cargo clippy --workspace       # Lint everything
+```
+
+## Generated Build Files
+
+Horus generates native build files in `.horus/` from your `horus.toml` declarations. You should never edit these directly:
+
+```
+.horus/
+├── Cargo.toml              # [workspace] with members list
+├── my-robot-messages/
+│   └── Cargo.toml          # [lib] pointing to ../../crates/messages/src/
+├── my-robot-driver/
+│   └── Cargo.toml          # [lib] pointing to ../../crates/driver/src/
+├── my-robot-controller/
+│   └── Cargo.toml          # [lib] pointing to ../../crates/controller/src/
+├── my-robot/
+│   └── Cargo.toml          # [[bin]] pointing to ../../crates/my-robot/src/
+└── target/                 # Shared build artifacts for all members
+```
+
+The generated `Cargo.toml` files point back to your source directories. All members share a single `target/` directory, so common dependencies compile once.
+
+Running `horus build` regenerates these files if your `horus.toml` has changed, then invokes cargo against the `.horus/` workspace.
+
+## Example: Complete Robotics Workspace
+
+Here is a realistic project structure for an autonomous robot:
+
+```
+my-robot/
+├── horus.toml
+└── crates/
+    ├── messages/           # Shared types
+    │   ├── horus.toml
+    │   └── src/lib.rs
+    ├── driver/             # Hardware abstraction
+    │   ├── horus.toml
+    │   └── src/lib.rs
+    ├── controller/         # Algorithms
+    │   ├── horus.toml
+    │   └── src/lib.rs
+    └── my-robot/           # Main binary
+        ├── horus.toml
+        └── src/main.rs
+```
+
+### messages crate
+
+Define sensor readings and commands that every other crate shares:
+
+```rust
+// crates/messages/src/lib.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaserScan {
+    pub ranges: Vec<f32>,
+    pub angle_min: f32,
+    pub angle_max: f32,
+    pub range_max: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CmdVel {
+    pub linear_x: f64,
+    pub angular_z: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Odometry {
+    pub x: f64,
+    pub y: f64,
+    pub theta: f64,
+}
+```
+
+```toml
+# crates/messages/horus.toml
+[package]
+name = "my-robot-messages"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+serde = { workspace = true }
+```
+
+### driver crate
+
+Abstract hardware behind traits so you can swap real sensors for simulated ones:
+
+```rust
+// crates/driver/src/lib.rs
+use my_robot_messages::{CmdVel, LaserScan, Odometry};
+
+pub trait LidarDriver: Send + Sync {
+    fn scan(&self) -> LaserScan;
+}
+
+pub trait MotorDriver: Send + Sync {
+    fn send_velocity(&self, cmd: &CmdVel);
+    fn read_odometry(&self) -> Odometry;
+}
+```
+
+```toml
+# crates/driver/horus.toml
+[package]
+name = "my-robot-driver"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+my-robot-messages = { path = "../messages" }
+```
+
+### controller crate
+
+Implement algorithms that depend on message types and driver traits:
+
+```rust
+// crates/controller/src/lib.rs
+use my_robot_messages::{CmdVel, LaserScan};
+
+pub struct ObstacleAvoider {
+    pub min_distance: f32,
+    pub turn_speed: f64,
+}
+
+impl ObstacleAvoider {
+    pub fn compute(&self, scan: &LaserScan) -> CmdVel {
+        let closest = scan.ranges.iter().cloned().fold(f32::MAX, f32::min);
+        if closest < self.min_distance {
+            CmdVel { linear_x: 0.0, angular_z: self.turn_speed }
+        } else {
+            CmdVel { linear_x: 0.5, angular_z: 0.0 }
+        }
+    }
+}
+```
+
+```toml
+# crates/controller/horus.toml
+[package]
+name = "my-robot-controller"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+my-robot-messages = { path = "../messages" }
+```
+
+### Main binary
+
+Tie everything together with horus nodes:
+
+```rust
+// crates/my-robot/src/main.rs
+use horus_library::prelude::*;
+use my_robot_controller::ObstacleAvoider;
+use my_robot_messages::{CmdVel, LaserScan};
+
+fn main() -> Result<()> {
+    let avoider = ObstacleAvoider {
+        min_distance: 0.5,
+        turn_speed: 1.0,
+    };
+
+    Scheduler::new()
+        .add("lidar_node", |ctx| {
+            let scan_pub: Publisher<LaserScan> = ctx.advertise("scan")?;
+            // Read from hardware or simulation
+            Ok(())
+        })
+        .add("controller", |ctx| {
+            let scan_sub: Subscriber<LaserScan> = ctx.subscribe("scan")?;
+            let cmd_pub: Publisher<CmdVel> = ctx.advertise("cmd_vel")?;
+            // Use avoider.compute() to generate commands
+            Ok(())
+        })
+        .build()?
+        .run()
+}
+```
+
+```toml
+# crates/my-robot/horus.toml
+[package]
+name = "my-robot"
+version = "0.1.0"
+
+[dependencies]
+horus_library = { workspace = true }
+my-robot-messages = { path = "../messages" }
+my-robot-controller = { path = "../controller" }
+```
+
+### Root workspace configuration
+
+```toml
+# Root horus.toml
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+horus_library = "0.1.9"
+serde = { version = "1.0", source = "crates.io", features = ["derive"] }
+```
+
+Build and run the whole project:
+
+```bash
+horus build                    # Compiles messages, driver, controller, then my-robot
+horus run -p my-robot          # Runs the main binary
+horus test                     # Tests all crates
+```

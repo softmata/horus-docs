@@ -183,8 +183,17 @@ const sections: SidebarSection[] = [
         href: "/python/library/python-message-library",
         order: 2,
         children: [
-          { title: "Message Library", href: "/python/library/python-message-library", order: 1 },
-          { title: "ML Utilities", href: "/python/library/ml-utilities", order: 2 },
+          { title: "Message Overview", href: "/python/library/python-message-library", order: 0 },
+          { title: "Geometry", href: "/python/messages/geometry", order: 1 },
+          { title: "Sensor", href: "/python/messages/sensor", order: 2 },
+          { title: "Control", href: "/python/messages/control", order: 3 },
+          { title: "Navigation", href: "/python/messages/navigation", order: 4 },
+          { title: "Diagnostics", href: "/python/messages/diagnostics", order: 5 },
+          { title: "Force & Haptics", href: "/python/messages/force", order: 6 },
+          { title: "Perception", href: "/python/messages/perception", order: 7 },
+          { title: "Vision", href: "/python/messages/vision", order: 8 },
+          { title: "Input & Audio", href: "/python/messages/input", order: 9 },
+          { title: "ML Utilities", href: "/python/library/ml-utilities", order: 10 },
         ]
       },
       { title: "Examples", href: "/python/examples", order: 3 },
@@ -204,6 +213,8 @@ const sections: SidebarSection[] = [
       { title: "AI-Assisted Dev", href: "/development/ai-assisted-development", order: 9 },
       { title: "Logging", href: "/development/logging", order: 10 },
       { title: "Telemetry Export", href: "/development/telemetry", order: 11 },
+      { title: "Native Tool Integration", href: "/development/native-tools", order: 12 },
+      { title: "Multi-Crate Workspaces", href: "/development/workspaces", order: 13 },
     ],
   },
   {
