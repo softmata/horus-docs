@@ -357,6 +357,31 @@ hf.validate()?;
 
 ---
 
+## Design Decisions
+
+### Why Lock-Free Seqlock Instead of Mutex
+
+Coordinate frame lookups happen inside control loops running at 1kHz or faster. A mutex-based design (as in ROS2 TF2) means a writer updating a transform can block readers — and in a real-time system, priority inversion from mutex contention causes unbounded latency spikes. TransformFrame uses a seqlock protocol: writers increment a sequence number before and after updating, and readers retry if they detect a concurrent write. This guarantees that readers never block, even under heavy write load. The worst case for a reader is a retry (~50ns extra), not an unbounded wait.
+
+### Why Dual API (Integer IDs + String Names)
+
+String-based frame lookups require hashing and comparison on every call — acceptable for setup code but wasteful in a 1kHz control loop that looks up the same frames every tick. TransformFrame provides both: string-based registration (`register_frame("camera", ...)`) for clarity at startup, and integer ID-based lookups (`tf_by_id(camera_id, world_id)`) for the hot path. Users cache frame IDs once during initialization and use them in the loop body, cutting lookup time from ~200ns to ~50ns. The string API remains available for introspection, CLI tools, and non-performance-critical code.
+
+### Why Built-In Instead of a Separate Package
+
+In ROS2, TF2 is a separate package that must be installed, configured, and launched independently. This creates a common failure mode: new users forget to run a transform broadcaster, and their system silently produces wrong results. TransformFrame is part of `horus_library` and available via `use horus::prelude::*` — no extra dependency, no separate process, no configuration. Every HORUS project has access to coordinate transforms by default. The CLI (`horus tf list`, `horus tf echo`) also works out of the box without installing additional tools.
+
+## Trade-offs
+
+| Area | Benefit | Cost |
+|------|---------|------|
+| **Seqlock protocol** | Readers never block; predictable sub-microsecond latency under contention | Readers may retry during a concurrent write — rare but adds ~50ns when it happens |
+| **Integer ID API** | ~50ns lookups in hot paths — 4x faster than string-based | Users must cache IDs at startup; using IDs without caching defeats the purpose |
+| **History buffer** | Time-travel queries with interpolation for sensor fusion and replay | Fixed-size ring buffer per dynamic frame (default 32 entries) consumes memory even if time-travel is unused |
+| **Pre-allocated frame slots** | No heap allocation during runtime — real-time safe after initialization | Maximum frame count must be chosen at startup; exceeding it requires `enable_overflow` (which uses a HashMap and is not RT-safe) |
+| **Built-in to horus_library** | Zero-config availability, no forgotten dependencies | Adds to the base library size even for projects that do not use coordinate transforms |
+| **Static frame optimization** | Static frames skip the history buffer — less memory, faster lookups | Changing a static frame (e.g., recalibration) requires an explicit `set_static_transform` call instead of the normal `update_transform` path |
+
 ## See Also
 
 - **[Message Types](/concepts/message-types)** — TransformStamped and other spatial messages
