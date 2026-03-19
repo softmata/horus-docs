@@ -6,7 +6,21 @@ weight: 32
 
 # Fault Tolerance
 
-Every node in a robot can fail — a sensor disconnects, a planning algorithm panics, a network request times out. HORUS failure policies control what happens next: stop the robot, restart the node, skip it temporarily, or ignore the error entirely.
+You need to prevent a single crashing node from killing your entire robot. HORUS failure policies let you define per-node behavior on failure: stop the system, restart with backoff, skip temporarily, or ignore entirely.
+
+## When To Use This
+
+- Any robot with more than one node (which is every production robot)
+- Sensor drivers that may disconnect (USB, serial, network)
+- Systems with non-critical nodes (logging, telemetry) that should not bring down the system
+- Safety-critical deployments where you need explicit failure contracts per node
+
+**Use [Safety Monitor](/advanced/safety-monitor) instead** if you need watchdog timers, deadline enforcement, or graduated degradation. Failure policies and safety monitoring are complementary -- use both in production.
+
+## Prerequisites
+
+- Familiarity with [Nodes](/concepts/core-concepts-nodes) and the [Scheduler Configuration](/advanced/scheduler-configuration) node builder API
+- Understanding of which nodes are critical vs non-critical in your system
 
 ## The Problem
 
@@ -215,8 +229,42 @@ if let Some(bb) = scheduler.get_blackbox() {
 }
 ```
 
+## Design Decisions
+
+**Why per-node policies instead of a global failure mode?**
+
+Different nodes have fundamentally different failure characteristics. A motor controller failure is safety-critical -- you must stop. A telemetry uploader failure is harmless -- you can ignore it. Per-node policies match the failure contract to the node's role in the system.
+
+**Why severity-aware handling?**
+
+A transient network timeout on a `Fatal` node should not kill the system -- it should restart. But shared memory corruption on an `Ignore` node must always stop -- it indicates fundamental system failure. Severity-aware handling prevents both over-reaction (killing the system on a glitch) and under-reaction (ignoring corruption).
+
+**Why exponential backoff on Restart?**
+
+A sensor driver that fails once probably has a transient issue (USB reset). A sensor driver that fails 5 times in rapid succession has a permanent problem. Exponential backoff gives transient issues time to resolve while quickly escalating persistent failures.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| One crashing node does not kill the system | Must think about failure contracts per node |
+| Restart with backoff handles transient hardware issues | Backoff adds latency during recovery |
+| Skip prevents non-critical failures from cascading | Skipped nodes produce no output during cooldown |
+| Severity overrides prevent both over- and under-reaction | Behavior depends on error severity, not just configured policy |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| System stops on a transient network error | `Fatal` policy on a node with transient failures | Use `Restart` for nodes that can recover, or rely on severity-aware de-escalation |
+| Node restarts endlessly | `max_restarts` set too high, or the failure is permanent | Lower `max_restarts` and check logs for the root cause |
+| Non-critical node drags down performance | `Skip` cooldown too short, node fails immediately after cooldown | Increase cooldown duration or investigate the root cause |
+| `Fatal` node did not stop the system | Error was classified as `Transient` severity, de-escalated to Restart | Expected behavior. Truly fatal errors (e.g., SHM corruption) always stop regardless |
+| Cannot find failure events after crash | No BlackBox configured | Add `.blackbox(64)` to the scheduler for crash forensics |
+
 ## See Also
 
-- [Safety Monitor](/advanced/safety-monitor) — Watchdog and graduated degradation
-- [BlackBox Recorder](/advanced/blackbox) — Crash forensics
-- [Scheduler Configuration](/advanced/scheduler-configuration) — Per-node builder API
+- [Safety Monitor](/advanced/safety-monitor) — Watchdog timers and graduated degradation
+- [BlackBox Recorder](/advanced/blackbox) — Crash forensics and post-mortem debugging
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Per-node builder API and execution classes
+- [Nodes](/concepts/core-concepts-nodes) — Node lifecycle and trait methods

@@ -1,12 +1,27 @@
 ---
-title: "Recipe: IMU Reader"
-description: "100Hz IMU sensor node that reads accelerometer and gyroscope data and publishes orientation estimates."
+title: "IMU Reader"
+description: "100 Hz IMU sensor node that reads accelerometer and gyroscope data and publishes orientation estimates"
 order: 3
 ---
 
-## IMU Reader
+# IMU Reader
 
-Reads IMU hardware at 100Hz, publishes raw `Imu` messages for downstream consumers. Uses a `#[repr(C)]` orientation estimate for zero-copy publishing.
+You need to read an IMU sensor (accelerometer + gyroscope) at a fixed rate and publish the data for downstream consumers. Here's a production-ready pattern with raw data publishing and orientation estimation.
+
+## When To Use This
+
+- Reading a 6-axis or 9-axis IMU over I2C/SPI
+- Publishing raw `Imu` messages for sensor fusion or logging
+- Estimating orientation from gyroscope integration (simple) or a complementary filter (production)
+
+**Use the built-in `Imu` message type** — don't define custom IMU structs. Downstream nodes (fusion, SLAM, display) expect `Imu`.
+
+## Prerequisites
+
+- [Quick Start](/getting-started/quick-start) completed
+- Familiarity with [Imu](/stdlib/messages/imu) message type and [Topic](/rust/api/topic)
+
+## Solution
 
 ### horus.toml
 
@@ -14,15 +29,15 @@ Reads IMU hardware at 100Hz, publishes raw `Imu` messages for downstream consume
 [package]
 name = "imu-reader"
 version = "0.1.0"
-description = "100Hz IMU sensor with orientation publishing"
+description = "100 Hz IMU sensor with orientation publishing"
 ```
 
-### Complete Code
+### src/main.rs
 
 ```rust
 use horus::prelude::*;
 
-/// Simplified orientation from integrated gyro
+/// Simplified orientation from integrated gyroscope
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
 #[repr(C)]
 struct Orientation {
@@ -31,8 +46,6 @@ struct Orientation {
     yaw: f32,
     timestamp_ns: u64,
 }
-
-// ── IMU Node ────────────────────────────────────────────────
 
 struct ImuNode {
     imu_pub: Topic<Imu>,
@@ -48,20 +61,17 @@ impl ImuNode {
         Ok(Self {
             imu_pub: Topic::new("imu.raw")?,
             orientation_pub: Topic::new("imu.orientation")?,
-            roll: 0.0,
-            pitch: 0.0,
-            yaw: 0.0,
+            roll: 0.0, pitch: 0.0, yaw: 0.0,
             tick_count: 0,
         })
     }
 
-    /// Simulate IMU hardware read (replace with real driver)
+    /// Read IMU hardware — replace with your I2C/SPI driver
     fn read_hardware(&self) -> Imu {
-        Imu {
-            orientation: [1.0, 0.0, 0.0, 0.0],  // identity quaternion (w,x,y,z)
-            angular_velocity: [0.01, 0.0, 0.05],  // rad/s (roll, pitch, yaw)
-            linear_acceleration: [0.0, 0.0, 9.81], // m/s² (x, y, z)
-        }
+        let mut imu = Imu::new();
+        imu.linear_acceleration = [0.0, 0.0, 9.81]; // gravity
+        imu.angular_velocity = [0.01, 0.0, 0.05];    // slow yaw
+        imu
     }
 }
 
@@ -71,11 +81,16 @@ impl Node for ImuNode {
     fn tick(&mut self) {
         let imu = self.read_hardware();
 
+        // Validate before publishing — hardware faults produce NaN
+        if !imu.is_valid() {
+            return; // skip corrupted readings
+        }
+
         // Publish raw IMU for any subscriber
         self.imu_pub.send(imu);
 
         // Simple gyro integration (replace with Madgwick/Mahony in production)
-        let dt = 1.0 / 100.0; // 100Hz
+        let dt = 1.0 / 100.0; // 100 Hz
         self.roll += imu.angular_velocity[0] as f32 * dt;
         self.pitch += imu.angular_velocity[1] as f32 * dt;
         self.yaw += imu.angular_velocity[2] as f32 * dt;
@@ -86,7 +101,7 @@ impl Node for ImuNode {
             roll: self.roll,
             pitch: self.pitch,
             yaw: self.yaw,
-            timestamp_ns: self.tick_count * 10_000_000, // 10ms per tick
+            timestamp_ns: self.tick_count * 10_000_000, // 10 ms per tick
         });
     }
 }
@@ -94,30 +109,90 @@ impl Node for ImuNode {
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
 
-    // Execution order: IMU reads hardware and publishes
     scheduler.add(ImuNode::new()?)
         .order(0)
-        .rate(100_u64.hz())    // 100Hz sensor rate — auto-enables RT
+        .rate(100_u64.hz())    // 100 Hz sensor rate — auto-enables RT
         .build()?;
 
     scheduler.run()
 }
 ```
 
-### Expected Output
+## Understanding the Code
 
-```text
-[HORUS] Scheduler running — tick_rate: 100 Hz
-[HORUS] Node "ImuReader" started (Rt, 100 Hz, budget: 8.0ms, deadline: 9.5ms)
-^C
-[HORUS] Shutting down...
-[HORUS] Node "ImuReader" shutdown complete
+- **`Imu::new()`** creates a message with identity quaternion, zero acceleration/velocity, and current timestamp
+- **`imu.is_valid()`** rejects NaN/infinite readings from faulty hardware
+- **`#[repr(C)]` + `Copy`** on `Orientation` enables zero-copy shared memory (~50 ns latency)
+- **`read_hardware()`** is a placeholder — replace with your actual I2C/SPI driver call
+- **Gyro integration drifts over time** — in production, use a Madgwick, Mahony, or complementary filter
+
+## Variations
+
+<Details title="Complementary Filter">
+
+Fuse accelerometer (noisy but no drift) with gyroscope (smooth but drifts) for stable orientation:
+
+```rust
+let alpha = 0.98; // trust gyro 98%, accel 2%
+let accel_pitch = (imu.linear_acceleration[0] as f32).atan2(imu.linear_acceleration[2] as f32);
+self.pitch = alpha * (self.pitch + imu.angular_velocity[1] as f32 * dt)
+           + (1.0 - alpha) * accel_pitch;
 ```
 
-### Key Points
+</Details>
 
-- **`Imu`** is a built-in horus message type with `orientation`, `angular_velocity`, `linear_acceleration`
-- **`#[repr(C)]` + `Copy`** on `Orientation` enables the PodTopic zero-copy path (~50ns latency)
-- **`read_hardware()`** is a placeholder — replace with your actual I2C/SPI driver call
-- **No `shutdown()` needed** — sensors don't actuate, so no safety cleanup required
-- **Gyro integration drifts** — in production, use a Madgwick or complementary filter
+<Details title="Using set_orientation_from_euler">
+
+Publish orientation directly on the `Imu` message instead of a separate `Orientation` struct:
+
+```rust
+let mut imu = self.read_hardware();
+imu.set_orientation_from_euler(self.roll as f64, self.pitch as f64, self.yaw as f64);
+imu.orientation_covariance[0] = 0.01; // mark orientation as available
+self.imu_pub.send(imu);
+```
+
+This lets downstream consumers call `imu.has_orientation()` to check.
+
+</Details>
+
+<Details title="Hardware I2C Example (Raspberry Pi)">
+
+Replace `read_hardware()` with a real I2C read using the `i2cdev` crate:
+
+```rust
+use i2cdev::core::I2CDevice;
+use i2cdev::linux::LinuxI2CDevice;
+
+fn read_hardware(&mut self) -> Imu {
+    let mut buf = [0u8; 14];
+    self.i2c.read(&mut buf).unwrap();
+    // Parse accelerometer and gyroscope from raw bytes
+    // (sensor-specific — consult your IMU datasheet)
+    let mut imu = Imu::new();
+    imu.linear_acceleration = parse_accel(&buf);
+    imu.angular_velocity = parse_gyro(&buf);
+    imu
+}
+```
+
+Add `i2cdev` to your `horus.toml` dependencies.
+
+</Details>
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Orientation drifts continuously | Pure gyro integration without correction | Use complementary or Madgwick filter |
+| `NaN` in published data | Hardware fault or I2C read error | Check `imu.is_valid()` before publishing |
+| Orientation jumps on startup | Initial gyro bias not calibrated | Average first 100 readings as bias offset |
+| Yaw rotates when stationary | Gyro bias in Z-axis | Subtract calibrated bias from `angular_velocity[2]` |
+| Topic data stale | Publisher rate too low | Verify `.rate(100_u64.hz())` matches hardware capability |
+
+## See Also
+
+- [Imu](/stdlib/messages/imu) — IMU message type reference
+- [Sensor Node Tutorial](/tutorials/01-sensor-node) — Step-by-step sensor tutorial
+- [Multi-Sensor Fusion Recipe](/recipes/multi-sensor-fusion) — Combine IMU with odometry
+- [Sensor Messages (Rust)](/rust/api/sensor-messages) — All sensor message types

@@ -8,6 +8,8 @@ weight: 25
 
 HORUS services provide synchronous request/response communication between nodes. Define a service with the `service!` macro, run a server with `ServiceServerBuilder`, and call it with `ServiceClient` or `AsyncServiceClient`.
 
+> **Python**: Services are Rust-only. Python bindings are not yet available.
+
 ## Defining a Service
 
 Use the `service!` macro to define request and response types:
@@ -79,16 +81,35 @@ pub fn call(&self, request: S::Request, timeout: Duration) -> ServiceResult<S::R
 
 Send a request and block until a response arrives or the timeout elapses.
 
-**Parameters:**
-- `request: S::Request` — The typed request message. `S` is the service type implementing `ServiceDef`.
-- `timeout: Duration` — Maximum time to wait for a response. Use `100_u64.ms()`, `1_u64.secs()`, etc.
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `request` | `S::Request` | yes | The typed request message. `S` is the service type from `service!` macro. |
+| `timeout` | `Duration` | yes | Maximum time to wait for a response. Create with `.ms()` or `.secs()`: `100_u64.ms()`. |
 
 **Returns:** `ServiceResult<S::Response>` — `Ok(response)` or `Err(ServiceError)`.
 
-**Errors:**
-- `ServiceError::Timeout` — No response within timeout
-- `ServiceError::NoServer` — No server is registered for this service
-- `ServiceError::ServiceFailed(msg)` — Server returned an error
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `ServiceError::Timeout` | No response within timeout |
+| `ServiceError::NoServer` | No server is registered for this service |
+| `ServiceError::ServiceFailed(msg)` | Server handler returned `Err(msg)` |
+| `ServiceError::Transport(msg)` | IPC communication failure |
+
+**When to use**
+
+- One-shot queries: "what is the robot's current pose?"
+- Parameter lookups from a configuration server
+- Any request that should complete in milliseconds
+
+**When NOT to use**
+
+- Long-running tasks — use [Actions](/rust/api/actions) instead
+- Continuous data streams — use [Topics](/rust/api/topic) instead
+- Non-critical lookups where timeout is acceptable — use `call_optional()` instead
 
 **Example:**
 ```rust
@@ -98,23 +119,94 @@ println!("x={}, y={}", response.x, response.y);
 
 #### call_resilient
 
+Sends a request with automatic retry on transient errors.
+
+**Signature**
+
 ```rust
-pub fn call_resilient(&self, request: S::Request, timeout: Duration) -> ServiceResult<S::Response>
+pub fn call_resilient(&mut self, request: S::Request, timeout: Duration) -> ServiceResult<S::Response>
 ```
 
-Like `call()`, but auto-retries on transient errors (timeout, transport). Uses default retry config: 3 retries, 10ms backoff, 2x multiplier.
+**Parameters**
 
-**Retry behavior:** Only `Timeout` and `Transport` errors trigger retries. `NoServer` and `ServiceFailed` propagate immediately. Total time can exceed `timeout` due to retries.
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `request` | `S::Request` | yes | The typed request message. |
+| `timeout` | `Duration` | yes | Timeout per attempt. Total time may exceed this due to retries. |
+
+**Returns**
+
+`ServiceResult<S::Response>` — `Ok(response)` after successful attempt, `Err` if all retries exhausted or permanent error.
+
+**Behavior**
+
+- Default retry config: 3 retries, 10ms initial backoff, 2x multiplier
+- Only transient errors (`Timeout`, `Transport`) trigger retries
+- Permanent errors (`NoServer`, `ServiceFailed`) propagate immediately — no retry
+- Total wall time can exceed `timeout` because each retry gets a fresh timeout
+
+**When to use**: Network-adjacent calls where transient failures are expected (sensor servers, remote nodes).
+
+**When NOT to use**: Latency-critical paths where retry delay is unacceptable — use `call()` with your own retry logic.
+
+#### call_resilient_with
+
+Sends a request with automatic retry using a custom retry configuration.
+
+**Signature**
+
+```rust
+pub fn call_resilient_with(&mut self, request: S::Request, timeout: Duration, config: RetryConfig) -> ServiceResult<S::Response>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `request` | `S::Request` | yes | The typed request message. |
+| `timeout` | `Duration` | yes | Timeout per attempt. |
+| `config` | `RetryConfig` | yes | Custom retry settings: `RetryConfig::new(max_retries, initial_backoff)` with `.multiplier()`, `.max_backoff()`. |
+
+**Returns**
+
+`ServiceResult<S::Response>` — same as `call_resilient()`.
+
+**Example**
+
+```rust
+use horus::prelude::*;
+
+let config = RetryConfig::new(5, 50_u64.ms())
+    .multiplier(3.0)
+    .max_backoff(1_u64.secs());
+
+let response = client.call_resilient_with(request, 2_u64.secs(), config)?;
+```
 
 #### call_optional
 
+Sends a request, returning `None` on timeout instead of an error.
+
+**Signature**
+
 ```rust
-pub fn call_optional(&self, request: S::Request, timeout: Duration) -> ServiceResult<Option<S::Response>>
+pub fn call_optional(&mut self, request: S::Request, timeout: Duration) -> ServiceResult<Option<S::Response>>
 ```
 
-Like `call()`, but returns `Ok(None)` on timeout instead of `Err(Timeout)`. Useful for non-critical lookups where missing data is acceptable.
+**Parameters**
 
-**Returns:** `Ok(Some(response))` on success, `Ok(None)` on timeout, `Err(e)` on other errors.
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `request` | `S::Request` | yes | The typed request message. |
+| `timeout` | `Duration` | yes | Maximum time to wait. |
+
+**Returns**
+
+- `Ok(Some(response))` — server responded successfully
+- `Ok(None)` — timeout elapsed, no response (not an error)
+- `Err(ServiceError)` — non-timeout error (NoServer, ServiceFailed, Transport)
+
+**When to use**: Non-critical lookups where missing data is acceptable — e.g., checking if a sensor is online before planning.
 
 ### Example
 
@@ -173,6 +265,55 @@ Non-blocking client that returns a `PendingServiceCall` handle. Check the handle
 | `check()` | `ServiceResult<Option<Res>>` | Non-blocking check: `Ok(Some(res))` if ready, `Ok(None)` if waiting, `Err` on timeout/failure |
 | `wait()` | `ServiceResult<Res>` | Block until response arrives or timeout |
 | `is_expired()` | `bool` | Whether the deadline has passed |
+
+#### check
+
+Polls for a response without blocking.
+
+**Signature**
+
+```rust
+pub fn check(&mut self) -> ServiceResult<Option<Res>>
+```
+
+**Returns**
+
+- `Ok(Some(response))` — response arrived
+- `Ok(None)` — still waiting, call again next tick
+- `Err(ServiceError::Timeout)` — deadline passed
+- `Err(other)` — transport or server error
+
+**When to use**: In `tick()` — check every cycle without blocking the scheduler.
+
+#### wait
+
+Blocks until the response arrives or the deadline passes.
+
+**Signature**
+
+```rust
+pub fn wait(self) -> ServiceResult<Res>
+```
+
+**Returns**
+
+`ServiceResult<Res>` — consumes the handle. Use `check()` for non-blocking.
+
+**When NOT to use**: Inside `tick()` of RT nodes — blocking causes deadline misses.
+
+#### is_expired
+
+Checks whether the deadline has passed.
+
+**Signature**
+
+```rust
+pub fn is_expired(&self) -> bool
+```
+
+**Returns**
+
+`true` if the timeout has elapsed. After this, `check()` will return `Err(Timeout)`.
 
 ### Example
 

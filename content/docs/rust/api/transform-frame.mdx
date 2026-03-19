@@ -6,7 +6,22 @@ weight: 30
 
 # TransformFrame API
 
-`TransformFrame` manages coordinate frame trees for real-time robotics. All lookups are lock-free and wait-free. Register frames with `FrameBuilder`, query transforms with `TransformQuery`, and update dynamic frames at sensor rates.
+`TransformFrame` manages coordinate frame trees for real-time robotics — the spatial relationships between your robot's base, sensors, and the world. All lookups are lock-free and wait-free. Register frames with `FrameBuilder`, query transforms with `TransformQuery`, and update dynamic frames at sensor rates.
+
+> New to coordinate frames? See [TransformFrame Concepts](/concepts/transform-frame) for an introduction.
+
+### Quick Reference
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `TransformFrame::new(config)` | `Result<Self>` | Create a new transform frame tree |
+| `.register_frame(name, parent)` | `Result<()>` | Add a frame to the tree |
+| `.update_transform(frame, transform, timestamp)` | `Result<()>` | Update a dynamic frame's transform |
+| `.tf(from, to)` | `Result<Transform>` | Look up transform between two frames |
+| `.tf_at(from, to, time)` | `Result<Transform>` | Look up transform at a specific time |
+| `.is_stale(frame, max_age)` | `bool` | Check if a frame's data is too old |
+| `.frame_exists(name)` | `bool` | Check if a frame is registered |
+| `.diagnostics()` | `FrameDiagnostics` | Get tree statistics and health |
 
 ## Creating a TransformFrame
 
@@ -168,6 +183,42 @@ tf.set_static_transform("camera", &Transform::xyz(0.1, 0.0, 0.6))?;
 | `update_transform(name, transform, timestamp_ns)` | `Result<()>` | Update by name (validates transform) |
 | `update_transform_by_id(id, transform, timestamp_ns)` | `Result<()>` | Update by ID (fastest, lock-free) |
 | `set_static_transform(name, transform)` | `Result<()>` | Update a static frame's offset |
+
+### `update_transform(name, transform, timestamp_ns)`
+
+Updates a dynamic frame's transform at the current timestamp.
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | `&str` | yes | Frame name (must be registered and dynamic, not static) |
+| `transform` | `&Transform` | yes | New transform relative to parent. NaN/Inf rejected. Quaternions auto-normalized. |
+| `timestamp_ns` | `u64` | yes | Timestamp in nanoseconds. Use `timestamp_now()` for current time. |
+
+**Returns**
+
+`Result<()>` — `Ok` on success, `Err` if frame doesn't exist or transform is invalid.
+
+**Behavior**
+
+- Validates transform: rejects NaN/Inf, auto-normalizes quaternions
+- Stores in history buffer for temporal interpolation (LERP + SLERP)
+- Lock-free write — safe to call from RT nodes at sensor rates
+
+**When to use**: Call every tick from sensor nodes that produce position data (odometry, SLAM, IMU integration).
+
+### `update_transform_by_id(id, transform, timestamp_ns)`
+
+Same as `update_transform` but uses `FrameId` instead of name string. Skips name lookup — use this in hot loops.
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `id` | `FrameId` | yes | Frame ID from `frame_id(name)`. Cache this at init time. |
+| `transform` | `&Transform` | yes | New transform. Same validation as `update_transform`. |
+| `timestamp_ns` | `u64` | yes | Timestamp in nanoseconds. |
 
 Transforms are automatically validated — NaN/Inf values are rejected and quaternions are auto-normalized.
 
@@ -361,6 +412,55 @@ let t = Transform::xyz(1.0, 0.0, 0.5).with_rpy(0.0, 0.1, 0.0);
 | `is_identity(epsilon)` | `bool` | Approximate identity test |
 | `translation_magnitude()` | `f64` | Translation vector length |
 | `rotation_angle()` | `f64` | Rotation angle in radians |
+
+### `tf(src, dst)` — Shorthand Transform Lookup
+
+Looks up the latest transform between two named frames.
+
+**Signature**
+
+```rust
+pub fn tf(&self, src: &str, dst: &str) -> HorusResult<Transform>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `src` | `&str` | yes | Source frame name (e.g., `"camera"`) |
+| `dst` | `&str` | yes | Destination frame name (e.g., `"world"`) |
+
+**Returns**
+
+`HorusResult<Transform>` — the transform that converts coordinates from `src` frame to `dst` frame.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `FrameNotFound` | Source or destination frame not registered |
+| `NoPathBetweenFrames` | Frames exist but have no common ancestor in the tree |
+
+**Behavior**
+
+- Returns the latest transform regardless of timestamp — use `tf_at()` for time-specific lookups
+- Equivalent to `query(src).to(dst).lookup()` but shorter
+- Lock-free read — safe to call from RT nodes at high frequency
+
+**Example**
+
+```rust
+use horus::prelude::*;
+
+// Where is the camera relative to the world?
+let camera_to_world = tf.tf("camera", "world")?;
+println!("Camera at: ({:.2}, {:.2}, {:.2})",
+    camera_to_world.translation[0],
+    camera_to_world.translation[1],
+    camera_to_world.translation[2]);
+```
+
+**When to use**: Simple one-off lookups. For complex queries (time-specific, point transformation, chain inspection), use the fluent `query()` API instead.
 
 ---
 

@@ -1,261 +1,210 @@
 ---
 title: "Topic API"
-description: "Zero-copy pub/sub communication channels between HORUS nodes"
+description: "Zero-copy pub/sub communication channels between HORUS nodes — the primary IPC primitive"
 weight: 20
 ---
 
 # Topic API
 
-`Topic<T>` is the primary communication primitive in HORUS. It provides typed publish/subscribe channels backed by shared memory for zero-copy IPC within a single machine.
+Topics are how nodes communicate in HORUS. `Topic<T>` provides typed publish/subscribe channels backed by shared memory for zero-copy IPC. Two Topic instances with the same name and type connect automatically — one publishes, the other subscribes. Backend selection (in-process ring buffer vs cross-process SHM) is automatic based on whether publisher and subscriber live in the same process.
 
-## Creating a Topic
+> **Python**: Available via `horus.Topic("name", Type)`. See [Python Bindings](/python/api/python-bindings).
+>
+> New to topics? Start with [Topics: How Nodes Talk](/concepts/topics-beginner) for a 5-minute introduction.
 
 ```rust
 use horus::prelude::*;
-
-// Default capacity and slot size
-let topic = Topic::<Twist>::new("cmd_vel");
-
-// Custom capacity (number of slots) and slot size (bytes per slot)
-let topic = Topic::<LaserScan>::with_capacity("scan", 8, 4096);
 ```
+
+---
+
+## Quick Reference — Constructors
 
 | Constructor | Returns | Description |
 |-------------|---------|-------------|
-| `Topic::<T>::new(name)` | `Topic<T>` | Create with default capacity and slot size |
-| `Topic::<T>::with_capacity(name, capacity, slot_size)` | `Topic<T>` | Create with explicit capacity and slot size |
+| `Topic::<T>::new(name)` | `HorusResult<Topic<T>>` | Creates with default capacity (4 slots) and auto-sized slots |
+| `Topic::<T>::with_capacity(name, capacity, slot_size)` | `HorusResult<Topic<T>>` | Creates with explicit buffer configuration |
 
-> Most users only need `Topic::new(name)`. Use `with_capacity` only if you need to tune buffer sizes for very large or very small messages.
-
-The `name` string identifies the shared-memory channel. Two `Topic` instances with the same name and type connect automatically — one publishes, the other subscribes. Backend selection (in-process ring buffer vs cross-process SHM) is automatic based on whether publisher and subscriber live in the same process.
-
----
-
-## Sending Messages
+## Quick Reference — Sending
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `send(msg)` | `()` | Publish a message (non-blocking, drops oldest if full) |
-| `try_send(msg)` | `Result<(), T>` | Publish if space available; returns message back on failure |
-| `send_blocking(msg, timeout)` | `Result<(), SendBlockingError>` | Block until space is available or timeout elapses |
+| `send(msg)` | `()` | Publishes a message. Non-blocking. Drops oldest if full. |
+| `try_send(msg)` | `Result<(), T>` | Publishes if space available. Returns message back on failure. |
+| `send_blocking(msg, timeout)` | `Result<(), SendBlockingError>` | Blocks until space available or timeout. |
 
-### SendBlockingError
-
-| Variant | Description |
-|---------|-------------|
-| `Timeout` | Timed out waiting for space in the ring buffer |
-
-### Example
-
-```rust
-let topic = Topic::<CmdVel>::new("cmd_vel");
-
-// Fire-and-forget (overwrites oldest if full)
-topic.send(CmdVel { linear: 1.0, angular: 0.0 });
-
-// Try without blocking
-match topic.try_send(CmdVel { linear: 0.5, angular: 0.1 }) {
-    Ok(()) => { /* sent */ }
-    Err(msg) => { /* buffer full, msg returned */ }
-}
-
-// Block up to 10ms
-use horus::prelude::*;
-match topic.send_blocking(CmdVel { linear: 1.0, angular: 0.0 }, 10_u64.ms()) {
-    Ok(()) => { /* sent */ }
-    Err(SendBlockingError::Timeout) => { /* timed out */ }
-}
-```
-
----
-
-## Receiving Messages
+## Quick Reference — Receiving
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `recv()` | `Option<T>` | Take the next unread message (FIFO order) |
-| `read_latest()` | `Option<T>` | Read the most recent message, skipping older ones (requires `T: Copy`) |
+| `recv()` | `Option<T>` | Takes the next unread message (FIFO). Consumes it. |
+| `try_recv()` | `Option<T>` | Same as `recv()`. Provided for API symmetry with `try_send()`. |
+| `read_latest()` | `Option<T>` | Reads the newest message, skipping older ones. Requires `T: Copy`. |
 
-`recv()` returns messages in order. Each message is delivered to each subscriber exactly once. `read_latest()` is useful for state-like data (sensor readings, poses) where you only care about the newest value.
-
-### Example
-
-```rust
-let topic = Topic::<Imu>::new("imu");
-
-// IMPORTANT: call recv() every tick to drain the buffer and avoid stale data accumulation
-// Process all pending messages
-while let Some(msg) = topic.recv() {
-    println!("Accel: ({}, {}, {})", msg.linear_accel.x, msg.linear_accel.y, msg.linear_accel.z);
-}
-
-// NOTE: read_latest() requires T: Copy — skips older messages and returns only the newest
-if let Some(latest) = topic.read_latest() {
-    println!("Latest orientation: {:?}", latest.orientation);
-}
-```
-
----
-
-## State & Metrics
+## Quick Reference — State & Metrics
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `name()` | `&str` | The topic name |
-| `has_message()` | `bool` | Whether there is at least one unread message |
-| `pending_count()` | `usize` | Number of unread messages in the buffer |
-| `dropped_count()` | `u64` | Total failed send attempts (includes buffer-full overwrites) |
+| `name()` | `&str` | Topic name |
+| `has_message()` | `bool` | Whether at least one unread message exists |
+| `pending_count()` | `u64` | Number of unread messages in the buffer |
+| `dropped_count()` | `u64` | Total messages dropped (buffer-full overwrites) |
+| `pub_count()` | `u32` | Number of active publishers |
+| `sub_count()` | `u32` | Number of active subscribers |
+| `mode()` | `BackendMode` | Current backend (InProcess, SharedMemory, etc.) |
+| `is_same_process()` | `bool` | Whether all pub/sub are in the same process |
+| `is_same_thread()` | `bool` | Whether all pub/sub are on the same thread |
+| `backend_name()` | `&'static str` | Human-readable backend name |
 | `metrics()` | `TopicMetrics` | Aggregate send/receive statistics |
+| `connection_state()` | `ConnectionState` | Current connection status |
 
-### TopicMetrics
+---
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `messages_sent()` | `u64` | Total messages published on this topic |
-| `messages_received()` | `u64` | Total messages consumed from this topic |
-| `send_failures()` | `u64` | Failed send attempts (e.g., `try_send` on a full buffer) |
-| `recv_failures()` | `u64` | Failed receive attempts (e.g., `recv` on empty buffer) |
+## Constructor Methods
 
-### Example
+### `new(name)`
+
+Creates a topic with default capacity and auto-sized slots.
+
+**Signature**
 
 ```rust
-let topic = Topic::<Twist>::new("cmd_vel");
+pub fn new(name: impl Into<String>) -> HorusResult<Self>
+```
 
-// Check state
-if topic.has_message() {
-    println!("{} messages pending", topic.pending_count());
-}
+**Parameters**
 
-// Check for dropped messages
-if topic.dropped_count() > 0 {
-    hlog!(warn, "Dropped {} messages", topic.dropped_count());
-}
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | `impl Into<String>` | yes | Topic identifier. Case-sensitive. Use `/`-delimited hierarchical names: `"sensors/imu"`, `"cmd_vel"`. Two Topic instances with the same name and type `T` connect automatically. |
 
-// Check metrics
-let m = topic.metrics();
-println!("Sent: {}, Received: {}", m.messages_sent(), m.messages_received());
+**Returns**
+
+`HorusResult<Topic<T>>` — connected to the named shared memory channel.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `HorusError` | SHM region creation failed (permissions, disk full) |
+
+**Behavior**
+
+- Default capacity: 4 slots (ring buffer)
+- Default slot size: `size_of::<T>()` rounded up to page alignment
+- Backend auto-selection: if publisher and subscriber are in the same process, uses an in-process ring buffer (no SHM overhead). Cross-process uses SHM.
+- Creating two `Topic<T>` with the same name connects them — no broker, no configuration
+
+**Example**
+
+```rust
+use horus::prelude::*;
+
+let pub_topic = Topic::<CmdVel>::new("cmd_vel")?;
+let sub_topic = Topic::<CmdVel>::new("cmd_vel")?; // connects to same channel
+
+pub_topic.send(CmdVel::new(1.0, 0.0));
+let msg = sub_topic.recv(); // Some(CmdVel { linear: 1.0, angular: 0.0 })
 ```
 
 ---
 
-## Pool-Backed Types (Zero-Copy)
+### `with_capacity(name, capacity, slot_size)`
 
-For large data types (`Image`, `PointCloud`, `DepthImage`, `Tensor`), HORUS uses pool-backed allocation to avoid copying payloads through the ring buffer. The `Topic` API provides specialized methods for these types.
+Creates a topic with explicit buffer configuration.
 
-### Image Topics
+**Signature**
 
 ```rust
-let topic = Topic::<Image>::new("camera/rgb");
-
-// Send (moves the Image into the pool slot)
-topic.send(image);
-
-// Try send (returns the Image on failure)
-match topic.try_send(image) {
-    Ok(()) => {}
-    Err(img) => { /* buffer full */ }
-}
-
-// IMPORTANT: call recv() every tick to drain the buffer — images are large and stale frames waste pool slots
-if let Some(img) = topic.recv() {
-    println!("{}x{} image received", img.width(), img.height());
-}
+pub fn with_capacity(name: &str, capacity: u32, slot_size: Option<usize>) -> HorusResult<Self>
 ```
 
-### PointCloud Topics
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | `&str` | yes | Topic identifier (same rules as `new`). |
+| `capacity` | `u32` | yes | Number of slots in the ring buffer. Must be a power of 2. Typical: 4, 8, 16. |
+| `slot_size` | `Option<usize>` | no | Bytes per slot. `None` = auto-sized from `size_of::<T>()`. Set explicitly for variable-size messages. |
+
+**Returns**
+
+`HorusResult<Topic<T>>`
+
+**When to use**
+
+- Large messages that need bigger slots (e.g., `LaserScan` with 360+ ranges)
+- High-frequency topics where you need more buffering to prevent drops
+- Small messages where you want to reduce memory footprint
+
+**When NOT to use**
+
+- Most cases — `Topic::new()` auto-sizes correctly
+- Pool-backed types (`Image`, `PointCloud`, `DepthImage`, `Tensor`) — they manage their own memory
+
+**Example**
 
 ```rust
-let topic = Topic::<PointCloud>::new("lidar/points");
+use horus::prelude::*;
 
-topic.send(cloud);
+// 8 slots, 4KB each — for large LiDAR scans
+let scan = Topic::<LaserScan>::with_capacity("lidar/scan", 8, Some(4096))?;
 
-// IMPORTANT: call recv() every tick to avoid stale point clouds filling the pool
-if let Some(cloud) = topic.recv() {
-    println!("{} points received", cloud.len());
-}
-```
-
-### DepthImage Topics
-
-```rust
-let topic = Topic::<DepthImage>::new("camera/depth");
-
-topic.send(depth);
-
-// IMPORTANT: call recv() every tick to drain depth frames
-if let Some(depth) = topic.recv() {
-    println!("{}x{} depth image", depth.width(), depth.height());
-}
-```
-
-### Tensor Topics
-
-For advanced ML pipelines, you can use `Topic<Tensor>` directly. The same zero-copy transport that backs `Image`, `PointCloud`, and `DepthImage` is available for raw tensor data. See the [Tensor Messages](/rust/api/tensor-messages) page for details.
-
-```rust
-let topic = Topic::<Tensor>::new("model/output");
-
-// Send and receive work the same as any other topic type
-topic.send(tensor);
-
-// IMPORTANT: call recv() every tick to avoid stale tensor data in the pool
-if let Some(t) = topic.recv() {
-    println!("Tensor shape: {:?}", t.shape());
-}
-```
-
-For most use cases, prefer the domain types above (`Image`, `PointCloud`, `DepthImage`) — they provide convenience methods like `pixel()`, `point_at()`, and `get_depth()` while using the same zero-copy path internally.
-
----
-
-## Detailed Method Reference
-
----
-
-### new
-
-```rust
-pub fn new(name: &str) -> Topic<T>
-```
-
-Create a topic with default capacity and slot size.
-
-**Parameters:**
-- `name: &str` — Topic identifier. Two `Topic` instances with the same name and matching type `T` connect automatically. Names are case-sensitive. Use `/`-delimited hierarchical names: `"sensors/lidar/scan"`.
-
-**Returns:** `Topic<T>` connected to the named shared memory channel.
-
-**Defaults:**
-- Capacity: 4 slots (ring buffer)
-- Slot size: `size_of::<T>()` rounded up to page alignment
-
-**Backend auto-selection:** If publisher and subscriber are in the same process, uses an in-process ring buffer (no SHM overhead). Cross-process uses SHM.
-
-**Example:**
-```rust
-let pub_topic = Topic::<CmdVel>::new("cmd_vel");
-let sub_topic = Topic::<CmdVel>::new("cmd_vel"); // connects to same channel
+// 16 slots, auto-sized — high-frequency IMU with extra buffering
+let imu = Topic::<Imu>::with_capacity("imu", 16, None)?;
 ```
 
 ---
 
-### send
+## Sending Methods
+
+### `send(msg)`
+
+Publishes a message. Non-blocking. Overwrites the oldest unread message if the buffer is full.
+
+**Signature**
 
 ```rust
 pub fn send(&self, msg: T)
 ```
 
-Publish a message. **Non-blocking. Overwrites oldest if buffer is full.**
+**Parameters**
 
-**Parameters:**
-- `msg: T` — The message to publish. Moved into the ring buffer.
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `msg` | `T` | yes | Message to publish. Moved into the ring buffer. |
 
-**Buffer full behavior:** If all slots are occupied, the oldest unread message is silently overwritten. No error is returned. Use `dropped_count()` to detect this.
+**Returns**
 
-**When to use:** Default for most real-time robotics — you always want the latest data, and blocking is unacceptable in a control loop.
+Nothing (`()`). Always succeeds — never blocks, never returns an error.
 
-**Example:**
+**Behavior**
+
+- If all slots are occupied, the oldest unread message is silently overwritten
+- Use `dropped_count()` to detect overwrites
+- Notifies any event-driven nodes (`.on("topic")`) that new data arrived
+- Fast path: ~3ns for same-thread publisher+subscriber (inlined ring write, no pointer chase)
+- Cross-process: serializes via SHM, ~150ns typical
+
+**When to use**
+
+- Default for real-time robotics — you always want the latest data
+- Control loops where blocking is unacceptable
+- Fire-and-forget telemetry
+
+**When NOT to use**
+
+- When you need to know if the message was received — use `try_send()` instead
+- When dropping messages is unacceptable — use `send_blocking()` instead
+
+**Example**
+
 ```rust
+use horus::prelude::*;
+
+let topic = Topic::<CmdVel>::new("cmd_vel")?;
+
+// Fire-and-forget (overwrites oldest if full)
 topic.send(CmdVel::new(1.0, 0.0));
 
 // Check if messages were dropped
@@ -266,377 +215,520 @@ if topic.dropped_count() > 0 {
 
 ---
 
-### recv
+### `try_send(msg)`
 
-```rust
-pub fn recv(&self) -> Option<T>
-```
+Attempts to publish without overwriting. Returns the message back if the buffer is full.
 
-Take the next unread message in FIFO order.
-
-**Returns:**
-- `Some(T)` — The oldest unread message (removed from buffer)
-- `None` — No unread messages available
-
-**Important:** Call `recv()` every tick in your node to drain the buffer. Failing to drain causes stale data accumulation and eventually message drops.
-
-**Delivery guarantee:** Each message is delivered to each subscriber exactly once. After `recv()` returns it, the message is consumed.
-
-**Example:**
-```rust
-// Process ALL pending messages each tick
-while let Some(scan) = self.scan_topic.recv() {
-    self.process(scan);
-}
-```
-
----
-
-### read_latest
-
-```rust
-pub fn read_latest(&self) -> Option<T>
-where T: Copy
-```
-
-Read the most recent message, skipping all older ones.
-
-**Returns:**
-- `Some(T)` — Copy of the newest message
-- `None` — No messages available
-
-**Type constraint:** Requires `T: Copy` because it reads without consuming — multiple calls return the same value until a new message arrives.
-
-**When to use:** State-like data where you only care about the current value: poses, sensor readings, configuration. NOT for command streams where every message matters.
-
-**Example:**
-```rust
-// Good: pose is state — only the latest matters
-if let Some(pose) = self.odom_topic.read_latest() {
-    self.current_position = pose;
-}
-
-// Bad: cmd_vel is a command — you'd miss intermediate commands
-// Use recv() instead for command streams
-```
-
----
-
-### try_send
+**Signature**
 
 ```rust
 pub fn try_send(&self, msg: T) -> Result<(), T>
 ```
 
-Attempt to send without overwriting. If the buffer is full, the message is returned to the caller.
+**Parameters**
 
-**Parameters:**
-- `msg: T` — The message to send. Returned on failure.
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `msg` | `T` | yes | Message to publish. Returned on failure. |
 
-**Returns:**
-- `Ok(())` — Sent successfully
-- `Err(msg)` — Buffer full, message returned
+**Returns**
 
-**When to use:** When you need to detect drops — implement backpressure, count losses, or log warnings. For fire-and-forget, use `send()` instead.
+- `Ok(())` — message published successfully
+- `Err(msg)` — buffer full, message returned to caller (not consumed)
 
-**Example:**
+**Behavior**
+
+- Non-blocking. Checks buffer space and either publishes or returns immediately.
+- The returned message can be retried or discarded — your choice.
+
+**When to use**
+
+- When you need to detect drops — implement backpressure, count losses, or log warnings
+- When the message is expensive to create and you don't want to waste it
+
+**When NOT to use**
+
+- Normal control loops — use `send()` (simpler, always succeeds)
+
+**Example**
+
 ```rust
-match topic.try_send(cmd) {
-    Ok(()) => {}
+use horus::prelude::*;
+
+let topic = Topic::<CmdVel>::new("cmd_vel")?;
+
+match topic.try_send(CmdVel::new(1.0, 0.0)) {
+    Ok(()) => { /* sent */ }
     Err(_returned) => {
-        self.drop_count += 1;
-        hlog!(warn, "Buffer full — {} drops total", self.drop_count);
+        hlog!(warn, "Buffer full — message not sent");
     }
 }
 ```
 
 ---
 
-### try_recv
+### `send_blocking(msg, timeout)`
 
-```rust
-pub fn try_recv(&self) -> Option<T>
-```
+Blocks until buffer space is available or the timeout elapses.
 
-Non-blocking receive. Functionally identical to `recv()` — both are non-blocking and return `Option<T>`. Provided for API symmetry with `try_send()`.
-
-**Returns:**
-- `Some(T)` — Next unread message
-- `None` — No messages available
-
-**Example:**
-```rust
-if let Some(msg) = topic.try_recv() {
-    self.process(msg);
-}
-```
-
----
-
-### send_blocking
+**Signature**
 
 ```rust
 pub fn send_blocking(&self, msg: T, timeout: Duration) -> Result<(), SendBlockingError>
 ```
 
-Send with guaranteed delivery. Blocks until buffer space is available or timeout expires. Uses a 3-phase strategy: immediate try, spin loop (sub-μs), then sleep in 100μs increments.
+**Parameters**
 
-**Parameters:**
-- `msg: T` — The message to send
-- `timeout: Duration` — Maximum time to wait
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `msg` | `T` | yes | Message to publish. Consumed on success. |
+| `timeout` | `Duration` | yes | Maximum time to wait for space. Create with `.ms()`: `10_u64.ms()`. |
 
-**Returns:**
-- `Ok(())` — Delivered
-- `Err(SendBlockingError::Timeout)` — Buffer stayed full for the entire timeout
+**Returns**
 
-**When to use:** Safety-critical commands (emergency stop, motor setpoints) where dropping a message is unacceptable. NOT for high-frequency data — use `send()` instead.
+- `Ok(())` — message published
+- `Err(SendBlockingError::Timeout)` — buffer stayed full for the entire timeout
 
-**Example:**
+**Behavior**
+
+Uses a graduated wait strategy for low latency:
+1. Immediate `try_send` (0 latency)
+2. Spin loop — 256 iterations (~sub-microsecond)
+3. Yield — 8 thread yields (~microseconds)
+4. Sleep — 100us increments until deadline
+
+**When to use**
+
+- When dropping messages is unacceptable and brief blocking is acceptable
+- Logging pipelines, recording, non-RT data transfer
+
+**When NOT to use**
+
+- Real-time control loops — blocking in `tick()` causes deadline misses
+- Any node with `.rate()` or `.budget()` — use `send()` instead
+
+**Example**
+
 ```rust
 use horus::prelude::*;
 
-// Critical: e-stop must be delivered
-match topic.send_blocking(stop_cmd, 1.ms()) {
-    Ok(()) => hlog!(info, "E-stop delivered"),
-    Err(_) => hlog!(error, "E-stop delivery FAILED — subscriber unresponsive"),
+let topic = Topic::<DiagnosticReport>::new("diagnostics")?;
+
+match topic.send_blocking(report, 10_u64.ms()) {
+    Ok(()) => { /* sent */ }
+    Err(SendBlockingError::Timeout) => {
+        hlog!(warn, "Diagnostic buffer full for 10ms — dropping report");
+    }
 }
 ```
 
 ---
 
-### with_capacity
+## Receiving Methods
+
+### `recv()`
+
+Takes the next unread message in FIFO order. Consumes it from the buffer.
+
+**Signature**
 
 ```rust
-pub fn with_capacity(name: &str, capacity: u32, slot_size: Option<usize>) -> HorusResult<Self>
+pub fn recv(&self) -> Option<T>
 ```
 
-Create a topic with custom ring buffer capacity.
+**Parameters**
 
-**Parameters:**
-- `name: &str` — Topic identifier
-- `capacity: u32` — Number of slots (rounded up to next power of 2)
-- `slot_size: Option<usize>` — Bytes per slot. `None` = auto-sized from `size_of::<T>()`
+None.
 
-**Returns:** `HorusResult<Topic<T>>`
+**Returns**
 
-**When to use:** Bursty producers that need more buffering, or memory-constrained systems that need smaller buffers.
+- `Some(T)` — the oldest unread message (removed from buffer)
+- `None` — no unread messages available
 
-**Example:**
+**Behavior**
+
+- Non-blocking. Returns immediately.
+- Each message is delivered to each subscriber exactly once. After `recv()` returns it, the message is consumed.
+- Fast path: ~3ns for same-thread (inlined ring read)
+
+**When to use**
+
+- Command streams where every message matters (velocity commands, goal updates)
+- Processing pipelines where order matters (image frames, sensor sequences)
+
+**When NOT to use**
+
+- State-like data where you only care about the latest value — use `read_latest()` instead
+
+**Example**
+
 ```rust
-// 256-slot buffer for a high-frequency sensor
-let topic = Topic::<Imu>::with_capacity("imu", 256, None)?;
+use horus::prelude::*;
 
-// Small buffer to save memory on a constrained device
-let topic = Topic::<Pose2D>::with_capacity("pose", 4, None)?;
+let topic = Topic::<Imu>::new("imu")?;
+
+// IMPORTANT: drain every tick to avoid stale data accumulation
+while let Some(msg) = topic.recv() {
+    process(msg);
+}
 ```
 
 ---
 
-### name
+### `try_recv()`
+
+Non-blocking receive. Functionally identical to `recv()`.
+
+**Signature**
+
+```rust
+pub fn try_recv(&self) -> Option<T>
+```
+
+**Returns**
+
+Same as `recv()`. Provided for API symmetry with `try_send()`.
+
+---
+
+### `read_latest()`
+
+Reads the most recent message, skipping all older ones.
+
+**Signature**
+
+```rust
+pub fn read_latest(&self) -> Option<T>
+where
+    T: Copy
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+- `Some(T)` — copy of the newest message
+- `None` — no messages available
+
+**Behavior**
+
+- Reads without consuming — multiple calls return the same value until a new message arrives
+- Skips all older messages — only the latest matters
+- Requires `T: Copy` because it reads (copies) without removing from the buffer
+
+**When to use**
+
+- State-like data where you only care about the current value: poses, sensor readings, configuration
+- Slow subscribers that can't keep up with a fast publisher
+
+**When NOT to use**
+
+- Command streams where every message matters — use `recv()` instead
+- Messages that aren't `Copy` (e.g., types with `Vec`, `String`)
+
+**Example**
+
+```rust
+use horus::prelude::*;
+
+let odom = Topic::<Odometry>::new("odom")?;
+
+// Good: pose is state — only the latest matters
+if let Some(pose) = odom.read_latest() {
+    current_position = pose;
+}
+```
+
+---
+
+## State & Metrics Methods
+
+### `name()`
+
+Returns the topic name.
+
+**Signature**
 
 ```rust
 pub fn name(&self) -> &str
 ```
 
-Returns the topic name string.
+**Returns**
 
-**Example:**
-```rust
-let topic = Topic::<f32>::new("sensor.temperature")?;
-assert_eq!(topic.name(), "sensor.temperature");
-```
+`&str` — the name passed to `new()` or `with_capacity()`.
 
 ---
 
-### has_message
+### `has_message()`
+
+Checks whether at least one unread message exists.
+
+**Signature**
 
 ```rust
 pub fn has_message(&self) -> bool
 ```
 
-Check if at least one unread message is available without consuming it.
+**Returns**
 
-**Example:**
-```rust
-if topic.has_message() {
-    let msg = topic.recv().unwrap();  // guaranteed Some
-}
-```
+`true` if `recv()` would return `Some`. `false` if the buffer is empty.
 
 ---
 
-### pending_count
+### `pending_count()`
+
+Returns the number of unread messages in the buffer.
+
+**Signature**
 
 ```rust
 pub fn pending_count(&self) -> u64
 ```
 
-Number of unread messages in the buffer.
+**Returns**
 
-**Example:**
-```rust
-if topic.pending_count() > 10 {
-    hlog!(warn, "Topic '{}' has {} pending — subscriber may be too slow",
-        topic.name(), topic.pending_count());
-}
-```
+`u64` — count of messages waiting to be consumed by `recv()`.
 
 ---
 
-### dropped_count
+### `dropped_count()`
+
+Returns the total number of messages dropped due to buffer-full overwrites.
+
+**Signature**
 
 ```rust
 pub fn dropped_count(&self) -> u64
 ```
 
-Total messages dropped due to buffer overflow (oldest overwritten by `send()`). Resets to 0 on topic creation.
+**Returns**
 
-**Example:**
+`u64` — cumulative count since topic creation. Incremented by `send()` when it overwrites the oldest slot.
+
+**When to use**
+
+- Monitor for backpressure — a rising `dropped_count()` means the subscriber is too slow
+- Log warnings when drops exceed a threshold
+
+**Example**
+
 ```rust
+use horus::prelude::*;
+
+let topic = Topic::<LaserScan>::new("scan")?;
+
 if topic.dropped_count() > 0 {
-    hlog!(warn, "{} messages dropped on '{}' — consider increasing capacity or subscriber rate",
-        topic.dropped_count(), topic.name());
+    hlog!(warn, "Dropped {} scans — subscriber can't keep up", topic.dropped_count());
 }
 ```
 
 ---
 
-### metrics
+### `pub_count()`
+
+Returns the number of active publishers on this topic.
+
+**Signature**
+
+```rust
+pub fn pub_count(&self) -> u32
+```
+
+---
+
+### `sub_count()`
+
+Returns the number of active subscribers on this topic.
+
+**Signature**
+
+```rust
+pub fn sub_count(&self) -> u32
+```
+
+---
+
+### `mode()`
+
+Returns the current backend mode.
+
+**Signature**
+
+```rust
+pub fn mode(&self) -> BackendMode
+```
+
+**Returns**
+
+`BackendMode` — the active transport. Auto-selected based on publisher/subscriber location.
+
+---
+
+### `is_same_process()`
+
+Checks whether all publishers and subscribers are in the same process.
+
+**Signature**
+
+```rust
+pub fn is_same_process(&self) -> bool
+```
+
+**Returns**
+
+`true` if using in-process ring buffer (fastest path, ~3ns). `false` if cross-process SHM.
+
+---
+
+### `is_same_thread()`
+
+Checks whether all publishers and subscribers are on the same thread.
+
+**Signature**
+
+```rust
+pub fn is_same_thread(&self) -> bool
+```
+
+**Returns**
+
+`true` if using the ultra-fast same-thread path (inlined ring operations, no atomics).
+
+---
+
+### `backend_name()`
+
+Returns a human-readable name for the active backend.
+
+**Signature**
+
+```rust
+pub fn backend_name(&self) -> &'static str
+```
+
+**Returns**
+
+`&'static str` — e.g., `"DirectChannel"`, `"SharedMemory"`.
+
+---
+
+### `metrics()`
+
+Returns aggregate send/receive statistics.
+
+**Signature**
 
 ```rust
 pub fn metrics(&self) -> TopicMetrics
 ```
 
-Aggregated send/receive statistics.
+**Returns**
 
-**Returns:** `TopicMetrics` with methods:
-- `messages_sent() -> u64`
-- `messages_received() -> u64`
-- `send_failures() -> u64`
-- `recv_failures() -> u64`
+`TopicMetrics` — see Types section below.
 
-**Example:**
-```rust
-let m = topic.metrics();
-println!("Sent: {}, Received: {}, Failures: send={} recv={}",
-    m.messages_sent(), m.messages_received(),
-    m.send_failures(), m.recv_failures());
-```
-
----
-
-## Using Topics in Nodes
-
-Topics are typically used inside `Node` implementations registered with a `Scheduler`:
+**Example**
 
 ```rust
 use horus::prelude::*;
 
-struct LidarProcessor {
-    scan_in: Topic<LaserScan>,
-    cmd_out: Topic<CmdVel>,
-}
+let topic = Topic::<CmdVel>::new("cmd_vel")?;
 
-impl LidarProcessor {
-    fn new() -> Self {
-        Self {
-            scan_in: Topic::new("scan"),
-            cmd_out: Topic::new("cmd_vel"),
-        }
-    }
-}
-
-impl Node for LidarProcessor {
-    fn name(&self) -> &str { "LidarProcessor" }
-
-    fn tick(&mut self) {
-        // IMPORTANT: call recv() every tick to drain the scan buffer
-        if let Some(scan) = self.scan_in.recv() {
-            // Find closest obstacle
-            let min_range = scan.ranges.iter()
-                .copied()
-                .filter(|r| *r > scan.range_min && *r < scan.range_max)
-                .fold(f32::MAX, f32::min);
-
-            // SAFETY: send zero velocity when obstacle is too close
-            let speed = if min_range < 0.5 { 0.0 } else { 1.0 };
-            self.cmd_out.send(CmdVel { linear: speed, angular: 0.0 });
-        }
-    }
-
-    // SAFETY: stop sending velocity commands on shutdown
-    fn shutdown(&mut self) -> Result<()> {
-        self.cmd_out.send(CmdVel { linear: 0.0, angular: 0.0 });
-        Ok(())
-    }
-}
-
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
-    scheduler.add(LidarProcessor::new())
-        // NOTE: .rate() auto-enables RT scheduling with 80% budget and 95% deadline
-        .rate(50.hz())
-        .build()?;
-    scheduler.run()
-}
+let m = topic.metrics();
+println!("Sent: {}, Received: {}, Failures: {}",
+    m.messages_sent(), m.messages_received(), m.send_failures());
 ```
 
 ---
 
-## Introspection & Diagnostics
+### `connection_state()`
+
+Returns the current connection status.
+
+**Signature**
+
+```rust
+pub fn connection_state(&self) -> ConnectionState
+```
+
+**Returns**
+
+`ConnectionState` — whether the topic is connected, waiting, or disconnected.
+
+---
+
+## Pool-Backed Types (Zero-Copy)
+
+For large data types (`Image`, `PointCloud`, `DepthImage`, `Tensor`), HORUS uses pool-backed allocation. The `Topic` API works the same — `send()`, `recv()`, `try_send()` — but the data is transferred via shared memory pools instead of copying through the ring buffer.
+
+```rust
+use horus::prelude::*;
+
+let camera = Topic::<Image>::new("camera/rgb")?;
+
+// Send (moves the Image into the pool slot)
+camera.send(image);
+
+// IMPORTANT: call recv() every tick to drain — images are large and stale frames waste pool slots
+if let Some(img) = camera.recv() {
+    println!("{}x{} image received", img.width(), img.height());
+}
+```
+
+See [Image API](/rust/api/image), [PointCloud API](/rust/api/pointcloud), [DepthImage API](/rust/api/depth-image), [Tensor API](/rust/api/tensor) for type-specific methods.
+
+---
+
+## Types
+
+### `TopicMetrics`
+
+Aggregate statistics returned by `topic.metrics()`.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `name()` | `&str` | Topic name |
-| `has_message()` | `bool` | At least one message available |
-| `pending_count()` | `u64` | Messages waiting to be consumed |
-| `dropped_count()` | `u64` | Messages dropped (buffer overflow) |
-| `metrics()` | `TopicMetrics` | Aggregated send/recv/failure counts |
+| `.messages_sent()` | `u64` | Total messages published on this topic |
+| `.messages_received()` | `u64` | Total messages consumed from this topic |
+| `.send_failures()` | `u64` | Failed send attempts (e.g., `try_send` on a full buffer) |
+| `.recv_failures()` | `u64` | Failed receive attempts (e.g., `recv` on empty buffer) |
 
-```rust
-// Monitor topic health
-let m = topic.metrics();
-if topic.dropped_count() > 0 {
-    hlog!(warn, "Topic '{}': {} messages dropped, {} pending",
-        topic.name(), topic.dropped_count(), topic.pending_count());
-}
-```
+### `SendBlockingError`
+
+Error returned by `send_blocking()`.
+
+| Variant | Description |
+|---------|-------------|
+| `Timeout` | The ring buffer stayed full for the entire timeout duration |
+
+### `BackendMode`
+
+Transport backend, auto-selected by the topic.
+
+| Variant | Description |
+|---------|-------------|
+| `InProcess` | In-process ring buffer (same process, ~3ns) |
+| `SharedMemory` | Cross-process shared memory (~150ns) |
+
+### `ConnectionState`
+
+Topic connection status.
+
+| Variant | Description |
+|---------|-------------|
+| `Connected` | Publisher and subscriber are actively communicating |
+| `Waiting` | Topic created but no peer connected yet |
+| `Disconnected` | Peer was connected but is now gone |
 
 ---
 
-## Real-World Scenarios
+## Production Example
 
-### Emergency Stop Chain
-
-Use `send_blocking()` for critical commands that must never be dropped:
+Multi-sensor fusion node subscribing to two topics and publishing a fused pose:
 
 ```rust
-struct SafetyMonitor {
-    estop_pub: Topic<EmergencyStop>,
-}
+use horus::prelude::*;
 
-impl Node for SafetyMonitor {
-    fn name(&self) -> &str { "SafetyMonitor" }
-
-    fn tick(&mut self) {
-        if self.detect_collision() {
-            let stop = EmergencyStop {
-                engaged: 1,
-                reason: *b"Collision detected\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-                ..Default::default()
-            };
-            // Block up to 1ms — guaranteed delivery for safety-critical commands
-            let _ = self.estop_pub.send_blocking(stop, 1.ms());
-        }
-    }
-}
-```
-
-### Multi-Sensor Fusion
-
-Multiple subscribers reading from different sensors, fusing into a single output:
-
-```rust
 struct FusionNode {
     imu_sub: Topic<Imu>,
     odom_sub: Topic<Odometry>,
@@ -649,7 +741,7 @@ impl Node for FusionNode {
     fn name(&self) -> &str { "Fusion" }
 
     fn tick(&mut self) {
-        // Always drain both topics every tick
+        // IMPORTANT: always drain both topics every tick
         if let Some(imu) = self.imu_sub.recv() { self.last_imu = Some(imu); }
         if let Some(odom) = self.odom_sub.recv() { self.last_odom = Some(odom); }
 
@@ -665,11 +757,12 @@ impl Node for FusionNode {
 
 ## See Also
 
-- [Topic Concepts](/concepts/core-concepts-topic) — Architecture, backends, and design patterns
+- [Topics Concept](/concepts/core-concepts-topic) — Architecture, backends, and design patterns
+- [Topics for Beginners](/concepts/topics-beginner) — Gentle introduction
 - [Communication Overview](/concepts/communication-overview) — When to use topics vs services vs actions
 - [Image API](/rust/api/image) — Pool-backed camera images
 - [PointCloud API](/rust/api/pointcloud) — Pool-backed 3D point clouds
 - [DepthImage API](/rust/api/depth-image) — Pool-backed depth images
-- [Tensor Messages](/rust/api/tensor-messages) — Tensor, Device, TensorDtype, and domain types
+- [Tensor API](/rust/api/tensor) — Tensor descriptor and DLPack
 - [Scheduler API](/rust/api/scheduler) — Running nodes that use topics
 - [Python Topic API](/python/api/python-bindings) — Python topic bindings

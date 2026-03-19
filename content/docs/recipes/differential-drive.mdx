@@ -1,12 +1,27 @@
 ---
-title: "Recipe: Differential Drive"
-description: "Complete 2-wheel differential drive robot: CmdVel velocity commands to left/right motor outputs with safety shutdown."
+title: "Differential Drive"
+description: "Convert CmdVel velocity commands to left/right motor outputs with safety shutdown"
 order: 2
 ---
 
-## Differential Drive
+# Differential Drive
 
-A 2-wheel robot that receives `CmdVel` velocity commands and converts them to left/right motor speeds. Implements safe shutdown — motors are always zeroed on exit.
+You need to convert `CmdVel` velocity commands (forward speed + turning rate) into left/right wheel speeds for a 2-wheel robot. Here's a production-ready pattern with safe shutdown.
+
+## When To Use This
+
+- Any 2-wheel differential drive robot (TurtleBot, warehouse AGV, hobby bots)
+- Converting `CmdVel` from a path planner or teleoperation to motor outputs
+- When you need velocity clamping and safe shutdown
+
+**Use [Servo Controller](/recipes/servo-controller) instead** for directly commanding servo positions. **Use [DifferentialDriveCommand](/rust/api/control-messages) instead** if your motor driver accepts left/right wheel speeds directly.
+
+## Prerequisites
+
+- [Quick Start](/getting-started/quick-start) completed
+- Familiarity with [CmdVel](/stdlib/messages/cmd-vel) and the [Node trait](/concepts/core-concepts-nodes)
+
+## Solution
 
 ### horus.toml
 
@@ -17,7 +32,7 @@ version = "0.1.0"
 description = "2-wheel differential drive with safe shutdown"
 ```
 
-### Complete Code
+### src/main.rs
 
 ```rust
 use horus::prelude::*;
@@ -27,15 +42,13 @@ const WHEEL_BASE: f32 = 0.3;    // meters between wheels
 const WHEEL_RADIUS: f32 = 0.05; // meters
 const MAX_RPM: f32 = 200.0;     // safety limit
 
-/// Motor output for a single wheel
+/// Motor output for left and right wheels
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
 #[repr(C)]
 struct WheelCmd {
     left_rpm: f32,
     right_rpm: f32,
 }
-
-// ── Drive Node ──────────────────────────────────────────────
 
 struct DriveNode {
     cmd_sub: Topic<CmdVel>,
@@ -57,12 +70,11 @@ impl Node for DriveNode {
     fn name(&self) -> &str { "Drive" }
 
     fn tick(&mut self) {
-        // IMPORTANT: always recv() every tick to drain the buffer
         if let Some(cmd) = self.cmd_sub.recv() {
             self.last_cmd = cmd;
         }
 
-        // Differential drive kinematics: convert (linear, angular) to (left, right)
+        // Differential drive kinematics: (linear, angular) → (left, right)
         let v = self.last_cmd.linear;
         let w = self.last_cmd.angular;
         let left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
@@ -76,8 +88,8 @@ impl Node for DriveNode {
         self.wheel_pub.send(WheelCmd { left_rpm, right_rpm });
     }
 
+    // SAFETY: zero both motors before exiting — prevents runaway
     fn shutdown(&mut self) -> Result<()> {
-        // SAFETY: zero both motors before exiting — prevents runaway
         self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
         Ok(())
     }
@@ -86,31 +98,73 @@ impl Node for DriveNode {
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
 
-    // Execution order: DriveNode reads cmd_vel and publishes wheel commands
     scheduler.add(DriveNode::new()?)
-        .order(0)              // only node, runs first
-        .rate(50_u64.hz())     // 50Hz control loop — auto-enables RT
-        .on_miss(Miss::Warn)   // log if tick overruns
+        .order(0)
+        .rate(50_u64.hz())     // 50 Hz control loop — auto-enables RT
+        .on_miss(Miss::Warn)
         .build()?;
 
     scheduler.run()
 }
 ```
 
-### Expected Output
+## Understanding the Code
 
-```text
-[HORUS] Scheduler running — tick_rate: 50 Hz
-[HORUS] Node "Drive" started (Rt, 50 Hz, budget: 16.0ms, deadline: 19.0ms)
-^C
-[HORUS] Shutting down...
-[HORUS] Node "Drive" shutdown complete
+- **Kinematics**: `v - w*L/2` and `v + w*L/2` is the standard unicycle-to-differential conversion, where `v` is linear velocity, `w` is angular velocity, and `L` is the wheel base
+- **`#[repr(C)]` + `Copy`** on `WheelCmd` enables zero-copy shared memory transport
+- **`.rate(50_u64.hz())`** auto-enables RT with 80% budget (16 ms) and 95% deadline (19 ms)
+- **`shutdown()`** sends zero RPM — prevents wheels spinning if the program crashes mid-tick
+- **`clamp()`** enforces motor safety limits even if upstream sends dangerous velocities
+
+## Variations
+
+<Details title="Holonomic (Mecanum) Drive">
+
+For a 4-wheel mecanum drive, extend `WheelCmd` to 4 wheels and use the mecanum kinematic model:
+
+```rust
+let fl = (v - w * L / 2.0 - vy) / WHEEL_RADIUS;
+let fr = (v + w * L / 2.0 + vy) / WHEEL_RADIUS;
+let rl = (v - w * L / 2.0 + vy) / WHEEL_RADIUS;
+let rr = (v + w * L / 2.0 - vy) / WHEEL_RADIUS;
 ```
 
-### Key Points
+This requires a 3-DOF velocity command — use `Twist` instead of `CmdVel`.
 
-- **`#[repr(C)]` + `Copy`** on `WheelCmd` enables zero-copy shared memory (PodTopic path)
-- **`.rate(50_u64.hz())`** auto-enables RT with 80% budget and 95% deadline
-- **`shutdown()`** sends zero command — prevents wheels spinning if the program crashes mid-tick
-- **Kinematics**: `v - w*L/2` and `v + w*L/2` is the standard unicycle-to-differential conversion
-- **`clamp()`** enforces motor safety limits even if upstream sends dangerous velocities
+</Details>
+
+<Details title="Acceleration Limiting">
+
+Add a ramp rate to prevent wheel slip on sudden velocity changes:
+
+```rust
+let max_accel = 2.0; // rad/s² per tick
+let target_left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+let limited_left = self.prev_left + (target_left - self.prev_left).clamp(-max_accel * dt, max_accel * dt);
+self.prev_left = limited_left;
+```
+
+</Details>
+
+<Details title="Odometry Feedback">
+
+Add wheel encoder integration to publish `Odometry` alongside wheel commands. See [Multi-Sensor Fusion](/recipes/multi-sensor-fusion) for combining with IMU.
+
+</Details>
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot drives in circles | Wheel base constant wrong | Measure center-to-center distance between wheels |
+| Motors overshoot on startup | No acceleration limiting | Add a ramp rate (see Variations above) |
+| Robot drifts when commanded straight | Wheel radii unequal | Calibrate `WHEEL_RADIUS` per wheel |
+| Wheels spin after Ctrl+C | Missing `shutdown()` | Always send zero in `shutdown()` |
+| Motor driver rejects commands | RPM exceeds driver limit | Reduce `MAX_RPM` to match your hardware |
+
+## See Also
+
+- [CmdVel](/stdlib/messages/cmd-vel) — Velocity command type
+- [Odometry](/stdlib/messages/odometry) — Position feedback from wheel encoders
+- [Motor Controller Tutorial](/tutorials/02-motor-controller) — Step-by-step motor control
+- [Emergency Stop Recipe](/recipes/emergency-stop) — Override cmd_vel on safety trigger

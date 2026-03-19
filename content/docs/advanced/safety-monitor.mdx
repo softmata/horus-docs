@@ -6,17 +6,32 @@ weight: 44
 
 # Safety Monitor
 
-The Safety Monitor provides real-time safety monitoring for safety-critical robotics applications. It enforces timing constraints, monitors node health, and applies deadline miss policies when safety violations occur.
+You need to enforce timing constraints on your robot's nodes and detect when a node hangs, overruns its budget, or misses a deadline. The safety monitor handles this automatically through watchdogs, budget enforcement, and configurable miss policies.
+
+## When To Use This
+
+- Any system with timing requirements (motor control, sensor fusion, safety-critical nodes)
+- Production deployments where a hung node must be detected and handled
+- Systems that need graduated degradation instead of all-or-nothing failure
+- When regulations or safety standards require deadline monitoring
+
+**Use [Fault Tolerance](/advanced/circuit-breaker) alongside this** for per-node failure policies (restart, skip, ignore). The safety monitor handles timing violations; failure policies handle execution errors. Use both in production.
+
+## Prerequisites
+
+- Familiarity with [Scheduler Configuration](/advanced/scheduler-configuration) — especially `.rate()`, `.budget()`, `.deadline()`, and `.on_miss()`
+- Understanding of [Execution Classes](/concepts/execution-classes) — especially RT auto-detection
+- Understanding of [Nodes](/concepts/core-concepts-nodes) — especially `enter_safe_state()` and `is_safe_state()`
 
 ## Overview
 
 The Safety Monitor includes:
-- **Watchdogs**: Monitor node liveness — trigger action if a critical node hangs
-- **Budget Enforcement**: Per-node tick budgets — act if a node takes too long (implicit when nodes have `.rate()` set)
+- **Watchdogs**: Monitor node liveness -- trigger action if a critical node hangs
+- **Budget Enforcement**: Per-node tick budgets -- act if a node takes too long (implicit when nodes have `.rate()` set)
 - **Deadline Tracking**: Count deadline misses and apply the configured `Miss` policy
-- **Miss Policies**: `Warn`, `Skip`, `SafeMode`, or `Stop` — per-node control over what happens on deadline miss
+- **Miss Policies**: `Warn`, `Skip`, `SafeMode`, or `Stop` -- per-node control over what happens on deadline miss
 
-The Scheduler manages the safety monitor internally — you configure it with composable builder methods and the scheduler automatically feeds watchdogs, checks budgets, and applies miss policies.
+The Scheduler manages the safety monitor internally -- you configure it with composable builder methods and the scheduler automatically feeds watchdogs, checks budgets, and applies miss policies.
 
 ## Enabling Safety Monitoring
 
@@ -421,9 +436,45 @@ use horus::prelude::*;
 // └──────────────────────────────────┘
 ```
 
+## Design Decisions
+
+**Why graduated degradation instead of immediate shutdown?**
+
+A brief jitter (1x timeout) should not trigger an emergency stop -- the node may recover on the next tick. Graduated escalation (warn, skip, isolate) gives transient issues time to resolve while still catching persistent failures. This matches how industrial safety systems work: alarm first, then intervene.
+
+**Why auto-derive budget from `.rate()` instead of requiring explicit values?**
+
+Most developers know their node's desired frequency but not its exact execution time. Auto-deriving budget at 80% of period and deadline at 95% provides a safe starting point. After profiling, developers can override with explicit `.budget()` and `.deadline()` values.
+
+**Why cooperative watchdogs instead of preemptive?**
+
+The watchdog cannot preempt a running `tick()` -- it can only detect that a tick has not completed. This is a deliberate choice: preempting a tick mid-execution could leave hardware in an unsafe state. Thread isolation ensures that a stalled node does not cascade to other nodes, while the watchdog triggers the safety response.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| Graduated degradation prevents overreaction to jitter | A truly stuck node takes 3x watchdog timeout to reach Isolated |
+| Auto-derived timing reduces configuration burden | 80%/95% defaults may not match your workload |
+| Per-node miss policies allow fine-grained control | Must configure each node individually |
+| Cooperative watchdogs cannot leave hardware in unsafe state | Cannot preempt a running tick |
+| Thread isolation prevents cascading stalls | RT threads consume OS resources |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No watchdog warnings despite slow nodes | `.watchdog()` not set on the scheduler | Add `.watchdog(500_u64.ms())` to the scheduler builder |
+| Emergency stop on startup | Watchdog timeout shorter than node initialization time | Increase watchdog timeout, or ensure `init()` completes quickly |
+| `Miss::SafeMode` has no effect | Node does not implement `enter_safe_state()` | Implement `enter_safe_state()` and `is_safe_state()` on your Node |
+| Node stuck in Isolated state | Node's `is_safe_state()` always returns `false` | Fix `is_safe_state()` to return `true` when the node has reached a safe state |
+| Budget violations but no deadline misses | Budget is soft (tracking only), deadline is the hard trigger | This is expected. Budget violations are informational. Set `.on_miss()` for deadline enforcement |
+| High deadline miss count in shutdown report | Rate too aggressive for actual computation time | Profile with `horus monitor`, then lower `.rate()` or increase `.budget()` |
+
 ## See Also
 
-- [Scheduling](/concepts/core-concepts-scheduler) - Scheduler overview and node ordering
-- [BlackBox Flight Recorder](/advanced/blackbox) - Event recording for post-mortem analysis
-- [Fault Tolerance](/advanced/circuit-breaker) - Failure policies and recovery
-- [Scheduler Configuration](/advanced/scheduler-configuration) - Builder methods and node configuration
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) — How the scheduler manages node execution
+- [BlackBox Flight Recorder](/advanced/blackbox) — Event recording for post-mortem analysis
+- [Fault Tolerance](/advanced/circuit-breaker) — Per-node failure policies (restart, skip, ignore)
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Builder methods and per-node configuration
+- [RT Setup](/advanced/rt-setup) — Linux real-time kernel for hard timing guarantees
