@@ -58,240 +58,231 @@ The key insight: keep AI inference in dedicated nodes. HORUS topics decouple the
 
 ---
 
-## Python ML Integration
+## ML Inference
 
-The fastest way to add AI to a HORUS application is through Python nodes. Python has the richest ML ecosystem, and HORUS's Python bindings give you full access to the pub/sub system.
+<LanguageTabs>
+  <LangTab language="Rust">
+    For production deployments where you need maximum performance, integrate ML inference directly in Rust.
 
-### Camera + ML Pipeline
+    ### ONNX Runtime (ort crate)
 
-```python
-from horus import Node, Scheduler
-import numpy as np
+    The `ort` crate provides Rust bindings for ONNX Runtime:
 
-# Simulated camera node (replace with your camera capture logic)
-def camera_tick(node):
-    # In a real robot, capture from camera hardware here
-    frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    node.send("cam.image_raw", frame.tolist())
+    Add to your `horus.toml`:
+    ```toml
+    [dependencies]
+    ort = "2.0"
+    ndarray = "0.15"
+    ```
 
-cam = Node(name="camera", pubs=["cam.image_raw"], tick=camera_tick, rate=30, order=0)
+    ```rust
+    use horus::prelude::*;
+    use ort::{GraphOptimizationLevel, Session};
+    use ndarray::Array;
 
-# ML processing node
-def ml_tick(node):
-    if node.has_msg("cam.image_raw"):
-        frame = node.recv("cam.image_raw")
-        # Run your ML model here
-        # e.g., model.predict(frame), torch inference, etc.
-        result = process_frame(frame)
-        node.send("detections", result)
-
-ml_node = Node(
-    name="ml_processor",
-    subs=["cam.image_raw"],
-    pubs=["detections"],
-    tick=ml_tick,
-    rate=10,  # Process at 10 FPS
-    order=1
-)
-
-# Control node reacts to detections
-def control_tick(node):
-    if node.has_msg("detections"):
-        detections = node.recv("detections")
-        # React to ML output
-        if detections.get("obstacle_detected"):
-            node.send("cmd_vel", {"linear": 0.0, "angular": 0.5})
-        else:
-            node.send("cmd_vel", {"linear": 1.0, "angular": 0.0})
-
-controller = Node(
-    name="controller",
-    subs=["detections"],
-    pubs=["cmd_vel"],
-    tick=control_tick,
-    rate=30,
-    order=2
-)
-
-scheduler = Scheduler()
-scheduler.add(cam)
-scheduler.add(ml_node)
-scheduler.add(controller)
-scheduler.run()
-```
-
-### PyTorch Example
-
-```python
-from horus import Node, run
-import torch
-
-# Load model once at startup
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-model.eval()
-
-def detect_tick(node):
-    if node.has_msg("cam.image_raw"):
-        frame = node.recv("cam.image_raw")
-        results = model(frame)
-        detections = results.pandas().xyxy[0].to_dict('records')
-        node.send("detections", detections)
-
-node = Node(
-    name="yolo_detector",
-    subs=["cam.image_raw"],
-    pubs=["detections"],
-    tick=detect_tick,
-    rate=10
-)
-
-run(node)
-```
-
-### ONNX Runtime (Python)
-
-```python
-from horus import Node, run
-import onnxruntime as ort
-import numpy as np
-
-session = ort.InferenceSession("model.onnx")
-input_name = session.get_inputs()[0].name
-
-def inference_tick(node):
-    if node.has_msg("cam.image_raw"):
-        frame = node.recv("cam.image_raw")
-        # Preprocess
-        input_data = np.array(frame).astype(np.float32)
-        input_data = np.expand_dims(input_data, axis=0)
-        # Run inference
-        outputs = session.run(None, {input_name: input_data})
-        node.send("ml.output", outputs[0].tolist())
-
-node = Node(
-    name="onnx_inference",
-    subs=["cam.image_raw"],
-    pubs=["ml.output"],
-    tick=inference_tick,
-    rate=15
-)
-
-run(node)
-```
-
-### ML Utilities
-
-HORUS provides Python ML utilities for common patterns:
-
-```python
-from horus.ml_utils import ONNXInferenceNode, PerformanceMonitor
-
-# Pre-built ONNX inference node
-class MyDetector(ONNXInferenceNode):
-    def __init__(self):
-        super().__init__(
-            model_path="models/detector.onnx",
-            input_topic="cam.image_raw",
-            output_topic="detections"
-        )
-
-    def preprocess(self, frame):
-        # Resize, normalize, etc.
-        return processed_frame
-
-    def postprocess(self, output):
-        # Parse model output into detections
-        return detections
-
-# Performance monitoring
-monitor = PerformanceMonitor(window_size=100)
-monitor.record(12.5)  # Record inference time in ms
-stats = monitor.get_stats()
-print(f"Avg: {stats['avg_latency_ms']:.1f}ms, P95: {stats['p95_latency_ms']:.1f}ms, FPS: {stats['fps']:.0f}")
-```
-
-See [ML Utilities](/python/library/ml-utilities) for the full API.
-
----
-
-## Rust Inference
-
-For production deployments where you need maximum performance, integrate ML inference directly in Rust.
-
-### ONNX Runtime (ort crate)
-
-The `ort` crate provides Rust bindings for ONNX Runtime:
-
-Add to your `Cargo.toml`:
-```toml
-[dependencies]
-horus = { path = "..." }
-horus_library = { path = "..." }
-ort = "2.0"
-ndarray = "0.15"
-```
-
-```rust
-use horus::prelude::*;
-use ort::{GraphOptimizationLevel, Session};
-use ndarray::Array;
-
-struct InferenceNode {
-    session: Session,
-    input_name: String,
-}
-
-impl InferenceNode {
-    fn new(model_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .commit_from_file(model_path)?;
-
-        let input_name = session.inputs[0].name.clone();
-
-        Ok(Self { session, input_name })
+    struct InferenceNode {
+        session: Session,
+        input_name: String,
     }
 
-    fn infer(&self, input: &[f32]) -> Option<Vec<f32>> {
-        let input_array = Array::from_shape_vec((1, input.len()), input.to_vec()).ok()?;
-        let outputs = self.session.run(
-            ort::inputs![&self.input_name => input_array.view()].ok()?
-        ).ok()?;
-        let output = outputs[0].try_extract_tensor::<f32>().ok()?;
-        Some(output.view().iter().copied().collect())
+    impl InferenceNode {
+        fn new(model_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let session = Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .commit_from_file(model_path)?;
+
+            let input_name = session.inputs[0].name.clone();
+
+            Ok(Self { session, input_name })
+        }
+
+        fn infer(&self, input: &[f32]) -> Option<Vec<f32>> {
+            let input_array = Array::from_shape_vec((1, input.len()), input.to_vec()).ok()?;
+            let outputs = self.session.run(
+                ort::inputs![&self.input_name => input_array.view()].ok()?
+            ).ok()?;
+            let output = outputs[0].try_extract_tensor::<f32>().ok()?;
+            Some(output.view().iter().copied().collect())
+        }
     }
-}
-```
+    ```
 
-### Tract (Pure Rust)
+    ### Tract (Pure Rust)
 
-Tract runs ONNX models with zero external dependencies:
+    Tract runs ONNX models with zero external dependencies:
 
-Add to your `Cargo.toml`:
-```toml
-[dependencies]
-horus = { path = "..." }
-horus_library = { path = "..." }
-tract-onnx = "0.21"
-```
+    Add to your `horus.toml`:
+    ```toml
+    [dependencies]
+    tract-onnx = "0.21"
+    ```
 
-```rust
-use tract_onnx::prelude::*;
+    ```rust
+    use tract_onnx::prelude::*;
 
-fn load_model(path: &str) -> TractResult<SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>> {
-    tract_onnx::onnx()
-        .model_for_path(path)?
-        .into_optimized()?
-        .into_runnable()
-}
+    fn load_model(path: &str) -> TractResult<SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>> {
+        tract_onnx::onnx()
+            .model_for_path(path)?
+            .into_optimized()?
+            .into_runnable()
+    }
 
-fn run_inference(model: &SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>, input: &[f32]) -> Option<Vec<f32>> {
-    let input_tensor = tract_ndarray::arr1(input).into_dyn();
-    let result = model.run(tvec!(input_tensor.into())).ok()?;
-    let output = result[0].to_array_view::<f32>().ok()?;
-    Some(output.iter().copied().collect())
-}
-```
+    fn run_inference(model: &SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>, input: &[f32]) -> Option<Vec<f32>> {
+        let input_tensor = tract_ndarray::arr1(input).into_dyn();
+        let result = model.run(tvec!(input_tensor.into())).ok()?;
+        let output = result[0].to_array_view::<f32>().ok()?;
+        Some(output.iter().copied().collect())
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    The fastest way to add AI to a HORUS application is through Python nodes. Python has the richest ML ecosystem, and HORUS's Python bindings give you full access to the pub/sub system.
+
+    ### Camera + ML Pipeline
+
+    ```python
+    from horus import Node, Scheduler
+    import numpy as np
+
+    # Simulated camera node (replace with your camera capture logic)
+    def camera_tick(node):
+        # In a real robot, capture from camera hardware here
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        node.send("cam.image_raw", frame.tolist())
+
+    cam = Node(name="camera", pubs=["cam.image_raw"], tick=camera_tick, rate=30, order=0)
+
+    # ML processing node
+    def ml_tick(node):
+        if node.has_msg("cam.image_raw"):
+            frame = node.recv("cam.image_raw")
+            # Run your ML model here
+            result = process_frame(frame)
+            node.send("detections", result)
+
+    ml_node = Node(
+        name="ml_processor",
+        subs=["cam.image_raw"],
+        pubs=["detections"],
+        tick=ml_tick,
+        rate=10,  # Process at 10 FPS
+        order=1
+    )
+
+    # Control node reacts to detections
+    def control_tick(node):
+        if node.has_msg("detections"):
+            detections = node.recv("detections")
+            if detections.get("obstacle_detected"):
+                node.send("cmd_vel", {"linear": 0.0, "angular": 0.5})
+            else:
+                node.send("cmd_vel", {"linear": 1.0, "angular": 0.0})
+
+    controller = Node(
+        name="controller",
+        subs=["detections"],
+        pubs=["cmd_vel"],
+        tick=control_tick,
+        rate=30,
+        order=2
+    )
+
+    scheduler = Scheduler()
+    scheduler.add(cam)
+    scheduler.add(ml_node)
+    scheduler.add(controller)
+    scheduler.run()
+    ```
+
+    ### PyTorch Example
+
+    ```python
+    from horus import Node, run
+    import torch
+
+    # Load model once at startup
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+    model.eval()
+
+    def detect_tick(node):
+        if node.has_msg("cam.image_raw"):
+            frame = node.recv("cam.image_raw")
+            results = model(frame)
+            detections = results.pandas().xyxy[0].to_dict('records')
+            node.send("detections", detections)
+
+    node = Node(
+        name="yolo_detector",
+        subs=["cam.image_raw"],
+        pubs=["detections"],
+        tick=detect_tick,
+        rate=10
+    )
+
+    run(node)
+    ```
+
+    ### ONNX Runtime
+
+    ```python
+    from horus import Node, run
+    import onnxruntime as ort
+    import numpy as np
+
+    session = ort.InferenceSession("model.onnx")
+    input_name = session.get_inputs()[0].name
+
+    def inference_tick(node):
+        if node.has_msg("cam.image_raw"):
+            frame = node.recv("cam.image_raw")
+            input_data = np.array(frame).astype(np.float32)
+            input_data = np.expand_dims(input_data, axis=0)
+            outputs = session.run(None, {input_name: input_data})
+            node.send("ml.output", outputs[0].tolist())
+
+    node = Node(
+        name="onnx_inference",
+        subs=["cam.image_raw"],
+        pubs=["ml.output"],
+        tick=inference_tick,
+        rate=15
+    )
+
+    run(node)
+    ```
+
+    ### ML Utilities
+
+    HORUS provides Python ML utilities for common patterns:
+
+    ```python
+    from horus.ml_utils import ONNXInferenceNode, PerformanceMonitor
+
+    # Pre-built ONNX inference node
+    class MyDetector(ONNXInferenceNode):
+        def __init__(self):
+            super().__init__(
+                model_path="models/detector.onnx",
+                input_topic="cam.image_raw",
+                output_topic="detections"
+            )
+
+        def preprocess(self, frame):
+            return processed_frame
+
+        def postprocess(self, output):
+            return detections
+
+    # Performance monitoring
+    monitor = PerformanceMonitor(window_size=100)
+    monitor.record(12.5)  # Record inference time in ms
+    stats = monitor.get_stats()
+    print(f"Avg: {stats['avg_latency_ms']:.1f}ms, P95: {stats['p95_latency_ms']:.1f}ms")
+    ```
+
+    See [ML Utilities](/python/library/ml-utilities) for the full API.
+  </LangTab>
+</LanguageTabs>
 
 ### Model Format Comparison
 
@@ -307,94 +298,95 @@ fn run_inference(model: &SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact
 
 For complex reasoning tasks (task planning, scene understanding, natural language), call cloud APIs from HORUS nodes.
 
-### Python (Recommended)
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+    use reqwest::blocking::Client;
+    use serde::{Deserialize, Serialize};
 
-```python
-from horus import Node, run
-import requests
-import os
+    #[derive(Serialize)]
+    struct ChatRequest {
+        model: String,
+        messages: Vec<ChatMessage>,
+        max_tokens: u32,
+    }
 
-API_KEY = os.environ["OPENAI_API_KEY"]
+    #[derive(Serialize, Deserialize)]
+    struct ChatMessage {
+        role: String,
+        content: String,
+    }
 
-def planner_tick(node):
-    if node.has_msg("user.goal"):
-        goal = node.recv("user.goal")
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            json={
-                "model": "gpt-4",
-                "messages": [
-                    {"role": "system", "content": "Generate robot action plans as JSON."},
-                    {"role": "user", "content": goal}
-                ],
-                "max_tokens": 500
-            }
-        )
-        plan = response.json()["choices"][0]["message"]["content"]
-        node.send("robot.plan", plan)
+    #[derive(Deserialize)]
+    struct ChatResponse {
+        choices: Vec<ChatChoice>,
+    }
 
-node = Node(
-    name="planner",
-    subs=["user.goal"],
-    pubs=["robot.plan"],
-    tick=planner_tick,
-    rate=1  # Check for goals once per second
-)
+    #[derive(Deserialize)]
+    struct ChatChoice {
+        message: ChatMessage,
+    }
 
-run(node)
-```
+    fn call_llm(client: &Client, api_key: &str, prompt: &str) -> Option<String> {
+        let request = ChatRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            max_tokens: 500,
+        };
 
-### Rust (reqwest)
+        let response = client
+            .post("https://api.openai.com/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&request)
+            .send()
+            .ok()?;
 
-```rust
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+        let chat_response: ChatResponse = response.json().ok()?;
+        Some(chat_response.choices[0].message.content.clone())
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    from horus import Node, run
+    import requests
+    import os
 
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-}
+    API_KEY = os.environ["OPENAI_API_KEY"]
 
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
+    def planner_tick(node):
+        if node.has_msg("user.goal"):
+            goal = node.recv("user.goal")
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                json={
+                    "model": "gpt-4",
+                    "messages": [
+                        {"role": "system", "content": "Generate robot action plans as JSON."},
+                        {"role": "user", "content": goal}
+                    ],
+                    "max_tokens": 500
+                }
+            )
+            plan = response.json()["choices"][0]["message"]["content"]
+            node.send("robot.plan", plan)
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
+    node = Node(
+        name="planner",
+        subs=["user.goal"],
+        pubs=["robot.plan"],
+        tick=planner_tick,
+        rate=1  # Check for goals once per second
+    )
 
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-}
-
-fn call_llm(client: &Client, api_key: &str, prompt: &str) -> Option<String> {
-    let request = ChatRequest {
-        model: "gpt-4".to_string(),
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }],
-        max_tokens: 500,
-    };
-
-    let response = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&request)
-        .send()
-        .ok()?;
-
-    let chat_response: ChatResponse = response.json().ok()?;
-    Some(chat_response.choices[0].message.content.clone())
-}
-```
+    run(node)
+    ```
+  </LangTab>
+</LanguageTabs>
 
 ---
 
@@ -418,44 +410,82 @@ ML inference is typically the bottleneck. Strategies to manage this:
 
 Process every Nth frame instead of every frame:
 
-```python
-frame_count = 0
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+    node! {
+        ThrottledMlNode {
+            sub { image: Vec<u8> -> "cam.image_raw" }
+            pub { detections: Vec<f32> -> "detections" }
+            data { frame_count: u32 = 0 }
 
-def ml_tick(node):
-    global frame_count
-    if node.has_msg("cam.image_raw"):
-        frame_count += 1
-        if frame_count % 5 == 0:  # Every 5th frame
-            frame = node.recv("cam.image_raw")
-            result = model.predict(frame)
-            node.send("detections", result)
-```
+            tick {
+                if let Some(frame) = self.image.recv() {
+                    self.frame_count += 1;
+                    if self.frame_count % 5 == 0 {  // Every 5th frame
+                        let result = run_inference(&frame);
+                        self.detections.send(result);
+                    }
+                }
+            }
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    frame_count = 0
+
+    def ml_tick(node):
+        global frame_count
+        if node.has_msg("cam.image_raw"):
+            frame_count += 1
+            if frame_count % 5 == 0:  # Every 5th frame
+                frame = node.recv("cam.image_raw")
+                result = model.predict(frame)
+                node.send("detections", result)
+    ```
+  </LangTab>
+</LanguageTabs>
 
 ### Async Processing
 
 Run ML in a background thread so the control loop isn't blocked:
 
-```python
-import horus
-import asyncio
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+    // Use .async_io() execution class for nodes that do heavy work
+    scheduler.add(ml_node)
+        .async_io()  // Runs in its own thread, won't block the scheduler
+        .rate(10_u64.hz())
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    import asyncio
 
-async def async_ml_tick(node):
-    if node.has_msg("cam.image_raw"):
-        frame = node.recv("cam.image_raw")
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, model.predict, frame)
-        node.send("detections", result)
+    async def async_ml_tick(node):
+        if node.has_msg("cam.image_raw"):
+            frame = node.recv("cam.image_raw")
+            # Run in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, model.predict, frame)
+            node.send("detections", result)
 
-# Async is auto-detected from the async tick function
-ml_node = horus.Node(
-    name="async_ml",
-    subs=["cam.image_raw"],
-    pubs=["detections"],
-    tick=async_ml_tick,
-    rate=10
-)
-```
+    # Async is auto-detected from the async tick function
+    ml_node = horus.Node(
+        name="async_ml",
+        subs=["cam.image_raw"],
+        pubs=["detections"],
+        tick=async_ml_tick,
+        rate=10
+    )
+    ```
+  </LangTab>
+</LanguageTabs>
 
 ### Use Appropriate Models
 

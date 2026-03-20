@@ -1,0 +1,161 @@
+---
+title: "Recipe: IMU Reader (Python)"
+description: "100 Hz IMU sensor node in Python that reads accelerometer and gyroscope data, estimates orientation via gyro integration, and publishes Imu messages."
+order: 3
+---
+
+## IMU Reader (Python)
+
+Reads a 6-axis IMU (accelerometer + gyroscope) at 100 Hz and publishes `Imu` messages for downstream consumers. Includes simple gyro integration for orientation estimation.
+
+### Problem
+
+You need to read IMU hardware at a fixed rate, validate readings, and publish typed `Imu` messages from Python.
+
+### When To Use
+
+- Reading a 6-axis or 9-axis IMU over I2C/SPI from Python
+- Publishing raw `Imu` messages for fusion, logging, or SLAM nodes
+- Prototyping IMU pipelines before porting to Rust
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/getting-started/installation))
+- Python 3.8+ with `horus` package
+
+### horus.toml
+
+```toml
+[package]
+name = "imu-reader-py"
+version = "0.1.0"
+description = "100 Hz IMU sensor with orientation publishing"
+language = "python"
+```
+
+### Complete Code
+
+```python
+#!/usr/bin/env python3
+"""100 Hz IMU reader with gyro-integrated orientation estimation."""
+
+import math
+import horus
+from horus import Node, Scheduler, Imu, us, ms
+
+# ── State ────────────────────────────────────────────────────
+
+roll = [0.0]
+pitch = [0.0]
+yaw = [0.0]
+tick_count = [0]
+
+# ── Hardware stub ────────────────────────────────────────────
+
+def read_hardware():
+    """Read IMU hardware — replace with your I2C/SPI driver.
+
+    Returns:
+        horus.Imu with accel and gyro fields populated.
+    """
+    return Imu(
+        accel_x=0.0,
+        accel_y=0.0,
+        accel_z=9.81,       # gravity on Z axis
+        gyro_x=0.01,        # slow roll
+        gyro_y=0.0,
+        gyro_z=0.05,        # slow yaw rotation
+    )
+
+# ── Node callbacks ───────────────────────────────────────────
+
+def imu_tick(node):
+    imu = read_hardware()
+
+    # Validate before publishing — hardware faults produce NaN
+    if (math.isnan(imu.accel_x) or math.isnan(imu.accel_y) or
+        math.isnan(imu.accel_z) or math.isnan(imu.gyro_x) or
+        math.isnan(imu.gyro_y) or math.isnan(imu.gyro_z)):
+        return  # skip corrupted readings
+
+    # Publish raw IMU for any subscriber
+    node.send("imu.raw", imu)
+
+    # Simple gyro integration (replace with Madgwick/Mahony in production)
+    dt = 1.0 / 100.0  # 100 Hz -> 10 ms per tick
+    roll[0] += imu.gyro_x * dt
+    pitch[0] += imu.gyro_y * dt
+    yaw[0] += imu.gyro_z * dt
+
+    tick_count[0] += 1
+
+    # Publish orientation estimate as a dict (or define a custom class)
+    node.send("imu.orientation", {
+        "roll": roll[0],
+        "pitch": pitch[0],
+        "yaw": yaw[0],
+        "tick": tick_count[0],
+    })
+
+def imu_shutdown(node):
+    print(f"ImuReader: {tick_count[0]} ticks, final yaw={yaw[0]:.4f} rad")
+
+# ── Main ─────────────────────────────────────────────────────
+
+imu_node = Node(
+    name="ImuReader",
+    tick=imu_tick,
+    shutdown=imu_shutdown,
+    rate=100,                      # 100 Hz sensor rate
+    order=0,
+    pubs=["imu.raw", "imu.orientation"],
+    subs=[],
+    budget=800 * us,               # 800 us budget for I2C/SPI read
+)
+
+if __name__ == "__main__":
+    horus.run(imu_node)
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 1000 Hz
+[HORUS] Node "ImuReader" started (100 Hz)
+^C
+ImuReader: 500 ticks, final yaw=2.5000 rad
+[HORUS] Shutting down...
+[HORUS] Node "ImuReader" shutdown complete
+```
+
+### Key Points
+
+- **`horus.Imu`** is the typed message with `accel_x/y/z` and `gyro_x/y/z` fields
+- **NaN validation** catches hardware faults before they propagate to downstream nodes
+- **Gyro integration drifts** over time — in production, use a complementary or Madgwick filter
+- **`read_hardware()`** is a placeholder — replace with your actual I2C/SPI driver (e.g., `smbus2` for Linux)
+- **`budget=800 * us`** accounts for I2C bus latency on typical embedded hardware
+
+### Variations
+
+- **Complementary filter**: Blend accelerometer gravity direction with gyro integration for stable pitch/roll
+- **Hardware I2C**: Use `smbus2` to read from an MPU6050 or BNO055 over I2C
+- **High-rate IMU**: Set `rate=1000` with `budget=200 * us` for 1 kHz industrial IMUs
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Orientation drifts continuously | Pure gyro integration without correction | Use complementary or Madgwick filter |
+| `NaN` in published data | Hardware fault or I2C read error | Add NaN check before publishing |
+| Orientation jumps on startup | Initial gyro bias not calibrated | Average first 100 readings as bias offset |
+| Yaw rotates when stationary | Gyro bias in Z-axis | Subtract calibrated bias from `gyro_z` |
+| Topic data stale | Publisher rate too low | Verify `rate=100` matches hardware capability |
+
+---
+
+## See Also
+
+- [IMU Reader (Rust)](/recipes/imu-reader) — Rust version of this recipe
+- [Multi-Sensor Fusion (Python)](/recipes/multi-sensor-fusion-python) — Combine IMU with odometry
+- [Python CV Node](/recipes/python-cv-node) — Python vision pipeline pattern

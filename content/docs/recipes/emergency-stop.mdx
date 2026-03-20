@@ -34,121 +34,189 @@ version = "0.1.0"
 description = "E-stop monitor with safety state handling"
 ```
 
-### src/main.rs
+### src/main.rs (or src/main.py)
 
-```rust
-use horus::prelude::*;
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+    use horus::prelude::*;
 
-/// E-stop trigger from hardware or software
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct EStopSignal {
-    triggered: u8,   // 0 = clear, 1 = triggered (u8 for repr(C) compat)
-    source: u8,      // 0 = hardware, 1 = software, 2 = remote
-}
-
-/// Status published by the E-stop monitor
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct SafetyStatus {
-    estop_active: u8,
-    consecutive_clears: u32,
-    uptime_ticks: u64,
-}
-
-struct EStopNode {
-    estop_sub: Topic<EStopSignal>,
-    cmd_pub: Topic<CmdVel>,
-    status_pub: Topic<SafetyStatus>,
-    estop_active: bool,
-    consecutive_clears: u32,
-    ticks: u64,
-}
-
-impl EStopNode {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            estop_sub: Topic::new("safety.estop")?,
-            cmd_pub: Topic::new("cmd_vel")?,
-            status_pub: Topic::new("safety.status")?,
-            estop_active: false,
-            consecutive_clears: 0,
-            ticks: 0,
-        })
+    /// E-stop trigger from hardware or software
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+    #[repr(C)]
+    struct EStopSignal {
+        triggered: u8,   // 0 = clear, 1 = triggered (u8 for repr(C) compat)
+        source: u8,      // 0 = hardware, 1 = software, 2 = remote
     }
-}
 
-impl Node for EStopNode {
-    fn name(&self) -> &str { "EStop" }
+    /// Status published by the E-stop monitor
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+    #[repr(C)]
+    struct SafetyStatus {
+        estop_active: u8,
+        consecutive_clears: u32,
+        uptime_ticks: u64,
+    }
 
-    fn tick(&mut self) {
-        self.ticks += 1;
+    struct EStopNode {
+        estop_sub: Topic<EStopSignal>,
+        cmd_pub: Topic<CmdVel>,
+        status_pub: Topic<SafetyStatus>,
+        estop_active: bool,
+        consecutive_clears: u32,
+        ticks: u64,
+    }
 
-        if let Some(signal) = self.estop_sub.recv() {
-            if signal.triggered != 0 {
-                // SAFETY: immediately activate E-stop
-                self.estop_active = true;
-                self.consecutive_clears = 0;
+    impl EStopNode {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                estop_sub: Topic::new("safety.estop")?,
+                cmd_pub: Topic::new("cmd_vel")?,
+                status_pub: Topic::new("safety.status")?,
+                estop_active: false,
+                consecutive_clears: 0,
+                ticks: 0,
+            })
+        }
+    }
+
+    impl Node for EStopNode {
+        fn name(&self) -> &str { "EStop" }
+
+        fn tick(&mut self) {
+            self.ticks += 1;
+
+            if let Some(signal) = self.estop_sub.recv() {
+                if signal.triggered != 0 {
+                    // SAFETY: immediately activate E-stop
+                    self.estop_active = true;
+                    self.consecutive_clears = 0;
+                } else {
+                    self.consecutive_clears += 1;
+                }
             } else {
-                self.consecutive_clears += 1;
+                // No signal received — treat as potential fault (fail-safe)
+                self.consecutive_clears = 0;
             }
-        } else {
-            // No signal received — treat as potential fault (fail-safe)
-            self.consecutive_clears = 0;
+
+            // Require N consecutive clear signals before releasing
+            const CLEAR_THRESHOLD: u32 = 50; // 50 ticks at 100 Hz = 0.5 seconds
+            if self.estop_active && self.consecutive_clears >= CLEAR_THRESHOLD {
+                self.estop_active = false;
+            }
+
+            if self.estop_active {
+                // SAFETY: override cmd_vel with zero — stops all motion
+                self.cmd_pub.send(CmdVel::zero());
+            }
+
+            self.status_pub.send(SafetyStatus {
+                estop_active: self.estop_active as u8,
+                consecutive_clears: self.consecutive_clears,
+                uptime_ticks: self.ticks,
+            });
         }
 
-        // Require N consecutive clear signals before releasing
-        const CLEAR_THRESHOLD: u32 = 50; // 50 ticks at 100 Hz = 0.5 seconds
-        if self.estop_active && self.consecutive_clears >= CLEAR_THRESHOLD {
-            self.estop_active = false;
+        fn shutdown(&mut self) -> Result<()> {
+            // SAFETY: zero velocity on shutdown
+            self.cmd_pub.send(CmdVel::zero());
+            Ok(())
         }
 
-        if self.estop_active {
-            // SAFETY: override cmd_vel with zero — stops all motion
+        fn enter_safe_state(&mut self) {
+            // SAFETY: called by scheduler if this node misses its deadline
+            self.estop_active = true;
             self.cmd_pub.send(CmdVel::zero());
         }
 
-        self.status_pub.send(SafetyStatus {
-            estop_active: self.estop_active as u8,
-            consecutive_clears: self.consecutive_clears,
-            uptime_ticks: self.ticks,
-        });
+        fn is_safe_state(&self) -> bool {
+            self.estop_active
+        }
     }
 
-    fn shutdown(&mut self) -> Result<()> {
-        // SAFETY: zero velocity on shutdown
-        self.cmd_pub.send(CmdVel::zero());
-        Ok(())
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new()
+            .watchdog(500_u64.ms())
+            .max_deadline_misses(1); // aggressive — isolate after 1 miss
+
+        // E-stop runs LAST — overrides any cmd_vel from other nodes
+        scheduler.add(EStopNode::new()?)
+            .order(100)                    // after drive/planner nodes
+            .rate(100_u64.hz())            // 100 Hz safety monitoring
+            .budget(200_u64.us())          // tight budget
+            .deadline(500_u64.us())        // tight deadline
+            .on_miss(Miss::SafeMode)       // force safe state on deadline miss
+            .build()?;
+
+        scheduler.run()
     }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, CmdVel, run, us, ms
 
-    fn enter_safe_state(&mut self) {
-        // SAFETY: called by scheduler if this node misses its deadline
-        self.estop_active = true;
-        self.cmd_pub.send(CmdVel::zero());
-    }
+    CLEAR_THRESHOLD = 50  # 50 ticks at 100 Hz = 0.5 seconds
 
-    fn is_safe_state(&self) -> bool {
-        self.estop_active
-    }
-}
+    def estop_init(node):
+        """Initialize E-stop state."""
+        node.state = {
+            "estop_active": False,
+            "consecutive_clears": 0,
+            "ticks": 0,
+        }
 
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new()
-        .watchdog(500_u64.ms())
-        .max_deadline_misses(1); // aggressive — isolate after 1 miss
+    def estop_tick(node):
+        s = node.state
+        s["ticks"] += 1
 
-    // E-stop runs LAST — overrides any cmd_vel from other nodes
-    scheduler.add(EStopNode::new()?)
-        .order(100)                    // after drive/planner nodes
-        .rate(100_u64.hz())            // 100 Hz safety monitoring
-        .budget(200_u64.us())          // tight budget
-        .deadline(500_u64.us())        // tight deadline
-        .on_miss(Miss::SafeMode)       // force safe state on deadline miss
-        .build()?;
+        signal = node.recv("safety.estop")
+        if signal is not None:
+            if signal["triggered"] != 0:
+                # SAFETY: immediately activate E-stop
+                s["estop_active"] = True
+                s["consecutive_clears"] = 0
+            else:
+                s["consecutive_clears"] += 1
+        else:
+            # No signal received — treat as potential fault (fail-safe)
+            s["consecutive_clears"] = 0
 
-    scheduler.run()
-}
-```
+        # Require N consecutive clear signals before releasing
+        if s["estop_active"] and s["consecutive_clears"] >= CLEAR_THRESHOLD:
+            s["estop_active"] = False
+
+        if s["estop_active"]:
+            # SAFETY: override cmd_vel with zero — stops all motion
+            node.send("cmd_vel", {"linear": 0.0, "angular": 0.0})
+
+        node.send("safety.status", {
+            "estop_active": 1 if s["estop_active"] else 0,
+            "consecutive_clears": s["consecutive_clears"],
+            "uptime_ticks": s["ticks"],
+        })
+
+    def estop_shutdown(node):
+        """SAFETY: zero velocity on shutdown."""
+        node.send("cmd_vel", {"linear": 0.0, "angular": 0.0})
+
+    estop = Node(
+        name="EStop",
+        init=estop_init,
+        tick=estop_tick,
+        shutdown=estop_shutdown,
+        rate=100,
+        order=100,
+        budget=200 * us,
+        subs=["safety.estop"],
+        pubs=["cmd_vel", "safety.status"],
+    )
+
+    run(estop, rt=True, watchdog_ms=500)
+    ```
+  </LangTab>
+</LanguageTabs>
 
 ## Understanding the Code
 

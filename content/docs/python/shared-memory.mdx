@@ -1,0 +1,395 @@
+---
+title: "Shared Memory Architecture (Python)"
+description: "How HORUS shared memory works from Python — ring buffers, zero-copy versus serialization, pool-backed types, cross-process discovery, and memory management"
+order: 8
+---
+
+# Shared Memory Architecture (Python)
+
+When your Python node calls `node.send("imu", reading)`, the data does not pass through a socket, a pipe, or the kernel. It lands in a ring buffer backed by shared memory. Another node — Python or Rust, same process or different — reads it directly from that same memory region. No serialization for typed messages. No copies for images. Sub-microsecond latency.
+
+You do not need to configure shared memory, allocate buffers, or manage file descriptors. The HORUS runtime handles all of it. This page explains what happens underneath so you can make informed decisions about message types, debug performance issues, and understand why certain patterns are faster than others.
+
+---
+
+## The Two-Sentence Version
+
+**Typed messages** (`CmdVel`, `Imu`, `Pose3D`) are binary-compatible structs written directly into shared memory — zero copies, approximately 1.5 us end-to-end. **Dict messages** (`node.send("data", {"key": value})`) are serialized to bytes first — one copy in, one copy out, approximately 5-50 us depending on size.
+
+If performance matters for a topic, use a typed message. If convenience matters, use a dict. Both travel through the same ring buffer.
+
+---
+
+## Ring Buffers
+
+Every topic is backed by a **circular buffer** in shared memory. The buffer has a fixed number of slots. The publisher writes to the next slot; the subscriber reads from the oldest unread slot.
+
+```
+Publisher writes here ──┐
+                        ▼
+┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+│ msg5 │ msg6 │ msg7 │ msg8 │      │      │      │      │
+└──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
+                  ▲
+                  └── Subscriber reads here
+```
+
+Key properties:
+
+- **Lock-free**: No mutexes. Publisher and subscriber use atomic operations, so neither blocks the other.
+- **Single-producer / single-consumer (SPSC)**: The fastest path. HORUS auto-detects when multiple publishers or subscribers exist and upgrades the backend.
+- **Overflow drops the oldest**: If the subscriber cannot keep up, the publisher overwrites the oldest unread slot. The subscriber sees the freshest data, not stale data. This is intentional — a robot controller needs the latest sensor reading, not one from 100 ms ago.
+- **Capacity is a power of two**: Slot lookup uses a bitmask instead of division — a single CPU instruction. The default capacity is auto-sized from the message type (16-1024 slots).
+
+From Python, you never interact with the ring buffer directly. `node.send()` writes into it; `node.recv()` reads from it.
+
+---
+
+## Zero-Copy vs. Copy: When Does a Copy Happen?
+
+This is the most important performance distinction in HORUS Python.
+
+### Typed Messages: Zero-Copy (~1.5 us)
+
+When you declare a topic with a typed message class, the data is a fixed-size binary struct:
+
+```python
+from horus import Node, CmdVel, Imu
+
+node = Node(
+    name="controller",
+    pubs=[CmdVel],          # typed — Pod zero-copy
+    subs=[Imu],             # typed — Pod zero-copy
+    tick=my_tick,
+    rate=100,
+)
+
+def my_tick(node):
+    reading = node.recv("imu")           # reads directly from SHM
+    cmd = CmdVel(linear_x=0.5, angular_z=0.1)
+    node.send("cmd_vel", cmd)            # writes directly to SHM
+```
+
+What happens internally:
+
+1. `node.send("cmd_vel", cmd)` — The `CmdVel` struct (a few dozen bytes) is `memcpy`'d into the ring buffer slot. No serialization.
+2. `node.recv("imu")` — The bytes are read from the ring buffer slot and interpreted as an `Imu` struct. No deserialization.
+
+This works because typed messages (`CmdVel`, `Imu`, `Pose2D`, `Pose3D`, `LaserScan`, `Odometry`, and the other 50+ types in `horus.messages`) are **POD types** — plain old data with no pointers, no heap allocations, and a fixed binary layout. The Rust and Python representations are byte-for-byte identical.
+
+### Dict Messages: Serialized (~5-50 us)
+
+When you use string topic names and send Python dicts, HORUS serializes the data with MessagePack:
+
+```python
+node = Node(
+    name="logger",
+    pubs=["status"],        # string — GenericMessage
+    tick=log_tick,
+    rate=10,
+)
+
+def log_tick(node):
+    node.send("status", {
+        "battery": 85.0,
+        "mode": "autonomous",
+        "errors": [],
+    })
+```
+
+What happens internally:
+
+1. `node.send("status", {...})` — The dict is serialized to bytes (MessagePack), then the bytes are copied into the ring buffer slot. **Two operations: serialize + copy.**
+2. `node.recv("status")` — The bytes are read from the ring buffer and deserialized back into a Python dict. **Two operations: copy + deserialize.**
+
+The overhead depends on the dict size. A small dict (a few fields) takes approximately 5 us. A large dict with nested structures can take 50 us or more.
+
+### Decision Table
+
+| Pattern | Transport | Latency | When to use |
+|---------|-----------|---------|-------------|
+| `pubs=[CmdVel]` | Pod zero-copy | ~1.5 us | Sensor data, control commands, anything with a known type |
+| `pubs=["data"]` + dict | MessagePack serialization | ~5-50 us | Prototyping, configuration, logs, variable-shape data |
+| `pubs=[Image]` | Pool-backed descriptor | ~3 us (descriptor) | Camera frames, see next section |
+| `pubs=[PointCloud]` | Pool-backed descriptor | ~3 us (descriptor) | LiDAR scans, 3D data |
+| `pubs=[Tensor]` | Pool-backed descriptor | ~3 us (descriptor) | ML features, costmaps, custom arrays |
+
+---
+
+## Pool-Backed Types: Image, PointCloud, DepthImage, Tensor
+
+Camera frames, LiDAR scans, and ML tensors are too large for ring buffer slots (a 1080p RGB image is 6 MB). HORUS handles these with **pool-backed shared memory**: the actual data lives in a separate shared memory pool, and only a small descriptor (64-336 bytes) travels through the ring buffer.
+
+```python
+from horus import Image, PointCloud, Tensor
+import numpy as np
+
+# Create an image — pixel data is allocated in the SHM pool
+img = Image(480, 640, "rgb8")
+
+# Write pixels — this writes directly into the SHM pool
+img.copy_from(camera_frame_bytes)
+
+# Or create from NumPy — one copy into the pool
+img = Image.from_numpy(frame_array, encoding="rgb8")
+```
+
+### NumPy Zero-Copy Views
+
+The key feature: **reading pool-backed data produces a zero-copy NumPy view**.
+
+```python
+def vision_tick(node):
+    img = node.recv("camera")
+    if img:
+        # to_numpy() returns a view into shared memory — NO COPY
+        pixels = img.to_numpy()    # shape: (480, 640, 3), dtype: uint8
+
+        # You can pass this directly to OpenCV, scikit-image, etc.
+        gray = np.mean(pixels, axis=2)
+        edges = np.abs(np.diff(gray, axis=1))
+```
+
+The `pixels` array points directly into the shared memory pool. No bytes are copied. The array is valid as long as the `img` object exists.
+
+The same applies to all pool-backed types:
+
+```python
+cloud = node.recv("lidar")
+points = cloud.to_numpy()        # shape: (N, 3), dtype: float32 — zero-copy
+
+depth = node.recv("depth")
+depth_map = depth.to_numpy()     # shape: (H, W), dtype: float32 — zero-copy
+
+tensor = node.recv("features")
+arr = tensor.numpy()             # shape matches creation — zero-copy
+```
+
+### GPU Interop via DLPack
+
+Pool-backed types support zero-copy conversion to PyTorch and JAX through the DLPack protocol:
+
+```python
+import torch
+
+# Image to PyTorch — zero-copy
+img = node.recv("camera")
+tensor = img.to_torch()               # torch.Tensor on CPU, backed by SHM
+
+# Tensor to PyTorch — zero-copy
+features = node.recv("features")
+pt = torch.from_dlpack(features)      # standard DLPack protocol
+
+# Tensor to JAX — zero-copy
+import jax
+jax_arr = features.to_jax()
+```
+
+DLPack is the standard zero-copy tensor exchange protocol supported by NumPy (1.25+), PyTorch (1.10+), JAX (0.4+), CuPy, and TensorFlow. One protocol covers all frameworks.
+
+### The Zero-Copy Chain
+
+For pool-backed types, the full data path involves zero copies on the receive side:
+
+```
+Rust allocator ──► SHM pool ──► Python receives descriptor
+                      │
+                      └──► img.to_numpy() ──► NumPy view (same memory)
+                      └──► img.to_torch() ──► PyTorch tensor (same memory)
+                      └──► img.to_jax()   ──► JAX array (same memory)
+```
+
+`from_numpy()` and `from_torch()` do copy once — they place data into the pool so it can be shared. `to_numpy()` and `to_torch()` do not copy — they create views into existing pool memory.
+
+| Direction | Method | Copies | Why |
+|-----------|--------|--------|-----|
+| Python to SHM | `Image.from_numpy(arr)` | 1 | Data must go into a pool slot at a specific address |
+| Python to SHM | `Tensor.from_torch(t)` | 1 | Same reason |
+| SHM to Python | `img.to_numpy()` | 0 | Returns a view into the pool slot |
+| SHM to Python | `torch.from_dlpack(tensor)` | 0 | DLPack wraps the pool pointer |
+
+---
+
+## Cross-Process Auto-Discovery
+
+Two Python processes (or a Python process and a Rust process) sharing a topic need no configuration. They discover each other through the shared memory filesystem.
+
+```bash
+# Terminal 1: Python sensor node
+horus run sensor.py
+
+# Terminal 2: Python controller node (or Rust — doesn't matter)
+horus run controller.py
+```
+
+What happens:
+
+1. Process A calls `Topic("imu")` internally, which creates a shared memory file and writes a header with type info, capacity, and a magic number.
+2. Process B calls `Topic("imu")`, finds the existing file, validates the type matches, and memory-maps the same region.
+3. Both processes read and write the same ring buffer. Writes by A are immediately visible to B.
+
+**Namespace isolation**: By default, each `horus run` invocation gets an auto-generated namespace (derived from session ID and user ID). Two terminals get different namespaces and cannot see each other's topics. To share topics across terminals:
+
+```bash
+# Both terminals must use the same namespace
+HORUS_NAMESPACE=robot horus run sensor.py
+HORUS_NAMESPACE=robot horus run controller.py
+```
+
+Or use `horus launch`, which sets the namespace automatically for all nodes in the launch file.
+
+**Mixed languages**: A Python node and a Rust node can share the same typed topic. The binary layout of `CmdVel` in Python and `CmdVel` in Rust is identical — same field offsets, same size, same alignment. Dict topics (GenericMessage) also work cross-language because both sides use the same MessagePack format.
+
+---
+
+## Platform Differences
+
+HORUS runs on Linux and macOS with the same Python API. The shared memory mechanism differs underneath:
+
+| Aspect | Linux | macOS |
+|--------|-------|-------|
+| SHM mechanism | `/dev/shm` (tmpfs backed by RAM) | `shm_open()` (Mach VM) |
+| Base directory | `/dev/shm/horus_<namespace>/` | `/tmp/horus_<namespace>/` |
+| Topic name rule | Any valid filename characters | **No slashes** — `shm_open` limitation |
+| Stale detection | `flock` (kernel-managed) | PID-based via `.meta` files |
+
+**Topic naming**: Always use dots as separators (`sensor.imu`, `camera.rgb`), never slashes. This rule is enforced on all platforms for portability. Your code works on both Linux and macOS without changes.
+
+---
+
+## Cleanup
+
+### Automatic (You Rarely Need This Section)
+
+HORUS has three automatic cleanup layers:
+
+1. **Normal exit**: When your Python process exits (Ctrl+C, `horus.run()` returns), shared memory files owned by that process are removed automatically.
+2. **Startup cleanup**: Every `horus` CLI command scans for stale namespaces from dead sessions and removes them. Cost: &lt;1 ms.
+3. **Pre-run cleanup**: Before every `horus run`, stale topics older than 5 minutes with no live processes are removed.
+
+You almost never need to think about cleanup. It happens silently.
+
+### Manual Escape Hatch
+
+If a process is killed with `kill -9` in rapid succession (before the next `horus` command triggers auto-cleanup), stale SHM files may linger. The manual escape hatch:
+
+```bash
+# Preview what would be cleaned
+horus clean --shm --dry-run
+
+# Remove stale SHM files
+horus clean --shm
+
+# Nuclear option: SHM + build cache + everything
+horus clean --all
+```
+
+**Never manually delete files under `/dev/shm/horus_*/`** — use `horus clean --shm` instead. The cleanup command knows which files are stale and which are actively in use.
+
+---
+
+## Memory Management: Python GC vs. Rust Allocator
+
+A common concern with shared memory in Python: does the garbage collector interfere? The short answer is **no**.
+
+### How It Works
+
+Shared memory buffers are allocated and managed by the Rust runtime, not by Python's memory allocator. When you receive an `Image` in Python, the Python object is a thin wrapper around a Rust-owned reference to a pool slot. The actual pixel data lives in mmap'd shared memory that Python's GC cannot see or move.
+
+```python
+img = node.recv("camera")
+pixels = img.to_numpy()     # NumPy view into SHM — not a Python heap object
+
+# Python's GC tracks 'img' and 'pixels' (the wrapper objects)
+# but the underlying 6MB of pixel data is in SHM, managed by Rust
+```
+
+### Lifetime Rules
+
+- **The NumPy view is valid as long as the source object exists.** If you drop the `img` reference and the GC collects it, the NumPy array becomes invalid. In practice, this is rarely a problem — you typically use the array within the same tick function.
+- **Pool slots use atomic reference counting.** When multiple subscribers receive the same image, each holds a reference. The pool slot is reclaimed only when all references are dropped.
+- **Python's GC cycles do not pause SHM access.** The GC only tracks Python wrapper objects (a few hundred bytes each). The megabytes of sensor data in shared memory are invisible to the GC.
+
+### What This Means in Practice
+
+- You do not need to call `del` or manually free shared memory objects.
+- Large images and point clouds do not contribute to GC pressure.
+- You can hold references to received messages across ticks without leaking SHM (the reference count keeps the slot alive).
+- If you store a `to_numpy()` view in a long-lived variable, make sure the source HORUS object also stays alive.
+
+---
+
+## When to Care About SHM Details
+
+Most Python users never need to think about shared memory. HORUS handles it. Here is when these details matter:
+
+**You should care when:**
+
+- You are choosing between typed messages and dicts for a high-frequency topic. Typed messages are 3-30x faster. See the decision table above.
+- You are processing camera images or LiDAR clouds and want to avoid unnecessary copies. Use `to_numpy()` instead of converting to a Python list.
+- You see "Topic not found" errors across processes — check that both processes use the same `HORUS_NAMESPACE`.
+- You are debugging latency spikes — use `horus topic list --verbose` to see which backend each topic uses.
+- You are running on macOS and topic names contain slashes — change to dots.
+
+**You should not care when:**
+
+- You are prototyping at low frequencies (10-30 Hz). Dict topics are fine.
+- You have a single-process application. Everything stays in-process with no SHM overhead.
+- You are writing application logic. Just call `node.send()` and `node.recv()`.
+
+---
+
+## Design Decisions and Trade-offs
+
+**Why shared memory instead of sockets or pipes?** Sockets and pipes require kernel transitions (`write()` + `read()` system calls) for every message — 1-5 us of overhead per message. Shared memory is just regular memory access: the CPU reads and writes at RAM speed without entering the kernel. For a robot running control loops at 1 kHz, that 1-5 us saving per message adds up to keeping the control cycle under budget.
+
+**Why ring buffers instead of queues?** Ring buffers have a fixed memory footprint (allocated once at topic creation) and predictable access patterns. A growable queue would require dynamic allocation, which is unpredictable in real-time contexts. The fixed size also means overflow behavior is explicit: the oldest message is dropped, and the subscriber always gets the freshest data.
+
+**Why drop oldest on overflow instead of blocking?** A robot controller that blocks waiting for a full buffer to drain is a robot controller that crashes into a wall. Dropping stale data and keeping fresh data is the safer default for robotics. If you need guaranteed delivery (log collection, recording), increase the ring buffer capacity.
+
+**Why typed messages are faster than dicts:** A `CmdVel` struct is 24 bytes with a fixed layout known at compile time. A dict `{"linear_x": 0.5, "angular_z": 0.1}` must be serialized to bytes (encoding field names, types, values), copied into the buffer, then deserialized on the other side. The typed path skips all of that — it writes the 24 bytes directly.
+
+**Why `from_numpy()` copies but `to_numpy()` does not:** The shared memory pool allocator controls where data lives — each slot is at a specific address within the mmap'd region. A NumPy array created by your application lives at an arbitrary heap address that cannot be shared across processes. So `from_numpy()` copies once into the pool. On the receive side, the data is already in shared memory at a known address, so `to_numpy()` wraps it as a view — no copy.
+
+**Why Python's GC does not affect performance:** Shared memory buffers are mmap'd regions managed by the Rust allocator. Python's garbage collector only tracks the small wrapper objects (a few hundred bytes). The megabytes of actual sensor data are invisible to the GC, so GC pauses do not cause latency spikes in the data path.
+
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| SHM ring buffers | Sub-microsecond latency, no kernel involvement | Platform-specific internals (hidden from Python users) |
+| Typed messages for POD types | Zero-copy, ~1.5 us end-to-end | Must use predefined message types (50+ available) |
+| Dict messages via MessagePack | Any Python object, no schema needed | 3-30x slower than typed messages |
+| Pool-backed large types | Zero-copy views for images and clouds | One copy on publish (`from_numpy()`) |
+| Atomic refcounting for pool slots | Multiple subscribers share one copy | Slots reclaimed only when all refs dropped |
+| Overflow drops oldest | Controller always gets fresh data | Subscribers that fall behind lose messages |
+
+---
+
+## Inspecting Topics at Runtime
+
+```bash
+# List all active topics with backend type and message rate
+horus topic list --verbose
+
+# Watch a topic's messages in real time
+horus topic echo sensor.imu
+
+# Measure publishing rate
+horus topic hz sensor.imu
+
+# Measure bandwidth
+horus topic bw camera.rgb
+
+# See running nodes and their topic connections
+horus node list
+```
+
+---
+
+## See Also
+
+- [Shared Memory (Concepts)](/concepts/shared-memory) — Full architecture: ring buffer internals, backend selection, cache-line layout, SIMD optimization
+- [Python Memory Types](/python/api/memory-types) — Image, PointCloud, DepthImage, Tensor API reference
+- [Python Image](/python/api/image) — Camera image API with encoding table and framework conversions
+- [Tensor](/python/api/tensor) — General-purpose shared memory tensor with Pythonic API
+- [Multi-Process Architecture](/concepts/multi-process) — Cross-process topics, namespace management, mixed-language nodes
+- [Python Bindings](/python/api/python-bindings) — Full Python API: Node, send/recv, topic declaration formats

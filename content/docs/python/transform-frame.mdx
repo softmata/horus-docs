@@ -1,0 +1,586 @@
+---
+title: "TransformFrame Guide (Python)"
+description: "Coordinate frame trees, static and dynamic transforms, lookups, point transforms, staleness, and diagnostics for Python developers"
+order: 16
+---
+
+# TransformFrame Guide (Python)
+
+A camera is mounted 15 cm above and 10 cm forward of the robot's center. A LiDAR is 30 cm above. An object detected in camera coordinates at `[2.0, 0.0, 1.5]` is meaningless to the path planner unless you can express it in the world frame. The path planner does not know where the camera is. It knows where the robot is in the world, and it needs the obstacle in the same frame.
+
+This is what TransformFrame solves. It stores a tree of named coordinate frames, each with a transform relative to its parent, and computes the transform between any two frames in the tree. You register "camera is offset from base_link by X," update "base_link is at this pose in the world," and then ask "where is this camera point in world coordinates?" TransformFrame chains the transforms through the tree and gives you the answer.
+
+```python
+from horus import TransformFrame, Transform
+
+tf_tree = TransformFrame()
+
+# Build the tree: world -> base_link -> camera, lidar
+tf_tree.register_frame("base_link", "world")
+tf_tree.register_static_frame("camera", Transform.from_translation([0.1, 0.0, 0.15]), parent="base_link")
+tf_tree.register_static_frame("lidar", Transform.from_translation([0.0, 0.0, 0.3]), parent="base_link")
+
+# Update robot pose as it moves
+tf_tree.update_transform("base_link", Transform.from_euler([1.5, 2.0, 0.0], [0.0, 0.0, 0.78]))
+
+# Where is a LiDAR detection in the world?
+world_point = tf_tree.transform_point("lidar", "world", [5.0, 0.0, 0.0])
+```
+
+---
+
+## Creating a TransformFrame
+
+The `TransformFrame` constructor takes an optional `TransformFrameConfig` that controls capacity and history depth.
+
+```python
+from horus import TransformFrame, TransformFrameConfig
+
+# Default: 512 frames, 32 history entries per frame
+tf_tree = TransformFrame()
+
+# Custom configuration
+config = TransformFrameConfig(max_frames=256, history_len=64)
+tf_tree = TransformFrame(config=config)
+
+# Presets for common use cases
+tf_tree = TransformFrame.small()    # 256 frames, ~550 KB
+tf_tree = TransformFrame.medium()   # 1024 frames, ~2.2 MB
+tf_tree = TransformFrame.large()    # 4096 frames, ~9 MB
+tf_tree = TransformFrame.massive()  # 16384 frames, ~35 MB
+```
+
+`max_frames` is the maximum number of frames the tree can hold. `history_len` is the number of past transforms stored per dynamic frame, used for temporal interpolation. When the history buffer fills, the oldest entry is dropped.
+
+**Choosing a size**: A simple mobile robot (base, 2 wheels, camera, LiDAR, IMU) needs ~10 frames. A humanoid (30 joints + sensors) needs ~50. A multi-robot system with 10 robots might need 500. `TransformFrame.small()` covers most single-robot systems. Use `TransformFrame.medium()` if you need headroom.
+
+```python
+# Check memory usage before allocating
+config = TransformFrameConfig(max_frames=1024, history_len=32)
+print(config.memory_estimate())  # "~2.2MB"
+```
+
+---
+
+## Building the Frame Tree
+
+Every frame has a name, a parent (except root frames), and a transform from the parent to the child. The tree is built by registering frames with their parent-child relationships.
+
+### Root Frames
+
+A root frame has no parent. Most systems have one root called `"world"`. Register a frame under a root by passing the root name as the parent:
+
+```python
+tf_tree.register_frame("base_link", "world")
+```
+
+If the parent frame does not exist, HORUS raises `HorusNotFoundError`. Register parents before children.
+
+### Static vs Dynamic Frames
+
+This is the most important distinction in the frame tree.
+
+**Static frames** have a fixed transform that never changes at runtime. Sensor mounts, fixed offsets between joints, calibration transforms -- these are static. Register them with `register_static_frame()`, which stores exactly one transform and skips interpolation on lookup:
+
+```python
+from horus import Transform
+
+# Camera is 10cm forward, 15cm up from base_link, fixed forever
+tf_tree.register_static_frame(
+    "camera",
+    Transform.from_translation([0.1, 0.0, 0.15]),
+    parent="base_link",
+)
+
+# LiDAR is 30cm above base_link, slightly tilted
+tf_tree.register_static_frame(
+    "lidar",
+    Transform.from_euler([0.0, 0.0, 0.3], [0.0, 0.05, 0.0]),
+    parent="base_link",
+)
+```
+
+**Dynamic frames** change at runtime. The robot's pose in the world, a pan-tilt head, a rotating joint -- these are dynamic. Register them with `register_frame()`, then call `update_transform()` as new data arrives:
+
+```python
+# Register (no initial transform)
+tf_tree.register_frame("base_link", "world")
+
+# Update as odometry arrives
+tf_tree.update_transform(
+    "base_link",
+    Transform.from_euler([x, y, 0.0], [0.0, 0.0, yaw]),
+)
+```
+
+Dynamic frames store a history of timestamped transforms (controlled by `history_len`). Lookups between timestamps use interpolation.
+
+### Complete Tree Example
+
+A typical mobile robot frame tree:
+
+```python
+from horus import TransformFrame, Transform
+
+tf_tree = TransformFrame()
+
+# Root: world frame (implicit, created when first child registers under it)
+tf_tree.register_frame("base_link", "world")        # Robot body in world
+tf_tree.register_frame("odom", "world")              # Odometry estimate
+
+# Static sensor mounts on the robot body
+tf_tree.register_static_frame("camera_link",
+    Transform.from_translation([0.1, 0.0, 0.15]),
+    parent="base_link")
+tf_tree.register_static_frame("lidar_link",
+    Transform.from_translation([0.0, 0.0, 0.3]),
+    parent="base_link")
+tf_tree.register_static_frame("imu_link",
+    Transform.from_translation([0.0, 0.0, 0.05]),
+    parent="base_link")
+
+# Dynamic: camera on a pan-tilt mount
+tf_tree.register_frame("camera_optical", "camera_link")
+```
+
+---
+
+## Updating Transforms
+
+Call `update_transform()` whenever new pose data arrives. Each call adds a timestamped entry to the frame's history buffer:
+
+```python
+from horus import Transform, get_timestamp_ns
+
+# Basic update (uses current time automatically)
+tf_tree.update_transform("base_link", Transform.from_euler(
+    [x, y, 0.0], [0.0, 0.0, yaw]
+))
+
+# Explicit timestamp (useful when the sensor provides its own timestamp)
+tf_tree.update_transform("base_link",
+    Transform.from_euler([x, y, 0.0], [0.0, 0.0, yaw]),
+    timestamp_ns=sensor_timestamp_ns,
+)
+```
+
+For performance-critical paths, use `update_transform_by_id()` to skip the name-to-ID lookup:
+
+```python
+# Cache the frame ID at init time
+base_id = tf_tree.frame_id("base_link")
+
+# Use the numeric ID in the hot loop
+def odom_tick(node):
+    tf_tree.update_transform_by_id(base_id, new_transform)
+```
+
+### Overwriting Static Transforms
+
+Static transforms are set at registration time. To change one later (e.g., after a recalibration), use `set_static_transform()`:
+
+```python
+# Recalibrate camera offset
+tf_tree.set_static_transform("camera_link",
+    Transform.from_euler([0.105, 0.002, 0.148], [0.001, 0.0, 0.003])
+)
+```
+
+---
+
+## Looking Up Transforms
+
+### Latest Transform
+
+`tf()` returns the most recent transform from the source frame to the target frame. This is the most common operation:
+
+```python
+# Get the transform from lidar to world
+lidar_to_world = tf_tree.tf("lidar_link", "world")
+print(f"LiDAR position in world: {lidar_to_world.translation}")
+```
+
+Under the hood, `tf()` walks the frame tree from source to target, composing transforms along the path. If the two frames share no common ancestor, it raises `HorusTransformError`.
+
+### Historical Transform
+
+`tf_at()` returns the interpolated transform at a specific timestamp. This is essential for sensor fusion, where sensor readings arrive with timestamps that may not align with the latest transform updates:
+
+```python
+# Get the robot's pose at the time the LiDAR scan was captured
+lidar_to_world_at_scan = tf_tree.tf_at("lidar_link", "world", timestamp_ns=scan_timestamp)
+```
+
+Interpolation uses SLERP for rotation and linear interpolation for translation. If the requested timestamp falls outside the history window, `HorusTransformError` is raised.
+
+For strict lookups without interpolation:
+
+```python
+# Exact timestamp match only (no interpolation)
+tf = tf_tree.tf_at_strict("lidar_link", "world", timestamp_ns=exact_ts)
+
+# Interpolation with tolerance window (default 100ms)
+tf = tf_tree.tf_at_with_tolerance("lidar_link", "world",
+    timestamp_ns=ts, tolerance_ns=50_000_000)  # 50ms tolerance
+```
+
+### Checking Availability
+
+Before a blocking lookup, check if the transform path exists:
+
+```python
+if tf_tree.can_transform("lidar_link", "world"):
+    tf = tf_tree.tf("lidar_link", "world")
+    # Use tf...
+
+# Check at a specific timestamp
+if tf_tree.can_transform_at("lidar_link", "world", timestamp_ns=ts):
+    tf = tf_tree.tf_at("lidar_link", "world", timestamp_ns=ts)
+```
+
+### Waiting for Transforms
+
+At startup, transforms may not be available yet (e.g., waiting for the first odometry message). Use `wait_for_transform()` to block until the transform becomes available:
+
+```python
+try:
+    tf = tf_tree.wait_for_transform("lidar_link", "world", timeout_sec=2.0)
+    print(f"Got transform: {tf.translation}")
+except HorusTimeoutError:
+    print("Transform not available within 2 seconds")
+```
+
+For non-blocking waits, use the async variant:
+
+```python
+import concurrent.futures
+
+future = tf_tree.wait_for_transform_async("lidar_link", "world", timeout_sec=5.0)
+
+# Do other work...
+
+try:
+    tf = future.result(timeout=5.0)  # Block only when you need the result
+except concurrent.futures.TimeoutError:
+    print("Still waiting for transform")
+```
+
+---
+
+## Transforming Points and Vectors
+
+The most common use of TransformFrame: transform sensor readings from the sensor's coordinate frame into a frame the rest of the system understands.
+
+### Points
+
+A point has position. `transform_point()` applies translation and rotation:
+
+```python
+# LiDAR detected an obstacle at [5.0, 0.0, 0.0] in lidar coordinates
+# Where is it in the world?
+world_point = tf_tree.transform_point("lidar_link", "world", [5.0, 0.0, 0.0])
+print(f"Obstacle at world: ({world_point[0]:.2f}, {world_point[1]:.2f}, {world_point[2]:.2f})")
+```
+
+### Vectors
+
+A vector has direction but no position. `transform_vector()` applies rotation only (no translation). Use this for velocities, normals, and directions:
+
+```python
+# IMU measures acceleration in its own frame
+# What direction is that in the world frame?
+accel_world = tf_tree.transform_vector("imu_link", "world", [0.0, 0.0, 9.81])
+```
+
+### Batch Pattern
+
+For processing multiple points (e.g., a full LiDAR scan), look up the transform once and apply it to each point:
+
+```python
+def process_scan(node):
+    scan = node.recv("scan")
+    if scan is None:
+        return
+
+    # Look up the transform once
+    lidar_to_world = tf_tree.tf("lidar_link", "world")
+
+    # Apply to each scan point
+    world_points = []
+    for angle, distance in zip(scan.angles, scan.ranges):
+        if distance > 0.0:
+            x = distance * math.cos(angle)
+            y = distance * math.sin(angle)
+            world_pt = lidar_to_world.transform_point([x, y, 0.0])
+            world_points.append(world_pt)
+
+    node.send("obstacles", world_points)
+```
+
+This is more efficient than calling `tf_tree.transform_point()` for each point, because the tree walk and transform composition happen only once.
+
+---
+
+## Staleness Detection
+
+Stale transforms are a real problem. If the odometry node crashes, `base_link` stops updating. Every lookup still succeeds -- it returns the last known transform -- but the robot has moved. You are now working with wrong data.
+
+### Checking Staleness
+
+```python
+# How long since base_link was last updated?
+age = tf_tree.time_since_last_update("base_link")
+if age is not None:
+    print(f"base_link last updated {age:.3f}s ago")
+else:
+    print("base_link has never been updated")
+
+# Convenience: is this frame's data too old?
+if tf_tree.is_stale("base_link", max_age_sec=0.1):
+    print("WARNING: Odometry data is stale!")
+```
+
+### Staleness Guard Pattern
+
+Check staleness before using transforms for control decisions:
+
+```python
+def controller_tick(node):
+    # Safety check: don't navigate with stale odometry
+    if tf_tree.is_stale("base_link", max_age_sec=0.2):
+        node.log_warning("Odometry stale — sending zero velocity")
+        node.send("cmd_vel", horus.CmdVel(linear=0.0, angular=0.0))
+        return
+
+    # Safe to navigate
+    robot_in_world = tf_tree.tf("base_link", "world")
+    cmd = compute_velocity(robot_in_world, goal)
+    node.send("cmd_vel", cmd)
+```
+
+### What "Stale" Means
+
+`time_since_last_update(name)` returns seconds since the last `update_transform()` call for that frame. It returns `None` if the frame was registered but never updated.
+
+`is_stale(name, max_age_sec)` returns `True` if the frame has never been updated or if the last update was longer ago than `max_age_sec`.
+
+Static frames are never stale -- they have no temporal component. `is_stale()` always returns `False` for static frames.
+
+---
+
+## Diagnostics
+
+### Tree Visualization
+
+Print a human-readable tree of all registered frames:
+
+```python
+print(tf_tree.format_tree())
+```
+
+Output:
+
+```
+world
+  base_link [dynamic, age=0.015s]
+    camera_link [static]
+    lidar_link [static]
+    imu_link [static]
+    camera_optical [dynamic, age=0.022s]
+```
+
+### Graphviz Export
+
+Export the frame tree as a DOT graph for rendering with Graphviz:
+
+```python
+dot = tf_tree.frames_as_dot()
+with open("frame_tree.dot", "w") as f:
+    f.write(dot)
+# Render: dot -Tpng frame_tree.dot -o frame_tree.png
+```
+
+### YAML Export
+
+Export the frame tree structure as YAML:
+
+```python
+print(tf_tree.frames_as_yaml())
+```
+
+### Statistics
+
+```python
+stats = tf_tree.stats()
+print(f"Frames: {stats['total_frames']}/{stats['max_frames']}")
+print(f"Static: {stats['static_frames']}, Dynamic: {stats['dynamic_frames']}")
+print(f"Tree depth: {stats['tree_depth']}, Roots: {stats['root_count']}")
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `total_frames` | `int` | Total registered frames |
+| `static_frames` | `int` | Frames that never change |
+| `dynamic_frames` | `int` | Frames updated at runtime |
+| `max_frames` | `int` | Maximum capacity |
+| `history_len` | `int` | Transform history buffer size per frame |
+| `tree_depth` | `int` | Maximum depth of the frame tree |
+| `root_count` | `int` | Number of root frames (no parent) |
+
+### Per-Frame Info
+
+```python
+info = tf_tree.frame_info("camera_link")
+print(f"Frame: {info['name']}, Parent: {info['parent']}, Static: {info['is_static']}")
+```
+
+### Integrity Validation
+
+```python
+if not tf_tree.validate():
+    print("Frame tree integrity check failed!")
+```
+
+`validate()` checks for cycles, orphaned frames, and internal consistency. Returns `True` if the tree is healthy.
+
+---
+
+## Error Handling
+
+| Operation | Exception | When |
+|-----------|-----------|------|
+| `tf_tree.tf("missing", "world")` | `HorusNotFoundError` | Frame not registered |
+| `tf_tree.tf("lidar", "disconnected")` | `HorusTransformError` | No path between frames |
+| `tf_tree.wait_for_transform(..., 1.0)` | `HorusTimeoutError` | Transform not available in time |
+| `tf_tree.register_frame("child", "missing")` | `HorusNotFoundError` | Parent not registered |
+| `tf_tree.unregister_frame("missing")` | `HorusNotFoundError` | Frame does not exist |
+| `tf_tree.tf_at_strict(s, d, old_ts)` | `HorusTransformError` | No exact timestamp match |
+| `Transform.from_matrix(bad)` | `ValueError` | Not a valid 4x4 matrix |
+
+The safe pattern for tick functions:
+
+```python
+from horus import HorusNotFoundError, HorusTransformError
+
+def perception_tick(node):
+    try:
+        lidar_to_world = tf_tree.tf("lidar_link", "world")
+        point_in_world = lidar_to_world.transform_point([5.0, 0.0, 0.0])
+        node.send("obstacle", point_in_world)
+    except HorusNotFoundError:
+        pass  # Frame not yet registered — skip this tick
+    except HorusTransformError as e:
+        node.log_warning(f"Transform failed: {e}")
+```
+
+---
+
+## Complete Example
+
+A mobile robot with IMU, LiDAR, and camera. The odometry node updates `base_link` in the world. The perception node transforms LiDAR detections into world coordinates. Static frames define sensor mounting positions.
+
+```python
+import horus
+from horus import TransformFrame, Transform
+import math
+
+# Global transform tree
+tf_tree = TransformFrame.medium()
+
+def setup_frames(node):
+    """Register all coordinate frames at startup."""
+    tf_tree.register_frame("base_link", "world")
+
+    # Static sensor mounts
+    tf_tree.register_static_frame("lidar_link",
+        Transform.from_translation([0.0, 0.0, 0.3]),
+        parent="base_link")
+    tf_tree.register_static_frame("camera_link",
+        Transform.from_euler([0.1, 0.0, 0.15], [0.0, 0.1, 0.0]),
+        parent="base_link")
+
+tick_count = 0
+
+def odometry_tick(node):
+    """Simulate robot moving in a circle, updating base_link pose."""
+    global tick_count
+    tick_count += 1
+    t = tick_count * 0.01
+
+    x = math.cos(t) * 2.0
+    y = math.sin(t) * 2.0
+    yaw = t + math.pi / 2
+
+    tf_tree.update_transform("base_link",
+        Transform.from_euler([x, y, 0.0], [0.0, 0.0, yaw]))
+
+def perception_tick(node):
+    """Transform LiDAR detections into world coordinates."""
+    if tf_tree.is_stale("base_link", max_age_sec=0.1):
+        node.log_warning("Odometry stale, skipping perception")
+        return
+
+    try:
+        lidar_to_world = tf_tree.tf("lidar_link", "world")
+        # Simulated detection at 5m directly ahead of LiDAR
+        point_in_world = lidar_to_world.transform_point([5.0, 0.0, 0.0])
+        node.send("obstacle_world", point_in_world)
+        node.log_info(f"Obstacle at world: ({point_in_world[0]:.2f}, "
+                       f"{point_in_world[1]:.2f}, {point_in_world[2]:.2f})")
+    except Exception:
+        pass  # Frame not yet available
+
+odom_node = horus.Node(
+    name="odometry",
+    tick=odometry_tick,
+    init=setup_frames,
+    rate=100,
+    pubs=["odom"],
+    order=0,
+)
+
+perception_node = horus.Node(
+    name="perception",
+    tick=perception_tick,
+    rate=10,
+    pubs=["obstacle_world"],
+    order=1,
+)
+
+horus.run(odom_node, perception_node, duration=10)
+```
+
+---
+
+## Design Decisions
+
+**Why a global tree instead of per-node transform state?** Multiple nodes need the same frame data. The perception node needs `lidar_link -> world`. The controller needs `base_link -> world`. The visualizer needs everything. A per-node tree would require broadcasting every transform update to every node, duplicating memory and adding synchronization complexity. A single shared tree, backed by lock-free shared memory, lets all nodes read the same data with no contention.
+
+**Why SLERP for rotation interpolation?** Linear interpolation of quaternions produces non-unit quaternions, which are invalid rotations. SLERP (Spherical Linear Interpolation) follows the shortest arc on the unit sphere, producing valid rotations at every interpolation step. This matters because transform lookups between timestamps use interpolation -- incorrect interpolation means incorrect robot pose, which compounds through the frame tree and produces incorrect world-frame coordinates.
+
+**Why bounded transform history instead of unlimited?** Each dynamic frame stores the last N transforms (configurable via `history_len`). Unlimited history would leak memory in long-running robots. Bounded history means old transforms are discarded -- if you query a timestamp older than the history window, you get a `HorusTransformError`. The default history length covers several seconds at typical update rates, which is sufficient for sensor fusion while keeping memory bounded.
+
+**Why separate static and dynamic frames?** Static frames (sensor mounts, fixed offsets) never change -- storing history for them wastes memory and adds lookup overhead. `register_static_frame()` stores exactly one transform and skips interpolation. Dynamic frames (robot base, moving joints) need timestamped history for interpolation. Separating them lets the system optimize each case: static lookups are O(1) with no interpolation, dynamic lookups use binary search + SLERP.
+
+**Why lock-free shared memory for the frame tree?** Multiple nodes read transforms concurrently (perception, control, visualization). A mutex-protected tree would serialize all readers, creating a bottleneck. The lock-free implementation uses atomic operations so readers never block each other or the writer. The cost is slightly more complex update logic, but the benefit is zero contention in multi-node systems.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| **Single shared tree** -- all nodes see the same transforms | Must manage tree lifecycle carefully; clearing the tree affects everyone |
+| **Lock-free reads** -- zero contention between nodes | Writers pay slightly more overhead for atomic updates |
+| **Bounded history** -- memory usage is predictable | Old timestamps become unavailable; must tune `history_len` for your update rate |
+| **Static frame optimization** -- O(1) lookup, no interpolation | Must decide at registration time; changing a static frame requires `set_static_transform()` |
+| **SLERP interpolation** -- correct rotation at all interpolation points | Slightly more expensive than linear interpolation (~2x per lookup) |
+| **Name-based API** -- readable code (`tf("lidar", "world")`) | String lookup per call; use `frame_id()` + `tf_by_id()` on hot paths |
+
+---
+
+## See Also
+
+- [TransformFrame API Reference](/python/api/transform-frame) -- Full method tables and signatures
+- [TransformFrame Concepts](/concepts/transform-frame) -- Architecture and design of the frame tree system
+- [Recipe: Coordinate Transform Tree](/recipes/transform-frames) -- Copy-paste transform tree setup
+- [Geometry Messages](/python/messages/geometry) -- Pose, Twist, and TransformStamped message types
+- [Python Bindings](/python/api/python-bindings) -- Core Python API reference

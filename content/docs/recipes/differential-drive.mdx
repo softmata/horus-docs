@@ -71,81 +71,135 @@ version = "0.1.0"
 description = "2-wheel differential drive with safe shutdown"
 ```
 
-### src/main.rs
+### src/main.rs (or src/main.py)
 
-```rust
-use horus::prelude::*;
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+    use horus::prelude::*;
 
-/// Robot physical parameters
-const WHEEL_BASE: f32 = 0.3;    // meters between wheels
-const WHEEL_RADIUS: f32 = 0.05; // meters
-const MAX_RPM: f32 = 200.0;     // safety limit
+    /// Robot physical parameters
+    const WHEEL_BASE: f32 = 0.3;    // meters between wheels
+    const WHEEL_RADIUS: f32 = 0.05; // meters
+    const MAX_RPM: f32 = 200.0;     // safety limit
 
-/// Motor output for left and right wheels
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct WheelCmd {
-    left_rpm: f32,
-    right_rpm: f32,
-}
-
-struct DriveNode {
-    cmd_sub: Topic<CmdVel>,
-    wheel_pub: Topic<WheelCmd>,
-    last_cmd: CmdVel,
-}
-
-impl DriveNode {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            cmd_sub: Topic::new("cmd_vel")?,
-            wheel_pub: Topic::new("wheel.cmd")?,
-            last_cmd: CmdVel::default(),
-        })
+    /// Motor output for left and right wheels
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+    #[repr(C)]
+    struct WheelCmd {
+        left_rpm: f32,
+        right_rpm: f32,
     }
-}
 
-impl Node for DriveNode {
-    fn name(&self) -> &str { "Drive" }
+    struct DriveNode {
+        cmd_sub: Topic<CmdVel>,
+        wheel_pub: Topic<WheelCmd>,
+        last_cmd: CmdVel,
+    }
 
-    fn tick(&mut self) {
-        if let Some(cmd) = self.cmd_sub.recv() {
-            self.last_cmd = cmd;
+    impl DriveNode {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                cmd_sub: Topic::new("cmd_vel")?,
+                wheel_pub: Topic::new("wheel.cmd")?,
+                last_cmd: CmdVel::default(),
+            })
+        }
+    }
+
+    impl Node for DriveNode {
+        fn name(&self) -> &str { "Drive" }
+
+        fn tick(&mut self) {
+            if let Some(cmd) = self.cmd_sub.recv() {
+                self.last_cmd = cmd;
+            }
+
+            // Differential drive kinematics: (linear, angular) → (left, right)
+            let v = self.last_cmd.linear;
+            let w = self.last_cmd.angular;
+            let left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+            let right = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+
+            // Convert rad/s to RPM and clamp to safety limit
+            let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
+            let left_rpm = (left * to_rpm).clamp(-MAX_RPM, MAX_RPM);
+            let right_rpm = (right * to_rpm).clamp(-MAX_RPM, MAX_RPM);
+
+            self.wheel_pub.send(WheelCmd { left_rpm, right_rpm });
         }
 
-        // Differential drive kinematics: (linear, angular) → (left, right)
-        let v = self.last_cmd.linear;
-        let w = self.last_cmd.angular;
-        let left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
-        let right = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
-
-        // Convert rad/s to RPM and clamp to safety limit
-        let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
-        let left_rpm = (left * to_rpm).clamp(-MAX_RPM, MAX_RPM);
-        let right_rpm = (right * to_rpm).clamp(-MAX_RPM, MAX_RPM);
-
-        self.wheel_pub.send(WheelCmd { left_rpm, right_rpm });
+        // SAFETY: zero both motors before exiting — prevents runaway
+        fn shutdown(&mut self) -> Result<()> {
+            self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
+            Ok(())
+        }
     }
 
-    // SAFETY: zero both motors before exiting — prevents runaway
-    fn shutdown(&mut self) -> Result<()> {
-        self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
-        Ok(())
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new();
+
+        scheduler.add(DriveNode::new()?)
+            .order(0)
+            .rate(50_u64.hz())     // 50 Hz control loop — auto-enables RT
+            .on_miss(Miss::Warn)
+            .build()?;
+
+        scheduler.run()
     }
-}
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, CmdVel, run, us
+    import math
 
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
+    WHEEL_BASE = 0.3      # meters between wheels
+    WHEEL_RADIUS = 0.05   # meters
+    MAX_RPM = 200.0        # safety limit
 
-    scheduler.add(DriveNode::new()?)
-        .order(0)
-        .rate(50_u64.hz())     // 50 Hz control loop — auto-enables RT
-        .on_miss(Miss::Warn)
-        .build()?;
+    def drive_tick(node):
+        cmd = node.recv("cmd_vel")
+        if cmd is not None:
+            node.state["last_cmd"] = cmd
 
-    scheduler.run()
-}
-```
+        last = node.state.get("last_cmd")
+        if last is None:
+            return
+
+        v = last.linear
+        w = last.angular
+
+        # Differential drive kinematics
+        left_rad = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
+        right_rad = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
+
+        # Convert rad/s to RPM and clamp
+        to_rpm = 60.0 / (2.0 * math.pi)
+        left_rpm = max(-MAX_RPM, min(MAX_RPM, left_rad * to_rpm))
+        right_rpm = max(-MAX_RPM, min(MAX_RPM, right_rad * to_rpm))
+
+        node.send("wheel.cmd", {"left_rpm": left_rpm, "right_rpm": right_rpm})
+
+    def drive_shutdown(node):
+        # SAFETY: zero both motors before exiting
+        node.send("wheel.cmd", {"left_rpm": 0.0, "right_rpm": 0.0})
+
+    drive = Node(
+        name="Drive",
+        tick=drive_tick,
+        shutdown=drive_shutdown,
+        rate=50,
+        order=0,
+        subs=["cmd_vel"],
+        pubs=["wheel.cmd"],
+    )
+
+    run(drive, rt=True)
+    ```
+  </LangTab>
+</LanguageTabs>
 
 ## Odometry: Closing the Loop
 
@@ -276,65 +330,6 @@ fn main() -> Result<()> {
     scheduler.run()
 }
 ```
-
-## Python Equivalent
-
-The same drive node in Python, using `horus.Node` with the callback API:
-
-```python
-import horus
-from horus import Node, CmdVel, run, us
-import math
-
-WHEEL_BASE = 0.3      # meters between wheels
-WHEEL_RADIUS = 0.05   # meters
-MAX_RPM = 200.0        # safety limit
-
-def drive_tick(node):
-    cmd = node.recv("cmd_vel")
-    if cmd is not None:
-        node.state["last_cmd"] = cmd
-
-    last = node.state.get("last_cmd")
-    if last is None:
-        return
-
-    v = last.linear
-    w = last.angular
-
-    # Differential drive kinematics
-    left_rad = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
-    right_rad = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
-
-    # Convert rad/s to RPM and clamp
-    to_rpm = 60.0 / (2.0 * math.pi)
-    left_rpm = max(-MAX_RPM, min(MAX_RPM, left_rad * to_rpm))
-    right_rpm = max(-MAX_RPM, min(MAX_RPM, right_rad * to_rpm))
-
-    node.send("wheel.cmd", {"left_rpm": left_rpm, "right_rpm": right_rpm})
-
-def drive_shutdown(node):
-    # SAFETY: zero both motors before exiting
-    node.send("wheel.cmd", {"left_rpm": 0.0, "right_rpm": 0.0})
-
-drive = Node(
-    name="Drive",
-    tick=drive_tick,
-    shutdown=drive_shutdown,
-    rate=50,
-    order=0,
-    subs=["cmd_vel"],
-    pubs=["wheel.cmd"],
-)
-
-run(drive, rt=True)
-```
-
-**Key differences from Rust**:
-- Python uses `node.recv("topic")` and `node.send("topic", data)` instead of typed `Topic<T>` fields
-- No `#[repr(C)]` — Python topics use `GenericMessage` serialization (slower but flexible)
-- `node.state` is a dict you can use for persistent state across ticks
-- `run()` is the one-liner entry point — no manual `Scheduler` construction needed
 
 ## Understanding the Code
 

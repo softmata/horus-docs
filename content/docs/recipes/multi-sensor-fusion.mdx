@@ -34,108 +34,170 @@ description = "IMU + odometry complementary filter"
 
 ### Complete Code
 
-```rust
-use horus::prelude::*;
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+    use horus::prelude::*;
 
-// Define custom messages with the message! macro (auto-derives Clone, Debug,
-// Serialize, Deserialize, LogSummary + #[repr(C)] for zero-copy transport)
-message! {
-    #[fixed]
-    WheelOdom {
-        x: f32,
-        y: f32,
-        theta: f32,
-        speed: f32,
+    // Define custom messages with the message! macro (auto-derives Clone, Debug,
+    // Serialize, Deserialize, LogSummary + #[repr(C)] for zero-copy transport)
+    message! {
+        #[fixed]
+        WheelOdom {
+            x: f32,
+            y: f32,
+            theta: f32,
+            speed: f32,
+        }
     }
-}
 
-message! {
-    #[fixed]
-    ImuHeading {
-        yaw: f32,
-        yaw_rate: f32,
+    message! {
+        #[fixed]
+        ImuHeading {
+            yaw: f32,
+            yaw_rate: f32,
+        }
     }
-}
 
-message! {
-    #[fixed]
-    FusedPose {
-        x: f32,
-        y: f32,
-        theta: f32,
-        speed: f32,
-        confidence: f32,
-}
+    message! {
+        #[fixed]
+        FusedPose {
+            x: f32,
+            y: f32,
+            theta: f32,
+            speed: f32,
+            confidence: f32,
+    }
 
-// ── Fusion Node ─────────────────────────────────────────────
+    // ── Fusion Node ─────────────────────────────────────────────
 
-struct FusionNode {
-    odom_sub: Topic<WheelOdom>,
-    imu_sub: Topic<ImuHeading>,
-    pose_pub: Topic<FusedPose>,
-    last_odom: Option<WheelOdom>,
-    last_imu: Option<ImuHeading>,
-    alpha: f32,
-}
+    struct FusionNode {
+        odom_sub: Topic<WheelOdom>,
+        imu_sub: Topic<ImuHeading>,
+        pose_pub: Topic<FusedPose>,
+        last_odom: Option<WheelOdom>,
+        last_imu: Option<ImuHeading>,
+        alpha: f32,
+    }
 
-impl FusionNode {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            odom_sub: Topic::new("odom.wheels")?,
-            imu_sub: Topic::new("imu.heading")?,
-            pose_pub: Topic::new("pose.fused")?,
-            last_odom: None,
-            last_imu: None,
-            alpha: 0.7, // favor IMU for heading (less drift than wheels on turns)
+    impl FusionNode {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                odom_sub: Topic::new("odom.wheels")?,
+                imu_sub: Topic::new("imu.heading")?,
+                pose_pub: Topic::new("pose.fused")?,
+                last_odom: None,
+                last_imu: None,
+                alpha: 0.7, // favor IMU for heading (less drift than wheels on turns)
+            })
+        }
+    }
+
+    impl Node for FusionNode {
+        fn name(&self) -> &str { "Fusion" }
+
+        fn tick(&mut self) {
+            // IMPORTANT: always recv() ALL topics every tick to drain buffers
+            if let Some(odom) = self.odom_sub.recv() {
+                self.last_odom = Some(odom);
+            }
+            if let Some(imu) = self.imu_sub.recv() {
+                self.last_imu = Some(imu);
+            }
+
+            // Fuse only when both sources are available
+            let (odom, imu) = match (&self.last_odom, &self.last_imu) {
+                (Some(o), Some(i)) => (o, i),
+                _ => return,
+            };
+
+            // Complementary filter: blend odom heading with IMU heading
+            let fused_theta = (1.0 - self.alpha) * odom.theta + self.alpha * imu.yaw;
+
+            let confidence = if imu.yaw_rate.abs() > 0.5 { 0.6 } else { 0.9 };
+
+            self.pose_pub.send(FusedPose {
+                x: odom.x,
+                y: odom.y,
+                theta: fused_theta,
+                speed: odom.speed,
+                confidence,
+            });
+        }
+    }
+
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new();
+
+        // Execution order: fusion reads both sensors and publishes fused pose
+        scheduler.add(FusionNode::new()?)
+            .order(0)
+            .rate(50_u64.hz())
+            .build()?;
+
+        scheduler.run()
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, run
+
+    ALPHA = 0.7  # favor IMU for heading
+
+    def fusion_init(node):
+        """Initialize cached sensor state."""
+        node.state = {
+            "last_odom": None,
+            "last_imu": None,
+        }
+
+    def fusion_tick(node):
+        s = node.state
+
+        # IMPORTANT: always recv() ALL topics every tick to drain buffers
+        odom = node.recv("odom.wheels")
+        if odom is not None:
+            s["last_odom"] = odom
+
+        imu = node.recv("imu.heading")
+        if imu is not None:
+            s["last_imu"] = imu
+
+        # Fuse only when both sources are available
+        if s["last_odom"] is None or s["last_imu"] is None:
+            return
+
+        odom = s["last_odom"]
+        imu = s["last_imu"]
+
+        # Complementary filter: blend odom heading with IMU heading
+        fused_theta = (1.0 - ALPHA) * odom["theta"] + ALPHA * imu["yaw"]
+        confidence = 0.6 if abs(imu["yaw_rate"]) > 0.5 else 0.9
+
+        node.send("pose.fused", {
+            "x": odom["x"],
+            "y": odom["y"],
+            "theta": fused_theta,
+            "speed": odom["speed"],
+            "confidence": confidence,
         })
-    }
-}
 
-impl Node for FusionNode {
-    fn name(&self) -> &str { "Fusion" }
+    fusion = Node(
+        name="Fusion",
+        init=fusion_init,
+        tick=fusion_tick,
+        rate=50,
+        order=0,
+        subs=["odom.wheels", "imu.heading"],
+        pubs=["pose.fused"],
+    )
 
-    fn tick(&mut self) {
-        // IMPORTANT: always recv() ALL topics every tick to drain buffers
-        if let Some(odom) = self.odom_sub.recv() {
-            self.last_odom = Some(odom);
-        }
-        if let Some(imu) = self.imu_sub.recv() {
-            self.last_imu = Some(imu);
-        }
-
-        // Fuse only when both sources are available
-        let (odom, imu) = match (&self.last_odom, &self.last_imu) {
-            (Some(o), Some(i)) => (o, i),
-            _ => return,
-        };
-
-        // Complementary filter: blend odom heading with IMU heading
-        let fused_theta = (1.0 - self.alpha) * odom.theta + self.alpha * imu.yaw;
-
-        let confidence = if imu.yaw_rate.abs() > 0.5 { 0.6 } else { 0.9 };
-
-        self.pose_pub.send(FusedPose {
-            x: odom.x,
-            y: odom.y,
-            theta: fused_theta,
-            speed: odom.speed,
-            confidence,
-        });
-    }
-}
-
-fn main() -> Result<()> {
-    let mut scheduler = Scheduler::new();
-
-    // Execution order: fusion reads both sensors and publishes fused pose
-    scheduler.add(FusionNode::new()?)
-        .order(0)
-        .rate(50_u64.hz())
-        .build()?;
-
-    scheduler.run()
-}
-```
+    run(fusion, rt=True)
+    ```
+  </LangTab>
+</LanguageTabs>
 
 ### Expected Output
 

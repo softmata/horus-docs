@@ -4,6 +4,7 @@ import Link from "next/link";
 import { FiGithub, FiMenu, FiSearch } from "react-icons/fi";
 import { ThemeToggle } from "./ThemeToggle";
 import { SearchModal } from "./SearchModal";
+import LanguageSelector from "./LanguageSelector";
 import { useState, useEffect } from "react";
 
 interface DocsNavProps {
@@ -79,6 +80,7 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
               </a>
 
               <div className="flex items-center gap-1 ml-1">
+                <LanguageSelector />
                 <ThemeToggle />
                 <a
                   href="https://github.com/softmata/horus"

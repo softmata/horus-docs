@@ -17,6 +17,9 @@ import { compileMDX } from 'next-mdx-remote/rsc';
 import remarkGfm from 'remark-gfm';
 import CodeBlock from '@/components/CodeBlock';
 import Callout from '@/components/Callout';
+import Tabs, { Tab } from '@/components/Tabs';
+import LanguageTabs, { LangTab } from '@/components/LanguageTabs';
+import Details from '@/components/Details';
 import {
   LatencyComparisonChart,
   LatencyScalingChart,
@@ -108,6 +111,14 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
       components: {
         // Callout component for notes, warnings, etc.
         Callout,
+        // Tabs for Rust/Python language switching
+        Tabs,
+        Tab,
+        // Language-aware tabs that sync across all instances on the page
+        LanguageTabs,
+        LangTab,
+        // Collapsible sections for optional content
+        Details,
         // Benchmark charts
         LatencyComparisonChart,
         LatencyScalingChart,
