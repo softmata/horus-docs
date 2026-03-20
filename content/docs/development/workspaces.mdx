@@ -6,9 +6,22 @@ order: 13
 
 # Multi-Crate Workspaces
 
-Real robotics projects outgrow a single crate quickly. You need shared message types that your driver, controller, and main binary all depend on. You need a hardware abstraction layer that multiple nodes consume. You need algorithm libraries that evolve independently from your application logic.
+You need to split your robotics project into multiple crates: shared message types, a hardware abstraction layer, algorithm libraries, and the main binary. HORUS workspaces let you organize these as members that compile together, share dependencies, and reference each other directly, without publishing anything to a registry.
 
-Workspaces let you split your project into multiple crates that compile together, share dependencies, and reference each other directly — without publishing anything to a registry.
+## When To Use This
+
+- Your project has shared message types used by multiple crates
+- You need a driver abstraction layer that separates hardware from application logic
+- Algorithm libraries (PID, SLAM, path planning) should be reusable across projects
+- Build times are slow because the entire project recompiles on every change
+
+**Use a single-file project instead** if you are prototyping or have a simple system with all nodes in one file.
+
+## Prerequisites
+
+- A HORUS project initialized with `horus new <name> --workspace`
+- Familiarity with [horus.toml](/concepts/horus-toml) (workspace and member configuration)
+- Familiarity with Rust crate structure (`src/lib.rs`, `src/main.rs`)
 
 ## Why Workspaces
 
@@ -199,13 +212,6 @@ cargo test --workspace         # Test everything
 cargo clippy --workspace       # Lint everything
 ```
 
----
-
-## See Also
-
-- [horus.toml](/concepts/horus-toml) — Project manifest
-- [CLI Reference](/development/cli-reference) — Build and run commands
-
 ## Generated Build Files
 
 Horus generates native build files in `.horus/` from your `horus.toml` declarations. You should never edit these directly:
@@ -372,20 +378,51 @@ fn main() -> Result<()> {
         turn_speed: 1.0,
     };
 
-    Scheduler::new()
-        .add("lidar_node", |ctx| {
-            let scan_pub: Publisher<LaserScan> = ctx.advertise("scan")?;
-            // Read from hardware or simulation
-            Ok(())
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz());
+    sched.add(LidarNode::new()?).order(0).build()?;
+    sched.add(Controller::new()?).order(1).build()?;
+    sched.run()
+}
+
+struct LidarNode {
+    scan_pub: Topic<LaserScan>,
+}
+
+impl LidarNode {
+    fn new() -> Result<Self> {
+        Ok(Self { scan_pub: Topic::new("scan")? })
+    }
+}
+
+impl Node for LidarNode {
+    fn name(&self) -> &str { "lidar_node" }
+    fn tick(&mut self) {
+        let scan = LaserScan::new();
+        self.scan_pub.send(scan);
+    }
+}
+
+struct Controller {
+    scan_sub: Topic<LaserScan>,
+    cmd_pub: Topic<CmdVel>,
+}
+
+impl Controller {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan_sub: Topic::new("scan")?,
+            cmd_pub: Topic::new("cmd_vel")?,
         })
-        .add("controller", |ctx| {
-            let scan_sub: Subscriber<LaserScan> = ctx.subscribe("scan")?;
-            let cmd_pub: Publisher<CmdVel> = ctx.advertise("cmd_vel")?;
-            // Use avoider.compute() to generate commands
-            Ok(())
-        })
-        .build()?
-        .run()
+    }
+}
+
+impl Node for Controller {
+    fn name(&self) -> &str { "controller" }
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_sub.recv() {
+            self.cmd_pub.send(CmdVel::new(0.5, 0.0));
+        }
+    }
 }
 ```
 
@@ -420,3 +457,22 @@ horus build                    # Compiles messages, driver, controller, then my-
 horus run -p my-robot          # Runs the main binary
 horus test                     # Tests all crates
 ```
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `unresolved import` for a workspace member | Member not added as a path dependency | Add `my-member = { path = "../member" }` to the consuming crate's `horus.toml` |
+| `workspace = true` not resolving | Dependency not declared in root `[workspace.dependencies]` | Add the dependency to the root `horus.toml` `[workspace.dependencies]` table |
+| `horus build` compiles everything every time | Source directory symlinks or timestamps changing | Ensure `.horus/` generated `Cargo.toml` points to correct `../../crates/` paths |
+| Member not included in build | Glob pattern does not match directory | Check `members = ["crates/*"]` matches your directory structure, or add explicit member paths |
+| Feature merge conflicts | Same dependency with different features across members | Centralize features in `[workspace.dependencies]` and use `workspace = true` everywhere |
+
+---
+
+## See Also
+
+- [horus.toml](/concepts/horus-toml) — Project manifest format for workspaces and members
+- [CLI Reference](/development/cli-reference) — `horus build`, `horus run -p`, and workspace commands
+- [Native Tool Integration](/development/native-tools) — Using `cargo` natively inside HORUS workspaces
+- [Package Management](/package-management/package-management) — Publishing workspace members to the registry

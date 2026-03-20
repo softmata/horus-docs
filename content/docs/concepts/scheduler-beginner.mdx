@@ -290,34 +290,48 @@ If you don't set `.on_miss()`, the default is `Miss::Warn` — the scheduler log
 
 Not all nodes have the same workload. A motor controller needs microsecond-precise timing. A path planner needs heavy CPU computation. A cloud uploader needs network I/O. Running them all the same way wastes resources and creates bottlenecks.
 
-The scheduler assigns each node an **execution class** that determines how it runs:
+<Callout type="tip">
+**You don't need to memorize this section to get started.** Just use `.order()` and optionally `.rate()` — the scheduler picks the right execution strategy automatically. Come back here when you have nodes with very different workload patterns.
+</Callout>
 
-| Class | How it runs | Auto-detected when you set | Use for |
-|-------|------------|---------------------------|---------|
-| **BestEffort** | Sequential in main loop | Default (no special config) | Logging, telemetry, display |
-| **Rt** | Dedicated thread | `.rate()`, `.budget()`, or `.deadline()` | Motor control, safety, sensor fusion |
-| **Compute** | Thread pool | `.compute()` | Path planning, SLAM, image processing |
-| **Event** | Wakes on topic message | `.on("topic_name")` | Emergency stop, command handlers |
-| **AsyncIo** | Tokio runtime | `.async_io()` | Cloud upload, HTTP, database |
+The scheduler assigns each node an **execution class** based on how you configure it. You describe *what you need*, the scheduler figures out *how to run it*:
 
-You don't pick a class directly — the scheduler infers it from how you configure the node:
+| What you configure | What the scheduler does | Example use case |
+|--------------------|------------------------|-----------------|
+| Nothing special | Runs sequentially in main loop | Logging, telemetry |
+| `.rate(1000.hz())` | Gives a dedicated real-time thread | Motor control, sensor fusion |
+| `.compute()` | Offloads to a CPU thread pool | Path planning, SLAM |
+| `.on("topic")` | Only wakes when that topic has new data | Emergency stop handler |
+| `.async_io()` | Runs on an async (Tokio) executor | Cloud upload, HTTP, database |
 
 ```rust
-// BestEffort (default) — no special config
+// Just order — runs in the main loop (simplest)
 scheduler.add(logger).order(2).build()?;
 
-// Rt — auto-detected from .rate()
+// Add rate — scheduler auto-creates a dedicated RT thread
 scheduler.add(motor).order(1).rate(1000_u64.hz()).build()?;
 
-// Compute — explicitly marked
+// Heavy CPU work — scheduler sends it to the thread pool
 scheduler.add(planner).order(1).compute().build()?;
 
-// Event — triggered by a topic message
+// Only run when emergency data arrives
 scheduler.add(estop).order(0).on("emergency.stop").build()?;
 ```
 
-<Callout type="tip">
-You don't need to understand execution classes to get started. Just use `.order()` and `.rate()` and the scheduler picks the right class. Execution classes become important when you have nodes with very different workload patterns and need to optimize resource usage.
+The key insight: **`.rate()` is the trigger for real-time behavior.** When you say "this node needs to run at 1000 Hz," the scheduler knows it needs a dedicated thread with timing guarantees — you don't have to request that explicitly. For deeper coverage of all five classes, see [Execution Classes](/concepts/execution-classes).
+
+## Common Pitfalls
+
+<Callout type="warning">
+
+**Setting `.rate()` auto-enables real-time.** If you set `.rate(100.hz())`, the scheduler gives the node a dedicated thread, an auto-derived budget (80% of the period), and an auto-derived deadline (95%). This is usually what you want, but if you just wanted a slower tick without RT overhead, set the tick rate on the scheduler instead: `Scheduler::new().tick_rate(100.hz())`.
+
+**Shutdown order is reversed.** Nodes shut down in reverse add-order. If your motor controller (added second) depends on sensor data (added first), the motor controller shuts down first — so it can stop motors while sensor data is still available. If you add them in the wrong order, the sensor disconnects while motors are still running.
+
+**`tick()` must return quickly.** Never `sleep()`, loop forever, or do blocking I/O inside `tick()`. The scheduler calls `tick()` thousands of times per second — if it blocks, every other node in the system stalls. Use `.async_io()` for I/O or `.compute()` for heavy CPU work.
+
+**Topic names must use dots, not slashes.** `"sensors.camera"` works on all platforms. `"sensors/camera"` fails on macOS (where `shm_open` doesn't support slashes). See [Topic Naming](/concepts/core-concepts-topic#use-dots-not-slashes).
+
 </Callout>
 
 ## A Complete Example

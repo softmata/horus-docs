@@ -52,6 +52,64 @@ horus monitor --tui
 horus monitor --reset-password
 ```
 
+## How It Works
+
+The monitor is a read-only observer that attaches to a running HORUS application without modifying its behavior. It reads data that the scheduler already writes as part of normal operation.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        HORUS Application                            │
+│                                                                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                          │
+│  │  Node A  │  │  Node B  │  │  Node C  │    Scheduler writes      │
+│  │  tick()  │  │  tick()  │  │  tick()  │    NodeMetrics + topic    │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘    metadata to SHM       │
+│       │              │              │         after each tick cycle  │
+│       ▼              ▼              ▼                                │
+│  ┌──────────────────────────────────────────┐                       │
+│  │           Shared Memory (SHM)            │                       │
+│  │  ┌────────────┐  ┌───────────────────┐   │                       │
+│  │  │ NodeMetrics │  │ Topic Ring Buffers│   │                       │
+│  │  │  per node   │  │   headers + data  │   │                       │
+│  │  └────────────┘  └───────────────────┘   │                       │
+│  └──────────────────────┬───────────────────┘                       │
+└─────────────────────────┼───────────────────────────────────────────┘
+                          │
+            mmap read-only│  (no copies, no syscalls)
+                          │
+┌─────────────────────────┼───────────────────────────────────────────┐
+│         horus monitor   │                                           │
+│                         ▼                                           │
+│  ┌──────────────────────────────────┐                               │
+│  │        SHM Reader (mmap)         │  Reads NodeMetrics, topic     │
+│  │   /proc scan for node discovery  │  headers, log buffer          │
+│  └──────┬───────────────┬───────────┘                               │
+│         │               │                                           │
+│   ┌─────▼─────┐   ┌────▼──────────────────────┐                    │
+│   │  TUI Mode │   │       Web Mode             │                    │
+│   │  ratatui  │   │  ┌──────────┐ ┌──────────┐ │                    │
+│   │  redraws  │   │  │  Axum    │ │WebSocket │ │                    │
+│   │  at 4 Hz  │   │  │  HTTP    │ │  push    │ │                    │
+│   │           │   │  │  server  │ │  at 4 Hz │ │                    │
+│   └───────────┘   │  └──────────┘ └──────────┘ │                    │
+│                   └────────────────────────────-┘                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Data flow step by step:**
+
+1. **Scheduler writes metrics** -- After each tick cycle, the scheduler updates `NodeMetrics` (tick count, duration, deadline misses) in the node's SHM region. Topic ring buffer headers already contain pub/sub counts, pending messages, and drop counts as part of normal IPC operation.
+
+2. **Monitor reads via mmap** -- The monitor process opens the same SHM files read-only via `mmap`. This is a pointer dereference, not a copy -- reads hit L1 cache when the data is recent. The monitor scans `/proc` to discover running node processes and reads the SHM topics directory to enumerate active topics.
+
+3. **Web UI via Axum** -- In web mode, an Axum HTTP server runs on a separate thread. REST endpoints (`/api/nodes`, `/api/topics`, `/api/graph`) return JSON snapshots. A WebSocket at `/api/ws` pushes live updates to connected browsers at 4 Hz (every 250ms).
+
+4. **TUI via ratatui** -- In TUI mode, a crossterm/ratatui terminal UI polls for keyboard input at 100ms intervals and refreshes the display at 250ms intervals (4 Hz). No HTTP server is started.
+
+<Callout type="info">
+The monitor never writes to SHM regions used by the application. The only write it performs is setting a verbose flag on a topic's SHM header when you enable topic debug logging from the TUI -- this is a single byte that the topic checks on each `send()`/`recv()`.
+</Callout>
+
 ## Web Interface
 
 The web monitor has **3 main tabs**:
@@ -73,6 +131,28 @@ A **status bar** at the top always shows:
 - Active Nodes count (hover for node list)
 - Active Topics count (hover for topic list)
 - Monitor port
+
+**What the dashboard looks like:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  [Monitor]  [Parameters]  [Packages]       ● 5 Nodes  ● 8 Topics │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─ Nodes ──────────────────┐  ┌─ Topics ──────────────────┐  │
+│   │  ● imu_driver     [RT]   │  │  sensors.imu    4 msgs    │  │
+│   │  ● camera_node    [Comp] │  │  sensors.lidar  12 msgs   │  │
+│   │  ● slam_engine    [RT]   │  │  cmd_vel        1 msg     │  │
+│   │  ● planner        [Comp] │  │  map.grid       0 msgs    │  │
+│   │  ● motor_driver   [RT]   │  │  odom           2 msgs    │  │
+│   └──────────────────────────┘  └────────────────────────────┘  │
+│                                                                 │
+│   [List View]  [Graph View]                                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+In **Graph View**, nodes appear as circles and topics as labeled connection points. Arrows show publish direction. Hovering a node highlights all of its connected topics.
 
 ### Parameters Tab
 
@@ -114,11 +194,66 @@ The TUI provides **8 tabs** navigated with arrow keys:
 | **Params** | Runtime parameter editor |
 | **Recordings** | Session recordings browser |
 
+**What the TUI looks like:**
+
+```
+┌─ HORUS Monitor ──────────────────────────────────────────────┐
+│ [Overview] [Nodes] [Topics] [Network] [TF] [Pkg] [Par] [Rec]│
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  System Health: OK           Uptime: 00:14:32               │
+│  Active Nodes: 5/5           Tick Rate: 100 Hz              │
+│                                                              │
+│  ┌─ Node Status ────────────────────────────────────────┐   │
+│  │  imu_driver     ████████████████████░░  92% budget   │   │
+│  │  camera_node    ██████████░░░░░░░░░░░░  45% budget   │   │
+│  │  slam_engine    ██████████████████░░░░  78% budget    │   │
+│  │  planner        ████████░░░░░░░░░░░░░░  35% budget   │   │
+│  │  motor_driver   ██████████████░░░░░░░░  62% budget    │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌─ Log ─────────────────────────────────────────────── ┐   │
+│  │  14:32:01 [INFO] imu_driver: tick 142800 (0.4ms)     │   │
+│  │  14:32:01 [INFO] slam_engine: map updated (2.1ms)    │   │
+│  │  14:32:01 [WARN] camera_node: frame dropped          │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ← → Navigate tabs  ↑ ↓ Select  Enter: Details  q: Quit    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Navigate between tabs with left/right arrow keys. Within each tab, use up/down arrows to select items, Enter to open detail panels, and Esc to close them. Press `q` to quit, `p` to pause/resume updates, `?` to show the help overlay.
+
 ### Topic Debug Logging
 
 In the **Topics** tab, press **Enter** on any topic to enable runtime debug logging. All `send()` and `recv()` calls on that topic will emit live log entries showing direction, IPC latency, and message summaries (if `LogSummary` is implemented). Press **Esc** to disable logging — zero overhead resumes immediately.
 
 No code changes or recompilation required.
+
+## Performance Overhead
+
+The monitor is designed to be always-on during development with negligible impact on your application.
+
+| Component | Overhead | Notes |
+|-----------|----------|-------|
+| SHM metric reads | Sub-microsecond | mmap pointer dereference, hits L1/L2 cache |
+| `/proc` node scan | ~1ms per scan | Runs at 4 Hz in the monitor process, not in your application |
+| HTTP server (Axum) | Own thread | Separate OS thread, does not compete with RT node threads |
+| WebSocket push | 4 Hz (250ms) | JSON serialization of node/topic snapshots, ~2-5 KB per push |
+| TUI redraw | 4 Hz (250ms) | Terminal write in monitor process only, event polling at 10 Hz |
+| Topic debug logging | ~100ns per `send()`/`recv()` | Only when verbose is enabled on a specific topic. Writes one log entry per call to the global log buffer |
+| Parameter reads | ~50ns | Lock-free atomic reads from `RuntimeParams` SHM |
+| **Total on application** | **Less than 0.1% CPU** | Monitor runs as a separate process. The only cost inside your application is the metric writes the scheduler already does |
+
+<Callout type="info">
+The scheduler writes `NodeMetrics` regardless of whether the monitor is running -- this data is used internally for deadline enforcement and watchdog detection. Running `horus monitor` adds zero overhead to your application's hot path. The monitor process itself typically uses 1-3% of a single CPU core.
+</Callout>
+
+**When does overhead increase?**
+
+- **Topic debug logging**: Enabling verbose mode on a high-frequency topic (e.g., 1 kHz IMU) adds log entries at that rate. Each entry is ~100ns, but at 1 kHz that is 100 microseconds per second -- still negligible, but visible in profiling.
+- **Many WebSocket clients**: Each connected browser receives the full snapshot. With 10+ simultaneous browser tabs, JSON serialization time may reach ~1ms per push cycle.
+- **Parameter writes**: Setting parameters from the web UI triggers a write to the params SHM. This is a one-time cost per edit, not a recurring overhead.
 
 ## Network Access
 
@@ -265,6 +400,56 @@ The monitor exposes a REST API (authenticated when a password is set):
 | Locked out of password | Forgotten password | Run `horus monitor --reset-password` or delete `~/.horus/dashboard_password.hash` |
 | TUI rendering broken | Terminal does not support 256 colors | Use a modern terminal (kitty, alacritty, wezterm) or try `TERM=xterm-256color horus monitor --tui` |
 | API returns 401 Unauthorized | Session expired or invalid token | Re-authenticate via `/api/login` endpoint |
+
+## Design Decisions
+
+### Why SHM-based, not network-based
+
+Traditional monitoring tools (e.g., Prometheus exporters, ROS2 introspection) add network hops to collect metrics. HORUS chose shared memory because:
+
+- **Zero overhead when not monitoring.** The scheduler writes `NodeMetrics` to SHM regardless -- it uses the same data for deadline enforcement. No extra serialization, no sockets, no packets.
+- **No configuration.** The monitor auto-discovers running nodes by scanning `/proc` and the SHM topics directory. No need to configure exporters, ports, or scrape endpoints.
+- **Works offline.** SHM monitoring works without any network stack, which matters on embedded systems and in containers without network access.
+
+If you need to send metrics to an external system (Grafana, Prometheus, Datadog), use [Telemetry Export](/development/telemetry) -- it reads the same SHM data and forwards it over the network.
+
+### Why both Web and TUI
+
+The monitor provides two interfaces because robots are developed and deployed in different environments:
+
+- **Web UI** is for development machines with a browser available. It supports the interactive graph view, drag-and-drop parameter files, and multiple team members can open it simultaneously from different devices on the network.
+- **TUI** is for SSH sessions into headless robots, CI environments, and embedded systems. It requires only a terminal -- no browser, no X11, no port forwarding. The TUI has feature parity with the web UI for reading data (nodes, topics, params, logs) and additionally supports topic debug logging via mmap.
+
+Both interfaces read from the same SHM data source. You can run them simultaneously -- `horus monitor` in one terminal for the web UI and `horus monitor --tui` in another for the TUI.
+
+### Why password auth, not tokens or mTLS
+
+The monitor uses simple password-based sessions (Argon2id hashing, 256-bit random session tokens) instead of API keys, OAuth, or mutual TLS:
+
+- **Single-user tool.** The monitor is typically accessed by one developer or a small team on a local network. OAuth and mTLS add complexity with no benefit.
+- **No external dependencies.** Password hashing is done locally with Argon2id. No identity provider, no certificate authority, no token refresh flows.
+- **Quick setup.** First run prompts for a password. No config files, no key generation, no certificate management.
+
+For production deployments exposed to the internet, place a reverse proxy with TLS (e.g., nginx) in front of the monitor rather than building TLS into the monitor itself.
+
+### Why read-only access to SHM
+
+The monitor opens SHM files with read-only mmap. It cannot modify topic buffers, corrupt node state, or interfere with the scheduler. The single exception is the topic verbose flag (one byte per topic), which enables debug logging. This is intentional:
+
+- **Safety.** A monitoring tool must never be able to crash or corrupt the system it observes. Read-only mmap enforces this at the OS level.
+- **No synchronization needed.** The monitor reads atomic counters and ring buffer headers that the scheduler writes. No locks, no contention, no priority inversion risk for RT nodes.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| SHM-based monitoring | Zero overhead, no network config, works offline | Only works on the same machine (use Telemetry Export for remote) |
+| Separate monitor process | Cannot crash the application, clean resource isolation | Must be started separately (`horus monitor`), adds one process |
+| Web + TUI dual interface | Works everywhere: browser, SSH, headless, embedded | Two codebases to maintain, feature parity requires discipline |
+| Password auth (not mTLS) | Simple setup, no PKI infrastructure needed | No per-user access control, no audit trail beyond rate limiting |
+| Read-only SHM access | Cannot corrupt application state, no lock contention | Cannot inject test data or modify parameters from the SHM side (uses params API instead) |
+| 4 Hz refresh rate | Smooth real-time feel without CPU waste | Cannot capture sub-250ms transient events (use BlackBox or topic debug logging for those) |
+| `/proc` scan for node discovery | Works without any registration protocol | Linux-specific, ~1ms per scan, may show stale entries briefly after node crash |
 
 ---
 

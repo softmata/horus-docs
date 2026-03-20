@@ -390,6 +390,45 @@ from horus import get_timestamp_ns
 now = get_timestamp_ns()
 ```
 
+## Error Handling
+
+| Operation | Exception | When |
+|-----------|-----------|------|
+| `tf_tree.tf("missing", "world")` | `HorusNotFoundError` | Frame not registered |
+| `tf_tree.tf("lidar", "disconnected_tree")` | `HorusTransformError` | No path between frames |
+| `tf_tree.wait_for_transform(..., timeout_sec=1.0)` | `HorusTimeoutError` | Transform not available within timeout |
+| `tf_tree.unregister_frame("missing")` | `HorusNotFoundError` | Frame doesn't exist |
+| `tf_tree.register_frame("child", "missing_parent")` | `HorusNotFoundError` | Parent frame not registered |
+| `tf_tree.tf_at_strict(src, dst, stale_ts)` | `HorusTransformError` | No exact timestamp match |
+| `Transform.from_matrix(bad_matrix)` | `ValueError` | Not a valid 4x4 matrix |
+
+```python
+from horus import HorusNotFoundError, HorusTransformError, HorusTimeoutError
+
+# Safe transform lookup
+try:
+    tf = tf_tree.tf("lidar", "world")
+    point_in_world = tf.transform_point([5.0, 0.0, 0.0])
+except HorusNotFoundError:
+    pass  # Frame not yet registered — skip this tick
+except HorusTransformError as e:
+    print(f"Transform failed: {e}")  # Stale data or disconnected tree
+```
+
+---
+
+## Design Decisions
+
+**Why SLERP for rotation interpolation?** Linear interpolation of quaternions produces non-unit quaternions (invalid rotations). SLERP (Spherical Linear Interpolation) follows the shortest arc on the unit sphere, producing valid rotations at every interpolation step. This matters because transform lookups between timestamps use interpolation — incorrect interpolation means incorrect robot pose, which compounds through the frame tree.
+
+**Why bounded transform history instead of unlimited?** Each frame stores the last N transforms (configurable via `history_len`). Unlimited history would leak memory in long-running robots. Bounded history means old transforms are discarded — if you query a timestamp older than the history window, you get a `HorusTransformError`. The default history length (64) covers ~1 second at typical update rates, which is sufficient for sensor fusion and safe enough for memory.
+
+**Why separate static and dynamic frames?** Static frames (sensor mounts, fixed offsets) never change — storing history for them wastes memory and adds lookup overhead. `register_static_frame()` stores exactly one transform and skips interpolation. Dynamic frames (robot base, moving joints) need timestamped history for interpolation. Separating them lets the system optimize each case: static lookups are O(1) with no interpolation, dynamic lookups use binary search + SLERP.
+
+**Why lock-free shared memory for the frame tree?** Multiple nodes read transforms concurrently (perception, control, visualization). A mutex-protected tree would serialize all readers, creating a bottleneck. The lock-free implementation uses atomic operations so readers never block each other or the writer. The cost is slightly more complex update logic, but the benefit is zero contention in multi-node systems.
+
+---
+
 ## See Also
 
 - [TransformFrame Concepts](/concepts/transform-frame) — Architecture and design

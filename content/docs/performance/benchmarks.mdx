@@ -1,841 +1,353 @@
 ---
 title: Benchmarks
-description: Performance testing with real robotics workloads
+description: Measured IPC latency, throughput, and real-time performance on real hardware
 order: 26
-category: "internals"
 ---
 
-# HORUS Benchmarks
+# Benchmarks
 
-Performance validation with real-world robotics workloads.
+All numbers on this page are **measured values** from the HORUS benchmark suite, not estimates. Run on **Intel i9-14900K (32 cores), WSL2, release mode, RDTSC cycle-accurate timing** on 2026-03-20.
+
+Reproduce on your hardware:
+```bash
+cargo run --release -p horus_benchmarks --bin all_paths_latency
+```
+
+---
 
 ## Quick Reference
 
-| Transport | Latency | Throughput | Use Case |
-|-----------|---------|------------|----------|
-| Same-thread | ~23 ns | 40M+ msg/s | In-process pipeline |
-| Cross-thread 1:1 | ~155 ns | 10M+ msg/s | Multi-threaded nodes |
-| Cross-process 1:1 | ~180 ns | 5M+ msg/s | Multi-process systems |
-| CmdVel (motor control) | ~500 ns | 2.7M msg/s | 1000 Hz control loops |
-| IMU (sensor fusion) | ~940 ns | 1.8M msg/s | 100 Hz sensor data |
-| LaserScan (2D lidar) | ~2.2 us | 633K msg/s | 10 Hz perception |
-| PointCloud 10K pts | ~360 us | 4.7K msg/s | 30 Hz 3D perception |
-| Python typed msg | ~1.5 us | N/A | AI/ML nodes |
+| Transport | p50 | Throughput | Use Case |
+|-----------|-----|-----------|----------|
+| Same-thread | **14ns** | 100M+ msg/s | In-process pipeline |
+| Cross-thread 1:1 | **82ns** | 13M+ msg/s | Multi-threaded nodes |
+| Cross-thread N:N | **182ns** | 8M+ msg/s | Multi-producer/consumer |
+| Cross-process 1:1 | **162ns** | 5M+ msg/s | Multi-process systems |
+| Cross-process broadcast | **165ns** | 5M+ msg/s | Latest-value broadcast |
+| CmdVel (16B) | **89ns** | 11.1M msg/s | Motor control at 1kHz+ |
+| Imu (304B) | **119ns** | 7.8M msg/s | Sensor fusion at 500Hz+ |
+| LaserScan (1.5KB) | **151ns** | 6.3M msg/s | Lidar at 10-40Hz |
+| Python typed msg | **1.7μs** | 2.7M msg/s | ML inference nodes |
+| HORUS vs Raw UDP | **54x faster** | — | 23ns vs 1,235ns |
 
 ---
 
-## Benchmark Methodology
+## IPC Latency — All Backend Paths
 
-### Measurement Approach
-- **Statistical sampling**: Criterion.rs with 20+ samples per measurement
-- **Confidence intervals**: Min/mean/max with outlier detection
-- **Controlled methodology**: 1s warm-up, 5s measurement phases
-- **Reproducible**: Less than 1% variance across measurements
-- **Comprehensive coverage**: 5 workload types, 4 scalability points
+Measured with `all_paths_latency`: 100,000 iterations per scenario, RDTSC timing with 6ns overhead subtracted, Tukey IQR outlier removal, bootstrap 95% confidence intervals.
 
-### Workload Testing
-- **Real workloads**: Control loops, sensor fusion, I/O operations
-- **Fault injection**: Failure policy recovery testing
-- **Scale testing**: Validated up to 200 concurrent nodes
-- **Mixed patterns**: Combined blocking/non-blocking operations
-- **Long-running**: 25+ second failure recovery tests
+### Intra-Process
 
-## Executive Summary
+| Scenario | Backend | p50 | p95 | p99 | p99.9 | max | CV |
+|----------|---------|-----|-----|-----|-------|-----|----|
+| Same thread | DirectChannel | **14ns** | 14ns | 14ns | 14ns | 14ns | 0.000 |
+| Cross-thread 1:1 | SpscIntra | **82ns** | 84ns | 85ns | 86ns | 86ns | 0.018 |
+| Cross-thread 1:N | SpmcIntra | **95ns** | 113ns | 119ns | 122ns | 122ns | 0.089 |
+| Cross-thread N:1 | MpscIntra | **178ns** | 282ns | 317ns | 333ns | 335ns | 0.302 |
+| Cross-thread N:N | MpmcIntra | **182ns** | 312ns | 354ns | 370ns | 371ns | 0.338 |
 
-**HORUS delivers sub-microsecond to low-microsecond latency for production robotics applications:**
+### Cross-Process
 
-| Message Type | Size | Latency (Topic N:N) | Throughput | Typical Rate | Headroom |
-|--------------|------|---------------|------------|--------------|----------|
-| **CmdVel** | 16 B | **~500 ns** | 2.7M msg/s | 1000 Hz | 2,700x |
-| **BatteryState** | 104 B | **~600 ns** | 1.67M msg/s | 1 Hz | 1.67M x |
-| **IMU** | 304 B | **~940 ns** | 1.8M msg/s | 100 Hz | 18,000x |
-| **Odometry** | 736 B | **~1.1 μs** | 1.3M msg/s | 50 Hz | 26,000x |
-| **LaserScan** | 1.5 KB | **~2.2 μs** | 633K msg/s | 10 Hz | 63,300x |
-| **PointCloud (1K)** | ~12 KB | **~12 μs** | 83K msg/s | 30 Hz | 2,767x |
-| **PointCloud (10K)** | ~120 KB | **~360 μs** | 4.7K msg/s | 30 Hz | 157x |
+| Scenario | Backend | p50 | p95 | p99 | p99.9 | max |
+|----------|---------|-----|-----|-----|-------|-----|
+| 1 pub, 1 sub | SpscShm | **162ns** | 182ns | 191ns | 195ns | 196ns |
+| 2 pub, 2 sub (broadcast) | PodShm | **165ns** | 217ns | 246ns | 264ns | 291ns |
 
-<LatencyComparisonChart />
+### Hardware Floor
 
+| Operation | p50 | What it measures |
+|-----------|-----|------------------|
+| Raw SHM atomic (cross-process) | **63ns** | Kernel/hardware minimum for cross-process |
+| Raw memcpy 8B | **11ns** | Cache-to-cache copy |
+| Raw memcpy 1KB | **17ns** | L1 cache bandwidth |
+| Raw memcpy 8KB | **49ns** | L2 cache bandwidth |
+| Raw memcpy 64KB | **811ns** | RAM bandwidth |
+| Atomic store+load | **11ns** | Single atomic round-trip |
 
----
+### Framework Overhead
 
-## Performance Highlights
+| Path | Total | Hardware floor | HORUS overhead |
+|------|-------|---------------|----------------|
+| Cross-process 1:1 (SpscShm) | 162ns | 63ns | **99ns** |
+| Cross-process broadcast (PodShm) | 165ns | 63ns | **102ns** |
 
-### Key Findings
-
-**Sub-microsecond latency** for messages up to 1.5KB
-**Serde integration** works flawlessly with complex nested structs
-**Linear scaling** with message size (predictable performance)
-**Massive headroom** for all typical robotics frequencies
-
-### Production Readiness
-
-- **Real-time control**: ~500 ns latency supports 1000Hz+ control loops with 2,700x headroom
-- **Sensor fusion**: Mixed workload maintains sub-microsecond performance (648 ns avg)
-- **Perception pipelines**: 10K point clouds @ 30Hz with 189x headroom
-- **Multi-robot systems**: Throughput supports 100+ robots on single node
+HORUS adds ~100ns over the hardware minimum for cross-process IPC. This covers: ring buffer indexing, sequence number management, epoch checking, and backend dispatch.
 
 ---
 
-## Detailed Results
+## Robotics Message Types
 
-### CmdVel (Motor Control Command)
+Measured with `robotics_messages_benchmark`: 50,000 iterations, cross-thread producer/consumer on separate cores.
 
-**Use Case**: Real-time motor control @ 1000Hz
-**Structure**: `{ timestamp: u64, linear: f32, angular: f32 }`
+| Message | Size | Median | p99 | Throughput | Typical Rate | Headroom |
+|---------|------|--------|-----|-----------|-------------|----------|
+| **CmdVel** | 16B | **89ns** | 91ns | 11.1M msg/s | 1,000 Hz | 11,100x |
+| **Imu** | 304B | **119ns** | 150ns | 7.8M msg/s | 500 Hz | 15,600x |
+| **JointCommand** | 928B | **128ns** | 157ns | 8.1M msg/s | 500 Hz | 16,200x |
+| **LaserScan** | 1,480B | **151ns** | 184ns | 6.3M msg/s | 40 Hz | 157,500x |
 
-```
-Average Latency: ~500 ns (Topic N:N)
-Throughput:      2.7M msg/s
-Topic 1:1:       ~85 ns median
-```
+### Real-Time Suitability
 
-**Analysis**: Sub-microsecond performance suitable for 1000Hz control loops with 2,700x headroom.
+| Control Rate | Budget | Worst-Case (p99) | Result |
+|-------------|--------|-------------------|--------|
+| 1 kHz (motor control) | 1ms | CmdVel 91ns | **PASS** (11,000x headroom) |
+| 10 kHz (servo control) | 100μs | CmdVel 91ns | **PASS** (1,100x headroom) |
+| 500 Hz (sensor fusion) | 2ms | Imu 150ns | **PASS** (13,300x headroom) |
+| 40 Hz (lidar) | 25ms | LaserScan 184ns | **PASS** (135,000x headroom) |
 
----
-
-### LaserScan (2D Lidar Data)
-
-**Use Case**: 2D lidar sensor data @ 10Hz
-**Structure**: `{ ranges: [f32; 360], angle_min/max, metadata }`
-
-```
-Average Latency: ~2.2 μs (Topic N:N)
-Throughput:      633K msg/s
-Topic 1:1:       ~900 ns estimated
-```
-
-**Analysis**: Consistent low-microsecond latency for 1.5KB messages. Can easily handle 10Hz lidar updates with 63,300x headroom.
+All message types pass real-time suitability at their typical robotics frequencies.
 
 ---
 
-### IMU (Inertial Measurement Unit)
+## HORUS vs Competition
 
-**Use Case**: Orientation and acceleration @ 100Hz
-**Structure**: `{ orientation: [f64; 4], angular_velocity: [f64; 3], linear_acceleration: [f64; 3], covariances: [f64; 27] }`
+Measured with `competitor_comparison`: 5 seconds sustained per transport, same machine.
 
-```
-Average Latency: ~940 ns (Topic N:N)
-Throughput:      1.8M msg/s
-Topic 1:1:       ~400 ns estimated
-```
+| Transport | Size | p50 | p95 | p99 | Throughput |
+|-----------|------|-----|-----|-----|-----------|
+| **HORUS SHM** | 8B | **23ns** | 25ns | 29ns | 100M+ msg/s |
+| Raw UDP | 8B | 1,235ns | 1,328ns | 1,558ns | 3.9M msg/s |
+| **HORUS SHM** | 32B | **23ns** | 25ns | 29ns | 101M+ msg/s |
+| Raw UDP | 32B | 1,122ns | 1,246ns | 2,129ns | 4.1M msg/s |
 
-**Analysis**: Sub-microsecond performance with complex nested arrays and 27-element covariance matrices.
+**Speedup: 54x** (8B), **49x** (32B) over raw UDP on the same machine.
 
----
-
-### Odometry (Pose + Velocity)
-
-**Use Case**: Robot localization @ 50Hz
-**Structure**: `{ pose: Pose2D, twist: Twist, pose_covariance: [f64; 36], twist_covariance: [f64; 36] }`
-
-```
-Average Latency: ~1.1 μs (Topic N:N)
-Throughput:      1.3M msg/s
-Topic 1:1:       ~600 ns estimated
-```
-
-**Analysis**: Low-microsecond latency for 736-byte messages with extensive covariance data.
-
----
-
-### PointCloud (3D Perception)
-
-#### Small (100 points @ 30Hz)
-```
-Average Latency: 1.85 μs
-Throughput:      539,529 msg/s
-Data Size:       ~1.2 KB
-```
-
-#### Medium (1,000 points @ 30Hz)
-```
-Average Latency: 7.55 μs
-Throughput:      132,432 msg/s
-Data Size:       ~12 KB
-```
-
-#### Large (10,000 points @ 30Hz)
-```
-Average Latency: ~360 μs (Topic N:N)
-Throughput:      4.7K msg/s
-Data Size:       ~120 KB
-```
-
-**Analysis**: Linear scaling with point count. Even 10K point clouds process in ~360 μs (sufficient for 30Hz perception with 157x headroom).
-
----
-
-### Mixed Workload (Realistic Robot Loop)
-
-**Simulation**: Real robot control loop @ 100Hz
-**Components**: CmdVel @ 100Hz + IMU @ 100Hz + BatteryState @ 1Hz
-
-```
-Total Operations: 20,100 messages
-Average Latency:  ~1.0 μs (Topic N:N)
-Throughput:       ~1.5M msg/s
-Range:            ~500-1200 ns
-```
-
-**Analysis**: Low-microsecond average latency for mixed message types simulating realistic robotics workload.
-
----
-
-## Comparison with traditional frameworks
-
-### Latency Comparison
-
-> **Measurement Note**: Topic 1:1 values below are **send-only** (one-direction). For round-trip (send+receive), approximately double these values (e.g., 87ns send-only → ~175ns round-trip).
-
-| Framework | Small Msg (send-only) | Medium Msg (send-only) | Large Msg (send-only) |
-|-----------|-----------|------------|-----------|
-| **HORUS Topic (1:1)** | **87 ns** | **~160 ns** | **~400 ns** |
-| **HORUS Topic (N:N)** | **313 ns** | **~500 ns** | **~1.1 μs** |
-| ROS2 (DDS) | 50-100 μs | 100-500 μs | 1-10 ms |
-| ROS2 (FastDDS) | 20-50 μs | 50-200 μs | 500 μs - 5 ms |
-
-**Performance Advantage**: HORUS is **230-575x faster** than ROS2 for typical message sizes.
-
-<SpeedupChart />
-
----
-
-## Latency by Message Size
-
-> **Measurement Note**: All latencies below are **send-only** (one-direction publish). "1:1" = single producer/consumer, "N:N" = multiple producers and consumers.
-
-| Message Size | Message Type | N:N (send-only) | 1:1 (send-only) | vs ROS2 |
-|-------------|--------------|-------------|--------------|---------|
-| 16 B | CmdVel | ~313 ns | 87 ns | **230-575x faster** |
-| 104 B | BatteryState | ~600 ns | ~350 ns | **83-286x faster** |
-| 304 B | IMU | ~940 ns | ~400 ns | **53-250x faster** |
-| 736 B | Odometry | ~1.1 μs | ~600 ns | **45-167x faster** |
-| 1,480 B | LaserScan | ~2.2 μs | ~900 ns | **23-111x faster** |
-
-**Observation**: Near-linear scaling with message size demonstrates efficient serialization and IPC.
-
-<LatencyScalingChart />
-
----
-
-## Python Performance
-
-The HORUS Python bindings (PyO3) call directly into the Rust shared memory layer. The cost of crossing the Python/Rust boundary is constant (~1.5μs) regardless of message size — large data (images, point clouds) uses zero-copy shared memory and bypasses this overhead entirely.
-
-### FFI Overhead (Rust vs Python)
-
-The key question: **what does Python cost you over pure Rust?**
-
-| Operation | Rust | Python | Overhead | Factor |
-|-----------|------|--------|----------|--------|
-| CmdVel send+recv (typed) | ~22ns | ~1,500ns | ~1,478ns | ~68x |
-| Imu send+recv (typed) | ~30ns | ~1,700ns | ~1,670ns | ~57x |
-| dict send+recv (generic) | ~22ns | ~5,400ns | ~5,378ns | ~245x |
-
-The ~1.5μs Python overhead comes from: PyO3 boundary crossing (~500ns), GIL acquisition (~500ns), and Python object allocation (~500ns). This is **constant** — a 1KB typed message has the same overhead as an 8B one.
-
-**When to use Python vs Rust:**
-- **Python**: AI inference (PyTorch, YOLO), prototyping, data science nodes — the ~1.5μs overhead is negligible compared to 10-200ms inference time
-- **Rust**: Motor controllers, safety monitors, sensor fusion at 1kHz — where 22ns matters
-
-### Python IPC Latency
-
-Measured with sustained runs (10s+, 100K+ samples) via `research_bench_python.py`:
-
-| Message Type | Path | p50 | p99 | p999 |
-|---|---|---|---|---|
-| CmdVel (typed) | Zero-copy | ~1.5μs | ~2.2μs | ~5.0μs |
-| Pose2D (typed) | Zero-copy | ~1.6μs | ~2.4μs | ~5.5μs |
-| Imu (typed) | Zero-copy | ~1.7μs | ~2.6μs | ~6.0μs |
-| dict small | MessagePack | ~5.4μs | ~8μs | ~15μs |
-| dict medium | MessagePack | ~9.1μs | ~14μs | ~25μs |
-| dict ~1KB | MessagePack | ~52μs | ~65μs | ~90μs |
-
-**Typed messages are 3-30x faster than dicts** because they bypass MessagePack serialization and use direct Pod memcpy through the Rust layer.
-
-### Image Zero-Copy
-
-`to_numpy()` returns a view into shared memory — O(1) regardless of image size:
-
-| Resolution | `to_numpy()` | `np.copy()` | Speedup |
-|---|---|---|---|
-| 320x240 (225KB) | ~3μs | ~3μs | 1x |
-| 640x480 (900KB) | ~3μs | ~13μs | 4x |
-| 1280x720 (2.7MB) | ~3μs | ~75μs | 25x |
-| 1920x1080 (6MB) | ~3μs | ~178μs | **59x** |
-
-At 1080p, zero-copy is **59x faster** than copying. For 4K frames, the speedup is even larger.
-
-### Running Python Benchmarks
-
-```bash
-# Quick validation (2s per test)
-python3 horus_py/benchmarks/research_bench_python.py --duration 2
-
-# Full research run (10s per test, CSV output)
-python3 horus_py/benchmarks/research_bench_python.py --duration 10 --csv python_results.csv
-
-# JSON summary
-python3 horus_py/benchmarks/research_bench_python.py --json python_summary.json
-```
-
----
-
-## Running Rust Benchmarks
-
-### Quick Run
-
-```bash
-cd horus
-cargo run --release -p horus_benchmarks --bin robotics_messages_benchmark
-```
-
-### Available Benchmarks
-
-| Binary | Description |
-|--------|-------------|
-| `robotics_messages_benchmark` | IPC latency with real robotics message types |
-| `all_paths_latency` | All 10 backend paths with RDTSC cycle precision |
-| `cross_process_benchmark` | Cross-process shared memory IPC |
-| `scalability_benchmark` | Scaling with producer/consumer thread counts |
-| `determinism_benchmark` | Execution determinism and jitter |
-| `dds_comparison_benchmark` | Comparison with DDS middleware (requires `--features dds`) |
-
-#### Extended Benchmarks
-
-Sustained runs, size sweeps, histograms, and competitor comparison:
-
-| Binary | Description |
-|--------|-------------|
-| `raw_baselines` | Hardware floor (memcpy, atomic, mmap) — no HORUS overhead |
-| `research_latency` | Sustained measurement + message size sweep (8B-4KB), CSV output |
-| `research_throughput` | Per-second throughput timeseries over 60s+ |
-| `research_jitter` | RT tick jitter histogram + IPC latency under CPU contention |
-| `research_scalability` | Node scaling (1-100) + topic scaling (1-1000) |
-| `competitor_comparison` | HORUS vs raw UDP (+ Zenoh with `--features zenoh`) |
-
-```bash
-# Run full benchmark suite (~30 minutes)
-./benchmarks/research/run_all.sh
-
-# Quick validation (~3 minutes)
-./benchmarks/research/run_all.sh --quick
-
-# Individual benchmark with CSV output
-cargo run --release -p horus_benchmarks --bin research_latency -- --duration 60 --csv results.csv
-```
-
-Run any benchmark with:
-
-```bash
-cargo run --release -p horus_benchmarks --bin <name>
-
-# JSON output for CI/regression tracking
-cargo run --release -p horus_benchmarks --bin <name> -- --json results.json
-```
-
-Criterion micro-benchmarks:
-
-```bash
-cd horus
-cargo bench -p horus_benchmarks
-```
-
-### Expected Output
-
-```
-
-  HORUS Production Message Benchmark Suite
-  Testing with real robotics message types
-
-
-  CmdVel (Motor Control Command)
-    Size: 16 bytes | Typical rate: 1000Hz
-    Latency (avg): ~500 ns (Topic N:N) / ~85 ns (Topic 1:1)
-    Throughput: 2.7M msg/s (Topic N:N)
-
-
-  LaserScan (2D Lidar Data)
-    Size: 1480 bytes | Typical rate: 10Hz
-    Latency (avg): ~2.2 μs (Topic N:N) / ~900 ns (Topic 1:1)
-    Throughput: 633K msg/s (Topic N:N)
-
-```
-
----
-
-## Use Case Selection
-
-### Message Type Guidelines
-
-**CmdVel (~500 ns N:N / ~85 ns 1:1)**
-- Motor control @ 1000Hz
-- Real-time actuation commands
-- Safety-critical control loops
-
-**IMU (~940 ns N:N / ~400 ns 1:1)**
-- High-frequency sensor fusion @ 100Hz
-- State estimation pipelines
-- Orientation tracking
-
-**LaserScan (~2.2 μs N:N / ~900 ns 1:1)**
-- 2D lidar @ 10Hz
-- Obstacle detection
-- SLAM front-end
-
-**Odometry (~1.1 μs N:N / ~600 ns 1:1)**
-- Pose estimation @ 50Hz
-- Dead reckoning
-- Filter updates
-
-**PointCloud (~360 μs for 10K pts)**
-- 3D perception @ 30Hz
-- Object detection pipelines
-- Dense mapping
-
----
-
-## Performance Characteristics
-
-### Strengths
-
-1. **Sub-microsecond latency** for messages up to 1.5KB
-2. **Consistent performance** across message types (low variance)
-3. **Linear scaling** with message size
-4. **Production-ready** throughput with large headroom
-5. **Serde integration** handles complex nested structs efficiently
-
-### Additional Notes
-
-- **Complex structs** (IMU with 27-element covariances): Still sub-microsecond
-- **Variable-size messages** (PointCloud with Vec): Linear scaling
-
----
-
-## Overhead Attribution
-
-How much latency does HORUS add over raw memory operations? Measured via `raw_baselines` benchmark:
-
-| Operation | 8B Latency | What it measures |
-|-----------|-----------|------------------|
-| Raw `memcpy` | ~11ns | Hardware floor (cache-to-cache copy) |
-| Raw atomic store+load | ~11ns | Signaling floor |
-| **HORUS same-process** | **~23ns** | +12ns over raw (ring buffer overhead) |
-| **HORUS cross-thread** | **~155ns** | +144ns (atomic coordination between threads) |
-| Raw UDP loopback | ~1,158ns | Kernel network stack |
-
-**HORUS adds 12ns** over raw memory for same-thread IPC — roughly 2 cache line accesses of overhead. Cross-thread adds atomic coordination cost but stays under 200ns.
-
-**HORUS is 50x faster than raw UDP** on the same machine — the kernel network stack adds ~1,100ns of overhead that shared memory eliminates entirely.
+HORUS eliminates the kernel network stack entirely. UDP requires `sendto()` + `recvfrom()` system calls (~1,100ns of kernel overhead). HORUS uses direct shared memory access (~23ns total).
 
 ---
 
 ## Scalability
 
-### Node Scaling
+Measured with `scalability_benchmark`: sustained throughput with varying producer/consumer thread counts.
 
-Scheduler tick overhead with increasing node count (measured via `research_scalability`):
+### Thread Scaling
 
-| Nodes | Tick Duration | Overhead vs 1 Node |
-|-------|--------------|-------------------|
-| 1 | 1,058 μs | baseline |
-| 10 | 1,072 μs | +1.3% |
-| 20 | 1,139 μs | +7.7% |
-| 50 | 1,178 μs | +11% |
-| 100 | 1,209 μs | **+14%** |
+| Producers | Consumers | Throughput | Per-Thread | Scaling Efficiency |
+|-----------|-----------|-----------|------------|-------------------|
+| 1 | 1 | 2.4M msg/s | 1.20M | baseline |
+| 2 | 1 | 7.2M msg/s | 2.40M | 300% |
+| 4 | 1 | 11.8M msg/s | 2.35M | 489% |
+| 1 | 2 | 3.5M msg/s | 1.17M | 146% |
+| 1 | 4 | 2.9M msg/s | 0.58M | 122% |
+| 2 | 2 | 6.8M msg/s | 1.70M | 141% |
+| 4 | 4 | 11.2M msg/s | 1.41M | 117% |
+| 8 | 8 | 8.4M msg/s | 0.52M | 44% |
 
-**Near-linear scaling**: 100 nodes adds only 14% overhead. Each additional node costs approximately 1.5μs.
+### Producer Scaling (1 Consumer)
 
-### Topic Scaling
+```
+1 producer:   3.0 M/s  ████████████
+2 producers:  8.7 M/s  ██████████████████████████████████
+3 producers: 11.5 M/s  ████████████████████████████████████████████
+4 producers: 11.9 M/s  ████████████████████████████████████████████
+6 producers: 13.5 M/s  █████████████████████████████████████████████████  ← peak
+8 producers: 11.5 M/s  ████████████████████████████████████████████
+```
 
-IPC latency with increasing topic count (all topics created simultaneously):
+Peak throughput at 6 producers (13.5M msg/s). Beyond 6, contention on the atomic head pointer causes slight degradation.
 
-| Topics | p50 Latency | Degradation |
-|--------|-------------|-------------|
-| 1 | 23ns | baseline |
-| 10 | 24ns | 0% |
-| 100 | 23ns | 0% |
-| 500 | 23ns | 0% |
-| 1,000 | 23ns | **0%** |
+### Consumer Scaling (1 Producer)
 
-**O(1) topic lookup**: Latency is constant regardless of how many topics exist in the system. Users can add sensors, monitors, and debug topics without affecting performance.
+```
+1 consumer:  2.8 M/s  ███████████
+2 consumers: 4.8 M/s  ██████████████████
+4 consumers: 4.8 M/s  ██████████████████
+8 consumers: 3.7 M/s  ██████████████
+```
 
-### IPC Latency by Topology and Message Size
-
-Complete IPC latency across all 5 topologies (measured via `research_latency` with sustained runs, 200K+ samples each):
-
-| Topology | 8B p50 | 256B p50 | 1KB p50 | Samples/2s |
-|----------|--------|----------|---------|------------|
-| Same-process | **22ns** | 30ns | 51ns | 40M |
-| 1:1 cross-thread | 154ns | 177ns | 235ns | 11M |
-| 3 pubs → 1 sub | 53ns | 57ns | 107ns | 20M |
-| 1 pub → 3 subs | 92ns | 138ns | 195ns | 16M |
-| 3 pubs × 3 subs | 184ns | 218ns | 233ns | 9M |
-
-**Key observations:**
-- **Linear size scaling**: Latency grows proportionally with message size (memcpy-dominated)
-- **Sub-200ns for all topologies** at 8B — every IPC path is under 200 nanoseconds
-- **MPSC is faster than SPSC** at 8B (53ns vs 154ns) — multiple producers amortize coordination overhead
-- **MPMC worst case is 184ns** for 8B — even with 6 concurrent participants, under 200ns
+Consumer scaling plateaus at 2 — the ring buffer uses broadcast semantics (all consumers read the same data), so adding consumers doesn't increase total throughput.
 
 ---
 
-## Real-World Applications
+## Real-Time Determinism
 
-| Application | Frequency | HORUS (Topic 1:1) | HORUS (Topic N:N) | ROS2 | Speedup |
-|-------------|-----------|--------------|-------------|------|---------|
-| Motor control | 1000 Hz | ~85 ns | ~500 ns | 50 μs | **200-588x** |
-| IMU fusion | 100 Hz | ~400 ns | ~940 ns | 50 μs | **53-125x** |
-| Lidar SLAM | 10 Hz | ~900 ns | ~2.2 μs | 100 μs | **45-111x** |
-| Vision | 30 Hz | ~120 μs | ~360 μs | 5 ms | **14-42x** |
-| Planning | 100 Hz | ~600 ns | ~1.1 μs | 100 μs | **91-167x** |
+Measured with `determinism_benchmark`: 10 runs of 100,000 iterations each, CPU-pinned to cores 0 and 1.
 
-<ThroughputChart />
+| Metric | Value |
+|--------|-------|
+| Mean latency | 87.0ns |
+| Median latency | 86.0ns |
+| Std dev | 7.9ns |
+| Min | 61ns |
+| Max | 112ns |
+| p95 | 102ns |
+| p99 | 109ns |
+| p99.9 | 112ns |
+| p99.99 | 112ns |
+| Run-to-run CV | 0.060 |
+| Deadline misses at 1μs | 212 / 1,000,000 (0.02%) |
+
+**Interpretation**: The 7.9ns standard deviation and 0.06 run-to-run coefficient of variation indicate highly deterministic behavior. The 0.02% deadline miss rate at the extremely aggressive 1μs deadline is due to OS scheduling jitter in WSL2 — on a bare-metal Linux system with `PREEMPT_RT` kernel and `isolcpus`, expect zero misses.
+
+---
+
+## Python Binding Performance
+
+Measured with `research_bench_python.py`: 5 seconds sustained per test, Python 3.12, PyO3 bindings v0.1.9.
+
+### Typed Message IPC (Zero-Copy Pod Path)
+
+| Message | p50 | p95 | p99 | p999 | Throughput |
+|---------|-----|-----|-----|------|-----------|
+| CmdVel send+recv | **1.7μs** | 1.8μs | 2.4μs | 15.2μs | 2.7M msg/s |
+| Pose2D send+recv | **1.7μs** | 1.9μs | 3.0μs | 18.2μs | 2.7M msg/s |
+| Imu send+recv | **1.9μs** | 2.0μs | 4.2μs | 21.1μs | 2.4M msg/s |
+
+### Generic Message IPC (Serialization Path)
+
+| Payload | p50 | p95 | p99 | Throughput |
+|---------|-----|-----|-----|-----------|
+| dict {v: 1.0} | **6.2μs** | 7.9μs | 19.9μs | 714K msg/s |
+| dict {x,y,z,w} | **12.4μs** | 15.3μs | 34.2μs | 382K msg/s |
+| dict 50 keys (~1KB) | **111μs** | 143μs | 196μs | 42K msg/s |
+
+**Typed messages are 4-65x faster than dicts** because they bypass serialization and use direct Pod memcpy through the Rust layer.
+
+### Image Zero-Copy
+
+| Operation | p50 | Throughput | Notes |
+|-----------|-----|-----------|-------|
+| Image.to_numpy (640x480) | **3.0μs** | 1.5M/s | Returns view into SHM pool |
+| np.from_dlpack (640x480) | **1.1μs** | 3.5M/s | DLPack protocol, true zero-copy |
+| np.copy (640x480) baseline | **14.0μs** | 334K/s | For comparison (actual copy) |
+
+`np.from_dlpack()` is **13x faster** than `np.copy()` — it returns a numpy array backed by the shared memory pool with no data movement.
+
+### FFI Overhead Attribution
+
+| Operation | Rust (ns) | Python (ns) | Overhead | Factor |
+|-----------|-----------|-------------|----------|--------|
+| CmdVel | 14 | 1,712 | 1,698ns | 122x |
+| Pose2D | 14 | 1,682 | 1,668ns | 120x |
+| Imu | 14 | 1,884 | 1,870ns | 135x |
+| dict (small) | 14 | 6,246 | 6,232ns | 446x |
+
+The ~1.7μs Python overhead comes from: PyO3 boundary crossing (~500ns), GIL acquisition (~500ns), and Python object allocation (~700ns). This overhead is **constant** regardless of message size.
+
+### Scheduler Tick Overhead
+
+| Metric | Value |
+|--------|-------|
+| Target rate | 10,000 Hz |
+| Achieved rate | **5,932 Hz** |
+| Per-tick overhead | ~11μs (Rust→Python→Rust) |
+| GC dip (worst second) | 96 fewer ticks |
+
+The GIL is the bottleneck for Python tick rate. For control loops above ~5kHz, use Rust nodes.
+
+### When to Use Python vs Rust
+
+| Use Case | Recommended | Why |
+|----------|-------------|-----|
+| ML inference (PyTorch, YOLO) | **Python** | 1.7μs overhead negligible vs 10-200ms inference |
+| Data science, prototyping | **Python** | Developer velocity matters more than latency |
+| Motor control at 1kHz+ | **Rust** | 89ns vs 1,700ns — 19x difference |
+| Safety monitors | **Rust** | Deterministic timing, no GIL |
+| Sensor fusion at 500Hz+ | **Rust** | Predictable p99 latency |
+
+---
+
+## Running Benchmarks
+
+### Rust Benchmarks
+
+```bash
+# Main benchmark: all 10 backend paths (~2 min)
+cargo run --release -p horus_benchmarks --bin all_paths_latency
+
+# Robotics message types: CmdVel, Imu, LaserScan, JointCommand
+cargo run --release -p horus_benchmarks --bin robotics_messages_benchmark
+
+# HORUS vs UDP comparison
+cargo run --release -p horus_benchmarks --bin competitor_comparison
+
+# Scalability: thread count sweep
+cargo run --release -p horus_benchmarks --bin scalability_benchmark
+
+# RT determinism: jitter analysis
+cargo run --release -p horus_benchmarks --bin determinism_benchmark
+
+# Hardware floor: raw memcpy, atomic, mmap
+cargo run --release -p horus_benchmarks --bin raw_baselines
+
+# Cross-process: true inter-process IPC
+cargo run --release -p horus_benchmarks --bin cross_process_benchmark
+
+# Full research suite (~30 min)
+./benchmarks/research/run_all.sh
+
+# Quick validation (~3 min)
+./benchmarks/research/run_all.sh --quick
+```
+
+### Python Benchmarks
+
+```bash
+cd horus_py
+
+# Quick validation (2s per test)
+PYTHONPATH=. python3 benchmarks/research_bench_python.py --duration 2
+
+# Full research run (10s per test)
+PYTHONPATH=. python3 benchmarks/research_bench_python.py --duration 10 --csv results.csv
+
+# JSON summary for CI
+PYTHONPATH=. python3 benchmarks/research_bench_python.py --json summary.json
+```
+
+### Criterion Micro-Benchmarks
+
+```bash
+# All criterion benches (HTML reports in target/criterion/)
+cargo bench -p horus_benchmarks
+
+# Filter by name
+cargo bench -p horus_benchmarks -- topic_latency
+```
 
 ---
 
 ## Methodology
 
-### Benchmark Pattern: Ping-Pong
-
-**HORUS uses the industry-standard ping-pong benchmark pattern for IPC latency measurement:**
-
-<MermaidDiagram
-  chart={`%%{init: {'sequence': {'padding': 15}}}%%
-sequenceDiagram
-    participant P as Producer (Core 0)
-    participant C as Consumer (Core 1)
-
-    P->>C: 1. Send message with RDTSC
-    Note right of C: 2. Read RDTSC, calc latency
-    C->>P: 3. Send ACK
-    Note left of P: 4. Wait for ACK
-    P->>C: 5. Send next message
-`}
-  caption="Ping-Pong Benchmark Pattern"
-/>
-
-**Why Ping-Pong?**
-- **Industry standard**: Used by ROS2, iceoryx2, ZeroMQ benchmarks
-- **Prevents queue buildup**: Each message acknowledged before next send
-- **Realistic**: Models request-response patterns in robotics
-- **Comparable**: Direct apples-to-apples comparison with other frameworks
-- **Conservative**: Measures true round-trip latency, not just one-way send
-
-**What we measure:**
-- Round-trip time: Producer  Consumer  ACK  Producer
-- Includes serialization, IPC, deserialization, and synchronization
-- Cross-core communication (Core 0 ↔ Core 1)
-
-**What we DON'T measure:**
-- Burst throughput (no backpressure)
-- One-way send time without acknowledgment
-- Same-core communication (unrealistic for multi-process IPC)
-
-### Test Environment
-
-- **Build**: `cargo build --release` with full optimizations
-- **CPU Governor**: Performance mode
-- **CPU Affinity**: Producer pinned to Core 0, Consumer pinned to Core 1
-- **Process Isolation**: Dedicated topics per benchmark
-- **Warmup**: 1,000 iterations before measurement
-- **Measurement**: RDTSC (cycle-accurate timestamps)
-
-### Message Realism
-
-- Actual HORUS library message types
-- Serde serialization (production path)
-- Realistic field values and sizes
-- Complex nested structures (IMU, Odometry)
-
-### Statistical Methodology
-
-- 10,000 iterations per test
-- Median, P95, P99 latency tracking
-- Variance tracking (min/max ranges)
-- Multiple message sizes
-- Mixed workload testing
-
-### Measurement Details
-
-**RDTSC Calibration:**
-- Null cost (back-to-back rdtsc): ~36 cycles
-- Target on modern x86_64: 20-30 cycles
-- Timestamp embedded directly in message payload
-
-**Cross-Core Testing:**
-- Producer and consumer on different CPU cores
-- Simulates real multi-process robotics systems
-- Includes cache coherency overhead (~60 cycles theoretical minimum)
-
----
-
-## Scheduler Performance
-
-### Enhanced Smart Scheduler
-
-HORUS now includes an intelligent scheduler that automatically optimizes node execution based on runtime behavior:
-
-**Key Enhancements:**
-- **Tiered Execution**: Explicit tier annotation (UltraFast, Fast, Normal)
-- **Failure Policies**: Per-node failure handling with automatic recovery
-- **Predictable by Default**: Sequential execution with consistent priority ordering
-- **Safety Monitoring**: WCET enforcement, watchdogs, and emergency stop
-
-### Comprehensive Benchmark Results
-
-**Test Configuration:**
-- Workload duration: 5 seconds per test
-- Sample size: 20 measurements per benchmark
-- Platform: Modern x86_64 Linux system
-
-| Workload Type | Mean Time | Description | Key Achievement |
-|---------------|-----------|-------------|-----------------|
-| **UltraFastControl** | **2.387s** | High-frequency control loops | Optimized for high-frequency control |
-| **FastSensor** | **2.382s** | Rapid sensor processing | Maintains sub-μs sensor fusion |
-| **HeavyIO** | **3.988s** | I/O-intensive operations | Async tier prevents blocking |
-| **MixedRealistic** | **4.064s** | Real-world mixed workload | Balanced optimization across tiers |
-| **FaultTolerance** | **25.485s** | With simulated failures | Failure policy recovery working |
-
-### Scalability Performance
-
-The scheduler demonstrates excellent linear scaling:
-
-| Node Count | Execution Time | Scaling Factor |
-|------------|---------------|----------------|
-| 10 nodes | **106.93ms** | Baseline |
-| 50 nodes | **113.93ms** | 1.07x (5x nodes) |
-| 100 nodes | **116.49ms** | 1.09x (10x nodes) |
-| 200 nodes | **119.55ms** | 1.12x (20x nodes) |
-
-**Key Insights:**
-- Near-linear scaling from 10 to 200 nodes
-- Only 13ms increase for 20x more nodes
-- Maintains sub-120ms for large systems
-- Automatic tier classification optimizes execution order
-
-<ScalabilityChart />
-
----
-
-## Real-Time Performance
-
-### RtNode Support
-
-HORUS now provides industrial-grade real-time support for safety-critical applications:
-
-**RT Features:**
-- **WCET Enforcement**: Worst-Case Execution Time monitoring
-- **Deadline Tracking**: Count and handle deadline misses
-- **Safety Monitor**: Emergency stop on critical failures
-- **Watchdog Timers**: Detect hung or crashed nodes
-
-### RT Performance Characteristics
-
-| Metric | Performance | Description |
-|--------|-------------|-------------|
-| **WCET Overhead** | **&lt;5μs** | Cost of monitoring execution time |
-| **Deadline Precision** | **±10μs** | Jitter in deadline detection |
-| **Watchdog Resolution** | **1ms** | Minimum detection time |
-| **Emergency Stop** | **&lt;100μs** | Time to halt all nodes |
-| **Context Switch** | **&lt;1μs** | Priority preemption overhead |
-
-### Safety-Critical Configuration
-
-Running with full safety monitoring enabled:
-
-```rust
-let scheduler = Scheduler::new().tick_rate(1000_u64.hz());
-```
-
-| Feature | Overhead | Impact |
-|---------|----------|--------|
-| WCET Tracking | ~1μs per node | Negligible for &gt;100μs tasks |
-| Deadline Monitor | ~500ns per node | Sub-microsecond overhead |
-| Watchdog Feed | ~100ns per tick | Minimal impact |
-| Safety Checks | ~2μs total | Worth it for safety |
-| Memory Locking | One-time 10ms | Prevents page faults |
-
-### Real-Time Test Results
-
-**Test: Mixed RT and Normal Nodes**
-- 2 critical RT nodes @ 1kHz
-- 2 normal nodes @ 100Hz
-- 2 background nodes @ 10Hz
-
-| Node Type | Target Rate | Achieved | Jitter | Misses |
-|-----------|------------|----------|--------|--------|
-| RT Critical | 1000 Hz | 999.8 Hz | ±10μs | 0 |
-| RT High | 500 Hz | 499.9 Hz | ±15μs | 0 |
-| Normal | 100 Hz | 99.9 Hz | ±50μs | &lt;0.1% |
-| Background | 10 Hz | 10 Hz | ±200μs | &lt;0.5% |
-
-**Zero deadline misses** for critical RT nodes over 1M iterations.
-
-<RealTimeChart />
-
----
-
-## All-Routes Latency
-
-HORUS automatically selects the optimal communication path based on topology (same-thread, cross-thread, cross-process) and producer/consumer count. This benchmark measures the latency of each automatically-selected route.
-
-### Benchmark Results
-
-| Scenario | Latency | Target | Notes |
-|----------|---------|--------|-------|
-| **Same thread, 1:1** | **16ns** | 60ns | Ultra-fast direct path |
-| **Cross-thread, 1:1** | **11ns** | 60ns | Optimized single-producer path |
-| **Cross-process, 1:1** | **182ns** | 100ns | Shared memory path |
-| **Cross-process, N:1** | **244ns** | 150ns | Multi-producer shared memory |
-| **Cross-process, N:N** | **187ns** | 200ns | General cross-process |
-
-### Latency by Topology
-
-| Topology | Producers | Consumers | Latency |
-|----------|-----------|-----------|---------|
-| Same thread | 1 | 1 | ~16ns |
-| Same process | 1 | 1 | ~11ns |
-| Same process | N | 1 | ~15ns |
-| Same process | 1 | N | ~15ns |
-| Same process | N | N | ~20ns |
-| Cross process | 1 | 1 | ~180ns |
-| Cross process | N | 1 | ~250ns |
-| Cross process | 1 | N | ~200ns |
-| Cross process | N | N | ~190ns |
-
-### Key Achievements
-
-- **Sub-20ns** for same-process communication
-- **Sub-200ns** for cross-process 1:1
-- **Sub-300ns** for multi-producer cross-process
-- **Zero configuration** — optimal path selected automatically
-- **Seamless migration** — path upgrades transparently as topology changes
-
-### Running the Benchmark
-
-```bash
-cd horus
-cargo build --release -p horus_benchmarks
-./target/release/all_paths_latency
-```
-
----
-
-## Summary
-
-**HORUS provides production-grade performance for real robotics applications:**
-
-**Automatic Path Selection (Recommended):**
-- **16 ns** — Same-thread
-- **11 ns** — Cross-thread, 1:1
-- **182 ns** — Cross-process, 1:1
-- **244 ns** — Cross-process, multi-producer
-- **187 ns** — Cross-process, multi-producer/consumer
-
-**Point-to-Point (1:1):**
-- **87 ns** — Send only (ultra-low latency)
-- **161 ns** — CmdVel (motor control)
-- **262 ns** — Send+Recv round-trip
-- **~400 ns** — IMU (sensor fusion)
-- **~120 μs** — PointCloud with 10K points
-
-**Multi-Producer/Consumer (N:N):**
-- **~313 ns** — CmdVel (motor control)
-- **~500 ns** — IMU (sensor fusion)
-- **~2.2 μs** — LaserScan (2D lidar)
-- **~1.1 μs** — Odometry (localization)
-- **~360 μs** — PointCloud with 10K points
-
-
-**Ready for production deployment** in demanding robotics applications requiring real-time performance with complex data types.
-
----
-
----
-
-## Python Benchmarks
-
-Real measurements from `horus_py/benchmarks/bench_python.py`. Python 3.12, Linux x86_64.
-
-### Message Send/Recv Latency
-
-Single-process Topic roundtrip (send + recv):
-
-| Message type | Median | Path |
-|---|---|---|
-| `CmdVel` (typed) | **1.5μs** | Zero-copy Pod memcpy |
-| `Pose2D` (typed) | **1.6μs** | Zero-copy Pod memcpy |
-| `Imu` (typed) | **1.6μs** | Zero-copy Pod memcpy |
-| dict `{"v": 1.0}` | **5.4μs** | GenericMessage + MessagePack |
-| dict `{"x", "y", "z"}` | **9.1μs** | GenericMessage + MessagePack |
-| dict ~1KB | **52μs** | GenericMessage + MessagePack |
-
-Typed messages are **6x faster** than dicts because they skip serialization entirely.
-
-### Zero-Copy Image/PointCloud
-
-`to_numpy()` returns a view into shared memory — **constant time regardless of data size**:
-
-| Data | `to_numpy()` (zero-copy) | `np.copy()` (naive) | Speedup |
-|---|---|---|---|
-| Image 320×240 (225KB) | **3.0μs** | 3.0μs | 1x |
-| Image 640×480 (900KB) | **3.0μs** | 13μs | **4x** |
-| Image 1280×720 (2.7MB) | **3.0μs** | 75μs | **25x** |
-| Image 1920×1080 (6MB) | **3.0μs** | 178μs | **59x** |
-| PointCloud 10K pts (120KB) | **2.8μs** | — | — |
-| PointCloud 100K pts (1.2MB) | **2.8μs** | — | — |
-| DepthImage 640×480 (1.2MB) | **2.8μs** | — | — |
-| `np.from_dlpack()` (DLPack) | **979ns** | — | — |
-
-The key insight: **3μs for a 6MB 1080p image vs 178μs to copy it.** This is the DLPack/shared memory pool advantage — Python gets a pointer to the data, not a copy.
-
-### Node Tick Overhead
-
-How fast can the Rust scheduler drive Python nodes:
-
-| Scenario | Throughput | Per-tick |
-|---|---|---|
-| Empty tick (Rust → Python → Rust) | **~530 Hz** | 1.9ms |
-| Tick + send(dict) | **~525 Hz** | 1.9ms |
-| Tick + send(dict) + recv(dict) | **~525 Hz** | 1.9ms |
-
-The bottleneck is Python's GIL (~1.8ms per acquisition), not the Rust binding (~30μs). The Rust scheduler, IPC, and safety monitoring add negligible overhead.
-
-### Generic Message Sizes
-
-MessagePack serialization for common robotics data:
-
-| Payload | Bytes | Fits in GenericMessage? |
-|---|---|---|
-| Empty dict | 1 | Yes (4KB max) |
-| CmdVel-like `{linear, angular}` | 34 | Yes |
-| IMU-like (accel + gyro + mag) | 100 | Yes |
-| LaserScan 360 rays | 3,251 | Yes |
-| 10 detections | 374 | Yes |
-
-### Running Python Benchmarks
-
-```bash
-cd horus_py
-PYTHONPATH=. python3 benchmarks/bench_python.py
-```
-
----
-
-## Next Steps
-
-- Learn how to maximize performance: [Performance Optimization](/performance/performance)
-- Explore message types: [Message Types](/concepts/message-types)
-- See usage examples: [Examples](/rust/examples/basic-examples)
-- Get started: [Quick Start](/getting-started/quick-start)
-
-**Build faster. Debug easier. Deploy with confidence.**
+### Timing
+
+- **RDTSC** (x86_64) with serializing fences (`lfence` + `mfence`), calibrated per-run (~3.37 GHz on test machine)
+- **Overhead**: ~6ns per measurement, subtracted from all samples
+- **Fallback**: `Instant::now()` (~11ns) on non-x86
+
+### Statistical Analysis
+
+- **Percentiles**: p1, p5, p25, p50, p75, p95, p99, p99.9, p99.99
+- **Confidence intervals**: Bootstrap with 10,000 resamples, 95% level
+- **Outlier filtering**: Tukey IQR (1.5x fence)
+- **Determinism metrics**: Coefficient of variation, run-to-run variance
+
+### Environment Control
+
+- **CPU governor**: Performance mode recommended (numbers above measured with `powersave` in WSL2)
+- **CPU affinity**: Producer and consumer pinned to separate physical cores
+- **Warmup**: 5,000-10,000 iterations discarded before measurement
+- **Measurement**: 50,000-100,000 iterations per test
+- **Turbo boost**: Disabled recommended for reproducibility
+
+### Reproducing These Numbers
+
+Your numbers will differ based on CPU, OS, governor, and VM/bare-metal:
+
+| Factor | Impact |
+|--------|--------|
+| `performance` governor vs `powersave` | 2-5x faster latencies |
+| Bare-metal Linux vs WSL2 | 10-30% faster, fewer outliers |
+| `PREEMPT_RT` kernel | Near-zero deadline misses |
+| `isolcpus` for benchmark cores | Lower jitter, tighter p99 |
+| Older CPU (i5 vs i9) | 1.5-3x slower |
+| ARM (Raspberry Pi, Jetson) | 3-10x slower, still sub-microsecond |
 
 ---
 
 ## See Also
 
-- [Optimization Guide](/performance/performance) — When and how to optimize
-- [Scheduler API](/rust/api/scheduler) — Timing configuration
+- [Performance Optimization](/performance/performance) — How to write fast HORUS code
+- [Shared Memory](/concepts/shared-memory) — SHM architecture and ring buffer details
+- [Scheduler API](/rust/api/scheduler) — Timing configuration and execution classes
+- [Python API](/python/api) — Python binding overhead and usage patterns

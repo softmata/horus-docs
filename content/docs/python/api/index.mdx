@@ -1,151 +1,808 @@
 ---
 title: "Python API"
-description: "HORUS Python bindings API reference"
+description: "Complete Python API reference for HORUS — Node, Scheduler, Topics, Clock, Drivers, and Messages"
+order: 0
 ---
 
 # Python API
 
-Complete Python API documentation for HORUS. The Python bindings are built with PyO3, exposing the core Rust framework to Python with zero-copy shared memory IPC.
+You have a Python ML model running inference at 30Hz. You need it to receive camera images from a Rust sensor driver and publish detections to a Rust planner — all through shared memory at microsecond latency. This page is the complete reference for doing that.
 
-## [Python Bindings](/python/api/python-bindings)
+> **Two layers**: `_horus` (Rust PyO3 internals) and `horus` (Python wrapper you import). This page documents the `horus` layer — the user-facing API.
 
-Full reference for the HORUS Python bindings:
-
-- `Node` — Create nodes with `tick`, `init`, and `shutdown` callbacks
-- `Topic` — Unified pub/sub with typed messages (CmdVel, Pose2D, Imu, etc.)
-- `Scheduler` — Node execution with priority ordering, rate control, and composable builder methods
-- `TransformFrame` / `Transform` — Coordinate frame management
-- `Image` / `PointCloud` / `DepthImage` — Zero-copy shared memory data with DLPack
-
-## [Custom Messages](/python/api/custom-messages)
-
-Create your own typed messages in Python:
-
-- **Runtime messages** - No build step, ~20-40μs latency
-- **Compiled messages** - Requires maturin, ~3-5μs latency
-- NumPy-based messages for better performance
-- YAML schema support for team projects
-
-## [Async Nodes](/python/api/async-nodes)
-
-Asynchronous Python nodes for non-blocking I/O operations.
-
-## [Memory Types](/python/api/memory-types)
-
-Zero-copy Image, PointCloud, and DepthImage with NumPy/PyTorch/JAX interop.
-
-## [Perception Types](/python/api/perception)
-
-Object detection, tracking, pose estimation — DetectionList, TrackedObject, COCOPose, PointCloudBuffer.
-
-## [TransformFrame](/python/api/transform-frame)
-
-Coordinate frame management — register frames, look up transforms, interpolate, export.
+```python
+import horus
+```
 
 ---
 
 ## Quick Reference
 
-### Core Classes
-
-| Class | Description |
-|-------|-------------|
-| `Node` | Computation unit — all config via kwargs (`tick`, `rate`, `order`, `budget`, etc.) |
-| `Topic` | Standalone pub/sub channel for inter-process IPC |
-| `Scheduler` | Node execution orchestrator (composable kwargs, no presets) |
-| `Params` | Dict-like runtime parameter store from `horus.toml` |
-| `Rate` | Drift-compensated rate limiter for background threads |
-| `NodeState` | Node lifecycle states |
-
-### Message Types
-
-| Class | Fields | Default Topic |
-|-------|--------|---------------|
-| `CmdVel` | `linear`, `angular` | `"cmd_vel"` |
-| `Pose2D` | `x`, `y`, `theta` | `"pose"` |
-| `Imu` | `accel_x/y/z`, `gyro_x/y/z` | `"imu"` |
-| `Odometry` | `x`, `y`, `theta`, `linear_velocity`, `angular_velocity` | `"odom"` |
-| `LaserScan` | `ranges`, `angle_min/max`, `range_min/max` | `"scan"` |
-
-### Transform System
-
-| Class | Description |
-|-------|-------------|
-| `TransformFrame` | Coordinate frame tree with transform lookups |
-| `Transform` | 3D transformation (translation + quaternion rotation) |
-| `TransformFrameConfig` | TransformFrame configuration with size presets |
-
-### Perception Types
-
-Available in `horus.perception`:
-
-| Class | Description |
-|-------|-------------|
-| `Detection` | Object detection result (bbox, class, confidence) |
-| `DetectionList` | Collection of detections with filtering |
-| `BoundingBox2D` | 2D bounding box with IoU calculation |
-| `PointCloudBuffer` | Point cloud with NumPy integration |
-| `TrackedObject` | Object tracking with velocity estimation |
-
-### Large Data Types
-
-| Class | Description |
-|-------|-------------|
-| `Image` | Pool-backed camera image with zero-copy framework conversions |
-| `PointCloud` | Pool-backed 3D point cloud with zero-copy ML interop |
-| `DepthImage` | Pool-backed depth image (F32 meters or U16 millimeters) |
-
-### Networking
-
-| Class | Description |
-|-------|-------------|
-| `RouterClient` | Connect to HORUS network router |
-| `RouterServer` | Host a HORUS network router |
+| Class/Function | Description |
+|---------------|-------------|
+| `horus.Node(...)` | Computation unit — tick, init, shutdown via kwargs |
+| `horus.Scheduler(...)` | Node orchestrator — tick rate, RT, watchdog, recording |
+| `horus.run(*nodes)` | One-liner: create scheduler, add nodes, run |
+| `horus.Topic(type)` | Standalone pub/sub (outside node lifecycle) |
+| `horus.now()` / `horus.dt()` | Framework clock (wall clock or SimClock) |
+| `horus.drivers.load()` | Load hardware drivers from `horus.toml` |
+| `horus.Params()` | Runtime parameter store |
+| `horus.Rate(hz)` | Drift-compensated rate limiter |
 
 ---
 
-## Installation
+## Node
 
-```bash
-pip install horus-robotics
+The `Node` class is the primary building block. All configuration happens in the constructor via kwargs — no class inheritance needed.
+
+### Constructor
+
+```python
+horus.Node(
+    name="my_node",           # Optional: auto-generated UUID if None
+    tick=my_tick_fn,          # Required for useful nodes: tick(node) or async def tick(node)
+    rate=30,                  # Hz (must be positive)
+    pubs=["cmd_vel"],         # Topics this node publishes to
+    subs=["scan"],            # Topics this node subscribes to
+    init=my_init_fn,          # Optional: init(node), called once at startup
+    shutdown=my_shutdown_fn,  # Optional: shutdown(node), called once at exit
+    on_error=my_error_fn,     # Optional: on_error(node, exception)
+    order=100,                # Execution priority (lower = earlier)
+    budget=300 * horus.us,    # Max tick time (seconds, use horus.us/horus.ms)
+    deadline=900 * horus.us,  # Hard deadline per tick
+    on_miss="warn",           # "warn", "skip", "safe_mode", "stop"
+    failure_policy="fatal",   # "fatal", "restart", "skip", "ignore"
+    compute=False,            # Run on thread pool (CPU-bound)
+    on="scan",                # Event-driven: tick only when topic receives data
+    priority=50,              # OS scheduling priority (1-99, requires RT)
+    core=0,                   # Pin to CPU core
+    watchdog=0.5,             # Per-node watchdog timeout (seconds)
+    default_capacity=1024,    # Ring buffer capacity for auto-created topics
+)
 ```
 
-## Minimal Example
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` or `None` | UUID | Unique node identifier |
+| `tick` | `Callable[[Node], None]` | `None` | Main loop function. Can be `async def` |
+| `rate` | `float` | `30` | Tick rate in Hz |
+| `pubs` | `list`, `str`, `dict`, or `None` | `None` | Publisher topic specs |
+| `subs` | `list`, `str`, `dict`, or `None` | `None` | Subscriber topic specs |
+| `init` | `Callable` or `None` | `None` | One-time setup. Can be `async def` |
+| `shutdown` | `Callable` or `None` | `None` | Cleanup on exit. Can be `async def` |
+| `on_error` | `Callable` or `None` | `None` | Error handler: `on_error(node, exception)` |
+| `order` | `int` | `100` | Execution order (lower = runs first in tick cycle) |
+| `budget` | `float` or `None` | `None` | Max tick execution time in seconds |
+| `deadline` | `float` or `None` | `None` | Hard deadline in seconds |
+| `on_miss` | `str` or `None` | `None` | Deadline miss policy |
+| `failure_policy` | `str` or `None` | `None` | Error recovery strategy |
+| `compute` | `bool` | `False` | Run on parallel thread pool |
+| `on` | `str` or `None` | `None` | Event-driven topic trigger |
+| `priority` | `int` or `None` | `None` | OS SCHED_FIFO priority (1-99) |
+| `core` | `int` or `None` | `None` | CPU core pinning |
+| `watchdog` | `float` or `None` | `None` | Per-node watchdog timeout (seconds) |
+| `default_capacity` | `int` | `1024` | Default ring buffer capacity |
+
+### Topic Spec Formats
+
+The `pubs` and `subs` parameters accept several formats:
+
+```python
+# String — single topic, GenericMessage (~5-50μs)
+pubs="cmd_vel"
+
+# List of strings — multiple topics, GenericMessage
+pubs=["cmd_vel", "status"]
+
+# Typed class — zero-copy POD (~1.5μs)
+pubs=[horus.CmdVel, horus.LaserScan]
+
+# Dict with custom names — typed with explicit topic name
+pubs={"cmd": horus.CmdVel, "scan": horus.LaserScan}
+
+# Dict with config — full control
+pubs={"cmd": {"type": horus.CmdVel, "capacity": 2048}}
+```
+
+**Performance**: Typed topics (`horus.CmdVel`) use zero-copy POD transport (~1.5μs). String topics use `GenericMessage` with JSON serialization (~5-50μs). Use typed topics for anything in a control loop.
+
+### Methods
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `send` | `send(topic: str, data) -> bool` | `True` on success | Publish data to a topic |
+| `recv` | `recv(topic: str) -> Any or None` | Message or `None` | Get latest message (pull-based) |
+| `recv_all` | `recv_all(topic: str) -> list` | List of messages | Drain all available messages |
+| `has_msg` | `has_msg(topic: str) -> bool` | `bool` | Check if a message is available |
+| `log_info` | `log_info(msg: str)` | — | Log at INFO level |
+| `log_warning` | `log_warning(msg: str)` | — | Log at WARNING level |
+| `log_error` | `log_error(msg: str)` | — | Log at ERROR level |
+| `log_debug` | `log_debug(msg: str)` | — | Log at DEBUG level |
+| `request_stop` | `request_stop()` | — | Signal scheduler to stop |
+| `publishers` | `publishers() -> list[str]` | Topic names | List of publisher topic names |
+| `subscribers` | `subscribers() -> list[str]` | Topic names | List of subscriber topic names |
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `name` | `str` | Node name |
+| `rate` | `float` | Tick rate in Hz |
+| `order` | `int` | Execution order |
+| `info` | `NodeInfo` | Scheduler-provided metrics (available during tick) |
+
+### Example: Basic Node
 
 ```python
 import horus
 
 def my_tick(node):
-    node.send("greeting", "Hello from Python!")
-    msg = node.recv("greeting")
-    if msg:
-        print(msg)
+    node.send("heartbeat", {"alive": True, "tick": horus.tick()})
 
-node = horus.Node(
-    name="MyNode",
-    pubs=["greeting"],
-    subs=["greeting"],
-    tick=my_tick,
-    rate=10
-)
-
+node = horus.Node(name="pinger", pubs=["heartbeat"], tick=my_tick, rate=1)
 horus.run(node)
 ```
 
+### Example: Typed Topics (Zero-Copy)
+
+```python
+import horus
+
+def controller_tick(node):
+    scan = node.recv("scan")
+    if scan:
+        # Compute velocity from scan data
+        cmd = horus.CmdVel(linear=0.5, angular=0.0)
+        node.send("cmd_vel", cmd)
+
+controller = horus.Node(
+    name="controller",
+    pubs=[horus.CmdVel],
+    subs=[horus.LaserScan],
+    tick=controller_tick,
+    rate=50
+)
+horus.run(controller)
+```
+
+### Example: Async Node
+
+```python
+import horus
+import aiohttp
+
+async def fetch_tick(node):
+    async with aiohttp.ClientSession() as session:
+        async with session.get("http://api.weather.com/current") as resp:
+            data = await resp.json()
+            node.send("weather", data)
+
+# async def is auto-detected — no extra configuration needed
+node = horus.Node(name="weather", pubs=["weather"], tick=fetch_tick, rate=0.1)
+horus.run(node)
+```
+
+When `tick`, `init`, or `shutdown` is an `async def`, the node automatically runs on the async I/O executor. This is mutually exclusive with `compute=True` and `on="topic"`.
+
+---
+
+## Scheduler
+
+Orchestrates node execution with tick-rate control, real-time scheduling, watchdogs, and recording.
+
+### Constructor
+
+```python
+horus.Scheduler(
+    *,                              # keyword-only
+    tick_rate=1000.0,               # Global tick rate in Hz
+    rt=False,                       # Enable RT scheduling (memory locking, SCHED_FIFO)
+    deterministic=False,            # SimClock, fixed dt, seeded RNG
+    blackbox_mb=0,                  # Flight recorder size (0 = disabled)
+    watchdog_ms=0,                  # Global watchdog timeout (0 = disabled)
+    recording=False,                # Enable session recording
+    name=None,                      # Scheduler name for logging
+    cores=None,                     # CPU affinity list (e.g., [0, 1])
+    max_deadline_misses=None,       # Escalation threshold
+    verbose=False,                  # Debug logging
+    telemetry=None,                 # Telemetry endpoint URL
+)
+```
+
+### Methods
+
+**Lifecycle:**
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `add` | `add(node: Node) -> Scheduler` | `self` (chaining) | Register a node |
+| `run` | `run(duration: float = None)` | — | Start tick loop. `None` = run forever |
+| `stop` | `stop()` | — | Signal graceful shutdown |
+| `is_running` | `is_running() -> bool` | `bool` | Check if scheduler is running |
+| `status` | `status() -> str` | `"idle"`, `"running"`, `"stopped"` | Current state |
+| `current_tick` | `current_tick() -> int` | Tick count | Current tick number |
+| `scheduler_name` | `scheduler_name() -> str` | Name | Scheduler name for logging |
+
+**Single-Tick Execution (Testing & Simulation):**
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `tick_once` | `tick_once(node_names: list = None)` | — | Execute one tick cycle (lazy init on first call) |
+| `tick_for` | `tick_for(duration: float, node_names: list = None)` | — | Run tick loop for a duration, then return |
+
+**Runtime Mutation:**
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `set_node_rate` | `set_node_rate(name: str, rate: float)` | — | Change a node's tick rate at runtime |
+| `set_tick_budget` | `set_tick_budget(name: str, budget_us: int)` | — | Change a node's tick budget at runtime (microseconds) |
+| `add_critical_node` | `add_critical_node(name: str, timeout_ms: int)` | — | Mark node as safety-critical with watchdog timeout |
+| `remove_node` | `remove_node(name: str) -> bool` | `bool` | Remove a node from the scheduler |
+
+**Introspection:**
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `get_node_stats` | `get_node_stats(name: str) -> dict` | Metrics dict | Get node performance stats |
+| `get_all_nodes` | `get_all_nodes() -> list` | Node info list | Get all registered nodes |
+| `get_node_names` | `get_node_names() -> list[str]` | Name list | Get all node names |
+| `get_node_count` | `get_node_count() -> int` | Count | Number of registered nodes |
+| `has_node` | `has_node(name: str) -> bool` | `bool` | Check if a node exists |
+| `get_node_info` | `get_node_info(name: str) -> int` | Order | Get execution order of a node |
+
+**RT & Safety:**
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `capabilities` | `capabilities() -> dict` | Capability dict | RT support, CPU features |
+| `has_full_rt` | `has_full_rt() -> bool` | `bool` | Full RT capabilities available? |
+| `degradations` | `degradations() -> list[str]` | Degradation list | RT features requested but unavailable |
+| `safety_stats` | `safety_stats() -> dict` | Stats dict | Watchdog stats, deadline misses, health states |
+
+**Recording & Replay:**
+
+| Method | Signature | Returns | Description |
+|--------|-----------|---------|-------------|
+| `is_recording` | `is_recording() -> bool` | `bool` | Session recording active? |
+| `is_replaying` | `is_replaying() -> bool` | `bool` | Session replay active? |
+| `stop_recording` | `stop_recording() -> list[str]` | File paths | Stop recording, return session files |
+| `list_recordings` | `list_recordings() -> list[str]` | Session list | List available recordings |
+| `delete_recording` | `delete_recording(name: str) -> bool` | `bool` | Delete a recorded session |
+
+### Context Manager
+
+```python
+with horus.Scheduler(tick_rate=100) as sched:
+    sched.add(sensor_node)
+    sched.add(controller_node)
+    sched.run(duration=10.0)  # Run for 10 seconds
+# sched.stop() called automatically on exit
+```
+
+### Example: Testing with tick_once()
+
+Step through ticks manually for unit testing and simulation:
+
+```python
+import horus
+
+results = []
+
+def sensor_tick(node):
+    node.send("temp", {"value": 25.0 + horus.tick() * 0.1})
+
+def logger_tick(node):
+    msg = node.recv("temp")
+    if msg:
+        results.append(msg["value"])
+
+sensor = horus.Node(name="sensor", pubs=["temp"], tick=sensor_tick, rate=100, order=0)
+logger = horus.Node(name="logger", subs=["temp"], tick=logger_tick, rate=100, order=1)
+
+sched = horus.Scheduler(tick_rate=100, deterministic=True)
+sched.add(sensor)
+sched.add(logger)
+
+# Step through 5 ticks
+for _ in range(5):
+    sched.tick_once()
+
+assert len(results) == 5
+assert results[0] == 25.0
+print(f"Passed: {results}")
+```
+
+### Example: Runtime Safety Configuration
+
+Mark safety-critical nodes and adjust budgets at runtime:
+
+```python
+import horus
+
+def motor_tick(node):
+    cmd = node.recv("cmd_vel")
+    if cmd:
+        node.send("motor_cmd", {"rpm": cmd.linear * 100})
+
+motor = horus.Node(
+    name="motor",
+    subs=[horus.CmdVel],
+    pubs=["motor_cmd"],
+    tick=motor_tick,
+    rate=1000,
+    budget=300 * horus.us,
+    on_miss="safe_mode",
+)
+
+sched = horus.Scheduler(tick_rate=1000, watchdog_ms=500)
+sched.add(motor)
+
+# Mark motor as critical — triggers enter_safe_state() on all nodes if motor
+# exceeds 500ms without ticking
+sched.add_critical_node("motor", timeout_ms=500)
+
+# Adjust budget at runtime (e.g., after profiling shows headroom)
+sched.set_tick_budget("motor", 200)  # tighten to 200μs
+
+# Check RT capabilities
+if sched.has_full_rt():
+    print("Full RT: memory locked, SCHED_FIFO active")
+else:
+    for d in sched.degradations():
+        print(f"RT degradation: {d}")
+
+sched.run()
+
+# After run, inspect safety stats
+stats = sched.safety_stats()
+if stats:
+    print(f"Deadline misses: {stats.get('deadline_misses', 0)}")
+    print(f"Watchdog timeouts: {stats.get('watchdog_timeouts', 0)}")
+```
+
+### Example: Recording and Replay
+
+Record a session for debugging, then inspect and manage recordings:
+
+```python
+import horus
+
+def sensor_tick(node):
+    node.send("imu", horus.Imu(accel_x=0.0, accel_y=0.0, accel_z=9.81))
+
+sensor = horus.Node(name="imu", pubs=[horus.Imu], tick=sensor_tick, rate=100)
+
+# Record a 5-second session
+sched = horus.Scheduler(tick_rate=100, recording=True)
+sched.add(sensor)
+sched.run(duration=5.0)
+
+# Stop recording and get file paths
+files = sched.stop_recording()
+print(f"Recorded to: {files}")
+
+# List all recordings
+for rec in sched.list_recordings():
+    print(f"  Session: {rec}")
+
+# Delete a recording
+sched.delete_recording(files[0])
+```
+
+### Example: Deterministic Mode (Reproducible Runs)
+
+Deterministic mode uses SimClock (fixed dt), seeded RNG, and sequential execution — every run produces identical output:
+
+```python
+import horus
+
+outputs = []
+
+def physics_tick(node):
+    # horus.dt() returns fixed 1/rate in deterministic mode
+    # horus.rng_float() returns tick-seeded values (reproducible)
+    noise = horus.rng_float() * 0.01
+    position = horus.dt() * 10.0 + noise
+    outputs.append(position)
+
+node = horus.Node(name="physics", tick=physics_tick, rate=100)
+
+# Run 1
+sched = horus.Scheduler(tick_rate=100, deterministic=True)
+sched.add(node)
+sched.run(duration=1.0)
+run1 = outputs.copy()
+
+# Run 2 — identical output
+outputs.clear()
+sched2 = horus.Scheduler(tick_rate=100, deterministic=True)
+sched2.add(horus.Node(name="physics", tick=physics_tick, rate=100))
+sched2.run(duration=1.0)
+run2 = outputs.copy()
+
+assert run1 == run2, "Deterministic mode guarantees identical output"
+```
+
+### Example: Introspection at Runtime
+
+Query scheduler and node state programmatically:
+
+```python
+sched = horus.Scheduler(tick_rate=100, name="my_robot")
+sched.add(sensor)
+sched.add(controller)
+
+# After starting (e.g., in a monitoring thread)
+print(f"Scheduler: {sched.scheduler_name()}")
+print(f"Status: {sched.status()}")
+print(f"Nodes: {sched.get_node_names()}")
+print(f"Count: {sched.get_node_count()}")
+print(f"Has motor? {sched.has_node('motor')}")
+
+# Per-node stats
+for name in sched.get_node_names():
+    stats = sched.get_node_stats(name)
+    print(f"  {name}: {stats['total_ticks']} ticks, avg {stats.get('avg_tick_duration_ms', 0):.2f}ms")
+```
+
+### Example: Multi-Node System
+
+```python
+import horus
+
+def sensor_tick(node):
+    reading = horus.Imu(accel_x=0.0, accel_y=0.0, accel_z=9.81)
+    node.send("imu", reading)
+
+def controller_tick(node):
+    imu = node.recv("imu")
+    if imu:
+        cmd = horus.CmdVel(linear=0.5 if imu.accel_z > 9.0 else 0.0, angular=0.0)
+        node.send("cmd_vel", cmd)
+
+sensor = horus.Node(name="imu_sensor", pubs=[horus.Imu], tick=sensor_tick, rate=100, order=0)
+controller = horus.Node(name="nav", subs=[horus.Imu], pubs=[horus.CmdVel], tick=controller_tick, rate=50, order=1)
+
+sched = horus.Scheduler(tick_rate=100, watchdog_ms=500)
+sched.add(sensor)
+sched.add(controller)
+sched.run()
+```
+
+---
+
+## run()
+
+One-liner convenience — creates a Scheduler, adds all nodes, and runs:
+
+```python
+horus.run(
+    *nodes,                         # Node instances to run
+    duration=None,                  # Seconds to run (None = forever)
+    tick_rate=1000.0,               # Global tick rate
+    rt=False,                       # RT scheduling
+    deterministic=False,            # Deterministic mode
+    watchdog_ms=0,                  # Watchdog timeout
+    blackbox_mb=0,                  # Flight recorder
+    recording=False,                # Session recording
+    name=None,                      # Scheduler name
+    cores=None,                     # CPU affinity
+    max_deadline_misses=None,       # Miss threshold
+    verbose=False,                  # Debug logging
+    telemetry=None,                 # Telemetry endpoint
+)
+```
+
+Equivalent to:
+```python
+sched = horus.Scheduler(tick_rate=tick_rate, rt=rt, ...)
+for node in nodes:
+    sched.add(node)
+sched.run(duration=duration)
+```
+
+---
+
+## Clock API
+
+Framework-aware clock that respects deterministic mode. Use these instead of `time.time()` for reproducible behavior.
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `horus.now()` | `float` | Current time in seconds (wall clock or SimClock) |
+| `horus.dt()` | `float` | Timestep for this tick (actual elapsed or fixed `1/rate`) |
+| `horus.elapsed()` | `float` | Seconds since scheduler start |
+| `horus.tick()` | `int` | Current tick number |
+| `horus.budget_remaining()` | `float` | Seconds of budget left this tick (`inf` if no budget) |
+| `horus.rng_float()` | `float` | Random `[0.0, 1.0)` (system entropy or tick-seeded in deterministic) |
+| `horus.timestamp_ns()` | `int` | Nanosecond timestamp for TransformFrame queries |
+
+**Unit constants**: `horus.us = 1e-6`, `horus.ms = 1e-3`
+
+```python
+# Set a 300μs budget
+node = horus.Node(budget=300 * horus.us, deadline=900 * horus.us, ...)
+```
+
+In **deterministic mode** (`deterministic=True`), `now()` returns SimClock time (advances by exactly `1/rate` per tick), `dt()` returns a fixed timestep, and `rng_float()` returns deterministic values seeded by the tick number. This makes recording/replay bit-exact.
+
+---
+
+## Topic (Standalone)
+
+For scripts, tests, and tools that don't need the full node lifecycle:
+
+```python
+topic = horus.Topic(horus.CmdVel)          # Typed (zero-copy)
+topic = horus.Topic("my_topic")            # String (GenericMessage)
+topic = horus.Topic(horus.CmdVel, capacity=64)  # Custom capacity
+```
+
+**Properties**: `name`, `is_network_topic`, `endpoint`, `backend_type`
+
+**Methods**: `send(message) -> bool`, `recv() -> Any or None`
+
+```python
+# One-shot publisher script
+import horus
+
+topic = horus.Topic(horus.CmdVel)
+topic.send(horus.CmdVel(linear=1.0, angular=0.0))
+```
+
+---
+
+## GenericMessage (String Topics)
+
+When you use a string name (`pubs=["data"]` or `Topic("data")`), Python dicts are serialized via MessagePack into a `GenericMessage`. This is the easiest path but has constraints:
+
+**Size limit**: 4KB max per message. Messages exceeding 4KB are spilled to a TensorPool region automatically, but very large dicts (>100KB) should use typed messages or Image/PointCloud instead.
+
+**Serializable types**: Any type MessagePack handles — `dict`, `list`, `str`, `int`, `float`, `bool`, `None`, `bytes`. Nested structures work. Custom classes do NOT work unless they implement `__dict__` or you convert to dict first.
+
+**Error behavior**: If serialization fails (e.g., passing a lambda or a socket object), `send()` raises `TypeError`.
+
+```python
+# These work
+node.send("data", {"x": 1.0, "y": 2.0})              # dict
+node.send("data", [1, 2, 3])                           # list
+node.send("data", "hello")                              # string
+node.send("data", {"nested": {"a": [1, 2]}})           # nested
+
+# These fail
+node.send("data", my_custom_object)                     # TypeError
+node.send("data", lambda: 42)                           # TypeError
+```
+
+**Performance**: ~6-12μs for small dicts, ~50-110μs for large dicts (50+ keys). For anything in a control loop, use typed topics (`pubs=[horus.CmdVel]`) at ~1.7μs.
+
+**Cross-language**: GenericMessage does NOT cross to Rust nodes. Rust nodes use typed `Topic<CmdVel>` — they cannot receive Python dicts. For cross-language communication, use typed message classes (`horus.CmdVel`, `horus.Imu`, etc.) that are binary-compatible between Rust and Python.
+
+---
+
+## Drivers
+
+Load hardware drivers configured in `horus.toml`:
+
+```python
+hw = horus.drivers.load()              # From horus.toml [drivers]
+hw = horus.drivers.load_from("path")   # From custom path
+horus.drivers.register_driver("name", MyDriverClass)  # Register Python driver
+```
+
+**HardwareSet accessors** (15 typed methods):
+
+| Method | Returns | Hardware |
+|--------|---------|----------|
+| `hw.dynamixel()` | `DriverParams` | Dynamixel servos |
+| `hw.rplidar()` | `DriverParams` | RPLidar scanners |
+| `hw.realsense()` | `DriverParams` | Intel RealSense cameras |
+| `hw.i2c()` | `DriverParams` | I2C devices |
+| `hw.serial()` | `DriverParams` | Serial ports |
+| `hw.can()` | `DriverParams` | CAN bus |
+| `hw.gpio()` | `DriverParams` | GPIO pins |
+| `hw.webcam()` | `DriverParams` | USB cameras |
+| `hw.local(name)` | `Node` | Locally registered driver |
+
+**DriverParams**: `get(key)`, `get_or(key, default)`, `has(key)`, `keys()`
+
+---
+
+## Error Types
+
+| Exception | When |
+|-----------|------|
+| `horus.HorusNotFoundError` | Topic, node, or resource not found |
+| `horus.HorusTransformError` | Transform lookup fails (frame not in tree) |
+| `horus.HorusTimeoutError` | Operation timed out |
+
+---
+
+## Supporting Types
+
+### NodeInfo
+
+Available as `node.info` during tick/init/shutdown. Provides scheduler-managed metrics:
+
+| Method/Property | Returns | Description |
+|----------------|---------|-------------|
+| `name` | `str` | Node name |
+| `state` | `str` | Current state |
+| `tick_count()` | `int` | Total ticks |
+| `error_count()` | `int` | Total errors |
+| `successful_ticks()` | `int` | Ticks without error |
+| `avg_tick_duration_ms()` | `float` | Average tick time |
+| `get_uptime()` | `float` | Seconds since init |
+| `get_metrics()` | `dict` | Full metrics snapshot |
+| `request_stop()` | — | Stop the scheduler |
+
+### NodeState (StrEnum)
+
+`UNINITIALIZED`, `INITIALIZING`, `RUNNING`, `STOPPING`, `STOPPED`, `ERROR`, `CRASHED`
+
+### Miss
+
+`horus.Miss.WARN`, `horus.Miss.SKIP`, `horus.Miss.SAFE_MODE`, `horus.Miss.STOP`
+
+---
+
+## Mixed Rust + Python Projects
+
+The most common production pattern: Rust for control loops, Python for ML inference. Both communicate via shared memory topics.
+
+### Project Structure
+
+```
+my-robot/
+├── horus.toml              # Shared config
+├── src/
+│   ├── sensor.rs           # Rust: hardware driver at 1kHz
+│   └── detector.py         # Python: YOLO inference at 30Hz
+└── launch.yaml             # Launch both together
+```
+
+### Which Types Cross the Boundary?
+
+| Type | Rust → Python | Python → Rust | Transport |
+|------|:---:|:---:|-----------|
+| Typed messages (`CmdVel`, `Imu`, `LaserScan`, etc.) | Yes | Yes | Zero-copy Pod (~1.7μs) |
+| `Image`, `PointCloud`, `DepthImage` | Yes | Yes | Pool-backed descriptor |
+| Python dicts (GenericMessage) | No | No | Python-only (MessagePack) |
+| Custom `message!` types | Yes | Yes | If same `#[repr(C)]` layout |
+
+**Rule**: Use typed message classes for cross-language topics. Python dicts only work between Python nodes.
+
+### Launch File
+
+```yaml
+# launch.yaml
+nodes:
+  - name: sensor
+    command: "horus run src/sensor.rs"
+    rate_hz: 1000
+
+  - name: detector
+    command: "horus run src/detector.py"
+    rate_hz: 30
+    depends_on: [sensor]
+```
+
+```bash
+horus launch launch.yaml
+```
+
+### Debugging Cross-Language Issues
+
+```bash
+# Verify both processes see the same topics
+horus topic list --verbose
+
+# Check message rate from Rust publisher
+horus topic hz camera.rgb
+
+# Watch messages flowing between languages
+horus topic echo camera.rgb
+```
+
+If a Python node can't receive from a Rust node: verify both use the **same typed message class** (e.g., `horus.Imu` in Python, `horus_library::messages::Imu` in Rust). String topics (GenericMessage) do not cross the boundary.
+
+---
+
+## Differences from Rust
+
+| Aspect | Python | Rust |
+|--------|--------|------|
+| Node definition | `horus.Node(tick=fn, ...)` kwargs | `impl Node for MyStruct` trait |
+| Topic creation | Auto-created from `pubs`/`subs` | Manual `Topic::new("name")` |
+| Async support | Auto-detected from `async def` | Explicit `.async_io()` builder |
+| Safety methods | Not available (`is_safe_state`, `enter_safe_state`) | Available on Node trait |
+| GIL | Acquired per tick, released during `run()` | N/A |
+| Performance | ~3μs overhead per tick (GIL acquire) | Zero overhead |
+| Error routing | Python exceptions → Rust `FailurePolicy` | Panics → `catch_unwind` → `FailurePolicy` |
+| Unit syntax | `300 * horus.us` | `300_u64.us()` (DurationExt) |
+
+---
+
+## Production Example: ML Inference Node
+
+```python
+import horus
+import numpy as np
+
+# Assume a pre-loaded model
+model = load_model("yolov8n.pt")
+
+def detect_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+
+    # Convert to numpy (zero-copy via DLPack)
+    frame = img.to_numpy()
+
+    # Run inference
+    detections = model.predict(frame)
+
+    # Publish results
+    for det in detections:
+        node.send("detections", {
+            "class": det.class_name,
+            "confidence": float(det.confidence),
+            "bbox": [det.x1, det.y1, det.x2, det.y2],
+            "timestamp_ns": horus.timestamp_ns(),
+        })
+
+detector = horus.Node(
+    name="yolo_detector",
+    subs=[horus.Image],
+    pubs=["detections"],
+    tick=detect_tick,
+    rate=30,
+    compute=True,       # Run on thread pool (CPU-bound inference)
+    budget=30 * horus.ms,
+    on_miss="skip",     # Skip frame if inference takes too long
+)
+
+horus.run(detector, tick_rate=100)
+```
+
+---
+
 ## Design Decisions
 
-**Why PyO3 bindings instead of a pure Python implementation?** The core scheduler, shared memory transport, and message types are written in Rust for deterministic real-time performance. PyO3 exposes them to Python with minimal overhead (~3us per IPC call). A pure Python implementation would add milliseconds of latency and lose zero-copy shared memory support.
+**Why a Python wrapper layer over PyO3?** The raw PyO3 bindings (`_horus`) expose Rust types directly, which have Rust-idiomatic APIs (builders, traits, enums). The Python wrapper (`horus`) translates these into Pythonic patterns: kwargs instead of builders, plain functions instead of trait methods, `None` instead of `Option`. This means the Python API can evolve independently of the Rust API.
 
-**Why `horus.Node()` kwargs instead of class inheritance?** Class inheritance requires boilerplate (`class MyNode(horus.Node): def tick(self):...`). The kwargs API (`horus.Node(name=..., tick=..., rate=...)`) is more Pythonic, works with plain functions and lambdas, and matches how modern Python frameworks (FastAPI, Click) configure behavior. All node configuration happens in one call.
+**Why kwargs, not class inheritance?** Class inheritance (`class MyNode(horus.Node): def tick(self):...`) requires boilerplate and doesn't work with plain functions or lambdas. The kwargs API (`horus.Node(tick=my_fn, rate=30)`) is more Pythonic, matches FastAPI/Click patterns, and all config happens in one call.
 
-**Why `node.recv()` returns data directly instead of a callback?** Pull-based reception (call `recv()` in your tick) keeps timing deterministic -- your tick function controls when data is consumed. Push-based callbacks would fire at unpredictable times, making it harder to reason about execution order and budget compliance.
+**Why `recv()` returns data, not a callback?** Pull-based reception keeps timing deterministic — your tick controls when data is consumed. Push-based callbacks fire at unpredictable times, making budget compliance harder. This matches the Rust `try_recv()` pattern.
 
-**Why separate `Topic` and `Node` APIs?** `Node` provides the high-level managed lifecycle (init/tick/shutdown, rate control, scheduling). `Topic` provides low-level standalone pub/sub for scripts, tests, and one-off tools that don't need full node lifecycle. Both share the same underlying shared memory transport.
+**Why release the GIL during `run()`?** The scheduler's tick loop is Rust code. Releasing the GIL via `py.detach()` during `run()` lets other Python threads (e.g., a Flask telemetry server) run concurrently. The GIL is re-acquired only when calling Python tick/init/shutdown callbacks.
+
+**Why `has_msg()` uses peek buffering?** `has_msg()` internally calls `recv()` and buffers the result. The next `recv()` returns the buffered value. This avoids a separate "peek" API while keeping the common `if node.has_msg("x"): data = node.recv("x")` pattern zero-overhead.
+
+---
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| Kwargs over inheritance | Concise, works with lambdas | No IDE auto-complete for tick signature |
+| Auto-create topics from specs | Zero boilerplate for pubs/subs | Topics created even if never used |
+| GenericMessage for string topics | Any Python dict/object works | ~5-50μs vs ~1.5μs for typed |
+| GIL release during run() | Other threads run freely | ~3μs GIL re-acquire per tick |
+| Peek buffering for has_msg() | Clean API, no separate peek | Consumes message on has_msg() check |
+| No `is_safe_state`/`enter_safe_state` | Simpler Python API | Safety-critical nodes must use Rust |
 
 ---
 
 ## See Also
 
-- [Python Overview](/python) — Python section hub
-- [Rust API Reference](/rust/api) — Rust equivalent APIs
-- [Getting Started (Python)](/getting-started/quick-start-python) — First Python app
+- [Python Bindings Deep Dive](/python/api/python-bindings) — Full PyO3 binding reference
+- [Async Nodes](/python/api/async-nodes) — Async I/O patterns and best practices
+- [Custom Messages](/python/api/custom-messages) — Runtime and compiled messages
+- [Image API](/python/api/image) — Zero-copy camera frames with NumPy/PyTorch
+- [TransformFrame](/python/api/transform-frame) — Coordinate frame management
+- [Node API (Rust)](/rust/api/node) — Rust equivalent for comparison
+- [Getting Started (Python)](/getting-started/quick-start-python) — First Python application

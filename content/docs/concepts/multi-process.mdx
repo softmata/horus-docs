@@ -272,7 +272,164 @@ Shared memory files persist after processes exit. Clean them with:
 horus clean --shm    # Remove stale shared memory regions
 ```
 
-Or they are automatically cleaned on the next `horus run`.
+In practice, you rarely need this — HORUS automatically cleans stale SHM on every `horus` CLI command and every `Scheduler::new()` call. The manual command is an escape hatch for debugging.
+
+---
+
+## What Happens When a Process Crashes
+
+When a process dies (even via SIGKILL or power loss):
+
+1. **SHM files persist** — the kernel closes the file descriptor and releases `flock` locks, but the mmap'd file stays on disk
+2. **Other processes continue** — subscribers see `dropped_count()` increase if the publisher was mid-write, but they don't crash
+3. **Backend auto-migrates** — when the crashed process restarts and reconnects, the topic detects the new participant and migrates the backend (e.g., from 1:1 to 1:N) within ~10μs
+4. **Automatic cleanup** — the next `horus` CLI command or `Scheduler::new()` call auto-cleans stale namespaces (&lt;1ms). No manual intervention needed.
+
+```bash
+# Process 1 crashes
+# Process 2 keeps running, reading stale data from the ring buffer
+# Process 1 restarts
+# Process 2 sees fresh data again — no reconfiguration needed
+```
+
+**Type mismatches**: If a restarted process changes its message type (e.g., from `CmdVel` to `Twist`), the join fails with an error. Both processes must use the same message type for the same topic name.
+
+---
+
+## Mixed-Language Multi-Process
+
+The most common multi-process pattern: Rust for control loops, Python for ML inference.
+
+**Rust sensor node** (`sensor.rs`):
+```rust
+use horus::prelude::*;
+
+struct CameraNode {
+    pub_img: Topic<Image>,
+}
+
+impl CameraNode {
+    fn new() -> Result<Self> {
+        Ok(Self { pub_img: Topic::new("camera.rgb")? })
+    }
+}
+
+impl Node for CameraNode {
+    fn name(&self) -> &str { "camera" }
+    fn tick(&mut self) {
+        let mut img = Image::new(640, 480, "rgb8");
+        // ... capture from hardware ...
+        self.pub_img.send(img);
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(30_u64.hz());
+    sched.add(CameraNode::new()?).order(0).build()?;
+    sched.run()
+}
+```
+
+**Python ML node** (`detector.py`):
+```python
+import horus
+import numpy as np
+
+def detect_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+    frame = img.to_numpy()  # Zero-copy via DLPack
+    # ... run YOLO inference ...
+    node.send("detections", {"class": "person", "confidence": 0.95})
+
+detector = horus.Node(
+    name="yolo",
+    subs=[horus.Image],
+    pubs=["detections"],
+    tick=detect_tick,
+    rate=30,
+    compute=True,
+)
+horus.run(detector)
+```
+
+**Run both**:
+```bash
+# Terminal 1 (Rust, 30 FPS camera)
+horus run sensor.rs
+
+# Terminal 2 (Python, ML inference)
+horus run detector.py
+```
+
+The `Image` flows through shared memory pool-backed transport — the Python node gets a zero-copy view of the pixels the Rust node wrote. No serialization, no copying.
+
+---
+
+## Debugging Multi-Process Systems
+
+### Identify which process owns what
+
+```bash
+horus topic list --verbose
+# Shows publisher/subscriber PIDs per topic
+
+horus node list
+# Shows all running nodes across all processes with PID, rate, CPU, memory
+```
+
+### Watch cross-process data flow
+
+```bash
+# Monitor messages from the Rust sensor in the Python process's terminal
+horus topic echo camera.rgb
+
+# Measure the actual publishing rate
+horus topic hz camera.rgb
+
+# Measure bandwidth
+horus topic bw camera.rgb
+```
+
+### Debug one process at a time
+
+```bash
+# Start the sensor normally
+horus run sensor.rs
+
+# Start the detector with verbose logging
+RUST_LOG=debug horus run detector.py
+```
+
+### Use the monitor for a system-wide view
+
+```bash
+horus monitor
+# Web UI at http://localhost:3000 shows ALL nodes from ALL processes
+# Topic graph view shows cross-process message flow
+```
+
+### Common debugging workflow
+
+1. `horus topic list` — verify both processes see the same topics
+2. `horus topic hz <topic>` — verify the publisher is sending at expected rate
+3. `horus topic echo <topic>` — verify message content is correct
+4. `horus node list` — verify both nodes are `Running` (not `Error` or `Crashed`)
+5. `horus bb --anomalies` — check for deadline misses or errors
+
+---
+
+## Common Errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| Topics not visible across processes | Different SHM namespaces | Set `HORUS_NAMESPACE=shared` in both terminals, or use `horus launch` |
+| `Type mismatch` on topic join | Process A uses `CmdVel`, Process B uses different type for same name | Ensure both processes use the exact same message type |
+| Stale data after crash | SHM files persist after process death | Usually auto-cleaned on next `horus run`. Manual: `horus clean --shm` |
+| `Topic not found` in CLI | CLI uses a different namespace than the running app | Run CLI in same terminal or set matching `HORUS_NAMESPACE` |
+| High `dropped_count` | Subscriber process is slower than publisher | Increase subscriber rate, reduce publisher rate, or increase topic capacity |
+| Permission denied on SHM | Different users running processes | Run both as the same user, or check `/dev/shm` permissions |
 
 ---
 
@@ -298,11 +455,13 @@ HORUS automatically detects whether a publisher and subscriber are in the same p
 | **No broker** | Sub-microsecond latency; no single point of failure; no extra process to deploy | Single-machine only — cross-machine communication requires an explicit network bridge |
 | **Transparent transport** | Same code works in single-process and multi-process; zero migration cost | Users cannot force a specific transport backend; automatic selection may surprise during debugging |
 | **Process isolation** | One crash does not take down the system; independent restart and upgrade | Higher baseline latency (~50ns cross-process vs ~3ns same-thread); shared memory files persist after exit and need cleanup |
-| **Shared memory persistence** | Fast reconnection — no handshake needed when a process restarts | Stale shared memory accumulates if processes crash; requires `horus clean --shm` for cleanup |
+| **Shared memory persistence** | Fast reconnection — no handshake needed when a process restarts | Stale files from crashes are auto-cleaned on next startup; `horus clean --shm` for manual override |
 | **Independent schedulers** | Each process can run at its own tick rate with its own ordering | No cross-process deterministic ordering — sensor-to-actuator chains across processes depend on timing, not scheduler order |
 
 ## See Also
 
+- [Shared Memory](/concepts/shared-memory) — SHM architecture, ring buffers, platform differences
 - [Topics (Full Reference)](/concepts/core-concepts-topic) — topic API and backend details
 - [Message Performance](/concepts/core-concepts-podtopic) — POD types and zero-copy transport
 - [Multi-Language](/concepts/multi-language) — Rust + Python interop patterns
+- [CLI Reference](/development/cli-reference) — `horus launch`, `horus topic list`, `horus clean`

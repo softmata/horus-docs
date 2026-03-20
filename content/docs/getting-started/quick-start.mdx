@@ -164,6 +164,52 @@ Temperature: 20.4°C
 
 Press **Ctrl+C** to stop. You should see the shutdown messages from both nodes.
 
+> **Debug vs Release**: `horus run` without `--release` uses debug mode (~60-200μs per tick). With `--release`, tick times drop to ~1-3μs. If you're thinking "HORUS is slow" — you're probably running in debug mode. Always use `--release` for performance testing.
+
+## Step 3.5: Introspect While Running
+
+While your app is running, open a **second terminal** and peek inside:
+
+```bash
+# See all active topics
+horus topic list
+# Output:
+# temperature (f32) — 1 publisher, 1 subscriber
+
+# Watch messages in real-time
+horus topic echo temperature
+# Output:
+# 20.1
+# 20.2
+# 20.3
+# ...
+
+# Check the publishing rate
+horus topic hz temperature
+# Output: average rate: 1.0 Hz
+
+# See running nodes
+horus node list
+# Output:
+# NAME                  RATE   STATUS
+# TemperatureSensor     1Hz    Running
+# TemperatureMonitor    1Hz    Running
+```
+
+This works because HORUS topics live in shared memory — any process on the machine can inspect them, including the CLI tools. This is your primary debugging tool.
+
+## Step 3.6: What Just Happened
+
+When you ran `horus run --release`, HORUS:
+
+1. **Parsed** `horus.toml` and compiled your Rust code via Cargo
+2. **Created shared memory** — a ring buffer at `/dev/shm/horus_<namespace>/topics/horus_temperature` for the "temperature" topic
+3. **Initialized nodes** — called `new()` on both structs, which opened the same SHM region via `Topic::new("temperature")`
+4. **Started the tick loop** — the scheduler calls `TemperatureSensor::tick()` then `TemperatureMonitor::tick()` in order, every cycle
+5. **On Ctrl+C** — sent SIGTERM, called `shutdown()` on both nodes, cleaned up SHM
+
+The data flow: `TemperatureSensor::tick()` writes an `f32` directly into the ring buffer (zero-copy, ~3ns). `TemperatureMonitor::tick()` reads it out. No serialization, no network, no kernel involvement.
+
 ## Step 4: Understand the Key Patterns
 
 You just used three core HORUS concepts:
@@ -245,9 +291,51 @@ The macro generates the struct, constructor, and `Node` trait implementation. Bo
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Failed to create Topic` | Stale shared memory from a previous run | Run `horus clean --shm` |
+| `Failed to create Topic` | Stale shared memory from a previous run | Usually auto-cleaned — if persists, run `horus clean --shm` |
 | Nothing prints | Monitor added but sensor missing | Ensure both nodes are added to the scheduler |
 | `horus run` fails to build | Missing system dependencies | See [Installation](/getting-started/installation) Step 1 |
+| Output looks slow | Running in debug mode | Use `horus run --release` |
+| Topic not in `topic list` | CLI is in a different SHM namespace | Run CLI in the same terminal, or set matching `HORUS_NAMESPACE` |
+| `Permission denied` on shared memory | SHM directory permissions | Run `horus doctor` to diagnose |
+| `Address already in use` | Another HORUS process still running | Check for running processes; if none, `horus clean --shm` |
+| `.build()` returns error | Duplicate node name or invalid config | Check that each node has a unique name |
+
+## Python Equivalent
+
+The same system in Python (8 lines):
+
+```python
+import horus
+
+temperature = 20.0
+
+def sensor_tick(node):
+    global temperature
+    temperature += 0.1
+    node.send("temperature", temperature)
+
+def monitor_tick(node):
+    temp = node.recv("temperature")
+    if temp is not None:
+        print(f"Temperature: {temp:.1f}°C")
+
+sensor = horus.Node(name="sensor", pubs=["temperature"], tick=sensor_tick, rate=1, order=0)
+monitor = horus.Node(name="monitor", subs=["temperature"], tick=monitor_tick, rate=1, order=1)
+
+horus.run(sensor, monitor)
+```
+
+See [Quick Start (Python)](/getting-started/quick-start-python) for a full walkthrough.
+
+## Graceful Shutdown
+
+When you press **Ctrl+C**, HORUS:
+1. Catches the SIGTERM signal
+2. Calls `shutdown()` on each node in registration order
+3. Cleans up shared memory regions owned by this process
+4. Prints a timing report (total ticks, average tick duration)
+
+Always zero actuators in `shutdown()` — if your node controls motors, send a stop command before exiting.
 
 ## Key Takeaways
 

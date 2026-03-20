@@ -1,0 +1,324 @@
+---
+title: "Tensor"
+description: "General-purpose shared memory tensor with Pythonic API for ML/AI workflows"
+order: 53
+---
+
+# Tensor
+
+General-purpose shared memory tensor for custom data. Feels like PyTorch/NumPy but lives in shared memory for zero-copy IPC.
+
+Use `Tensor` for costmaps, feature maps, state vectors, occupancy grids, CNN outputs, RL observations -- any array data that needs to move between nodes without serialization overhead.
+
+```python
+import horus
+import numpy as np
+import torch
+
+# Create a costmap in shared memory
+costmap = horus.Tensor([1000, 1000], dtype="float32")
+costmap.numpy()[:] = compute_costmap()  # write directly to SHM
+
+# Send to another process (168B descriptor, not 4MB)
+topic = horus.Topic("nav.costmap", "Tensor")
+topic.send(costmap)
+
+# Receive and use with any library
+received = topic.recv()
+arr = received.numpy()                  # NumPy (zero-copy)
+pt = torch.from_dlpack(received)        # PyTorch (zero-copy)
+```
+
+## Constructors
+
+```python
+from horus import Tensor
+
+# Shape + dtype (zero-initialized)
+t = Tensor([480, 640, 3], dtype="uint8")
+t = Tensor([1000, 1000], dtype="float32")
+
+# Static constructors
+t = Tensor.zeros([100, 100])              # explicit zeros
+t = Tensor.empty([100, 100])              # fast, uninitialized
+
+# From data (one copy into shared memory)
+t = Tensor.from_numpy(np.array(...))      # from NumPy
+t = Tensor.from_torch(torch_tensor)       # from PyTorch
+t = Tensor.from_dlpack(any_dlpack_obj)    # from any DLPack source
+```
+
+## Properties
+
+```python
+t.shape        # [480, 640, 3]
+t.dtype        # "float32"
+t.nbytes       # total bytes
+t.numel        # total elements
+len(t)         # first dimension
+```
+
+## Framework Interop
+
+Every Python ML library works with `horus.Tensor` out of the box:
+
+### NumPy
+
+```python
+arr = t.numpy()                # zero-copy view
+arr = np.asarray(t)            # also zero-copy (via __array_interface__)
+arr = np.from_dlpack(t)        # also works (via __dlpack__)
+```
+
+### PyTorch
+
+```python
+pt = torch.from_dlpack(t)     # zero-copy into PyTorch
+t = Tensor.from_torch(pt)     # copy into shared memory
+
+# Use directly in models
+features = model(torch.from_dlpack(t))
+action = Tensor.from_torch(policy(obs_tensor))
+```
+
+### SciPy
+
+```python
+# Signal processing on IMU data
+filtered = scipy.signal.filtfilt(b, a, t.numpy())
+
+# Distance transform on costmap
+inflated = scipy.ndimage.distance_transform_edt(t.numpy())
+
+# KD-tree on point cloud
+tree = scipy.spatial.KDTree(t.numpy())
+```
+
+### scikit-learn
+
+```python
+# Normalize sensor data
+scaled = StandardScaler().fit_transform(t.numpy())
+
+# PCA on feature vectors
+reduced = PCA(n_components=10).fit_transform(t.numpy())
+
+# Cluster point cloud
+labels = DBSCAN(eps=0.5).fit_predict(t.numpy())
+```
+
+### OpenCV
+
+```python
+# Image processing
+gray = cv2.cvtColor(t.numpy(), cv2.COLOR_RGB2GRAY)
+edges = cv2.Canny(t.numpy(), 50, 150)
+resized = cv2.resize(t.numpy(), (320, 240))
+```
+
+### Pandas
+
+```python
+# Robot telemetry as DataFrame
+df = pd.DataFrame(t.numpy(), columns=["x", "y", "theta", "v"])
+rolling_avg = df.rolling(50).mean()
+```
+
+### JAX
+
+```python
+jax_arr = jnp.array(t.numpy())
+grad = jax.grad(loss_fn)(jax_arr)
+```
+
+## Pythonic Operations
+
+### Indexing
+
+```python
+t[0]                # first row/element
+t[10:20]            # slice
+t[0, :, 3]          # multi-dimensional
+t[5] = 42.0         # write
+t[0:10] = arr       # slice write
+```
+
+### Shape Operations
+
+```python
+t.reshape(100, 100)   # reshape (view, no copy if contiguous)
+t.reshape([50, 200])  # list form
+t.flatten()            # 1D view
+t.squeeze()            # remove size-1 dims
+t.unsqueeze(0)         # add dim: [5] -> [1, 5]
+t.unsqueeze(-1)        # add dim: [5] -> [5, 1]
+t.T                    # transpose (2D)
+t.view([2, 3, 4])     # explicit reshape
+t.slice(10, 20)        # slice first dimension
+```
+
+### Arithmetic
+
+Returns a new `Tensor` backed by shared memory:
+
+```python
+result = t + 10        # scalar
+result = a + b         # tensor + tensor
+result = t + np_array  # tensor + numpy
+result = t * 2.0
+result = t / 5
+result = t - other
+result = -t            # negation
+```
+
+### Comparisons
+
+Returns a bool `Tensor`:
+
+```python
+mask = t > 0.5
+mask = t == 0
+mask = t < threshold
+mask = t >= 2.0
+mask = t <= other
+```
+
+### Reductions
+
+```python
+t.sum()            # scalar sum (returns 1-element Tensor)
+t.sum(dim=0)       # sum along axis
+t.mean()
+t.mean(dim=1)
+t.max()
+t.min(dim=0)
+```
+
+### Type Conversion
+
+```python
+t.astype("float16")    # returns new Tensor
+t.to_float32()         # convenience
+t.to_float16()
+t.to_int32()
+t.to_uint8()
+t.tolist()             # Python list
+```
+
+## Supported Dtypes
+
+| dtype | NumPy | PyTorch | Bytes |
+|-------|-------|---------|-------|
+| `"float32"` | `float32` | `float32` | 4 |
+| `"float64"` | `float64` | `float64` | 8 |
+| `"float16"` | `float16` | `float16` | 2 |
+| `"int8"` | `int8` | `int8` | 1 |
+| `"int16"` | `int16` | `int16` | 2 |
+| `"int32"` | `int32` | `int32` | 4 |
+| `"int64"` | `int64` | `int64` | 8 |
+| `"uint8"` | `uint8` | `uint8` | 1 |
+| `"uint16"` | `uint16` | -- | 2 |
+| `"uint32"` | `uint32` | -- | 4 |
+| `"uint64"` | `uint64` | -- | 8 |
+| `"bool"` | `bool_` | `bool` | 1 |
+
+## Usage with Topics
+
+```python
+from horus import Tensor, Topic
+
+topic = Topic("features", "Tensor")
+
+# Publish — 168B descriptor through ring buffer, data stays in SHM
+t = Tensor.from_numpy(np.random.randn(64, 64).astype(np.float32))
+topic.send(t)
+
+# Subscribe — zero-copy access
+received = topic.recv()
+if received:
+    arr = received.numpy()   # direct view into shared memory
+```
+
+## Relation to Image, PointCloud, DepthImage
+
+`Tensor` is the general-purpose type. `Image`, `PointCloud`, and `DepthImage` are specialized wrappers with domain-specific methods (`.width`, `.encoding`, `.point_count`).
+
+All domain types can be converted to a `Tensor` view via `.as_tensor()`:
+
+```python
+img = horus.Image(480, 640, "rgb8")
+t = img.as_tensor()              # zero-copy Tensor view
+t.shape                          # [480, 640, 3]
+torch.from_dlpack(t)             # works
+t.reshape(480 * 640, 3)          # works
+t + 50                           # works
+```
+
+Domain types also support direct indexing and arithmetic:
+
+```python
+img[240, 320]        # pixel access
+img + 50             # returns Tensor
+cloud[0]             # first point
+len(cloud)           # number of points
+depth[100, 200]      # depth value
+```
+
+## Robotics Examples
+
+### Costmap for Path Planning
+
+```python
+grid = horus.Tensor([500, 500], dtype="float32")
+arr = grid.numpy()
+arr[:] = compute_costmap()
+
+# Inflate obstacles with scipy
+from scipy.ndimage import distance_transform_edt
+obstacles = (arr > 0.8).astype(np.float32)
+inflated = 1.0 - np.clip(distance_transform_edt(1 - obstacles) / 20.0, 0, 1)
+grid.numpy()[:] = inflated
+
+topic.send(grid)
+```
+
+### RL Policy Inference
+
+```python
+# Observation from sensors
+obs = horus.Tensor.from_numpy(
+    np.concatenate([imu_data, lidar_ranges, joint_positions]).astype(np.float32)
+)
+
+# PyTorch inference
+pt_obs = torch.from_dlpack(obs)
+with torch.no_grad():
+    action = policy(pt_obs)
+
+# Send command
+cmd = horus.Tensor.from_torch(action)
+cmd_topic.send(cmd)
+```
+
+### Feature Map Between Nodes
+
+```python
+# Detection node
+img_tensor = torch.from_dlpack(img.as_tensor())
+features = backbone(img_tensor.unsqueeze(0).float() / 255.0)
+feature_map = horus.Tensor.from_torch(features.squeeze(0))
+feature_topic.send(feature_map)
+
+# Planning node
+features = feature_topic.recv()
+planning_input = features.numpy()  # zero-copy into numpy
+path = planner.plan(planning_input)
+```
+
+## See Also
+
+- [Memory Types](/python/api/memory-types) -- Overview of all pool-backed types
+- [Image](/python/api/image) -- Camera images
+- [PointCloud](/python/api/pointcloud) -- 3D point clouds
+- [DepthImage](/python/api/depth-image) -- Depth maps
+- [Topic](/concepts/core-concepts-topic) -- Zero-copy IPC

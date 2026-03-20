@@ -12,6 +12,34 @@ A reusable PID controller node that reads a setpoint and measured value, then pu
 
 You need a closed-loop controller that drives a measured value toward a target setpoint with tunable response characteristics.
 
+### How PID Works
+
+A PID controller is a **feedback loop**. It continuously measures the difference between where you *want* to be (setpoint) and where you *are* (measured value), then computes a control output to close that gap. The output is the sum of three terms, each addressing a different aspect of the error:
+
+**P (Proportional) -- reacts to the present error**
+
+`P = Kp * error`
+
+The proportional term is the simplest: multiply the current error by a gain. Large error produces large output, pushing the system toward the setpoint. P alone gets you close but usually leaves a small residual error (called *steady-state error*) because the output shrinks as the error shrinks -- at some point the output is too small to overcome friction or load.
+
+**I (Integral) -- eliminates steady-state error**
+
+`I = Ki * sum_of_errors_over_time`
+
+The integral term accumulates past errors. Even if the current error is tiny, the integral keeps growing until the system reaches the setpoint exactly. This eliminates steady-state error but introduces risk: if the system is saturated (actuator at its limit), the integral keeps accumulating, causing *windup*. That is why the code clamps the integral to `integral_max`.
+
+**D (Derivative) -- reduces overshoot**
+
+`D = Kd * rate_of_change_of_error`
+
+The derivative term looks at how fast the error is changing. If the error is shrinking rapidly (you are approaching the setpoint), D produces a braking force that prevents overshoot. The downside: differentiating a noisy sensor signal amplifies the noise. That is why the code applies a low-pass filter to the derivative.
+
+**Combined output:**
+
+`output = P + I + D`
+
+The final output is clamped to `[output_min, output_max]` to protect the actuator from impossible commands.
+
 ### When To Use
 
 - Position, velocity, or temperature control loops
@@ -191,6 +219,282 @@ fn main() -> Result<()> {
 - **200Hz is typical** for position/velocity PID; use 1kHz+ for current/torque loops
 - **Gains (kp, ki, kd)** are constructor parameters — wire from config or topic for online tuning
 
+### Tuning Your PID
+
+Getting the gains right is the hardest part of PID. Two approaches work well in practice.
+
+**Manual tuning (recommended starting point):**
+
+1. Set `ki = 0` and `kd = 0`. Start with P-only control.
+2. Increase `kp` until the system responds quickly to setpoint changes but starts to oscillate or overshoot.
+3. Add `kd` to dampen the overshoot. Increase `kd` until the overshoot is acceptable. If the output becomes jerky, increase the derivative filter `alpha`.
+4. Add a small `ki` to eliminate steady-state error. Start low (e.g., 0.1) and increase until the residual error disappears. Watch for integral windup -- if the system overshoots after saturation, reduce `integral_max`.
+
+**Ziegler-Nichols method (systematic):**
+
+1. Set `ki = 0` and `kd = 0`.
+2. Increase `kp` from zero until the system oscillates with a constant amplitude. This is the *ultimate gain* `Ku`.
+3. Measure the *oscillation period* `Tu` (seconds per cycle).
+4. Compute the gains:
+
+| Controller | Kp | Ki | Kd |
+|---|---|---|---|
+| P-only | `0.5 * Ku` | 0 | 0 |
+| PI | `0.45 * Ku` | `1.2 * Kp / Tu` | 0 |
+| PID | `0.6 * Ku` | `2 * Kp / Tu` | `Kp * Tu / 8` |
+
+Ziegler-Nichols gives aggressive tuning. You will likely need to reduce `kp` by 20-30% and increase `kd` for less overshoot.
+
+### Online Tuning with Parameters
+
+You can adjust PID gains at runtime without restarting. Add `RuntimeParams` to the node and read gains each tick:
+
+```rust
+use horus::prelude::*;
+
+struct TunablePidNode {
+    params: RuntimeParams,
+    setpoint_sub: Topic<Setpoint>,
+    measurement_sub: Topic<Measurement>,
+    output_pub: Topic<ControlOutput>,
+    // State
+    kp: f32,
+    ki: f32,
+    kd: f32,
+    integral: f32,
+    prev_error: f32,
+    prev_derivative: f32,
+    output_min: f32,
+    output_max: f32,
+    integral_max: f32,
+    alpha: f32,
+    target: f32,
+    measured: f32,
+    tick_count: u64,
+}
+
+impl TunablePidNode {
+    fn new() -> Result<Self> {
+        let params = RuntimeParams::init()?;
+        Ok(Self {
+            kp: params.get_or("kp", 2.0),
+            ki: params.get_or("ki", 0.5),
+            kd: params.get_or("kd", 0.1),
+            params,
+            setpoint_sub: Topic::new("pid.setpoint")?,
+            measurement_sub: Topic::new("pid.measurement")?,
+            output_pub: Topic::new("pid.output")?,
+            integral: 0.0,
+            prev_error: 0.0,
+            prev_derivative: 0.0,
+            output_min: -1.0,
+            output_max: 1.0,
+            integral_max: 0.5,
+            alpha: 0.8,
+            target: 0.0,
+            measured: 0.0,
+            tick_count: 0,
+        })
+    }
+}
+
+impl Node for TunablePidNode {
+    fn name(&self) -> &str { "TunablePID" }
+
+    fn tick(&mut self) {
+        // Reload gains every 200 ticks (~1s at 200Hz)
+        if self.tick_count % 200 == 0 {
+            self.kp = self.params.get_or("kp", self.kp as f64) as f32;
+            self.ki = self.params.get_or("ki", self.ki as f64) as f32;
+            self.kd = self.params.get_or("kd", self.kd as f64) as f32;
+        }
+        self.tick_count += 1;
+
+        // ... rest of PID logic identical to PidNode::tick() ...
+    }
+}
+```
+
+Then tune from the command line while the system is running:
+
+```bash
+# Increase proportional gain
+horus param set TunablePID kp 3.0
+
+# Reduce integral to fix overshoot
+horus param set TunablePID ki 0.2
+
+# Add more derivative damping
+horus param set TunablePID kd 0.3
+```
+
+Changes take effect within one second (the next param reload cycle). No restart needed.
+
+### Python Equivalent
+
+The same PID controller in Python, using `horus.Node`:
+
+```python
+import horus
+from horus import Node, run, us
+
+def pid_init(node):
+    """Initialize PID state."""
+    node.state = {
+        "kp": 2.0, "ki": 0.5, "kd": 0.1,
+        "integral": 0.0,
+        "prev_error": 0.0,
+        "prev_derivative": 0.0,
+        "integral_max": 0.5,
+        "alpha": 0.8,
+        "output_min": -1.0,
+        "output_max": 1.0,
+        "target": 0.0,
+        "measured": 0.0,
+    }
+
+def pid_tick(node):
+    """PID control loop — called every tick."""
+    s = node.state
+
+    # Read inputs
+    if node.has_msg("pid.setpoint"):
+        msg = node.recv("pid.setpoint")
+        s["target"] = msg["target"]
+
+    if node.has_msg("pid.measurement"):
+        msg = node.recv("pid.measurement")
+        s["measured"] = msg["value"]
+
+    dt = 1.0 / 200.0
+    error = s["target"] - s["measured"]
+
+    # P term
+    p_term = s["kp"] * error
+
+    # I term with anti-windup
+    s["integral"] += error * dt
+    s["integral"] = max(-s["integral_max"], min(s["integral_max"], s["integral"]))
+    i_term = s["ki"] * s["integral"]
+
+    # D term with low-pass filter
+    raw_d = (error - s["prev_error"]) / dt
+    filtered = s["alpha"] * s["prev_derivative"] + (1.0 - s["alpha"]) * raw_d
+    d_term = s["kd"] * filtered
+    s["prev_derivative"] = filtered
+    s["prev_error"] = error
+
+    # Output with clamping
+    command = max(s["output_min"], min(s["output_max"], p_term + i_term + d_term))
+
+    node.send("pid.output", {
+        "command": command,
+        "error": error,
+        "p_term": p_term,
+        "i_term": i_term,
+        "d_term": d_term,
+    })
+
+def pid_shutdown(node):
+    """Zero the output on shutdown."""
+    node.send("pid.output", {"command": 0.0, "error": 0.0,
+                              "p_term": 0.0, "i_term": 0.0, "d_term": 0.0})
+
+pid_node = Node(
+    name="PID",
+    tick=pid_tick,
+    init=pid_init,
+    shutdown=pid_shutdown,
+    rate=200,
+    order=0,
+    budget=400 * us,
+    subs=["pid.setpoint", "pid.measurement"],
+    pubs=["pid.output"],
+)
+
+run(pid_node, rt=True)
+```
+
+### Testing Your PID
+
+Use `tick_once()` to step through the controller deterministically and assert on output:
+
+```rust
+#[test]
+fn test_pid_step_response() {
+    // Create scheduler in deterministic mode
+    let mut scheduler = Scheduler::new()
+        .deterministic(true)
+        .tick_rate(200_u64.hz());
+
+    let setpoint_pub: Topic<Setpoint> = Topic::new("pid.setpoint").unwrap();
+    let measurement_pub: Topic<Measurement> = Topic::new("pid.measurement").unwrap();
+    let output_sub: Topic<ControlOutput> = Topic::new("pid.output").unwrap();
+
+    scheduler.add(PidNode::new(2.0, 0.5, 0.1).unwrap())
+        .order(0)
+        .rate(200_u64.hz())
+        .build()
+        .unwrap();
+
+    // Send a step input: target=1.0, measured=0.0
+    setpoint_pub.send(Setpoint { target: 1.0 });
+    measurement_pub.send(Measurement { value: 0.0 });
+
+    // First tick — large error, P dominates
+    scheduler.tick_once().unwrap();
+    let out = output_sub.recv().unwrap();
+    assert!(out.command > 0.0, "output should be positive for positive error");
+    assert!((out.error - 1.0).abs() < 1e-6, "error should be 1.0");
+    assert!(out.p_term > out.i_term, "P should dominate on first tick");
+
+    // Run 200 more ticks — simulate convergence
+    for _ in 0..200 {
+        // Simulate plant: measured moves toward command
+        let m = measurement_pub.recv().unwrap_or(Measurement { value: 0.0 });
+        let new_val = m.value + out.command * 0.01; // simple integrator plant
+        measurement_pub.send(Measurement { value: new_val });
+        scheduler.tick_once().unwrap();
+    }
+
+    // Error should be small after 200 ticks (1 second at 200Hz)
+    let final_out = output_sub.recv().unwrap();
+    assert!(final_out.error.abs() < 0.1, "should converge near setpoint");
+}
+```
+
+Key testing patterns:
+- **Deterministic mode** ensures identical results on every run
+- **`tick_once()`** gives precise single-step control -- no threads, no timing variance
+- **Test the step response**: set target, measure output after N ticks, assert convergence
+- **Test edge cases**: zero gains, saturated output, setpoint changes, integral windup
+
+### Design Decisions
+
+**Why anti-windup (integral clamping)?**
+
+Without clamping, the integral term grows unbounded when the output is saturated (e.g., the motor is at full power but the error persists). When conditions change and the error reverses, the integral has accumulated so much that the controller overshoots massively before recovering. Clamping `integral` to `[-integral_max, integral_max]` caps this accumulation. The `integral_max` value should be set so that `ki * integral_max` produces roughly half of your output range.
+
+**Why a derivative filter (low-pass on D)?**
+
+The derivative term computes `(error - prev_error) / dt`. Real sensor data has noise -- small random fluctuations that produce enormous derivative spikes. These spikes translate directly into actuator jitter. The exponential moving average filter (`alpha * prev + (1-alpha) * new`) smooths the derivative at the cost of a small phase lag. An `alpha` of 0.8 provides strong filtering; 0.1 is nearly unfiltered. For noisy sensors (encoders, IMUs), keep `alpha` between 0.7 and 0.9.
+
+**Why output clamping?**
+
+Every actuator has physical limits. Sending a motor a command of 10.0 when it only accepts -1.0 to 1.0 is at best wasted and at worst dangerous. Clamping the final output to `[output_min, output_max]` enforces actuator limits in software. Set these to match your hardware specifications.
+
+### Trade-offs
+
+| Decision | Benefit | Cost |
+|----------|---------|------|
+| Anti-windup clamping | Prevents massive overshoot after saturation | Slows convergence when `integral_max` is too low |
+| Derivative low-pass filter | Eliminates actuator jitter from sensor noise | Adds phase lag; slower response to real transients |
+| Output clamping | Protects actuators from impossible commands | Controller cannot express urgency beyond the clamp |
+| Fixed `dt` (from rate) | Simple, no clock dependency in tick | Inaccurate if scheduler tick drifts significantly |
+| Debug fields in `ControlOutput` | Easy tuning via `horus topic echo pid.output` | Extra 16 bytes per message (negligible for most use cases) |
+| Single-rate PID | Straightforward implementation | Cannot run inner loop faster than outer loop (use cascaded PID for that) |
+| Constructor gains | Compile-time configuration, no runtime overhead | Requires restart to change (use `RuntimeParams` for online tuning) |
+
 ### Variations
 
 - **Velocity PID**: Change `dt` to match your actual tick rate. Use `.rate(1000_u64.hz())` for current/torque loops
@@ -215,3 +519,5 @@ fn main() -> Result<()> {
 
 - [Differential Drive Recipe](/recipes/differential-drive) — Uses PID output
 - [Scheduler API](/rust/api/scheduler) — Rate and timing configuration
+- [Parameters](/development/parameters) — `RuntimeParams` for online tuning
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) — `tick_once()`, deterministic mode, execution classes

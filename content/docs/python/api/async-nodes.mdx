@@ -177,6 +177,74 @@ No special handling — the scheduler detects which is async and routes accordin
 
 **Mixing sync and async:** The scheduler treats async nodes as AsyncIo execution class, which runs on the I/O thread pool alongside Rust `.async_io()` nodes. Sync and async nodes communicate through the same topics with no special handling -- shared memory IPC is thread-safe by design.
 
+## Error Handling
+
+When an async tick raises an exception, it flows through the same `FailurePolicy` as sync nodes -- there is no separate error path for async. `KeyboardInterrupt` is special-cased: it sets the scheduler's stop flag instead of propagating, so Ctrl+C triggers a clean shutdown rather than crashing.
+
+Use try/except inside your async tick to handle expected failures gracefully:
+
+```python
+import horus
+import aiohttp
+
+async def resilient_tick(node):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("http://api.example.com/data") as resp:
+                data = await resp.json()
+                node.send("api_data", data)
+    except aiohttp.ClientError as e:
+        node.log_error(f"HTTP request failed: {e}")
+    except Exception as e:
+        node.log_error(f"Unexpected error: {e}")
+
+node = horus.Node(
+    name="resilient_fetcher",
+    tick=resilient_tick,
+    rate=1,
+    pubs=["api_data"],
+)
+horus.run(node)
+```
+
+## Cancellation Behavior
+
+When the scheduler stops (Ctrl+C, duration expires), pending awaits complete before `shutdown` runs -- they are **not** cancelled. This means a hanging `await` will block shutdown indefinitely.
+
+Always use timeouts on network requests and any other awaits that could hang. If your async tick makes an HTTP call without a timeout and the server never responds, the entire scheduler will hang on shutdown waiting for that tick to finish.
+
+## Timeout Pattern
+
+Wrap network calls with `asyncio.wait_for()` to guarantee bounded execution time:
+
+```python
+import asyncio
+import aiohttp
+
+async def safe_tick(node):
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await asyncio.wait_for(
+                session.get("http://api.example.com/data"),
+                timeout=2.0
+            )
+            data = await resp.json()
+            node.send("api_data", data)
+    except asyncio.TimeoutError:
+        node.log_warning("API timeout — skipping this tick")
+    except Exception as e:
+        node.log_error(f"API error: {e}")
+```
+
+## Common Errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| Node hangs on shutdown | await without timeout | Use `asyncio.wait_for()` |
+| `compute=True` with `async def` | Mutually exclusive | Remove `compute=True` or make tick synchronous |
+| `on="topic"` with `async def` | Mutually exclusive | Remove `on=` or make tick synchronous |
+| Low throughput | GIL + await overhead | Reduce rate, use batch processing |
+
 ## See Also
 
 - [Python Bindings](/python/api/python-bindings) — Core Python API
