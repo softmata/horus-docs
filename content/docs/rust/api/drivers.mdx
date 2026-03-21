@@ -1,45 +1,40 @@
 ---
 title: "Driver API"
-description: "Load hardware connections from config, typed Terra handles, local driver registration"
+description: "Configure hardware in horus.toml, load driver configs, register local driver nodes"
 weight: 6
 ---
 
 # Driver API
 
-Load pre-configured hardware connections from `horus.toml` and use them in your nodes.
+Load hardware driver configurations from `horus.toml` and use them in your nodes.
 
 ```rust
 use horus::prelude::*;
 use horus::drivers;
 ```
 
-## Two Paths
+## Overview
 
-**Config + Code** — config declares hardware, code controls scheduling:
+The driver system separates **what hardware you have** (config in `horus.toml`) from **how you use it** (code). Today this gives you:
 
-```rust
-// horus.toml provides port, baudrate, servo_ids
-let mut hw = drivers::load()?;
-let handle = hw.dynamixel("arm")?;
+- **Config-driven hardware declarations** in `horus.toml [drivers]`
+- **Typed parameter access** via `DriverParams` (port, baudrate, servo IDs, etc.)
+- **Local driver registration** via `register_driver!` — your own `Node` implementations loaded from config
+- **Package driver dispatch** — third-party driver nodes installed via `horus add`
 
-scheduler.add(ArmDriver::new(handle))
-    .rate(500_u64.hz())
-    .on_miss(Miss::SafeMode)
-    .build()?;
-```
+<Callout type="info">
+**Terra integration is in progress.** The typed Terra accessors (`.dynamixel()`, `.rplidar()`, etc.) currently return config parameters only — they do not create hardware connections. For now, use `DriverParams` to read config values and create hardware connections yourself using the appropriate library (e.g., `serialport`, `rppal`, or terra crates directly). When Terra integration lands, the same config will work with zero code changes.
+</Callout>
 
-**Pure Code** — no config, direct Terra usage:
+## Three Driver Sources
 
-```rust
-use terra::dynamixel::DynamixelBus;
+| Source | Config key | What it does today |
+|--------|-----------|-------------------|
+| **Local code** | `node = "MyDriver"` | Instantiates your registered `Node` from config params |
+| **Registry package** | `package = "crate-name"` | Instantiates a third-party `Node` from config params |
+| **Terra HAL** | `terra = "dynamixel"` | Parses config params (hardware connection coming soon) |
 
-let bus = DynamixelBus::open("/dev/ttyUSB0", 1_000_000)?;
-scheduler.add(ArmDriver::new(bus))
-    .rate(500_u64.hz())
-    .build()?;
-```
-
-Both produce the same node with the same scheduling API.
+---
 
 ## Loading Drivers
 
@@ -59,13 +54,102 @@ Load from a specific config file. Useful for testing or multi-robot setups.
 let mut hw = drivers::load_from("tests/test_drivers.toml")?;
 ```
 
+---
+
+## Local Drivers (Fully Working)
+
+The recommended pattern today: declare hardware params in config, register your driver struct, and load it at runtime.
+
+### Step 1: Define your driver
+
+```rust
+use horus::prelude::*;
+use horus::drivers::{DriverParams, register_driver};
+
+struct ConveyorDriver {
+    port: String,
+    speed: f64,
+    publisher: Topic<CmdVel>,
+}
+
+impl ConveyorDriver {
+    fn from_params(params: &DriverParams) -> Result<Self> {
+        let port: String = params.get("port")?;
+        let speed: f64 = params.get_or("speed", 1.0);
+
+        Ok(Self {
+            port,
+            speed,
+            publisher: Topic::new("conveyor.velocity")?,
+        })
+    }
+}
+
+impl Node for ConveyorDriver {
+    fn name(&self) -> &str { "ConveyorDriver" }
+
+    fn tick(&mut self) {
+        self.publisher.send(CmdVel::new(self.speed as f32, 0.0));
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.publisher.send(CmdVel::new(0.0, 0.0));
+    }
+}
+
+// Register so [drivers.conveyor] node = "ConveyorDriver" works
+register_driver!(ConveyorDriver, ConveyorDriver::from_params);
+```
+
+### Step 2: Configure in horus.toml
+
+```toml
+[drivers.conveyor]
+node = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+### Step 3: Load and schedule
+
+```rust
+fn main() -> Result<()> {
+    let mut hw = drivers::load()?;
+
+    let mut scheduler = Scheduler::new().tick_rate(50_u64.hz());
+    scheduler.add(hw.local("conveyor")?)
+        .order(0)
+        .rate(50_u64.hz())
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+`hw.local()` looks up `"ConveyorDriver"` in the compile-time registry and calls `from_params()` with the config values. It returns `Box<dyn Node>` — ready for the scheduler.
+
+---
+
 ## `HardwareSet`
 
-Returned by `drivers::load()`. Provides typed accessors for each driver category.
+Returned by `drivers::load()`. Provides config access and driver instantiation.
 
-### Terra Accessors
+### Factory Accessors
 
-Each returns a `DriverHandle` with the connection params from config:
+| Method | Config key | Returns |
+|--------|-----------|---------|
+| `hw.local("name")` | `node = "StructName"` | `Box<dyn Node>` — from `register_driver!` |
+| `hw.package("name")` | `package = "crate-name"` | `Box<dyn Node>` — from registry package |
+| `hw.node("name")` | any | `Box<dyn Node>` — dispatches based on source type |
+
+`.node()` is a generic accessor that works for all source types:
+- **Local** → delegates to `.local()`
+- **Package** → delegates to `.package()`
+- **Terra** → returns a stub node (use terra config accessors instead)
+
+### Terra Config Accessors
+
+These accessors return a `DriverHandle` containing the parsed config params and the terra driver name. Use them to read hardware configuration from `horus.toml`:
 
 | Method | Config key | Hardware |
 |--------|-----------|----------|
@@ -89,45 +173,70 @@ Each returns a `DriverHandle` with the connection params from config:
 
 All error with a clear message listing available drivers if the name is not found.
 
-### Factory Accessors
+<Callout type="warning">
+These accessors return **config params only** — they do not open hardware connections. Create connections yourself using the params. When Terra integration lands, these will return live hardware handles.
+</Callout>
 
-| Method | Config key | Returns |
-|--------|-----------|---------|
-| `hw.local("name")` | `node = "StructName"` | `Box&lt;dyn Node&gt;` |
-| `hw.package("name")` | `package = "crate-name"` | `Box&lt;dyn Node&gt;` |
-| `hw.node("name")` | any | `Box&lt;dyn Node&gt;` — works for all 3 sources |
+**Using terra config accessors today:**
 
-`.node()` is a generic accessor that dispatches based on driver type:
-- **Terra** → wraps in a stub node (use typed accessors for full hardware access)
-- **Package** → delegates to `.package()`
-- **Local** → delegates to `.local()`
+```rust
+let handle = hw.dynamixel("arm")?;
+
+// Read config values
+let port: String = handle.params().get("port")?;
+let baud: u32 = handle.params().get("baudrate")?;
+let ids: Vec<u8> = handle.params().get("servo_ids")?;
+
+// Create your own connection using the config
+let serial = serialport::new(&port, baud).open()?;
+```
 
 ### Introspection
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `hw.list()` | `Vec&lt;&str&gt;` | Sorted list of configured driver names |
+| `hw.list()` | `Vec<&str>` | Sorted list of configured driver names |
 | `hw.has("name")` | `bool` | Whether a driver is configured |
-| `hw.params("name")` | `Option&lt;&DriverParams&gt;` | Config params for a driver |
-| `hw.driver_type("name")` | `Option&lt;&DriverType&gt;` | Terra / Package / Local / Legacy |
-| `hw.topic_mapping("name")` | `Option&lt;&TopicMapping&gt;` | Topic config for auto-bridging |
+| `hw.params("name")` | `Option<&DriverParams>` | Config params for a driver |
+| `hw.driver_type("name")` | `Option<&DriverType>` | Terra / Package / Local / Legacy |
+| `hw.topic_mapping("name")` | `Option<&TopicMapping>` | Topic config for auto-bridging |
 | `hw.len()` | `usize` | Number of configured drivers |
 | `hw.is_empty()` | `bool` | Whether no drivers are configured |
 
+---
+
 ## `DriverHandle`
 
-Wraps a Terra driver's connection params. Pass to your node constructor.
+Wraps a driver's config params and terra name. Pass to your node constructor.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `handle.params()` | `&DriverParams` | Config params from `[drivers.NAME]` |
-| `handle.terra_name()` | `Option&lt;&str&gt;` | Terra shortname (e.g., `"dynamixel"`) |
+| `handle.terra_name()` | `Option<&str>` | Terra shortname (e.g., `"dynamixel"`) |
 
-```rust
-let handle = hw.dynamixel("arm")?;
-let port: String = handle.params().get("port")?;
-let terra_name: Option&lt;&str&gt; = handle.terra_name(); // "dynamixel"
-```
+---
+
+## `DriverParams`
+
+Typed access to config values from a `[drivers.NAME]` table.
+
+| Method | Description |
+|--------|-------------|
+| `params.get::<T>("key")?` | Required param — errors if missing or wrong type |
+| `params.get_or("key", default)` | Optional param — returns default if missing or wrong type |
+| `params.has("key")` | Whether a key exists |
+| `params.keys()` | Iterator over param names |
+| `params.len()` | Number of params |
+| `params.is_empty()` | Whether there are no params |
+| `params.raw("key")` | Raw `toml::Value` for a key |
+
+### Supported Types
+
+`get::<T>()` supports: `String`, `bool`, `i32`, `i64`, `u32`, `u64`, `u8`, `f32`, `f64`, `Vec<T>` (for any supported `T`).
+
+**Type coercion:** TOML integers convert to floats (`1000` &rarr; `1000.0`). No other cross-type coercion — a string `"42"` will NOT parse as an integer. Use the correct TOML type in your config.
+
+---
 
 ## `TopicMapping`
 
@@ -137,105 +246,46 @@ Optional topic configuration for auto-bridging drivers to HORUS topics. Set via 
 [drivers.imu]
 terra = "mpu6050"
 bus = "i2c-1"
-topic = "sensors/imu"           # sensor data output
+topic = "sensors.imu"
 
 [drivers.arm]
 terra = "dynamixel"
 port = "/dev/ttyUSB0"
-topic_state = "arm/joint_states"     # state output
-topic_command = "arm/joint_commands"  # command input
+topic_state = "arm.joint_states"
+topic_command = "arm.joint_commands"
 ```
 
 | Field | Description |
 |-------|-------------|
-| `topic` | Sensor data output topic (e.g., `"sensors/imu"`) |
-| `topic_state` | Joint state output topic (e.g., `"arm/joint_states"`) |
-| `topic_command` | Command input topic (e.g., `"arm/joint_commands"`) |
+| `topic` | Sensor data output topic |
+| `topic_state` | Joint state output topic |
+| `topic_command` | Command input topic |
 
-Access via `hw.topic_mapping("name")`:
+These fields are **not** included in `DriverParams` — they're bridge configuration. Access via `hw.topic_mapping("name")`:
 
 ```rust
 if let Some(mapping) = hw.topic_mapping("arm") {
     if let Some(state_topic) = &mapping.topic_state {
-        println!("State published on: {}", state_topic);
+        let pub_state: Topic<JointState> = Topic::new(state_topic)?;
     }
 }
 ```
 
-Topic fields are **not** included in `DriverParams` — they're bridge configuration, not device params. Used by bridge layers (e.g., `terra-horus`) to auto-create sensor/actuator forwarding.
-
-## `DriverParams`
-
-Typed access to config values from a `[drivers.NAME]` table.
-
-| Method | Description |
-|--------|-------------|
-| `params.get::&lt;String&gt;("port")?` | Required param — errors if missing or wrong type |
-| `params.get::&lt;u32&gt;("baudrate")?` | Supports String, bool, i32, u32, u64, f32, f64, `Vec&lt;T&gt;` |
-| `params.get_or("timeout", 1000u32)` | Optional param — returns default if missing |
-| `params.has("key")` | Whether a key exists |
-| `params.keys()` | Iterator over param names |
-| `params.raw("key")` | Raw `toml::Value` for a key |
+---
 
 ## `register_driver!`
 
-Register a local driver factory so `hw.local("name")` can instantiate it.
+Register a local driver factory so `hw.local("name")` can instantiate it from config.
 
 ```rust
-use horus::prelude::*;
-use horus::drivers::{DriverParams, register_driver};
-
-struct ConveyorDriver {
-    port: Box&lt;dyn serialport::SerialPort&gt;,
-    belt_length: u32,
-    pub_state: Topic&lt;ConveyorState&gt;,
-}
-
-impl ConveyorDriver {
-    fn from_params(params: &DriverParams) -> HorusResult&lt;Self&gt; {
-        let port_name = params.get::&lt;String&gt;("port")?;
-        let baud = params.get_or("baudrate", 57600u32);
-        Ok(Self {
-            port: serialport::new(&port_name, baud).open()?,
-            belt_length: params.get_or("belt_length_mm", 2400),
-            pub_state: Topic::new("conveyor.state")?,
-        })
-    }
-}
-
-impl Node for ConveyorDriver {
-    fn tick(&mut self) {
-        let pos = self.read_encoder();
-        self.pub_state.send(&ConveyorState { position_mm: pos });
-    }
-    fn enter_safe_state(&mut self) {
-        self.write_speed(0.0);
-    }
-}
-
-// One line — registers the factory
-register_driver!(ConveyorDriver, ConveyorDriver::from_params);
+register_driver!(MyDriver, MyDriver::from_params);
 ```
 
-Then in `horus.toml`:
+The factory function signature: `fn(&DriverParams) -> Result<Self>`.
 
-```toml
-[drivers.conveyor]
-node = "ConveyorDriver"
-port = "/dev/ttyACM0"
-baudrate = 57600
-belt_length_mm = 2400
-```
+The macro uses `.init_array` for compile-time registration — no manual setup needed.
 
-And in `main.rs`:
-
-```rust
-let mut hw = drivers::load()?;
-scheduler.add(hw.local("conveyor")?)
-    .order(100)
-    .rate(50_u64.hz())
-    .build()?;
-```
+---
 
 ## `DriverType`
 
@@ -251,25 +301,7 @@ match hw.driver_type("arm") {
 }
 ```
 
-## Adding to Scheduler
-
-`scheduler.add()` accepts both concrete types and `Box&lt;dyn Node&gt;`:
-
-```rust
-// Concrete type — most common
-scheduler.add(ArmDriver::new(handle)).build()?;
-
-// Box&lt;dyn Node&gt; — from hw.local() or hw.package()
-scheduler.add(hw.local("conveyor")?).build()?;
-
-// Both use the same .add() — full builder API available
-scheduler.add(hw.local("sensor")?)
-    .order(5)
-    .rate(500_u64.hz())
-    .on_miss(Miss::Skip)
-    .failure_policy(FailurePolicy::restart(3, 100_u64.ms()))
-    .build()?;
-```
+---
 
 ## Complete Example
 
@@ -285,75 +317,66 @@ port = "/dev/ttyUSB0"
 baudrate = 1000000
 servo_ids = [1, 2, 3, 4, 5, 6]
 
-[drivers.lidar]
-terra = "rplidar"
-port = "/dev/ttyUSB1"
-
-[drivers.imu]
-terra = "bno055"
-bus = "i2c-1"
-address = 0x28
+[drivers.conveyor]
+node = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
 ```
 
 ```rust
 use horus::prelude::*;
 use horus::drivers;
 
-fn main() -> HorusResult&lt;()&gt; {
+fn main() -> Result<()> {
     let mut hw = drivers::load()?;
 
     let mut sched = Scheduler::new()
-        .tick_rate(1000_u64.hz())
-        .prefer_rt()
-        .watchdog(200_u64.ms());
+        .tick_rate(100_u64.hz());
 
-    sched.add(ArmDriver::new(hw.dynamixel("arm")?))
-        .order(0).rate(500_u64.hz())
-        .on_miss(Miss::SafeMode)
+    // Local driver — fully working, loaded from config
+    sched.add(hw.local("conveyor")?)
+        .order(0)
+        .rate(50_u64.hz())
         .build()?;
 
-    sched.add(LidarDriver::new(hw.rplidar("lidar")?))
-        .order(10).rate(40_u64.hz())
-        .on_miss(Miss::Skip)
-        .build()?;
+    // Terra driver — read config, create your own connection
+    if hw.has("arm") {
+        let handle = hw.dynamixel("arm")?;
+        let port: String = handle.params().get("port")?;
+        let baud: u32 = handle.params().get("baudrate")?;
+        let ids: Vec<u8> = handle.params().get("servo_ids")?;
 
-    sched.add(ImuDriver::new(hw.i2c("imu")?))
-        .order(5).rate(100_u64.hz())
-        .build()?;
-
-    sched.add(Planner::new())
-        .order(50).rate(10_u64.hz()).compute()
-        .build()?;
+        sched.add(ArmDriver::new(&port, baud, ids)?)
+            .order(10)
+            .rate(500_u64.hz())
+            .on_miss(Miss::SafeMode)
+            .build()?;
+    }
 
     sched.run()
 }
 ```
 
-## Testing with Mock Drivers
+---
 
-Use `terra = "virtual"` in a test config:
+## Testing with Mock Config
 
-```toml
-# tests/test_drivers.toml
-[drivers.arm]
-terra = "virtual"
-joints = 6
-
-[drivers.lidar]
-terra = "virtual"
-type = "lidar"
-```
+Use `drivers::load_from()` to load from a test config file:
 
 ```rust
 #[test]
-fn robot_initializes() {
-    let mut hw = drivers::load_from("tests/test_drivers.toml").unwrap();
-    let mut sched = Scheduler::new().deterministic(true);
+fn conveyor_from_config() {
+    std::fs::write("test_drivers.toml", r#"
+        [drivers.conveyor]
+        node = "ConveyorDriver"
+        port = "/dev/null"
+        speed = 0.0
+    "#).unwrap();
 
-    sched.add(ArmDriver::new(hw.dynamixel("arm").unwrap()))
-        .build().unwrap();
+    let mut hw = drivers::load_from("test_drivers.toml").unwrap();
+    let _node = hw.local("conveyor").unwrap();
 
-    sched.tick_once().unwrap();
+    std::fs::remove_file("test_drivers.toml").ok();
 }
 ```
 
@@ -361,52 +384,31 @@ fn robot_initializes() {
 
 ## Error Handling
 
-All driver methods return `HorusResult<T>`. Common error conditions:
+All driver methods return `Result<T>`. Common error conditions:
 
 | Operation | Error | When |
 |-----------|-------|------|
-| `drivers::load()` | `ConfigError` | No `horus.toml` found in current directory or parents (searches up to 10 levels) |
-| `drivers::load()` | `ConfigError` | `horus.toml` exists but `[drivers]` section has invalid TOML syntax |
-| `hw.dynamixel("name")` | `ConfigError` | Driver `"name"` not found in `[drivers]` config. Error message lists available drivers. |
-| `hw.dynamixel("name")` | `ConfigError` | Driver exists but has wrong source type (e.g., calling `.dynamixel()` on a `package` driver) |
-| `hw.local("name")` | `ConfigError` | Driver exists but no factory registered via `register_driver!` for the node name |
-| `hw.package("name")` | `ConfigError` | Package driver not installed or not registered |
-
-**Example — graceful error handling:**
+| `drivers::load()` | `ConfigError` | No `horus.toml` found (searches up to 10 levels) |
+| `hw.dynamixel("name")` | `ConfigError` | Driver not found — error lists available drivers |
+| `hw.dynamixel("name")` | `ConfigError` | Wrong source type (e.g., calling `.dynamixel()` on a `package` driver) |
+| `hw.local("name")` | `ConfigError` | No factory registered via `register_driver!` |
+| `params.get::<T>("key")` | `ConfigError` | Key missing or type mismatch |
 
 ```rust
-use horus::prelude::*;
-
-fn init_hardware() -> Result<()> {
-    let mut hw = match drivers::load() {
-        Ok(hw) => hw,
-        Err(e) => {
-            hlog!(error, "No hardware config: {}", e);
-            hlog!(info, "Running in simulation mode");
-            return Ok(());
-        }
-    };
-
-    // Check if driver exists before accessing
-    if hw.has("arm") {
-        let bus = hw.dynamixel("arm")?;
-        hlog!(info, "Arm connected on {}", bus.params().get_or("port", "/dev/ttyUSB0"));
-    } else {
-        hlog!(warn, "No 'arm' driver configured — skipping");
+let mut hw = match drivers::load() {
+    Ok(hw) => hw,
+    Err(e) => {
+        hlog!(error, "No hardware config: {}", e);
+        hlog!(info, "Running in simulation mode");
+        return Ok(());
     }
+};
 
-    Ok(())
+if hw.has("arm") {
+    let handle = hw.dynamixel("arm")?;
+    hlog!(info, "Arm on {}", handle.params().get_or("port", "/dev/ttyUSB0"));
 }
 ```
-
-**Introspection methods:**
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `hw.has("name")` | `bool` | Check if a driver is configured |
-| `hw.list()` | `Vec<&str>` | All configured driver names (sorted) |
-| `hw.params("name")` | `Option<&DriverParams>` | Raw config params for a driver |
-| `hw.driver_type("name")` | `Option<&DriverType>` | Source type: `Terra`, `Package`, `Local`, `Legacy` |
 
 ---
 

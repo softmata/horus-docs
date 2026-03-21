@@ -460,6 +460,104 @@ sudo systemctl status horus-robot
 journalctl -u horus-robot -f
 ```
 
+## Docker Deployment
+
+For containerized robots or fleet management, deploy as a Docker image:
+
+### Multi-Stage Dockerfile (Rust)
+
+```dockerfile
+# Stage 1: Build on x86_64 (cross-compile for ARM if needed)
+FROM rust:1.92-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    gcc-aarch64-linux-gnu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install HORUS
+RUN curl -fsSL https://horusrobotics.dev/install | bash
+
+WORKDIR /app
+COPY . .
+
+# Cross-compile for ARM64 (adjust for your robot's arch)
+RUN rustup target add aarch64-unknown-linux-gnu
+RUN CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --release --target aarch64-unknown-linux-gnu
+
+# Stage 2: Minimal runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    i2c-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/my_robot /usr/local/bin/
+COPY horus.toml /app/
+
+WORKDIR /app
+CMD ["my_robot"]
+```
+
+### Running with Hardware Access
+
+```bash
+docker build -t my-robot .
+
+docker run --rm \
+    --device /dev/i2c-1 \
+    --device /dev/ttyUSB0 \
+    --cap-add SYS_NICE \
+    my-robot
+```
+
+**Key flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `--device /dev/i2c-1` | I2C bus access |
+| `--device /dev/ttyUSB0` | Serial port access |
+| `--device /dev/gpiochip0` | GPIO access |
+| `--cap-add SYS_NICE` | RT scheduling (SCHED_FIFO) |
+| `--privileged` | Full hardware access (use only if needed) |
+| `--ipc=host` | Share host IPC namespace (for cross-container SHM topics) |
+| `-v /dev/shm:/dev/shm` | Share host shared memory (alternative to `--ipc=host`) |
+
+### Docker Compose (Multi-Node Robot)
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+services:
+  sensor:
+    build: ./sensor
+    devices:
+      - /dev/i2c-1
+      - /dev/ttyUSB0
+    cap_add:
+      - SYS_NICE
+    ipc: host  # Share SHM for zero-copy topics
+    restart: unless-stopped
+
+  controller:
+    build: ./controller
+    cap_add:
+      - SYS_NICE
+    ipc: host
+    depends_on:
+      - sensor
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+> **SHM sharing**: For nodes in separate containers to communicate via zero-copy shared memory, use `ipc: host` or mount `/dev/shm`. Without this, topics fall back to network transport.
+
+---
+
 ## Troubleshooting
 
 ### "Connection refused" when deploying

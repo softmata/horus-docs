@@ -35,6 +35,13 @@ import {
   TransformFrameSpeedupChart,
   TransformFrameMemoryChart,
   TransformFrameConcurrentChart,
+  IPCBackendChart,
+  MessagePerformanceChart,
+  HorusVsUDPChart,
+  ThreadScalingChart,
+  DeterminismChart,
+  PythonFFIOverheadChart,
+  PythonZeroCopyChart,
 } from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
 
@@ -135,6 +142,14 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
         TransformFrameSpeedupChart,
         TransformFrameMemoryChart,
         TransformFrameConcurrentChart,
+        // Measured benchmark charts
+        IPCBackendChart,
+        MessagePerformanceChart,
+        HorusVsUDPChart,
+        ThreadScalingChart,
+        DeterminismChart,
+        PythonFFIOverheadChart,
+        PythonZeroCopyChart,
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {

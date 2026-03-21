@@ -1,0 +1,220 @@
+---
+title: "GIL & Performance"
+description: "How the GIL works in HORUS, tick rate ceilings, and when to use Python vs Rust"
+order: 20
+---
+
+# GIL & Performance
+
+The GIL (Global Interpreter Lock) is the single most important performance factor for Python HORUS nodes. Understanding how it works lets you design systems that maximize Python's strengths while avoiding its limitations.
+
+---
+
+## How the GIL Works in HORUS
+
+The scheduler's tick loop runs in Rust. The GIL is only acquired when calling your Python callbacks:
+
+```
+Rust scheduler tick loop (no GIL held)
+  │
+  ├── Acquire GIL (~500ns)
+  ├── Call Python tick(node)
+  ├── Release GIL
+  │
+  ├── Acquire GIL (~500ns)
+  ├── Call Python tick(node) for next node
+  ├── Release GIL
+  │
+  └── ... (Rust handles timing, SHM, RT)
+```
+
+**Key insight**: The scheduler, shared memory transport, ring buffers, and RT scheduling are all pure Rust — they run without the GIL. Only your Python `tick()`, `init()`, and `shutdown()` callbacks acquire the GIL.
+
+---
+
+## Tick Rate Ceiling
+
+The GIL acquisition + Python callback overhead is ~11μs per tick. This puts a hard ceiling on Python tick rates:
+
+| Target Rate | Budget per Tick | Achievable? | Headroom |
+|-------------|----------------|:-----------:|----------|
+| 100 Hz | 10ms | Yes | 900x |
+| 1,000 Hz | 1ms | Yes | 90x |
+| 5,000 Hz | 200μs | Marginal | ~18x |
+| 10,000 Hz | 100μs | No | Measured: ~5,932 Hz max |
+
+**Practical ceiling: ~5-6 kHz** for trivial tick functions. With real work (NumPy, I/O, computation), expect lower.
+
+### What Costs What
+
+| Operation | Time | Source |
+|-----------|------|--------|
+| GIL acquire + release | ~500ns + 500ns | PyO3 boundary |
+| Python object allocation | ~700ns | Per-tick overhead |
+| `node.send(CmdVel)` | ~1.7μs | Typed message (total) |
+| `node.send(dict)` | ~6-50μs | GenericMessage serialization |
+| `node.recv()` | ~1.5μs | Typed message |
+| NumPy array creation | ~1-5μs | Depends on size |
+| `img.to_numpy()` | ~3μs | SHM view |
+| `np.from_dlpack(img)` | ~1.1μs | True zero-copy |
+
+---
+
+## When to Use Python vs Rust
+
+| Use Case | Language | Why |
+|----------|---------|-----|
+| ML inference (PyTorch, YOLO, TensorFlow) | **Python** | 1.7μs overhead negligible vs 10-200ms inference |
+| Data science, prototyping | **Python** | Developer velocity matters more than latency |
+| HTTP APIs, database queries | **Python** | Use async nodes, GIL released during I/O |
+| Visualization, dashboards | **Python** | matplotlib, plotly, etc. |
+| Motor control at 1kHz+ | **Rust** | 89ns vs 1,700ns — 19x difference |
+| Safety monitors | **Rust** | Deterministic timing, no GIL |
+| Sensor fusion at 500Hz+ | **Rust** | Predictable p99 latency |
+| High-frequency sensor drivers | **Rust** | Direct hardware access, no Python overhead |
+
+**Rule of thumb**: If your tick function takes &gt;1ms (ML inference, complex planning, I/O), Python is fine — the GIL overhead is negligible. If it takes &lt;100μs (control loops, sensor processing), use Rust.
+
+---
+
+## `compute=True` for CPU-Bound Nodes
+
+For CPU-heavy Python nodes (ML inference, path planning), use `compute=True` to run on a thread pool:
+
+```python
+detector = horus.Node(
+    name="yolo",
+    tick=detect_tick,
+    rate=30,
+    compute=True,       # Runs on worker thread, not main tick loop
+    on_miss="skip",
+)
+```
+
+**What this does**: The node runs on a separate thread. The GIL is still acquired for `tick()`, but it doesn't block the main scheduler loop — other nodes tick on time.
+
+**What this doesn't do**: It doesn't bypass the GIL. Two `compute=True` Python nodes still serialize through the GIL. For true parallelism in Python, use multi-process with `horus launch`.
+
+---
+
+## GC Pauses
+
+Python's garbage collector can cause tick jitter:
+
+| GC Impact | Typical Duration |
+|-----------|-----------------|
+| Gen 0 collection | ~50-200μs |
+| Gen 1 collection | ~500μs-2ms |
+| Gen 2 collection | ~5-50ms |
+
+### Mitigation
+
+```python
+import gc
+
+def init(node):
+    # Disable automatic GC — run manually between ticks
+    gc.disable()
+
+def tick(node):
+    do_work()
+
+    # Run GC only when budget allows
+    if horus.budget_remaining() > 5 * horus.ms:
+        gc.collect(0)  # Gen 0 only (~100μs)
+```
+
+For hard-RT Python nodes, disable GC entirely and manage memory manually (pre-allocate buffers, reuse objects).
+
+---
+
+## Optimization Patterns
+
+### Pre-allocate Outside tick()
+
+```python
+import numpy as np
+
+# BAD: allocate every tick
+def tick(node):
+    buffer = np.zeros((640, 480, 3))  # ~1ms allocation
+    process(buffer)
+
+# GOOD: allocate once in init
+buffer = None
+
+def init(node):
+    global buffer
+    buffer = np.zeros((640, 480, 3))  # One-time cost
+
+def tick(node):
+    process(buffer)  # Reuse buffer
+```
+
+### Use Typed Messages, Not Dicts
+
+```python
+# SLOW: ~6-50μs (MessagePack serialization)
+node.send("cmd_vel", {"linear": 1.0, "angular": 0.5})
+
+# FAST: ~1.7μs (zero-copy POD)
+node.send("cmd_vel", horus.CmdVel(linear=1.0, angular=0.5))
+```
+
+### Use DLPack for Images
+
+```python
+import numpy as np
+
+# SLOW: ~14μs (data copy)
+frame = np.array(img)
+
+# FAST: ~1.1μs (zero-copy view)
+frame = np.from_dlpack(img)
+```
+
+---
+
+## Measuring Tick Performance
+
+```python
+import horus
+import time
+
+tick_times = []
+
+def profiled_tick(node):
+    start = time.perf_counter_ns()
+
+    # Your actual work here
+    do_work()
+
+    elapsed_us = (time.perf_counter_ns() - start) / 1000
+    tick_times.append(elapsed_us)
+
+    if len(tick_times) % 1000 == 0:
+        avg = sum(tick_times[-1000:]) / 1000
+        p99 = sorted(tick_times[-1000:])[990]
+        node.log_info(f"Tick avg: {avg:.1f}μs, p99: {p99:.1f}μs")
+```
+
+Or use the scheduler's built-in stats:
+
+```python
+sched = horus.Scheduler(tick_rate=100)
+sched.add(my_node)
+sched.run(duration=10.0)
+
+stats = sched.get_node_stats("my_node")
+print(f"Avg tick: {stats.get('avg_tick_duration_ms', 0):.2f}ms")
+```
+
+---
+
+## See Also
+
+- [Performance Guide](/python/performance) — Python-specific performance patterns
+- [Benchmarks](/performance/benchmarks) — Measured latency numbers
+- [Choosing a Language](/getting-started/choosing-language) — Rust vs Python comparison
+- [Scheduler API](/python/api/scheduler) — `compute=True`, budgets, deadlines
+- [NumPy & Zero-Copy](/python/numpy-zerocopy) — DLPack and pool-backed images

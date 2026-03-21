@@ -1,0 +1,182 @@
+---
+title: "Error Types"
+description: "Python exception types — HorusNotFoundError, HorusTransformError, HorusTimeoutError, and common error patterns"
+order: 8
+---
+
+# Error Types
+
+HORUS defines three custom exception types plus uses standard Python exceptions. All are importable from `horus`.
+
+```python
+from horus import HorusNotFoundError, HorusTransformError, HorusTimeoutError
+```
+
+---
+
+## Custom Exceptions
+
+| Exception | Base | When Raised |
+|-----------|------|-------------|
+| `HorusNotFoundError` | `Exception` | Topic, node, frame, or resource not found |
+| `HorusTransformError` | `Exception` | Transform lookup fails (frame not in tree, stale data, extrapolation) |
+| `HorusTimeoutError` | `Exception` | Blocking operation exceeded timeout |
+
+### HorusNotFoundError
+
+Raised when looking up a topic, node, or transform frame that doesn't exist.
+
+```python
+import horus
+
+try:
+    tf = horus.TransformFrame()
+    result = tf.lookup("base_link", "nonexistent_frame")
+except horus.HorusNotFoundError as e:
+    print(f"Frame not found: {e}")
+```
+
+**Common causes:**
+- Subscribing to a topic that no publisher has created
+- Looking up a transform frame before it's been broadcast
+- Querying a node that hasn't registered with the scheduler
+
+### HorusTransformError
+
+Raised when a transform lookup fails due to stale data, extrapolation, or disconnected frames.
+
+```python
+import horus
+
+try:
+    tf = horus.TransformFrame()
+    result = tf.lookup("base_link", "camera", timestamp=horus.timestamp_ns())
+except horus.HorusTransformError as e:
+    print(f"Transform error: {e}")
+    # Fall back to last known transform or skip this tick
+```
+
+**Common causes:**
+- Querying a timestamp older than the transform buffer window
+- Frames not connected in the transform tree
+- Transform publisher stopped broadcasting
+
+### HorusTimeoutError
+
+Raised when a blocking operation exceeds its timeout.
+
+```python
+try:
+    tf = horus.TransformFrame()
+    # Wait up to 1 second for transform to become available
+    result = tf.lookup_with_timeout("base_link", "gripper", timeout_ms=1000)
+except horus.HorusTimeoutError:
+    print("Transform not available within 1 second")
+```
+
+---
+
+## Standard Python Exceptions
+
+HORUS also raises standard Python exceptions in certain cases:
+
+| Exception | When |
+|-----------|------|
+| `ValueError` | Invalid parameter (negative rate, empty name, bad capacity) |
+| `TypeError` | Wrong type passed to `send()` (e.g., lambda, socket object) |
+| `RuntimeError` | Scheduler not running, double-start, or internal error |
+| `OSError` | Hardware I/O failure (from driver libraries like serialport, smbus2) |
+
+---
+
+## Common Error Patterns
+
+### Graceful Hardware Fallback
+
+```python
+import horus
+
+try:
+    hw = horus.drivers.load()
+except Exception as e:
+    print(f"No hardware config: {e}")
+    print("Running in simulation mode")
+    hw = None
+
+if hw and hw.has("arm"):
+    arm = hw.dynamixel("arm")
+    port = arm.get_or("port", "/dev/ttyUSB0")
+else:
+    port = None  # Sim mode
+```
+
+### Stale Transform Recovery
+
+```python
+def tick(node):
+    try:
+        transform = tf.lookup("base_link", "camera")
+        process_with_transform(transform)
+    except horus.HorusTransformError:
+        # Use identity transform as fallback
+        node.log_warning("Transform stale, using identity")
+        process_without_transform()
+```
+
+### Topic Not Found
+
+```python
+def tick(node):
+    msg = node.recv("sensor.data")
+    if msg is None:
+        return  # No message available — normal, not an error
+
+    # recv() returns None for no data, raises HorusNotFoundError
+    # only if the topic itself doesn't exist (rare — topics auto-created from pubs/subs)
+```
+
+### Protecting Against Serialization Errors
+
+```python
+def tick(node):
+    data = compute_result()
+
+    try:
+        node.send("results", data)
+    except TypeError as e:
+        # Data contains non-serializable type (custom class, socket, etc.)
+        node.log_error(f"Cannot serialize: {e}")
+        # Convert to dict and retry
+        node.send("results", {"value": str(data)})
+```
+
+---
+
+## Rust-to-Python Error Mapping
+
+When Rust code raises an error that crosses the PyO3 boundary:
+
+| Rust Error | Python Exception |
+|-----------|-----------------|
+| `NotFoundError` | `HorusNotFoundError` |
+| `TransformError` | `HorusTransformError` |
+| `TimeoutError` | `HorusTimeoutError` |
+| `ValidationError` | `ValueError` |
+| `ConfigError` | `ValueError` |
+| `InvalidInput` | `ValueError` |
+| `InvalidDescriptor` | `ValueError` |
+| `ParseError` | `ValueError` |
+| `SerializationError` | `TypeError` |
+| `Io` | `OSError` |
+| `Memory` | `MemoryError` |
+| `CommunicationError` | `RuntimeError` |
+| All other variants | `RuntimeError` |
+
+---
+
+## See Also
+
+- [Error Handling Guide](/python/error-handling) — Error handling patterns and best practices
+- [Node API](/python/api/node) — `on_error` callback for node-level error handling
+- [Scheduler API](/python/api/scheduler) — `failure_policy` for error recovery
+- [Rust Error Types](/rust/api/error-types) — Rust equivalent (13 variants)
