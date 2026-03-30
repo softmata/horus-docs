@@ -7,20 +7,55 @@ order: 8
 
 ## LiDAR Obstacle Avoidance (C++)
 
-Read 360-degree LiDAR scans, find closest obstacle, steer away or stop.
+Read 360-degree LiDAR scans, identify the closest obstacle, and generate reactive velocity commands to steer away from danger while maintaining forward progress.
 
-### Code
+### Problem
+
+Your robot has a planar LiDAR and needs to navigate without hitting things. A full path planner is overkill for simple environments. You need a lightweight reactive behavior: drive forward when the path is clear, slow down and steer away when obstacles appear.
+
+### How It Works
+
+The node processes a 360-degree `LaserScan` in three zones:
+
+1. **Front zone** (roughly -30 to +30 degrees): if an obstacle is here, the robot must stop or slow down
+2. **Left zone** (0-180 degrees): obstacles here pull the robot to the right
+3. **Right zone** (180-360 degrees): obstacles here pull the robot to the left
+
+The algorithm finds the closest point in the full scan, then decides:
+- If the closest obstacle is beyond the safe distance: drive at full speed
+- If it is within the safe distance but outside the critical zone: slow down and turn away
+- If it is within the critical distance: stop and rotate in place
+
+The turn direction is chosen to steer *away* from the closest obstacle. If the obstacle is on the left half of the scan (index 0-179), turn right (negative angular velocity). If on the right half (180-359), turn left (positive angular velocity).
+
+### When To Use
+
+- Simple hallway or warehouse navigation without a map
+- Backup safety behavior when the primary planner fails
+- Prototyping before implementing a full costmap-based planner
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 using namespace horus::literals;
 
 class LidarAvoidance : public horus::Node {
 public:
-    LidarAvoidance(float safe_dist = 0.5f, float max_speed = 0.3f)
-        : Node("lidar_avoidance"), safe_dist_(safe_dist), max_speed_(max_speed)
+    LidarAvoidance(float safe_dist, float critical_dist, float max_speed, float turn_rate)
+        : Node("lidar_avoidance"),
+          safe_dist_(safe_dist),
+          critical_dist_(critical_dist),
+          max_speed_(max_speed),
+          turn_rate_(turn_rate)
     {
         scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
         cmd_pub_  = advertise<horus::msg::CmdVel>("cmd_vel");
@@ -32,46 +67,168 @@ public:
 
         const auto* s = scan->get();
 
-        // Find minimum range and its angle
+        // ── Find minimum range and its bearing ──────────────────────
         float min_range = 999.0f;
         int min_idx = 0;
+        int valid_count = 0;
+
         for (int i = 0; i < 360; i++) {
-            if (s->ranges[i] > 0.01f && s->ranges[i] < min_range) {
-                min_range = s->ranges[i];
-                min_idx = i;
+            float r = s->ranges[i];
+            // Filter invalid readings: too close (sensor noise) or too far (max range)
+            if (r > 0.05f && r < 12.0f) {
+                valid_count++;
+                if (r < min_range) {
+                    min_range = r;
+                    min_idx = i;
+                }
             }
         }
 
+        // ── Detect sensor failure ───────────────────────────────────
+        // If fewer than 10% of beams are valid, sensor may be obscured or broken
+        if (valid_count < 36) {
+            horus::log::error("lidar_avoidance",
+                "Insufficient valid LiDAR readings — stopping for safety");
+            horus::msg::CmdVel stop{};
+            cmd_pub_->send(stop);
+            horus::blackbox::record("lidar_avoidance", "Sensor failure: <10% valid beams");
+            return;
+        }
+
+        // ── Decide action based on proximity ────────────────────────
         horus::msg::CmdVel cmd{};
-        if (min_range < safe_dist_) {
-            // Obstacle close — turn away
+
+        if (min_range < critical_dist_) {
+            // CRITICAL: obstacle very close — rotate in place
             cmd.linear = 0.0f;
-            cmd.angular = (min_idx < 180) ? -0.5f : 0.5f;
-            horus::log::warn("lidar_avoidance", "Obstacle detected, turning");
+            cmd.angular = (min_idx < 180) ? -turn_rate_ : turn_rate_;
+            horus::log::warn("lidar_avoidance", "Critical obstacle — rotating in place");
+        } else if (min_range < safe_dist_) {
+            // CAUTION: obstacle within safe zone — slow down and steer away
+            // Speed proportional to distance (closer = slower)
+            float speed_factor = (min_range - critical_dist_) / (safe_dist_ - critical_dist_);
+            cmd.linear = max_speed_ * speed_factor * 0.5f;
+            cmd.angular = (min_idx < 180) ? -turn_rate_ * 0.7f : turn_rate_ * 0.7f;
         } else {
-            // Clear — go forward
+            // CLEAR: no close obstacles — full speed ahead
             cmd.linear = max_speed_;
             cmd.angular = 0.0f;
         }
+
         cmd_pub_->send(cmd);
+
+        // Log at 1 Hz (every 10th tick at 10 Hz)
+        if (++tick_count_ % 10 == 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "min=%.2fm at %d deg  cmd=(%.2f m/s, %.2f rad/s)  valid=%d/360",
+                min_range, min_idx, cmd.linear, cmd.angular, valid_count);
+            horus::log::info("lidar_avoidance", buf);
+        }
     }
 
     void enter_safe_state() override {
+        // Stop all motion on safety event
         horus::msg::CmdVel stop{};
         cmd_pub_->send(stop);
+        horus::blackbox::record("lidar_avoidance", "Entered safe state, motion stopped");
     }
 
 private:
     horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
     horus::Publisher<horus::msg::CmdVel>*     cmd_pub_;
-    float safe_dist_, max_speed_;
+
+    // Tunable parameters
+    float safe_dist_;      // meters — start slowing down
+    float critical_dist_;  // meters — stop and rotate
+    float max_speed_;      // m/s forward speed
+    float turn_rate_;      // rad/s rotation speed
+
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(10_hz);
-    LidarAvoidance avoid(0.5f, 0.3f);
-    sched.add(avoid).order(10).build();
+    sched.tick_rate(10_hz).name("lidar_avoidance_demo");
+
+    // safe=0.8m, critical=0.3m, max=0.3 m/s, turn=0.8 rad/s
+    LidarAvoidance avoid(0.8f, 0.3f, 0.3f, 0.8f);
+    sched.add(avoid)
+        .order(10)
+        .budget(5_ms)
+        .on_miss(horus::Miss::Skip)  // skip if overrun — stale scan data is dangerous
+        .build();
+
     sched.spin();
 }
 ```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot oscillates left/right near walls | Turn rate too high or safe distance too large | Reduce `turn_rate_` or `safe_dist_` |
+| Robot drives into obstacles | `safe_dist_` too small for robot's stopping distance | Increase safe distance to account for braking at `max_speed_` |
+| Robot stops and never recovers | `critical_dist_` too large or turn direction blocked | Reduce critical distance or add a "wander" timeout |
+| Robot ignores nearby obstacles | LiDAR returns values &lt;0.05m that are filtered out | Adjust minimum range filter to match your sensor's spec |
+| Jerky motion near obstacles | 10 Hz too slow for smooth speed modulation | Increase tick rate to 20-30 Hz |
+| Robot stops with no obstacle | Sensor returns spurious short-range readings | Add median filter on `ranges[]` before processing |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| Three-tier response (clear/caution/critical) | Smoother behavior than binary go/stop — gradual slowdown feels natural |
+| Speed proportional to obstacle distance | Closer obstacles mean slower approach — natural deceleration curve |
+| Sensor failure detection | If the LiDAR is blocked or broken, stopping is safer than driving blind |
+| 10 Hz tick rate | Matches typical LiDAR publish rate (10-15 Hz); faster ticks waste CPU re-processing the same scan |
+| `Miss::Skip` policy | Processing a stale scan with old obstacle positions is dangerous |
+| `enter_safe_state()` stops robot | Any system-level safety event must halt motion |
+| Min range filter at 0.05m | Most LiDARs report noise below their minimum range |
+
+### Variations
+
+**Weighted gap-finding** — steer toward the largest open gap instead of away from the closest obstacle:
+```cpp
+// Find the widest contiguous gap of ranges > safe_dist_
+int best_start = 0, best_len = 0, cur_start = 0, cur_len = 0;
+for (int i = 0; i < 360; i++) {
+    if (s->ranges[i] > safe_dist_) {
+        if (cur_len == 0) cur_start = i;
+        cur_len++;
+    } else {
+        if (cur_len > best_len) { best_start = cur_start; best_len = cur_len; }
+        cur_len = 0;
+    }
+}
+int gap_center = best_start + best_len / 2;
+cmd.angular = (gap_center - 180) * 0.01f;  // steer toward gap
+```
+
+**Vector field histogram (VFH)** — build a polar histogram of obstacle density:
+```cpp
+// Bin ranges into sectors, compute steering from obstacle-free sectors
+float histogram[36] = {};  // 10-degree bins
+for (int i = 0; i < 360; i++) {
+    int bin = i / 10;
+    if (s->ranges[i] < safe_dist_) histogram[bin] += 1.0f;
+}
+// Steer toward the bin with lowest obstacle density
+```
+
+**Follow-the-wall** — maintain a constant distance from a wall for corridor navigation:
+```cpp
+// Use readings at 90 and 270 degrees for left/right wall distance
+float left_dist  = s->ranges[90];
+float right_dist = s->ranges[270];
+float wall_error = left_dist - desired_wall_dist_;
+cmd.angular = kp_wall_ * wall_error;  // P-controller on wall distance
+```
+
+### Key Takeaways
+
+- Always validate sensor data — filter out-of-range readings and detect sensor failure
+- Three-tier response (clear/caution/critical) is smoother and safer than binary go/stop
+- Match tick rate to sensor publish rate — faster ticks just reprocess the same data
+- `Miss::Skip` is essential for reactive avoidance — stale obstacle data is dangerous
+- Speed proportional to obstacle distance gives a natural deceleration profile

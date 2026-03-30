@@ -7,19 +7,58 @@ order: 7
 
 ## IMU Reader (C++)
 
-Read accelerometer + gyroscope data, fuse with a complementary filter, publish orientation.
+Read accelerometer and gyroscope data from an IMU, fuse them with a complementary filter, and publish a stable orientation estimate.
 
-### Code
+### Problem
+
+Raw IMU data is noisy and incomplete. The gyroscope gives accurate short-term rotation rates but drifts over time. The accelerometer gives a gravity reference (absolute orientation) but is noisy and wrong during acceleration. You need to combine both into a single orientation estimate that is both stable and responsive.
+
+### How It Works
+
+A **complementary filter** blends two imperfect signals by exploiting their complementary strengths:
+
+- **Gyroscope**: Integrate angular velocity to get angle. Accurate over short intervals but drifts because integration accumulates small errors indefinitely.
+- **Accelerometer**: Compute angle from gravity direction (`atan2(ay, az)` for pitch). No drift, but noisy and corrupted by any linear acceleration (driving, bumping, vibration).
+
+The filter runs a weighted blend every tick:
+
+```text
+angle = alpha * (angle + gyro * dt) + (1 - alpha) * accel_angle
+```
+
+- `alpha = 0.98` means 98% gyro trust (smooth, responsive) and 2% accelerometer correction (eliminates long-term drift).
+- High `alpha` (0.99): smoother but slower to correct drift. Good for slow-moving platforms.
+- Low `alpha` (0.90): faster drift correction but more susceptible to acceleration noise.
+
+This is mathematically equivalent to a first-order high-pass filter on the gyro and a low-pass filter on the accelerometer, with the crossover frequency determined by `alpha` and the sample rate.
+
+### When To Use
+
+- Orientation estimation for ground robots, drones, or stabilization platforms
+- When you need a lightweight filter without the complexity of a full Kalman filter
+- When the robot experiences moderate linear acceleration (walking, driving)
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <cmath>
+#include <cstdio>
 using namespace horus::literals;
 
 class ImuReader : public horus::Node {
 public:
-    ImuReader() : Node("imu_reader") {
+    ImuReader(double alpha = 0.98)
+        : Node("imu_reader"), alpha_(alpha)
+    {
+        // Subscribe to raw IMU data from the hardware driver
         imu_sub_  = subscribe<horus::msg::Imu>("imu.raw");
+        // Publish filtered orientation for downstream consumers
         pose_pub_ = advertise<horus::msg::Pose2D>("imu.orientation");
     }
 
@@ -28,34 +67,154 @@ public:
         if (!data) return;
 
         const auto* imu = data->get();
+
+        // ── Extract sensor readings ─────────────────────────────────
         double ax = imu->linear_acceleration[0];
         double ay = imu->linear_acceleration[1];
         double az = imu->linear_acceleration[2];
-        double gz = imu->angular_velocity[2];
+        double gx = imu->angular_velocity[0];   // roll rate (rad/s)
+        double gy = imu->angular_velocity[1];   // pitch rate (rad/s)
+        double gz = imu->angular_velocity[2];   // yaw rate (rad/s)
 
-        // Accelerometer angle (pitch from gravity)
-        double accel_angle = std::atan2(ay, az);
+        double dt = 1.0 / 200.0;  // matches 200 Hz tick rate
 
-        // Complementary filter: 98% gyro, 2% accelerometer
-        double dt = 0.01;
-        angle_ = 0.98 * (angle_ + gz * dt) + 0.02 * accel_angle;
+        // ── Accelerometer angles from gravity vector ────────────────
+        // Only valid when linear acceleration is negligible
+        double accel_roll  = std::atan2(ay, az);
+        double accel_pitch = std::atan2(-ax, std::sqrt(ay * ay + az * az));
 
+        // ── Complementary filter ────────────────────────────────────
+        // Gyro integration for short-term accuracy,
+        // accelerometer correction for long-term drift elimination
+        roll_  = alpha_ * (roll_  + gx * dt) + (1.0 - alpha_) * accel_roll;
+        pitch_ = alpha_ * (pitch_ + gy * dt) + (1.0 - alpha_) * accel_pitch;
+
+        // Yaw from gyro only — accelerometer cannot sense yaw
+        // (magnetometer would be needed for absolute yaw reference)
+        yaw_ += gz * dt;
+
+        // Normalize yaw to [-pi, pi]
+        if (yaw_ > M_PI)  yaw_ -= 2.0 * M_PI;
+        if (yaw_ < -M_PI) yaw_ += 2.0 * M_PI;
+
+        // ── Publish orientation ─────────────────────────────────────
         horus::msg::Pose2D pose{};
-        pose.theta = angle_;
+        pose.x     = roll_;   // repurpose x for roll (radians)
+        pose.y     = pitch_;  // repurpose y for pitch (radians)
+        pose.theta = yaw_;    // theta for yaw (radians)
         pose_pub_->send(pose);
+
+        // ── Detect anomalies ────────────────────────────────────────
+        // Gravity magnitude should be ~9.81 m/s^2. Large deviations
+        // indicate high linear acceleration — filter becomes less reliable
+        double gravity_mag = std::sqrt(ax * ax + ay * ay + az * az);
+        if (std::abs(gravity_mag - 9.81) > 2.0) {
+            horus::log::warn("imu_reader",
+                "High linear acceleration detected — filter accuracy degraded");
+        }
+
+        // Log at 1 Hz (every 200th tick at 200 Hz)
+        if (++tick_count_ % 200 == 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "roll=%.1f  pitch=%.1f  yaw=%.1f deg  |g|=%.2f",
+                roll_ * 180.0 / M_PI, pitch_ * 180.0 / M_PI,
+                yaw_ * 180.0 / M_PI, gravity_mag);
+            horus::log::info("imu_reader", buf);
+        }
     }
 
 private:
     horus::Subscriber<horus::msg::Imu>*   imu_sub_;
     horus::Publisher<horus::msg::Pose2D>*  pose_pub_;
-    double angle_ = 0;
+
+    // Filter parameter
+    double alpha_;  // gyro trust factor (0.90-0.99 typical)
+
+    // Orientation state (radians)
+    double roll_  = 0;
+    double pitch_ = 0;
+    double yaw_   = 0;
+
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(100_hz);
-    ImuReader imu;
-    sched.add(imu).order(5).build();
+    sched.tick_rate(200_hz).name("imu_demo");
+
+    // alpha=0.98: 98% gyro, 2% accel — good default for ground robots
+    ImuReader imu(0.98);
+    sched.add(imu)
+        .order(5)            // run early — downstream nodes depend on orientation
+        .budget(200_us)      // IMU processing is lightweight
+        .on_miss(horus::Miss::Skip)  // skip if overrun — stale orientation is worse than missing one
+        .build();
+
     sched.spin();
 }
 ```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Orientation drifts in one direction | Gyro bias not compensated | Calibrate gyro at startup (average readings while stationary) |
+| Pitch/roll jitter during motion | `alpha` too low (too much accel trust) | Increase alpha to 0.98-0.99 |
+| Pitch/roll sluggish to correct | `alpha` too high (too little accel correction) | Decrease alpha toward 0.95 |
+| Yaw drifts continuously | No absolute yaw reference (expected) | Add magnetometer or use SLAM for yaw correction |
+| Angles jump when robot accelerates | Accelerometer reads linear accel, not just gravity | Increase alpha or gate accel when `\|g\| != 9.81` |
+| NaN in orientation output | `atan2(0, 0)` or dt=0 | Guard against zero denominators, validate IMU data |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| Complementary filter over Kalman | Simpler, cheaper, no matrix math — sufficient for most ground robots |
+| `alpha = 0.98` default | Standard starting point: responsive with low drift |
+| 200 Hz tick rate | Matches typical IMU output rate (MPU-6050, ICM-20948) |
+| `Miss::Skip` policy | Stale orientation from accumulated lag is worse than dropping one reading |
+| Yaw from gyro only | Accelerometer cannot sense yaw — magnetometer needed for correction |
+| Gravity magnitude check | Detects high linear acceleration where filter accuracy degrades |
+| `Pose2D` for output | Lightweight, sufficient for 3-axis orientation (roll/pitch/yaw) |
+
+### Variations
+
+**Gyro bias calibration** — average readings at startup for drift reduction:
+```cpp
+// During first 500 ticks, accumulate gyro bias
+if (calibrating_ && cal_count_ < 500) {
+    gx_bias_ += gx; gy_bias_ += gy; gz_bias_ += gz;
+    cal_count_++;
+    return;
+}
+if (calibrating_) {
+    gx_bias_ /= 500; gy_bias_ /= 500; gz_bias_ /= 500;
+    calibrating_ = false;
+    horus::log::info("imu_reader", "Gyro calibration complete");
+}
+gx -= gx_bias_; gy -= gy_bias_; gz -= gz_bias_;
+```
+
+**Adaptive alpha** — trust accelerometer less during high acceleration:
+```cpp
+double gravity_mag = std::sqrt(ax*ax + ay*ay + az*az);
+double deviation = std::abs(gravity_mag - 9.81);
+// Scale alpha from 0.98 (stationary) to 0.999 (high accel)
+double adaptive_alpha = std::clamp(0.98 + deviation * 0.005, 0.98, 0.999);
+roll_ = adaptive_alpha * (roll_ + gx * dt) + (1.0 - adaptive_alpha) * accel_roll;
+```
+
+**Magnetometer-corrected yaw** — add absolute yaw reference:
+```cpp
+double mag_yaw = std::atan2(mag_y, mag_x);  // from magnetometer
+yaw_ = alpha_ * (yaw_ + gz * dt) + (1.0 - alpha_) * mag_yaw;
+```
+
+### Key Takeaways
+
+- The complementary filter is the simplest reliable IMU fusion — start here before reaching for a Kalman filter
+- `alpha` controls the drift vs. noise trade-off: higher values are smoother but drift more slowly
+- Yaw always drifts without an external reference (magnetometer or SLAM)
+- Run the IMU reader early in the execution order — downstream nodes (controllers, SLAM) depend on fresh orientation
+- `Miss::Skip` is correct for sensor processing — accumulated lag causes stale readings
