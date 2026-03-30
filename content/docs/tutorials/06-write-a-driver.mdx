@@ -1,0 +1,516 @@
+---
+title: "Tutorial 6: Write a Reusable Driver"
+description: "Build a hardware driver package that others can install from the HORUS registry — from serial protocol to published package"
+order: 60
+---
+
+# Tutorial 6: Write a Reusable Driver
+
+Tutorial 5 showed how to use hardware. This tutorial shows how to **create a driver** — a reusable hardware driver package that anyone can install with `horus install` and configure in their `horus.toml`.
+
+**What you'll build:** A driver for a serial motor controller (generic protocol) that publishes `JointState` and subscribes to `JointCommand` topics. By the end, it's installable from the registry.
+
+**Prerequisites:** [Tutorial 5: Hardware Drivers](/tutorials/05-hardware-drivers) completed.
+
+**Time:** 30 minutes
+
+---
+
+## Architecture of a Driver Package
+
+A driver package is a HORUS project that:
+1. Reads config from `NodeParams` (port, baudrate, etc.)
+2. Communicates with hardware (serial, I2C, CAN, etc.)
+3. Publishes sensor data to topics
+4. Subscribes to command topics
+5. Handles errors and safe states
+
+<MermaidDiagram
+  chart={`flowchart LR
+    C["horus.toml"] --> P["NodeParams"]
+    P --> N["MotorDriver Node"]
+    H["Hardware"] --- N
+    N -->|publish| S["joint_state"]
+    CMD["joint_cmd"] -->|subscribe| N
+`}
+  caption="Driver architecture: config → params → node → hardware + topics"
+/>
+
+---
+
+## Step 1: Create the Project
+
+```bash
+horus new horus-driver-serial-motor
+cd horus-driver-serial-motor
+```
+
+Edit `horus.toml`:
+
+```toml
+[package]
+name = "horus-driver-serial-motor"
+version = "0.1.0"
+description = "Generic serial motor controller driver for HORUS"
+type = "driver"
+license = "Apache-2.0"
+keywords = ["motor", "serial", "driver", "actuator"]
+
+[dependencies]
+serialport = { version = "4.5", source = "crates.io" }
+```
+
+The `type = "driver"` metadata tells the registry this is a driver package, which affects how it shows up in search results.
+
+---
+
+## Step 2: Define the Driver Struct
+
+<LanguageTabs>
+<LangTab language="Rust">
+
+```rust
+// simplified
+// src/main.rs
+use horus::prelude::*;
+use horus::hardware::{self, NodeParams};
+use horus::register_driver;
+use std::io::{Read, Write};
+use std::time::Duration;
+
+/// Serial motor controller driver.
+///
+/// Communicates with a motor controller over UART using a simple
+/// binary protocol: [0xFF, motor_id, position_hi, position_lo, checksum].
+struct SerialMotorDriver {
+    port: Box<dyn serialport::SerialPort>,
+    motor_ids: Vec<u8>,
+    state_pub: Topic<JointState>,
+    cmd_sub: Topic<JointCommand>,
+}
+
+impl SerialMotorDriver {
+    fn from_params(params: &NodeParams) -> Result<Self> {
+        let port_name: String = params.get("port")?;
+        let baudrate: u32 = params.get_or("baudrate", 115200);
+        let motor_ids: Vec<u8> = params.get_or("motor_ids", vec![1]);
+        let topic_prefix: String = params.get_or("topic_prefix", "motor".to_string());
+
+        let port = serialport::new(&port_name, baudrate)
+            .timeout(Duration::from_millis(10))
+            .open()
+            .map_err(|e| Error::from(ConfigError::Other(
+                format!("Failed to open {}: {}", port_name, e)
+            )))?;
+
+        Ok(Self {
+            port,
+            motor_ids,
+            state_pub: Topic::new(&format!("{}.joint_state", topic_prefix))?,
+            cmd_sub: Topic::new(&format!("{}.joint_cmd", topic_prefix))?,
+        })
+    }
+
+    /// Read current positions from the controller.
+    fn read_positions(&mut self) -> Vec<f64> {
+        let mut positions = Vec::with_capacity(self.motor_ids.len());
+
+        for &id in &self.motor_ids {
+            // Send query: [0xFF, id, 0x00, 0x00, checksum]
+            let checksum = 0xFF ^ id;
+            let cmd = [0xFF, id, 0x00, 0x00, checksum];
+            if self.port.write_all(&cmd).is_err() {
+                positions.push(0.0);
+                continue;
+            }
+
+            // Read response: [0xFF, id, pos_hi, pos_lo, checksum]
+            let mut buf = [0u8; 5];
+            if self.port.read_exact(&mut buf).is_ok() && buf[0] == 0xFF && buf[1] == id {
+                let raw = ((buf[2] as u16) << 8) | buf[3] as u16;
+                // Convert raw position (0-4095) to radians (0-2pi)
+                positions.push(raw as f64 / 4095.0 * std::f64::consts::TAU);
+            } else {
+                positions.push(0.0);
+            }
+        }
+
+        positions
+    }
+
+    /// Send position commands to the controller.
+    fn write_positions(&mut self, positions: &[f64]) {
+        for (i, &id) in self.motor_ids.iter().enumerate() {
+            if let Some(&pos) = positions.get(i) {
+                // Convert radians to raw (0-4095)
+                let raw = ((pos / std::f64::consts::TAU) * 4095.0).clamp(0.0, 4095.0) as u16;
+                let hi = (raw >> 8) as u8;
+                let lo = (raw & 0xFF) as u8;
+                let checksum = 0xFF ^ id ^ hi ^ lo;
+                let cmd = [0xFF, id, hi, lo, checksum];
+                let _ = self.port.write_all(&cmd);
+            }
+        }
+    }
+}
+```
+
+</LangTab>
+<LangTab language="Python">
+
+```python
+# src/main.py
+import horus
+import serial
+import struct
+import math
+
+class SerialMotorDriver:
+    def __init__(self, params):
+        port_name = params.get("port", "/dev/ttyUSB0")
+        baudrate = params.get("baudrate", 115200)
+        self.motor_ids = params.get("motor_ids", [1])
+        topic_prefix = params.get("topic_prefix", "motor")
+
+        self.port = serial.Serial(port_name, baudrate, timeout=0.01)
+
+        self.state_pub = horus.Topic(f"{topic_prefix}.joint_state", horus.JointState)
+        self.cmd_sub = horus.Topic(f"{topic_prefix}.joint_cmd", horus.JointCommand)
+
+    def read_positions(self):
+        positions = []
+        for motor_id in self.motor_ids:
+            checksum = 0xFF ^ motor_id
+            self.port.write(bytes([0xFF, motor_id, 0x00, 0x00, checksum]))
+            buf = self.port.read(5)
+            if len(buf) == 5 and buf[0] == 0xFF and buf[1] == motor_id:
+                raw = (buf[2] << 8) | buf[3]
+                positions.append(raw / 4095.0 * 2 * math.pi)
+            else:
+                positions.append(0.0)
+        return positions
+
+    def write_positions(self, positions):
+        for i, motor_id in enumerate(self.motor_ids):
+            if i < len(positions):
+                raw = int(positions[i] / (2 * math.pi) * 4095)
+                raw = max(0, min(4095, raw))
+                hi, lo = raw >> 8, raw & 0xFF
+                checksum = 0xFF ^ motor_id ^ hi ^ lo
+                self.port.write(bytes([0xFF, motor_id, hi, lo, checksum]))
+```
+
+</LangTab>
+</LanguageTabs>
+
+---
+
+## Step 3: Implement the Node Trait
+
+<LanguageTabs>
+<LangTab language="Rust">
+
+```rust
+// simplified
+impl Node for SerialMotorDriver {
+    fn name(&self) -> &str { "SerialMotorDriver" }
+
+    fn init(&mut self) -> Result<()> {
+        // Verify communication by reading positions once
+        let positions = self.read_positions();
+        log::info!(
+            "SerialMotorDriver initialized: {} motors, positions: {:?}",
+            self.motor_ids.len(),
+            positions
+        );
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        // Read current state and publish
+        let positions = self.read_positions();
+        self.state_pub.send(JointState {
+            name: self.motor_ids.iter().map(|id| format!("motor_{}", id)).collect(),
+            position: positions,
+            ..Default::default()
+        });
+
+        // Apply commands if any
+        if let Some(cmd) = self.cmd_sub.recv() {
+            self.write_positions(&cmd.position);
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        log::info!("SerialMotorDriver shutting down — stopping all motors");
+        // Send zero velocity to all motors
+        let zeros = vec![0.0; self.motor_ids.len()];
+        self.write_positions(&zeros);
+        Ok(())
+    }
+
+    fn enter_safe_state(&mut self) {
+        // Emergency: stop all motors immediately
+        let zeros = vec![0.0; self.motor_ids.len()];
+        self.write_positions(&zeros);
+    }
+
+    fn is_safe_state(&self) -> bool {
+        true // Motors stopped
+    }
+}
+
+// Register so hardware::load() can instantiate this driver from horus.toml
+register_driver!(SerialMotorDriver, SerialMotorDriver::from_params);
+```
+
+</LangTab>
+<LangTab language="Python">
+
+```python
+def tick(node):
+    driver = node.state  # stored in node state
+
+    # Read current state and publish
+    positions = driver.read_positions()
+    node.send("motor.joint_state", horus.JointState(
+        name=[f"motor_{id}" for id in driver.motor_ids],
+        position=positions,
+    ))
+
+    # Apply commands if any
+    cmd = node.recv("motor.joint_cmd")
+    if cmd:
+        driver.write_positions(cmd.position)
+
+# Create driver from params
+params = horus.hardware.load().raw("motor")
+driver = SerialMotorDriver(params)
+
+motor_node = horus.Node(
+    "SerialMotorDriver",
+    subs=["motor.joint_cmd"],
+    pubs=["motor.joint_state"],
+    tick=tick,
+    rate=100,
+    state=driver,
+)
+
+horus.run(motor_node)
+```
+
+</LangTab>
+</LanguageTabs>
+
+---
+
+## Step 4: Wire Up main()
+
+`hardware::load()` reads your `horus.toml` `[hardware]` section and returns ready-to-use nodes — one `(name, Box<dyn Node>)` pair per device entry. For a driver package, you typically construct the node directly from params and add it to the scheduler:
+
+<LanguageTabs>
+<LangTab language="Rust">
+
+```rust
+// simplified
+fn main() -> Result<()> {
+    env_logger::init();
+
+    // hardware::load() returns Vec<(String, Box<dyn Node>)>
+    // Each entry is a ready-to-use node from [hardware] config
+    let nodes = hardware::load()?;
+
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz());
+
+    for (name, node) in nodes {
+        sched = sched
+            .add(node)
+                .rate(100_u64.hz())
+                .on_miss(Miss::SafeMode)
+                .build()?;
+    }
+
+    sched.build()?.run()
+}
+```
+
+</LangTab>
+</LanguageTabs>
+
+---
+
+## Step 5: Test Without Hardware
+
+Create a test config and use `hardware::load_from()`:
+
+```rust
+// simplified
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> &'static str {
+        r#"
+        [hardware.motor]
+        use = "serial"
+        port = "/dev/null"
+        baudrate = 115200
+        motor_ids = [1, 2, 3]
+        topic_prefix = "test_motor"
+        "#
+    }
+
+    #[test]
+    fn driver_parses_config() {
+        std::fs::write("/tmp/test_motor_driver.toml", test_config()).unwrap();
+        let nodes = hardware::load_from("/tmp/test_motor_driver.toml").unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].0, "motor");
+
+        std::fs::remove_file("/tmp/test_motor_driver.toml").ok();
+    }
+
+    #[test]
+    fn driver_has_safe_state() {
+        // Verify the driver implements enter_safe_state
+        // In a real test, you'd use a mock serial port
+    }
+}
+```
+
+For more thorough testing with simulated serial ports, use the `serialport` crate's `TTYPort::pair()` for virtual serial ports on Linux, or test with `horus run --sim` where the simulator provides virtual motor feedback.
+
+---
+
+## Step 6: Publish to the Registry
+
+Once your driver works, publish it so others can install it:
+
+```bash
+# Login (first time only)
+horus auth login
+
+# Verify package metadata
+horus check
+
+# Publish
+horus publish
+```
+
+Users can then install and use your driver:
+
+```bash
+horus install horus-driver-serial-motor
+```
+
+```toml
+# Their horus.toml
+[hardware.arm]
+use = "horus-driver-serial-motor"
+port = "/dev/ttyUSB0"
+baudrate = 115200
+motor_ids = [1, 2, 3, 4, 5]
+topic_prefix = "arm"
+```
+
+---
+
+## Driver Design Checklist
+
+Before publishing, verify your driver follows these practices:
+
+### Config
+
+- [ ] All hardware-specific values come from `NodeParams`, not hardcoded
+- [ ] Reasonable defaults for optional params (`get_or()`)
+- [ ] `topic_prefix` param so users can namespace topics per robot
+- [ ] Error messages include the port/device name for debugging
+
+### Safety
+
+- [ ] `enter_safe_state()` stops all actuators immediately
+- [ ] `is_safe_state()` returns `true` when motors are stopped
+- [ ] `shutdown()` cleanly closes the hardware connection
+- [ ] `on_miss(Miss::SafeMode)` configured for actuator drivers
+
+### Topics
+
+- [ ] Follow the [topic naming convention](/getting-started/simulation#topic-naming-convention): `{prefix}.{data_type}`
+- [ ] Use standard message types (`JointState`, `JointCommand`, `Imu`, `LaserScan`, etc.)
+- [ ] Publish at a consistent rate matching the hardware capability
+
+### Testing
+
+- [ ] Config parsing tested with `hardware::load_from()`
+- [ ] Works with `horus run --sim` (simulator provides mock data)
+- [ ] Graceful behavior when hardware is disconnected (no panics)
+
+### Package metadata
+
+- [ ] `type = "driver"` in `horus.toml [package]`
+- [ ] `description` explains what hardware it supports
+- [ ] `keywords` include the hardware name and interface type
+- [ ] `license` specified
+
+---
+
+## Example: Complete horus.toml for a Multi-Hardware Robot
+
+```toml
+[package]
+name = "warehouse-robot"
+version = "0.1.0"
+
+[robot]
+name = "agv"
+description = "agv.urdf"
+
+[hardware.wheels]
+use = "horus-driver-serial-motor"
+port = "/dev/ttyUSB0"
+motor_ids = [1, 2]
+topic_prefix = "agv"
+
+[hardware.lidar]
+use = "rplidar"
+port = "/dev/ttyUSB1"
+
+[hardware.arm]
+use = "horus-driver-serial-motor"
+port = "/dev/ttyUSB2"
+motor_ids = [1, 2, 3, 4, 5, 6]
+topic_prefix = "arm"
+
+[hardware.imu]
+use = "bno055"
+bus = "/dev/i2c-1"
+
+[hardware.sim_wheels]
+use = "horus-driver-serial-motor"
+sim = true
+
+[hardware.sim_lidar]
+use = "rplidar"
+sim = true
+noise = 0.01
+
+[hardware.sim_arm]
+use = "horus-driver-serial-motor"
+sim = true
+
+[hardware.sim_imu]
+use = "bno055"
+sim = true
+```
+
+Notice that `horus-driver-serial-motor` is used **multiple times** — for the wheels, the arm, and their simulated counterparts — each with different config values. The `sim = true` flag marks devices that should use simulated backends instead of real hardware. This is the power of config-driven drivers with the unified `use` field.
+
+---
+
+## Next Steps
+
+- [Publishing & Registry](/package-management/publishing) — detailed publishing workflow
+- [Creating CLI Plugins](/plugins/creating-plugins) — extend the `horus` CLI
+- [Real Hardware](/recipes/real-hardware) — complete I2C and serial examples with real libraries

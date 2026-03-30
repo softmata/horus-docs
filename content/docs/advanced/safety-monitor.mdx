@@ -1,0 +1,545 @@
+---
+title: "Safety Monitor"
+description: "Real-time safety monitoring with watchdogs, budget enforcement, and deadline miss policies"
+weight: 44
+---
+
+# Safety Monitor
+
+You need to enforce timing constraints on your robot's nodes and detect when a node hangs, overruns its budget, or misses a deadline. The safety monitor handles this automatically through watchdogs, budget enforcement, and configurable miss policies.
+
+## When To Use This
+
+- Any system with timing requirements (motor control, sensor fusion, safety-critical nodes)
+- Production deployments where a hung node must be detected and handled
+- Systems that need graduated degradation instead of all-or-nothing failure
+- When regulations or safety standards require deadline monitoring
+
+**Use [Fault Tolerance](/advanced/circuit-breaker) alongside this** for per-node failure policies (restart, skip, ignore). The safety monitor handles timing violations; failure policies handle execution errors. Use both in production.
+
+## Prerequisites
+
+- Familiarity with [Scheduler Configuration](/advanced/scheduler-configuration) — especially `.rate()`, `.budget()`, `.deadline()`, and `.on_miss()`
+- Understanding of [Execution Classes](/concepts/execution-classes) — especially RT auto-detection
+- Understanding of [Nodes](/concepts/core-concepts-nodes) — especially `enter_safe_state()` and `is_safe_state()`
+
+## Overview
+
+The Safety Monitor includes:
+- **Watchdogs**: Monitor node liveness -- trigger action if a critical node hangs
+- **Budget Enforcement**: Per-node tick budgets -- act if a node takes too long (implicit when nodes have `.rate()` set)
+- **Deadline Tracking**: Count deadline misses and apply the configured `Miss` policy
+- **Miss Policies**: `Warn`, `Skip`, `SafeMode`, or `Stop` -- per-node control over what happens on deadline miss
+
+The Scheduler manages the safety monitor internally -- you configure it with composable builder methods and the scheduler automatically feeds watchdogs, checks budgets, and applies miss policies.
+
+## Enabling Safety Monitoring
+
+Use composable builder methods to enable safety monitoring. Each method adds a specific safety feature:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    // Production: watchdog for frozen node detection
+    let mut scheduler = Scheduler::new()
+        .watchdog(500_u64.ms())
+        .tick_rate(1000_u64.hz());
+
+    // Safety-critical: require RT + blackbox + strict deadline limit
+    let mut scheduler = Scheduler::new()
+        .require_rt()
+        .watchdog(500_u64.ms())
+        .blackbox(64)
+        .tick_rate(1000_u64.hz())
+        .max_deadline_misses(3);
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    # Production: watchdog for frozen node detection
+    scheduler = horus.Scheduler(tick_rate=1000, watchdog_ms=500)
+
+    # Safety-critical: RT + blackbox + strict deadline limit
+    scheduler = horus.Scheduler(
+        tick_rate=1000,
+        rt=True,
+        watchdog_ms=500,
+        blackbox_mb=64,
+    )
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Composable Builder Comparison
+
+| Builder | Watchdog | Budget Enforcement | Memory Locking | Blackbox |
+|---------|----------|-------------------|----------------|----------|
+| `new()` | No | Implicit (when nodes have `.rate()`) | No | No |
+| `.watchdog(500_u64.ms())` | **Yes** (500ms) | Implicit | No | No |
+| `.require_rt()` | No | Implicit | **Yes** | No |
+| `.watchdog(500_u64.ms()).require_rt()` | **Yes** (500ms) | Implicit | **Yes** | No |
+| `.watchdog(500_u64.ms()).blackbox(64)` | **Yes** (500ms) | Implicit | No | **Yes** (64MB) |
+
+## Configuring Nodes with Rates
+
+After configuring the scheduler, add nodes with timing constraints using the node builder. Setting `.rate()` automatically marks the node as RT and derives budget (80% of period) and deadline (95% of period):
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    let mut scheduler = Scheduler::new()
+        .watchdog(500_u64.ms())
+        .tick_rate(1000_u64.hz());
+
+    // RT node — rate auto-derives budget and deadline
+    scheduler.add(motor_controller)
+        .order(0)
+        .rate(1000_u64.hz())       // budget=800us, deadline=950us
+        .on_miss(Miss::SafeMode)   // Enter safe state on miss
+        .build()?;
+
+    scheduler.add(sensor_fusion)
+        .order(1)
+        .rate(200_u64.hz())        // budget=4ms, deadline=4.75ms
+        .on_miss(Miss::Skip)       // Skip tick on miss
+        .build()?;
+
+    scheduler.run()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, us
+
+    scheduler = horus.Scheduler(tick_rate=1000, watchdog_ms=500)
+
+    # RT node — rate auto-derives budget and deadline
+    scheduler.add(Node(tick=motor_fn, rate=1000, order=0, on_miss="safe_mode"))
+    scheduler.add(Node(tick=fusion_fn, rate=200, order=1, on_miss="skip"))
+
+    scheduler.run()
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Watchdogs
+
+Watchdogs monitor node liveness. The scheduler automatically feeds watchdogs on successful node ticks. If a critical node fails to execute within the watchdog timeout, the safety monitor triggers graduated degradation.
+
+```
+Normal operation:
+  Node tick → success → watchdog fed → timer reset
+
+Failure scenario:
+  Node hangs → watchdog timeout expires → graduated degradation → EMERGENCY STOP
+```
+
+### Timeout Guidelines
+
+```
+Watchdog timeout should be:
+  - Longer than expected execution time
+  - Shorter than safety-critical response time
+
+Example:
+  Expected tick period:  10ms
+  Safety deadline:      100ms
+  Watchdog timeout:      50ms  (5× period)
+```
+
+## Budget and Deadline Enforcement
+
+Budget and deadline are two levels of timing enforcement:
+
+- **Budget** is the expected computation time (soft limit). Budget violations are tracked in `RtStats` for monitoring.
+- **Deadline** is the hard limit. When exceeded, the `Miss` policy fires (`Warn`, `Skip`, `SafeMode`, or `Stop`).
+
+When you set `.rate()`, both are auto-derived: budget = 80% of period, deadline = 95% of period. When you set `.budget()` without `.deadline()`, the deadline equals the budget — your budget IS your hard limit:
+
+```rust
+// simplified
+// Auto-derived from rate
+scheduler.add(motor_controller)
+    .order(0)
+    .rate(1000_u64.hz())       // budget=800us, deadline=950us
+    .on_miss(Miss::SafeMode)   // Fires on DEADLINE miss (>950us)
+    .build()?;
+
+// Explicit budget — deadline auto-derived to match
+scheduler.add(fast_loop)
+    .order(0)
+    .budget(500_u64.us())      // budget=500us, deadline=500us (auto)
+    .on_miss(Miss::Stop)       // Fires when tick exceeds 500us
+    .build()?;
+
+// Explicit budget + deadline — slack between them
+scheduler.add(with_slack)
+    .order(0)
+    .budget(500_u64.us())      // Soft: track violations above 500us
+    .deadline(900_u64.us())    // Hard: Miss policy fires above 900us
+    .on_miss(Miss::SafeMode)
+    .build()?;
+```
+
+Violations are also recorded in the BlackBox when using `.blackbox(n)`.
+
+## Node Health States
+
+Every node has a health state tracked internally by the scheduler. The four states form a graduated degradation ladder:
+
+| State | Meaning |
+|-------|---------|
+| `Healthy` | Normal operation — node ticks every cycle |
+| `Warning` | Watchdog at 1x timeout — node still ticks, but a warning is logged |
+| `Unhealthy` | Watchdog at 2x timeout — node is **skipped** in the tick loop |
+| `Isolated` | Watchdog at 3x timeout — `enter_safe_state()` is called, node is skipped |
+
+### Graduated Degradation Transitions
+
+The scheduler evaluates watchdog severity every tick and transitions nodes through health states automatically:
+
+<MermaidDiagram
+  chart={`%%{init: {'stateDiagram': {'padding': 15}}}%%
+stateDiagram-v2
+    Healthy --> Warning: 1x timeout
+    Warning --> Unhealthy: 2x timeout
+    Unhealthy --> Isolated: 3x timeout
+    Warning --> Healthy: successful tick
+    Isolated --> Healthy: recovery (RestoreRate)
+`}
+  caption="Graduated degradation: Healthy → Warning → Unhealthy → Isolated, with recovery paths"
+/>
+
+**Escalation** happens when a node's watchdog is not fed (the node is slow or hung):
+
+- **Healthy to Warning** — 1x watchdog timeout elapsed. The node still runs, but the scheduler logs a warning.
+- **Warning to Unhealthy** — 2x timeout. The node is skipped entirely in the tick loop to prevent cascading delays.
+- **Unhealthy to Isolated** — 3x timeout. The scheduler calls `enter_safe_state()` on the node and continues to skip it. For critical nodes, this also triggers an emergency stop.
+
+**Recovery** happens on successful ticks:
+
+- A `Warning` node that ticks successfully transitions back to `Healthy` immediately, and its watchdog is re-fed.
+- An `Isolated` or rate-reduced node can recover through the graduated degradation system — after enough consecutive successful ticks at a reduced rate, the scheduler restores the original rate and transitions back to `Healthy`.
+
+### Relationship to Miss Policies
+
+Node health states and `Miss` policies are complementary:
+
+- **`Miss` policies** act on individual deadline/budget violations (skip one tick, enter safe mode, stop the scheduler).
+- **Health states** track sustained behavior over time via the watchdog. A node can be in `Warning` even if its `Miss` policy is `Warn` — repeated warnings escalate to `Unhealthy` and eventually `Isolated`.
+
+Both systems work together: the `Miss` policy handles immediate responses, while health states provide graduated, automatic degradation for persistently failing nodes.
+
+### Shutdown Report
+
+When the scheduler shuts down with `.watchdog()` enabled, the timing report includes a health summary:
+
+```
+Node Health:
+  [OK] All 4 nodes healthy
+```
+
+Or, if any nodes degraded during the run:
+
+```
+Node Health:
+  3 healthy, 1 warning, 0 unhealthy, 0 isolated, 0 stopped
+    - sensor_fusion: WARNING
+```
+
+## Miss — Deadline Miss Policy
+
+The `Miss` enum controls what happens when a node exceeds its deadline:
+
+| Policy | Behavior |
+|--------|----------|
+| `Miss::Warn` | Log a warning and continue (default) |
+| `Miss::Skip` | Skip the node for this tick |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node |
+| `Miss::Stop` | Stop the entire scheduler |
+
+### SafeMode in Detail
+
+When `Miss::SafeMode` triggers:
+1. The scheduler calls `enter_safe_state()` on the offending node
+2. Each subsequent tick, the scheduler checks `is_safe_state()`
+3. When the node reports safe, normal operation resumes
+
+Implement these on your Node:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    impl Node for MotorController {
+        fn enter_safe_state(&mut self) {
+            self.velocity = 0.0;
+            self.disable_motor();
+        }
+
+        fn is_safe_state(&self) -> bool {
+            self.velocity == 0.0
+        }
+
+        fn tick(&mut self) { /* ... */ }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    velocity = 0.0
+    in_safe_state = False
+
+    def motor_tick(node):
+        global velocity, in_safe_state
+        if in_safe_state:
+            velocity = 0.0
+            node.log_info("In safe state — motor disabled")
+            return
+        # Normal motor control logic
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## RT Node Isolation
+
+Each RT node runs on its own dedicated thread by default. If one RT node stalls (deadlock, infinite loop, hardware fault), other RT nodes keep ticking independently on their own threads.
+
+```
+Thread 1: [MotorLeft.tick()]  → sleep → repeat
+Thread 2: [MotorRight.tick()] → sleep → repeat    ← keeps running
+Thread 3: [ArmServo.tick()]   → sleep → repeat    ← keeps running
+
+If MotorLeft stalls, MotorRight and ArmServo are unaffected.
+```
+
+This is critical for robots where each actuator must be independently controllable. A stalled left wheel controller must not take down the right wheel.
+
+Use `.core(N)` to pin specific nodes to CPU cores for cache locality:
+
+```rust
+// simplified
+scheduler.add(left_motor).order(0).rate(1000_u64.hz()).core(2).build()?;
+scheduler.add(right_motor).order(1).rate(1000_u64.hz()).core(3).build()?;
+```
+
+> **Note:** The watchdog detects stalled nodes but cannot preempt a running `tick()` — cooperative scheduling means the node must return from `tick()` for the watchdog to take action. Thread isolation ensures the stall doesn't cascade to other nodes.
+
+## Shutdown Safety
+
+The scheduler guarantees that shutdown always completes, even if an RT node is stalled. Each RT thread gets 3 seconds to exit cleanly after `running` is set to `false`. If a thread doesn't exit within the timeout, it is detached and the scheduler continues shutting down other nodes.
+
+This prevents a single stalled node from blocking the entire process — critical for emergency stop scenarios where the robot must halt immediately.
+
+## Emergency Stop
+
+Emergency stop is triggered automatically by:
+- Watchdog expiration (node hangs)
+- `Miss::Stop` policy on deadline miss
+- Exceeding the `max_deadline_misses` threshold
+
+When emergency stop triggers:
+1. All node execution is halted
+2. An emergency stop event is recorded in the BlackBox
+3. The scheduler transitions to emergency state
+4. RT threads are given 3 seconds to exit before being detached
+
+### Inspecting After Emergency Stop
+
+```rust,ignore
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(1000_u64.hz());
+
+// ... application runs and hits emergency stop ...
+
+// Inspect what happened via BlackBox
+// Inspect safety events via CLI: horus blackbox --anomalies
+if let Some(bb) = scheduler.get_blackbox() {
+    for record in bb.lock().expect("blackbox lock").anomalies() {
+        println!("[tick {}] {:?}", record.tick, record.event);
+    }
+}
+```
+
+## Best Practices
+
+### 1. Start with Conservative Rates
+
+Set rates generously initially, then tighten after profiling:
+
+```rust
+// simplified
+// Start: use rate() — auto-derives budget at 80% of period
+scheduler.add(motor_controller)
+    .order(0)
+    .rate(500_u64.hz())        // period=2ms, budget=1.6ms
+    .on_miss(Miss::Warn)       // Log only while tuning
+    .build()?;
+
+// After profiling: tighten to 1kHz
+scheduler.add(motor_controller)
+    .order(0)
+    .rate(1000_u64.hz())       // period=1ms, budget=800us
+    .on_miss(Miss::SafeMode)   // Enforce in production
+    .build()?;
+```
+
+### 2. Layer Safety Checks
+
+Use composable builders (watchdog + blackbox) with per-node miss policies:
+
+```rust
+// simplified
+// .watchdog() gives you frozen node detection
+// Budget enforcement is implicit from .rate()
+let mut scheduler = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(1000_u64.hz());
+
+// Then set per-node policies for fine-grained control
+scheduler.add(motor_controller)
+    .order(0)
+    .rate(1000_u64.hz())
+    .on_miss(Miss::SafeMode)  // Critical — enter safe state
+    .build()?;
+
+scheduler.add(telemetry)
+    .order(10)
+    .rate(10_u64.hz())
+    .on_miss(Miss::Skip)      // Non-critical — just skip
+    .build()?;
+```
+
+### 3. Choose the Right Configuration
+
+| Use Case | Configuration |
+|----------|--------------|
+| Medical / surgical robots | `.require_rt().watchdog(500_u64.ms()).blackbox(64)` |
+| Industrial control | `.require_rt().watchdog(500_u64.ms())` |
+| CNC / aerospace | `.require_rt().watchdog(500_u64.ms()).blackbox(64).max_deadline_misses(3)` |
+| General production | `.watchdog(500_u64.ms()).blackbox(64)` |
+
+### 4. Test Safety Setup
+
+Verify your system handles deadline misses correctly:
+
+```rust,ignore
+#[test]
+fn test_safety_critical_setup() {
+    let mut scheduler = Scheduler::new()
+        .watchdog(500_u64.ms())
+        .tick_rate(1000_u64.hz());
+
+    scheduler.add(test_node)
+        .order(0)
+        .rate(1000_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()
+        .expect("should build node");
+}
+```
+
+## Graduated Watchdog Severity
+
+> **Note:** The watchdog and health states are managed automatically by the scheduler — you configure them via `.watchdog(Duration)` and `.on_miss(Miss)` on the node builder. The internal severity levels below explain the scheduler's behavior, not APIs you call directly.
+
+The watchdog doesn't just fire a binary "alive/dead" check. It uses **graduated severity** based on how many timeout multiples have elapsed since the last heartbeat:
+
+```text
+Time since last heartbeat:
+
+  0────────1x timeout────────2x timeout────────3x timeout────
+  │   Ok        │   Warning       │   Expired        │  Critical
+  │ (healthy)   │ (node is slow)  │ (skip this node) │ (safety response)
+```
+
+| Severity | Threshold | Scheduler Response |
+|----------|-----------|-------------------|
+| **Ok** | Within timeout | Normal execution |
+| **Warning** | 1x timeout elapsed | Log warning, node health → `Warning` |
+| **Expired** | 2x timeout elapsed | Skip node in tick loop, health → `Unhealthy` |
+| **Critical** | 3x timeout elapsed | Trigger safety response, health → `Isolated` |
+
+This prevents a brief jitter from triggering an emergency stop. The scheduler escalates gradually:
+1. **Warn** first (gives the node a chance to recover)
+2. **Skip** if still unresponsive (other nodes keep running)
+3. **Isolate** if critically stuck (enter safe state if configured)
+
+## Tick Timing Ring
+
+The scheduler tracks per-node timing statistics using a circular ring buffer:
+
+- **Min/Max/Avg** tick execution time per node
+- Used by the monitor TUI and web dashboard to display CPU load
+- Helps identify nodes that are close to their budget limits
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Timing stats are reported in the shutdown summary:
+// ┌─ Timing Report ─────────────────┐
+// │ lidar_driver:  avg=0.8ms  max=1.2ms  budget=2.0ms  ✓
+// │ planner:       avg=4.5ms  max=8.1ms  budget=5.0ms  ⚠ (max exceeds budget)
+// │ motor_ctrl:    avg=0.2ms  max=0.3ms  budget=1.0ms  ✓
+// └──────────────────────────────────┘
+```
+
+## Design Decisions
+
+**Why graduated degradation instead of immediate shutdown?**
+
+A brief jitter (1x timeout) should not trigger an emergency stop -- the node may recover on the next tick. Graduated escalation (warn, skip, isolate) gives transient issues time to resolve while still catching persistent failures. This matches how industrial safety systems work: alarm first, then intervene.
+
+**Why auto-derive budget from `.rate()` instead of requiring explicit values?**
+
+Most developers know their node's desired frequency but not its exact execution time. Auto-deriving budget at 80% of period and deadline at 95% provides a safe starting point. After profiling, developers can override with explicit `.budget()` and `.deadline()` values.
+
+**Why cooperative watchdogs instead of preemptive?**
+
+The watchdog cannot preempt a running `tick()` -- it can only detect that a tick has not completed. This is a deliberate choice: preempting a tick mid-execution could leave hardware in an unsafe state. Thread isolation ensures that a stalled node does not cascade to other nodes, while the watchdog triggers the safety response.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| Graduated degradation prevents overreaction to jitter | A truly stuck node takes 3x watchdog timeout to reach Isolated |
+| Auto-derived timing reduces configuration burden | 80%/95% defaults may not match your workload |
+| Per-node miss policies allow fine-grained control | Must configure each node individually |
+| Cooperative watchdogs cannot leave hardware in unsafe state | Cannot preempt a running tick |
+| Thread isolation prevents cascading stalls | RT threads consume OS resources |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No watchdog warnings despite slow nodes | `.watchdog()` not set on the scheduler | Add `.watchdog(500_u64.ms())` to the scheduler builder |
+| Emergency stop on startup | Watchdog timeout shorter than node initialization time | Increase watchdog timeout, or ensure `init()` completes quickly |
+| `Miss::SafeMode` has no effect | Node does not implement `enter_safe_state()` | Implement `enter_safe_state()` and `is_safe_state()` on your Node |
+| Node stuck in Isolated state | Node's `is_safe_state()` always returns `false` | Fix `is_safe_state()` to return `true` when the node has reached a safe state |
+| Budget violations but no deadline misses | Budget is soft (tracking only), deadline is the hard trigger | This is expected. Budget violations are informational. Set `.on_miss()` for deadline enforcement |
+| High deadline miss count in shutdown report | Rate too aggressive for actual computation time | Profile with `horus monitor`, then lower `.rate()` or increase `.budget()` |
+
+## See Also
+
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) — How the scheduler manages node execution
+- [BlackBox Flight Recorder](/advanced/blackbox) — Event recording for post-mortem analysis
+- [Fault Tolerance](/advanced/circuit-breaker) — Per-node failure policies (restart, skip, ignore)
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Builder methods and per-node configuration
+- [RT Setup](/advanced/rt-setup) — Linux real-time kernel for hard timing guarantees

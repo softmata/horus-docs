@@ -1,0 +1,241 @@
+---
+title: "Recipe: LiDAR Obstacle Avoidance"
+description: "Reactive obstacle avoidance using LaserScan data to generate safe velocity commands."
+order: 5
+---
+
+## LiDAR Obstacle Avoidance
+
+Reads `LaserScan` data from a 2D LiDAR, identifies obstacles in three zones (left, center, right), and publishes reactive `CmdVel` commands to avoid collisions. Stops if an obstacle is too close.
+
+### Problem
+
+You need a robot to avoid obstacles in real time using 2D LiDAR scan data without a pre-built map.
+
+### When To Use
+
+- Mobile robots navigating unknown environments
+- Reactive safety layer underneath a path planner
+- Quick prototyping of autonomous navigation
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/getting-started/installation))
+- A LiDAR driver publishing `LaserScan` to `lidar.scan` (or the [IMU Reader](/recipes/imu-reader) recipe for testing)
+
+### horus.toml
+
+```toml
+[package]
+name = "lidar-avoidance"
+version = "0.1.0"
+description = "Reactive obstacle avoidance from LaserScan"
+```
+
+### Complete Code
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    /// Safety zones (meters)
+    const STOP_DISTANCE: f32 = 0.3;    // emergency stop
+    const SLOW_DISTANCE: f32 = 0.8;    // reduce speed
+    const CRUISE_SPEED: f32 = 0.5;     // m/s forward
+    const TURN_SPEED: f32 = 0.8;       // rad/s turning
+
+    // ── Avoidance Node ──────────────────────────────────────────
+
+    struct AvoidanceNode {
+        scan_sub: Topic<LaserScan>,
+        cmd_pub: Topic<CmdVel>,
+    }
+
+    impl AvoidanceNode {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                scan_sub: Topic::new("lidar.scan")?,
+                cmd_pub: Topic::new("cmd_vel")?,
+            })
+        }
+
+        /// Find minimum range in a slice of the scan
+        fn min_range(ranges: &[f32], start: usize, end: usize) -> f32 {
+            ranges[start..end]
+                .iter()
+                .copied()
+                .filter(|r| r.is_finite() && *r > 0.01)
+                .fold(f32::MAX, f32::min)
+        }
+    }
+
+    impl Node for AvoidanceNode {
+        fn name(&self) -> &str { "Avoidance" }
+
+        fn tick(&mut self) {
+            // IMPORTANT: always recv() every tick to drain the buffer
+            let scan = match self.scan_sub.recv() {
+                Some(s) => s,
+                None => return, // no data yet — skip this tick
+            };
+
+            // LaserScan.ranges is [f32; 360] — fixed 360 rays covering the scan arc
+            let n = scan.ranges.len(); // 360
+
+            // Split scan into three zones: left (0..120), center (120..240), right (240..360)
+            let third = n / 3;
+            let left_min = Self::min_range(&scan.ranges, 0, third);
+            let center_min = Self::min_range(&scan.ranges, third, 2 * third);
+            let right_min = Self::min_range(&scan.ranges, 2 * third, n);
+
+            // Reactive behavior
+            let cmd = if center_min < STOP_DISTANCE {
+                // WARNING: obstacle dead ahead — emergency stop
+                CmdVel { linear: 0.0, angular: 0.0 }
+            } else if center_min < SLOW_DISTANCE {
+                // Obstacle ahead — turn toward the more open side
+                let angular = if left_min > right_min { TURN_SPEED } else { -TURN_SPEED };
+                CmdVel { linear: 0.1, angular }
+            } else if left_min < SLOW_DISTANCE {
+                // Obstacle on left — veer right
+                CmdVel { linear: CRUISE_SPEED * 0.7, angular: -TURN_SPEED * 0.5 }
+            } else if right_min < SLOW_DISTANCE {
+                // Obstacle on right — veer left
+                CmdVel { linear: CRUISE_SPEED * 0.7, angular: TURN_SPEED * 0.5 }
+            } else {
+                // Clear — cruise forward
+                CmdVel { linear: CRUISE_SPEED, angular: 0.0 }
+            };
+
+            self.cmd_pub.send(cmd);
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            // SAFETY: stop the robot on exit
+            self.cmd_pub.send(CmdVel { linear: 0.0, angular: 0.0 });
+            Ok(())
+        }
+    }
+
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new();
+
+        // Execution order: reads lidar scan, publishes velocity
+        scheduler.add(AvoidanceNode::new()?)
+            .order(0)
+            .rate(20_u64.hz())     // 20Hz — match typical LiDAR rate
+            .on_miss(Miss::Warn)
+            .build()?;
+
+        scheduler.run()
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, run
+    import math
+
+    STOP_DISTANCE = 0.3   # emergency stop
+    SLOW_DISTANCE = 0.8   # reduce speed
+    CRUISE_SPEED = 0.5    # m/s forward
+    TURN_SPEED = 0.8      # rad/s turning
+
+    def min_range(ranges, start, end):
+        """Find minimum valid range in a slice of the scan."""
+        valid = [r for r in ranges[start:end]
+                 if math.isfinite(r) and r > 0.01]
+        return min(valid) if valid else float("inf")
+
+    def avoidance_tick(node):
+        scan = node.recv("lidar.scan")
+        if scan is None:
+            return  # no data yet — skip this tick
+
+        ranges = scan["ranges"]
+        n = len(ranges)  # 360
+        third = n // 3
+
+        left_min = min_range(ranges, 0, third)
+        center_min = min_range(ranges, third, 2 * third)
+        right_min = min_range(ranges, 2 * third, n)
+
+        # Reactive behavior
+        if center_min < STOP_DISTANCE:
+            cmd = {"linear": 0.0, "angular": 0.0}
+        elif center_min < SLOW_DISTANCE:
+            angular = TURN_SPEED if left_min > right_min else -TURN_SPEED
+            cmd = {"linear": 0.1, "angular": angular}
+        elif left_min < SLOW_DISTANCE:
+            cmd = {"linear": CRUISE_SPEED * 0.7, "angular": -TURN_SPEED * 0.5}
+        elif right_min < SLOW_DISTANCE:
+            cmd = {"linear": CRUISE_SPEED * 0.7, "angular": TURN_SPEED * 0.5}
+        else:
+            cmd = {"linear": CRUISE_SPEED, "angular": 0.0}
+
+        node.send("cmd_vel", cmd)
+
+    def avoidance_shutdown(node):
+        """SAFETY: stop the robot on exit."""
+        node.send("cmd_vel", {"linear": 0.0, "angular": 0.0})
+
+    avoidance = Node(
+        name="Avoidance",
+        tick=avoidance_tick,
+        shutdown=avoidance_shutdown,
+        rate=20,
+        order=0,
+        subs=["lidar.scan"],
+        pubs=["cmd_vel"],
+    )
+
+    run(avoidance, rt=True)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 20 Hz
+[HORUS] Node "Avoidance" started (Rt, 20 Hz, budget: 40.0ms, deadline: 47.5ms)
+^C
+[HORUS] Shutting down...
+[HORUS] Node "Avoidance" shutdown complete
+```
+
+### Key Points
+
+- **Three-zone split** (left/center/right) is the simplest reactive architecture — extend to N zones for smoother behavior
+- **`min_range()` filters** invalid readings (`NaN`, `Inf`, near-zero) before comparison
+- **`STOP_DISTANCE`** is the hard safety limit — tune to your robot's stopping distance at cruise speed
+- **`shutdown()` sends zero velocity** — robot stops even if killed mid-avoidance-maneuver
+- **20Hz matches most 2D LiDARs** (RPLiDAR A1/A2, Hokuyo URG) — no benefit running faster than sensor
+- **Pair with differential-drive recipe** — this publishes `cmd_vel`, the drive recipe subscribes to it
+
+### Variations
+
+- **N-zone split**: Divide the scan into more zones (e.g., 8) for smoother steering gradients
+- **Vector Field Histogram (VFH)**: Replace zone logic with polar histogram for denser environments
+- **Speed scaling**: Scale `CRUISE_SPEED` proportionally to nearest obstacle distance for smoother deceleration
+- **Rear sensor**: Add a second `LaserScan` subscriber for rear obstacle detection during reversing
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot stops but nothing is nearby | `NaN`/`Inf` in scan ranges not filtered | Check `min_range()` filters invalid readings |
+| Robot turns in circles | `STOP_DISTANCE` too large for the environment | Reduce `STOP_DISTANCE` or increase `SLOW_DISTANCE` gap |
+| Robot hits obstacles | `STOP_DISTANCE` too small for braking distance | Increase `STOP_DISTANCE` to match max speed stopping distance |
+| No velocity commands published | No `LaserScan` on `lidar.scan` | Verify LiDAR driver is running with `horus monitor` |
+| Jittery steering | Scan data noisy or rate too high | Add temporal smoothing or reduce `.rate()` to match LiDAR rate |
+
+---
+
+## See Also
+
+- [LaserScan](/stdlib/messages/laser-scan) — LiDAR message type
+- [Emergency Stop Recipe](/recipes/emergency-stop) — Safety stop pattern

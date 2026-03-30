@@ -1,0 +1,329 @@
+---
+title: "Launch System"
+description: "Multi-process orchestration with full observability — session discovery, control topics, e-stop propagation, and coordinated shutdown"
+order: 15
+---
+
+# Launch System
+
+The Scheduler runs multiple nodes inside a single process. The launch system runs multiple *processes* on the same machine — each process can contain its own Scheduler with its own nodes.
+
+```yaml
+# formation.yaml — users only write this
+session: formation
+nodes:
+  - name: controller
+    package: control-pkg
+    rate_hz: 100
+  - name: perception
+    package: perception-pkg
+    rate_hz: 30
+    depends_on: [controller]
+```
+
+```bash
+horus launch formation.yaml
+```
+
+---
+
+## When to Use Scheduler vs Launch
+
+| Situation | Use |
+|-----------|-----|
+| All nodes in one language, one binary | **Scheduler only** |
+| Mixed Rust + Python nodes | **Launch** (separate processes) |
+| Crash isolation (camera crash shouldn't kill motor) | **Launch** (process boundaries) |
+| Multiple robots on one machine | **Launch** (namespaced sessions) |
+| Simulation testing, deterministic replay | **Scheduler** (`tick_once()`, `deterministic(true)`) |
+| Field deployment on embedded hardware | **Launch** (swap nodes by editing YAML, no recompile) |
+| Maximum performance (sub-microsecond IPC) | **Scheduler** (in-process backends: 3-36ns) |
+
+**Rule of thumb:** Start with Scheduler. Move to launch when you need process isolation, mixed languages, or runtime node composition without recompiling.
+
+---
+
+## How Launch Integrates with HORUS
+
+Launch is not a separate system — it is wired into the same observability infrastructure as the Scheduler. When you run `horus launch`, this is what happens:
+
+### 1. Process Spawning
+
+Launch parses the YAML, resolves dependencies via topological sort, and spawns each node as a separate OS process. Each process receives environment variables:
+
+- `HORUS_NODE_NAME` — the Scheduler reads this as its default name
+- `HORUS_NAMESPACE` — shared memory namespace isolation
+- `HORUS_PARAM_*` — parameters from the launch YAML, consumed by `RuntimeParams::new()`
+
+### 2. Session Registry (Auto-Discovery)
+
+After spawning, launch writes a session manifest to shared memory:
+
+```
+/dev/shm/horus_{namespace}/launch/{session}.json
+```
+
+It then polls node presence files to discover which Schedulers appeared. Once a process creates a Scheduler, launch auto-detects it and records the Scheduler name, control topic, and node list — all without any configuration from the user.
+
+```bash
+# See active sessions
+horus launch --status
+```
+
+```
+ACTIVE LAUNCH SESSIONS
+
+  ● formation (3 processes, uptime: 5m 32s)
+    File: formation.yaml
+
+    NAME                 PID      STATUS     SCHEDULER            RESTARTS
+    controller           12346    running    controller           0
+    perception           12347    running    perception           0
+    drivers              12348    running    drivers              0
+```
+
+### 3. Control Topics
+
+Launch creates a session-level control topic:
+
+```
+horus.launch.ctl.{session}
+```
+
+Commands sent to this topic are routed to the correct per-Scheduler control topic. This means `StopNode("controller")` goes to `horus.ctl.controller` automatically — CLI tools don't need to know which Scheduler owns which node.
+
+### 4. E-Stop Propagation
+
+Launch subscribes to the `_horus.estop` topic. When any node triggers an emergency stop:
+
+1. Launch sends `GracefulShutdown` to every discovered Scheduler control topic
+2. Schedulers run their full shutdown sequence (node `shutdown()` callbacks, blackbox flush, presence cleanup)
+3. If a process doesn't exit within 2 seconds, launch sends SIGTERM
+4. If still alive after 3 more seconds, SIGKILL
+
+### 5. Coordinated Shutdown
+
+Pressing Ctrl+C triggers the same three-phase shutdown:
+
+```
+Phase A: GracefulShutdown → all Scheduler control topics (2s grace)
+Phase B: SIGTERM → any survivors (3s grace)
+Phase C: SIGKILL → any still alive
+```
+
+This ensures nodes get their `shutdown()` callback called, hardware is released, files are flushed, and presence files are cleaned up — instead of raw SIGKILL losing everything.
+
+### 6. Blackbox Events
+
+Launch records lifecycle events to a JSONL log:
+
+```
+/dev/shm/horus_{namespace}/launch/{session}.events.jsonl
+```
+
+Events: `SessionStart`, `NodeSpawned`, `NodeCrashed`, `NodeRestarted`, `SessionStop`. Each includes nanosecond timestamps and process details. View with:
+
+```bash
+cat /dev/shm/horus_*/launch/*.events.jsonl | jq .
+```
+
+### 7. CLI Integration
+
+Nodes spawned by launch appear in standard CLI tools with session grouping:
+
+```bash
+horus node list          # groups nodes under "Launch: session (N nodes)"
+horus topic echo <topic> # live data from any launched process
+horus topic list         # shows all topics across all launched processes
+horus param get <key>    # reads params from launched processes
+horus param set <key> <v># sets params at runtime on launched processes
+horus launch --status    # shows all active sessions with per-process table
+horus launch --stop <s>  # stops a session from any terminal
+horus launch --list <f>  # dry-run: shows nodes and dependencies
+```
+
+Example output of `horus node list` with a running launch session:
+
+```
+Running Nodes:
+
+  Launch: formation (3 nodes)
+  NAME                        STATUS   PRIORITY     RATE      TICKS   SOURCE
+  ---------------------------------------------------------------------------
+  pid_loop                   Running          0    100 Hz       5032   12346
+  planner                    Running          0     50 Hz       2516   12346
+  detector                   Running        100     30 Hz       1510   12347
+
+  Total: 3 node(s)
+```
+
+### 8. Node Kill Routing
+
+`horus node kill <name>` automatically detects if a node belongs to a launch session. If it does, the command routes through the launch control topic (`horus.launch.ctl.{session}`) so the launch monitor can track the stop, update the session manifest, and potentially restart the process. Non-launched nodes use the direct Scheduler control path as before.
+
+### 9. Network Replication
+
+Launched processes can enable `horus_net` for LAN topic replication:
+
+```yaml
+session: fleet
+env:
+  HORUS_NET_ENABLED: "true"
+nodes:
+  - name: robot_a
+    command: ./target/release/controller
+  - name: robot_b
+    command: ./target/release/controller
+```
+
+Network replication is on by default. Use `.network(false)` to disable. The launch system discovers networked Schedulers the same way as local ones — via SHM presence files and the scheduler directory.
+
+---
+
+## Launch File Reference
+
+```yaml
+# Session name (used for SHM manifest, control topic, event log)
+session: my_robot
+
+# Global namespace (all topics prefixed)
+namespace: robot_1
+
+# Global environment variables (applied to all nodes)
+env:
+  HORUS_LOG_LEVEL: info
+
+nodes:
+  - name: controller          # Required: unique name
+    package: control-pkg      # Run via `horus run control-pkg`
+    # OR
+    command: "python ctrl.py" # Run a custom command
+
+    rate_hz: 100              # Target tick rate (hint — Scheduler controls actual rate)
+    priority: 0               # Launch order (lower = earlier)
+    namespace: /arm           # Per-node namespace prefix
+
+    params:                   # Injected as HORUS_PARAM_* env vars
+      max_speed: 1.5
+      robot_id: 1
+
+    env:                      # Extra environment variables
+      CUDA_VISIBLE_DEVICES: "0"
+
+    depends_on: [sensor]      # Wait for these nodes to start first
+    start_delay: 0.5          # Seconds to wait before launching
+    restart: on-failure       # "never" (default), "always", "on-failure"
+    args: [--verbose]         # Extra command-line arguments
+```
+
+---
+
+## Parameters: Launch YAML to Node Code
+
+Parameters in the launch YAML reach your node code automatically:
+
+```yaml
+# launch.yaml
+nodes:
+  - name: controller
+    package: control-pkg
+    params:
+      max_speed: 1.5
+      robot_id: 1
+```
+
+```rust
+// In your node's init()
+let params = RuntimeParams::new()?;
+let speed: f64 = params.get("max_speed").unwrap_or(1.0);
+let id: i64 = params.get("robot_id").unwrap_or(0);
+```
+
+```python
+# In your Python node
+params = horus.RuntimeParams()
+speed = params.get("max_speed", default=1.0)
+```
+
+The launch system sets `HORUS_PARAM_MAX_SPEED=1.5` and `HORUS_PARAM_ROBOT_ID=1` as environment variables. `RuntimeParams::new()` reads all `HORUS_PARAM_*` variables automatically, parsing them as the appropriate type (number, boolean, or string).
+
+---
+
+## Restart Policies
+
+| Policy | Behavior |
+|--------|----------|
+| `never` (default) | Process exits, launch records the event, moves on |
+| `on-failure` | Restart only if exit code is non-zero. Exponential backoff (100ms to 10s). Max 10 restarts. |
+| `always` | Restart on any exit. Same backoff and max restarts. |
+
+---
+
+## Compared to ROS 2
+
+| Feature | ROS 2 Launch | HORUS Launch |
+|---------|-------------|--------------|
+| Config format | Python scripts or XML | YAML only |
+| Process management | roslaunch / ros2 launch | `horus launch` |
+| Parameter injection | Launch parameters → node params | `HORUS_PARAM_*` → `RuntimeParams` |
+| Session discovery | N/A | Auto-discovered from SHM |
+| Control routing | N/A | `horus.launch.ctl.{session}` topic |
+| E-stop propagation | Custom | Built-in, wired to `_horus.estop` |
+| Coordinated shutdown | SIGINT only | Control topic → SIGTERM → SIGKILL |
+| Event logging | rosout | JSONL blackbox per session |
+| Observability | `ros2 node list` (separate) | `horus node list` shows session grouping |
+
+The key difference: ROS 2 launch is a process spawner that delegates everything to DDS. HORUS launch is wired into the SHM observability stack — it discovers Schedulers, routes control commands, propagates safety events, and records lifecycle data.
+
+---
+
+## Mixed Language Example
+
+The primary reason launch exists — running Rust and Python nodes together:
+
+```yaml
+# mixed_robot.yaml
+session: mixed_robot
+nodes:
+  - name: controller
+    command: ./target/release/motor_controller
+    params:
+      max_speed: 1.5
+      pid_kp: 2.0
+
+  - name: perception
+    command: python3 ml_detector.py
+    depends_on: [controller]
+    params:
+      model: yolov8n
+      confidence: 0.7
+```
+
+Both processes communicate via SHM topics — the Rust controller publishes `cmd_vel`, the Python ML node subscribes to `camera.image` and publishes `detections`. All visible in `horus topic list`, all controllable via `horus launch --stop`.
+
+---
+
+## CLI Quick Reference
+
+```bash
+# Launch
+horus launch robot.yaml              # start all nodes
+horus launch robot.yaml --dry-run    # show plan without starting
+horus launch robot.yaml --list       # show nodes and dependencies
+horus launch robot.yaml --namespace r1  # override namespace
+
+# Monitor
+horus launch --status                # show all active sessions
+horus node list                      # show nodes grouped by session
+horus topic list                     # show topics from all processes
+horus topic echo <topic>             # stream live data
+
+# Control
+horus launch --stop <session>        # stop a session from any terminal
+horus node kill <name>               # stop a node (routes via launch if applicable)
+
+# Debug
+horus param get <key>                # read runtime params
+horus param set <key> <value>        # set params at runtime
+cat /dev/shm/horus_*/launch/*.events.jsonl | jq .  # view lifecycle events
+```

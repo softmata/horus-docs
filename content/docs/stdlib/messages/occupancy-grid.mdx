@@ -1,0 +1,163 @@
+---
+title: "OccupancyGrid & CostMap"
+description: "Grid-based environment maps for navigation, mapping, and path planning"
+order: 4
+---
+
+# OccupancyGrid & CostMap
+
+`OccupancyGrid` represents a 2D grid map of the environment where each cell stores an occupancy probability. `CostMap` extends it with inflated costs around obstacles for safe path planning. Together they form the mapping and planning backbone for autonomous navigation.
+
+## When to Use
+
+Use `OccupancyGrid` when your robot builds maps from sensor data (SLAM) or loads pre-built maps for localization. Use `CostMap` when you need to plan paths that keep a safe distance from obstacles.
+
+## ROS2 Equivalent
+
+`nav_msgs/OccupancyGrid` -- same grid structure with origin, resolution, and cell values. HORUS adds `CostMap` as a first-class type (in ROS2 this lives in the costmap_2d package).
+
+## Cell Values
+
+| Value | Meaning |
+|-------|---------|
+| `-1` | Unknown (unexplored) |
+| `0` | Free space |
+| `1-49` | Probably free (low probability of obstacle) |
+| `50-99` | Probably occupied |
+| `100` | Definitely occupied |
+
+## Rust Example
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create a 10m x 10m map at 5cm resolution
+let origin = Pose2D::new(-5.0, -5.0, 0.0);
+let mut grid = OccupancyGrid::new(200, 200, 0.05, origin);
+
+// Mark a cell as occupied
+grid.set_occupancy(100, 100, 100);
+
+// Convert between world and grid coordinates
+let (gx, gy) = grid.world_to_grid(1.5, 2.0).unwrap();
+let (wx, wy) = grid.grid_to_world(gx, gy).unwrap();
+
+// Query occupancy
+if grid.is_free(1.5, 2.0) {
+    println!("Path is clear");
+}
+
+// Create a cost map for path planning
+let costmap = CostMap::from_occupancy_grid(grid, 0.55); // 55cm inflation
+let cost = costmap.cost(1.5, 2.0);
+```
+
+## Python Example
+
+```python
+from horus import OccupancyGrid, Topic
+
+# Create a 100x100 grid at 5cm resolution
+grid = OccupancyGrid(100, 100, 0.05)
+
+# Set cell values
+grid.set_occupancy(50, 50, 100)  # Mark as occupied
+
+# Query the map
+if grid.is_free(1.0, 1.0):
+    print("Cell is free")
+
+# Coordinate conversion
+gx, gy = grid.world_to_grid(1.0, 1.0)
+wx, wy = grid.grid_to_world(gx, gy)
+
+# Publish
+topic = Topic(OccupancyGrid)
+topic.send(grid)
+```
+
+## OccupancyGrid Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `resolution` | `f32` | m/cell | Meters per cell. Default: `0.05` (5cm) |
+| `width` | `u32` | cells | Grid width |
+| `height` | `u32` | cells | Grid height |
+| `origin` | `Pose2D` | m, rad | World pose of the bottom-left corner |
+| `data` | `Vec<i8>` | 0--100 | Cell values, row-major. `-1`=unknown, `0`=free, `100`=occupied |
+| `frame_id` | `[u8; 32]` | -- | Coordinate frame (e.g., `"map"`) |
+| `metadata` | `[u8; 64]` | -- | Free-form metadata |
+| `timestamp_ns` | `u64` | ns | Timestamp in nanoseconds since epoch |
+
+## OccupancyGrid Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new(w, h, res, origin)` | `(u32, u32, f32, Pose2D) -> Self` | Create grid initialized to unknown (-1) |
+| `world_to_grid(x, y)` | `(f64, f64) -> Option<(u32, u32)>` | Convert world coordinates to grid indices |
+| `grid_to_world(gx, gy)` | `(u32, u32) -> Option<(f64, f64)>` | Convert grid indices to world coordinates (cell center) |
+| `occupancy(gx, gy)` | `(u32, u32) -> Option<i8>` | Get cell value at grid coordinates |
+| `set_occupancy(gx, gy, val)` | `(u32, u32, i8) -> bool` | Set cell value (clamped to -1..100) |
+| `is_free(x, y)` | `(f64, f64) -> bool` | True if occupancy is in 0..50 |
+| `is_occupied(x, y)` | `(f64, f64) -> bool` | True if occupancy >= 50 |
+
+## CostMap Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `occupancy_grid` | `OccupancyGrid` | -- | Underlying occupancy grid |
+| `costs` | `Vec<u8>` | 0--255 | Cost values per cell. `253`=lethal, `255`=unknown |
+| `inflation_radius` | `f32` | m | Inflation radius. Default: `0.55` |
+| `cost_scaling_factor` | `f32` | -- | Exponential decay factor. Default: `10.0` |
+| `lethal_cost` | `u8` | -- | Cost threshold for lethal obstacles. Default: `253` |
+
+## CostMap Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `from_occupancy_grid(grid, radius)` | `(OccupancyGrid, f32) -> Self` | Create costmap with inflation |
+| `compute_costs()` | `-> ()` | Recompute costs from occupancy data |
+| `cost(x, y)` | `(f64, f64) -> Option<u8>` | Get cost at world coordinates |
+
+## Common Patterns
+
+**SLAM pipeline:**
+
+```
+LaserScan --> SLAM algorithm --> OccupancyGrid (map)
+                             \-> Pose2D (localization)
+```
+
+**Path planning pipeline:**
+
+<MermaidDiagram
+  chart={`flowchart LR
+    A["OccupancyGrid"] --> B["CostMap (inflated)"]
+    B --> C["path planner"]
+    C --> D["NavPath"]
+    C --> E["CmdVel"]
+`}
+  caption="Path planning pipeline"
+/>
+
+**Inflation:** The `CostMap` applies exponential cost decay around obstacles. A cell at distance `d` from an obstacle gets cost proportional to `(1 - d/radius)^scaling_factor`. This creates a smooth gradient that path planners use to keep the robot away from walls and obstacles.
+
+## Design Decisions
+
+**Why `-1` for unknown instead of a separate boolean mask?** Using `-1` within the same `i8` cell value avoids a second parallel array and matches the ROS2 convention. Three-state cells (unknown/free/occupied) are sufficient for most SLAM and planning algorithms. The tradeoff is that cell values are signed, which requires care when converting to unsigned cost values.
+
+**Why separate OccupancyGrid and CostMap?** Raw occupancy (from SLAM) and inflated costs (for planning) serve different consumers. A SLAM node publishes `OccupancyGrid`; a planner reads `CostMap`. Keeping them separate means SLAM doesn't need to know inflation parameters, and multiple planners can use different inflation radii from the same base map.
+
+**Why exponential cost decay for inflation?** Linear decay creates sharp cost boundaries that cause path oscillation. Exponential decay (`(1 - d/radius)^scaling_factor`) produces smooth gradients that path planners follow naturally, keeping the robot at a comfortable distance from obstacles without sudden turns.
+
+**Resolution tradeoffs:** 5cm default resolution balances map precision (fine enough for indoor navigation) with memory usage (a 20m x 20m map at 5cm is 400x400 = 160KB). For outdoor robots, use 10-25cm resolution; for warehouse micro-navigation, use 1-2cm.
+
+---
+
+## See Also
+
+- [Navigation Messages (Rust)](/rust/api/navigation-messages) — Full Rust API
+- [Navigation Messages (Python)](/python/messages/navigation) — Python API
+- [Navigation](/stdlib/messages/navigation) — NavGoal, NavPath, PathPlan
+- [LaserScan](/stdlib/messages/laser-scan) — LiDAR data that builds occupancy grids

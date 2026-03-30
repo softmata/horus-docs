@@ -1,0 +1,220 @@
+---
+title: Platform Support
+description: How HORUS works across Linux, macOS, and Windows — what's identical, what differs, and what to watch for
+order: 5
+---
+
+# Platform Support
+
+HORUS runs on Linux, macOS, and Windows. The core framework — topics, nodes, scheduler, shared memory IPC — works identically on all platforms. You write the same code everywhere. The `horus_sys` hardware abstraction layer handles OS differences internally.
+
+## Quick Summary
+
+| Capability | Linux | macOS | Windows |
+|-----------|-------|-------|---------|
+| **Topics (pub/sub)** | Full | Full | Full |
+| **Nodes and Scheduler** | Full | Full | Full |
+| **Shared Memory IPC** | Full | Full | Full |
+| **Real-Time Scheduling** | Full (SCHED_FIFO) | Partial (Mach threads) | Partial (REALTIME_PRIORITY) |
+| **CLI (`horus` commands)** | Full | Full | Full |
+| **Python Bindings** | Full | Full | Full |
+| **Plugin Sandbox** | Full (seccomp) | Not available | Not available |
+| **Device Discovery** | Full (/dev) | Full (IOKit) | Full (SetupDi) |
+
+## Same Code, Every Platform
+
+Your HORUS application code is platform-independent. This Rust node runs on all three OSes:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+use horus::prelude::*;
+
+struct SensorNode {
+    imu_sub: Topic<Imu>,
+}
+
+impl SensorNode {
+    fn new() -> HorusResult<Self> {
+        Ok(Self { imu_sub: Topic::new("imu.data")? })
+    }
+}
+
+impl Node for SensorNode {
+    fn name(&self) -> &str { "sensor" }
+    fn tick(&mut self) {
+        if let Some(reading) = self.imu_sub.recv() {
+            println!("accel: {:?}", reading.linear_acceleration);
+        }
+    }
+}
+
+fn main() -> HorusResult<()> {
+    let mut scheduler = Scheduler::new()
+        .tick_rate(100_u64.hz());
+
+    scheduler.add(SensorNode::new()?)
+        .order(0)
+        .rate(100_u64.hz())
+        .build()?;
+
+    scheduler.run()
+}
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    def tick(node):
+        msg = node.recv("imu.data")
+        if msg:
+            print(f"accel: {msg.linear_acceleration}")
+
+    sensor = horus.Node("sensor", subs=["imu.data"], tick=tick, rate=100)
+    horus.run(sensor)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+No `#ifdef`, no platform checks, no conditional imports. HORUS handles it.
+
+## How It Works Under the Hood
+
+### Shared Memory (IPC)
+
+HORUS uses shared memory for zero-copy inter-process communication. Each platform uses a different OS mechanism, but the API is identical:
+
+| Platform | Backend | Location | Performance |
+|----------|---------|----------|-------------|
+| **Linux** | tmpfs-backed files | `/dev/shm/horus_{namespace}/` | Fastest (RAM-backed filesystem) |
+| **macOS** | POSIX `shm_open()` | Kernel objects (no filesystem path) | Fast (kernel-managed) |
+| **Windows** | `CreateFileMappingW` | Pagefile-backed | Fast (OS page cache) |
+
+You never interact with these directly. When you call `Topic::new("sensor.imu")`, HORUS creates the shared memory region using the right backend for your OS.
+
+<Callout type="info">
+**Topic names must use dots, not slashes.** Use `"sensor.imu"` not `"sensor/imu"`. On macOS, `shm_open()` treats slashes as directory separators, which causes failures. Dots work on all platforms.
+</Callout>
+
+### Real-Time Scheduling
+
+Real-time scheduling quality varies by OS:
+
+| Platform | Mechanism | Priority Range | Typical Jitter | Memory Lock |
+|----------|-----------|---------------|----------------|-------------|
+| **Linux** | `SCHED_FIFO` | 1–99 | ~10μs (PREEMPT_RT) | Full (`mlockall`) |
+| **macOS** | Mach thread constraints | 1–99 | ~500μs | Partial (`mlock`) |
+| **Windows** | `REALTIME_PRIORITY_CLASS` | 1–31 | ~1–10ms | Partial (`VirtualLock`) |
+
+When you call `.rate(100_u64.hz())` or `.budget(200_u64.us())` on a node builder, HORUS automatically uses the best available RT mechanism. On macOS and Windows, real-time guarantees are weaker — the framework does its best, but the OS kernel doesn't provide the same determinism as Linux with PREEMPT_RT.
+
+<Callout type="warn">
+**For production robotics with hard real-time requirements, use Linux.** macOS and Windows are suitable for development, testing, and non-safety-critical applications.
+</Callout>
+
+### Timer Precision
+
+| Platform | Sleep Resolution | Clock Source |
+|----------|-----------------|--------------|
+| **Linux** | 1 ns (`clock_nanosleep`) | `CLOCK_MONOTONIC` |
+| **macOS** | ~42 ns (`mach_absolute_time`) | Mach timebase |
+| **Windows** | ~100 ns (QPC + `timeBeginPeriod`) | Query Performance Counter |
+
+Your code doesn't need to handle this — `Scheduler` uses the best available timer automatically.
+
+## CLI Commands
+
+All `horus` CLI commands work on every platform:
+
+```bash
+horus new my-project      # Create a project
+horus build               # Build it
+horus run                 # Run it
+horus test                # Test it
+horus check               # Lint and validate
+horus doctor              # Check system health
+```
+
+### Scripts
+
+Scripts defined in `horus.toml` run through the platform's native shell:
+
+| Platform | Shell | Command |
+|----------|-------|---------|
+| **Linux / macOS** | `sh -c` | POSIX shell (bash, zsh, etc.) |
+| **Windows** | `cmd.exe /C` | Windows command processor |
+
+```toml
+[scripts]
+build-release = "cargo build --release"    # Works everywhere
+start-sim = "horus sim3d --headless"       # Works everywhere
+```
+
+<Callout type="warn">
+**Scripts using Unix-specific tools won't work on Windows.** Commands like `rsync`, `grep`, `sed`, `awk`, or piping through `|` with Unix utilities require those tools to be installed. On Windows, consider using PowerShell equivalents or installing Git Bash / MSYS2.
+</Callout>
+
+### File Paths
+
+HORUS handles path separators automatically. Use forward slashes in `horus.toml` — they work on all platforms:
+
+```toml
+[dependencies]
+my-driver = { path = "drivers/my-driver" }   # Works on Windows too
+```
+
+## Platform-Specific Notes
+
+### Linux
+
+Linux is the primary development and deployment platform for HORUS.
+
+- **Full real-time support** with PREEMPT_RT kernel (see [RT Setup Guide](/advanced/rt-setup))
+- **Plugin sandboxing** via seccomp-BPF for untrusted plugins
+- **Device access** via `/dev/*` (serial ports, cameras, GPIO)
+- **Deploy to robots** with `horus deploy` (requires SSH + rsync on target)
+
+### macOS
+
+macOS is fully supported for development and testing.
+
+- **Shared memory** uses `shm_open()` kernel objects — no `/dev/shm` directory needed
+- **No PREEMPT_RT** — real-time scheduling uses Mach thread constraints (best-effort)
+- **No plugin sandbox** — seccomp is Linux-only. Plugins run without sandboxing
+- **Xcode Command Line Tools** are the only prerequisite (`xcode-select --install`)
+
+### Windows
+
+Windows support is for development and testing. Production deployment should target Linux.
+
+- **Shared memory** uses Windows file mappings (pagefile-backed) — works without special setup
+- **Real-time scheduling** uses `REALTIME_PRIORITY_CLASS` — weaker guarantees than Linux
+- **No plugin sandbox** — seccomp is Linux-only
+- **No `rsync`/`ssh` by default** — `horus deploy` requires WSL 2 or Git Bash
+
+<Callout type="info">
+**WSL 2 gives you the full Linux experience on Windows.** If you need RT scheduling, plugin sandboxing, or Linux-specific tools, WSL 2 is the recommended approach. HORUS running inside WSL 2 behaves identically to native Linux.
+</Callout>
+
+## Developing Cross-Platform Projects
+
+If your HORUS project needs to work on multiple OSes:
+
+1. **Use dots in topic names** — `"sensor.imu"` not `"sensor/imu"`
+2. **Avoid Unix-specific tools in scripts** — or provide platform alternatives
+3. **Test RT-sensitive code on Linux** — macOS/Windows RT jitter is higher
+4. **Use `horus doctor`** to check platform capabilities on any machine
+5. **Deploy to Linux** for production — develop anywhere
+
+## Compile-Time Verification
+
+HORUS verifies cross-platform compilation in CI on every commit:
+
+- **Linux x86_64**: Full build + 3,000+ tests
+- **macOS x86_64 + ARM64**: Full build + tests
+- **Windows x86_64**: Full build + core tests
+- **Linux ARM64**: Cross-compilation check (for Raspberry Pi / Jetson)
+
+If your code compiles on any one platform, it compiles on all of them.

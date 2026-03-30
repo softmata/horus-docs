@@ -1,0 +1,125 @@
+---
+title: "Tutorial: LiDAR Sensor Node (C++)"
+description: "Build a LiDAR sensor node that publishes scan data and processes it for obstacle avoidance"
+order: 1.5
+---
+
+# Tutorial: LiDAR Sensor Node (C++)
+
+In this tutorial, you'll build a complete obstacle avoidance robot controller in C++. You'll learn:
+
+- Creating a scheduler with real-time settings
+- Publishing sensor data with the zero-copy loan pattern
+- Subscribing to data and processing it
+- Multi-node pipelines with execution ordering
+
+## Step 1: Create the Project
+
+```bash
+horus new lidar_robot --cpp
+cd lidar_robot
+```
+
+## Step 2: Write the Controller
+
+Replace `src/main.cpp` with:
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+int main() {
+    auto sched = horus::Scheduler()
+        .tick_rate(100_hz)
+        .prefer_rt();
+
+    // ── Topics ─────────────────────────────────────────────
+    auto scan_pub = sched.advertise<horus::msg::LaserScan>("lidar.scan");
+    auto scan_sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+    auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+
+    // ── Node 1: Simulated LiDAR Driver ─────────────────────
+    sched.add("lidar_driver")
+        .rate(100_hz)
+        .order(0)
+        .tick([&] {
+            auto scan = scan_pub.loan();
+            // Simulate: obstacles at 45° and 315°
+            for (int i = 0; i < 360; ++i) {
+                if (i > 40 && i < 50) {
+                    scan->ranges[i] = 0.3f;  // close obstacle
+                } else {
+                    scan->ranges[i] = 5.0f;  // clear
+                }
+            }
+            scan->angle_min = 0.0f;
+            scan->angle_max = 6.28318f;
+            scan_pub.publish(std::move(scan));
+        })
+        .build();
+
+    // ── Node 2: Obstacle Avoidance Controller ──────────────
+    sched.add("controller")
+        .rate(50_hz)
+        .order(10)
+        .budget(5_ms)
+        .on_miss(horus::Miss::Skip)
+        .tick([&] {
+            auto scan = scan_sub.recv();
+            if (!scan) return;
+
+            // Find minimum range in front 60° arc
+            float min_front = 999.0f;
+            for (int i = 150; i < 210; ++i) {
+                if (scan->ranges[i] > 0.01f && scan->ranges[i] < min_front) {
+                    min_front = scan->ranges[i];
+                }
+            }
+
+            auto cmd = cmd_pub.loan();
+            if (min_front < 0.5f) {
+                cmd->linear  = 0.0f;
+                cmd->angular = 0.5f;  // turn
+            } else {
+                cmd->linear  = 0.3f;
+                cmd->angular = 0.0f;  // go straight
+            }
+            cmd_pub.publish(std::move(cmd));
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+## Step 3: Build and Run
+
+```bash
+horus build
+horus run
+```
+
+## Step 4: Monitor
+
+In another terminal:
+
+```bash
+horus topic list          # see active topics
+horus topic hz cmd_vel    # check publish rate
+horus node list           # see running nodes
+horus topic echo cmd_vel  # watch velocity commands
+```
+
+## Key Takeaways
+
+1. **Captured pub/sub** — create topics outside the tick lambda, capture by reference
+2. **Loan pattern** — `pub.loan()` gives you a direct SHM pointer (0ns data access)
+3. **Execution order** — `order(0)` runs before `order(10)`, ensuring sensor data is fresh
+4. **Budget enforcement** — `budget(5_ms)` + `on_miss(Skip)` keeps the system responsive
+5. **Zero configuration** — no XML launch files, no msg files, no codegen step
+
+## Next Steps
+
+- Add a third node for motor control
+- Use `horus record` to capture and replay the session
+- Try `horus sim3d` for 3D simulation with physics

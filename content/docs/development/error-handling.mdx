@@ -1,0 +1,850 @@
+---
+title: "Error Handling"
+description: "Unified error types, result handling, retry configuration, and best practices for HORUS applications"
+order: 70
+---
+
+# Error Handling
+
+You need to handle errors properly in your HORUS nodes: propagate failures with context, retry transient errors, and degrade gracefully when hardware is unavailable. HORUS provides a unified `Error` type built on Rust's `Result` with structured sub-errors, automatic conversions, and retry utilities.
+
+## When To Use This
+
+- Returning errors from node `init()` and helper functions
+- Adding context when propagating errors with `?`
+- Matching on specific error variants to handle them differently
+- Retrying transient errors (network faults, topic full) with exponential backoff
+- Integrating with `anyhow` in application-level code
+
+**Use [Debugging Workflows](/development/debugging) instead** if you need to diagnose runtime problems like panics and deadline misses.
+
+## Prerequisites
+
+- Familiarity with Rust's `Result<T, E>` and `?` operator
+- `use horus::prelude::*;` in your code (exports `Error`, `Result`, `horus_internal!`, `HorusContext`)
+
+## Quick Start
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    fn my_function() -> Result<()> {
+        // Your code here
+        Ok(())
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    def my_function():
+        # Errors raise horus.HorusError
+        pass
+    ```
+  </LangTab>
+</LanguageTabs>
+
+The prelude exports these error types:
+- `Error` - The main error enum (short alias for `HorusError`)
+- `Result<T>` - Alias for `std::result::Result<T, Error>` (short alias for `HorusResult<T>`)
+
+The long names `HorusError` and `HorusResult<T>` still work for backward compatibility, but new code should prefer the short aliases.
+
+## Core Error Types
+
+### Error
+
+The main error type for all HORUS operations (also available as `HorusError` for backward compatibility):
+
+### Error Variants
+
+Each variant wraps a structured **sub-error enum** with specific fields for pattern matching:
+
+| Variant | Sub-error type | Domain |
+|---------|---------------|--------|
+| `Io(std::io::Error)` | — | File system and I/O errors |
+| `Config(ConfigError)` | `ConfigError` | Configuration parsing/validation |
+| `Communication(CommunicationError)` | `CommunicationError` | IPC, topics, network |
+| `Node(NodeError)` | `NodeError` | Node lifecycle (init, tick, shutdown) |
+| `Memory(MemoryError)` | `MemoryError` | SHM, mmap, tensor pools |
+| `Serialization(SerializationError)` | `SerializationError` | JSON, YAML, TOML, binary |
+| `NotFound(NotFoundError)` | `NotFoundError` | Missing frames, topics, nodes |
+| `Resource(ResourceError)` | `ResourceError` | Already exists, permission denied, unsupported |
+| `InvalidInput(ValidationError)` | `ValidationError` | Out-of-range, invalid format, constraints |
+| `Parse(ParseError)` | `ParseError` | Integer, float, boolean parsing |
+| `InvalidDescriptor(String)` | — | Cross-process tensor descriptor validation |
+| `Transform(TransformError)` | `TransformError` | Extrapolation, stale data |
+| `Timeout(TimeoutError)` | `TimeoutError` | Operation exceeded time limit |
+| `Internal { message, file, line }` | — | Internal errors with source location |
+| `Contextual { message, source }` | — | Error with preserved source chain |
+
+## Creating Errors
+
+### Using Constructors
+
+`Error` provides convenience constructors for the most common variants:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Configuration error
+let err = Error::config("Invalid frequency: must be positive");
+
+// Node error with context (takes node name + message)
+let err = Error::node("MotorController", "Failed to initialize PWM");
+
+// Network fault (communication sub-type)
+let err = Error::network_fault("192.168.1.100", "Connection refused");
+
+// Internal error (prefer horus_internal! macro for file/line capture)
+let err = horus_internal!("Unexpected state reached");
+```
+
+### Using Variants Directly
+
+For errors without convenience constructors, construct the sub-error directly:
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::error::{ResourceError, NotFoundError, CommunicationError};
+
+let err = Error::Resource(ResourceError::PermissionDenied {
+    resource: "/dev/ttyUSB0".into(),
+    required_permission: "read/write".into(),
+});
+
+let err = Error::Resource(ResourceError::AlreadyExists {
+    resource_type: "session".into(),
+    name: "main".into(),
+});
+
+let err = Error::NotFound(NotFoundError::Topic {
+    name: "cmd_vel".into(),
+});
+```
+
+### Internal Errors with Source Location
+
+Use the `horus_internal!()` macro to create internal errors that automatically capture file and line number:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Captures file/line automatically
+return Err(horus_internal!("Unexpected state: {:?}", state));
+// Produces: Internal { message: "Unexpected state: ...", file: "src/foo.rs", line: 42 }
+```
+
+### Contextual Errors with Source Chain
+
+Use `Error::Contextual` to wrap errors with additional context while preserving the original error chain:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let config = load_file("robot.yaml")
+    .map_err(|e| Error::Contextual {
+        message: "Failed to load robot configuration".to_string(),
+        source: Box::new(e),
+    })?;
+// Produces: "Failed to load robot configuration\n  Caused by: <original error>"
+```
+
+## Error Context
+
+The `HorusContext` trait lets you wrap errors with descriptive context:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+fn load_config(path: &str) -> Result<Config> {
+    let data = std::fs::read_to_string(path)
+        .horus_context(format!("Failed to read config from {}", path))?;
+
+    let config: Config = toml::from_str(&data)
+        .horus_context("Invalid TOML in config file")?;
+
+    Ok(config)
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `.horus_context(msg)` | Wrap error with a static context message |
+| `.horus_context_with(\|\| format!(...))` | Wrap with a lazily-evaluated message (avoids allocation on success) |
+
+Works on any `Result<T, E>` where `E: std::error::Error`.
+
+## Error Propagation
+
+### Using the `?` Operator
+
+```rust
+// simplified
+use horus::prelude::*;
+
+fn load_robot_config(path: &str) -> Result<Config> {
+    // File I/O errors automatically convert to Error::Io
+    let content = std::fs::read_to_string(path)?;
+
+    // JSON errors automatically convert to Error::Serialization
+    let config: Config = serde_json::from_str(&content)?;
+
+    Ok(config)
+}
+```
+
+### Automatic Conversions
+
+`Error` implements `From` for many common error types:
+
+| Source Type | Target Variant |
+|-------------|----------------|
+| `std::io::Error` | `Error::Io` |
+| `serde_json::Error` | `Error::Serialization` |
+| `serde_yaml::Error` | `Error::Serialization` |
+| `toml::de::Error` | `Error::Config` |
+| `toml::ser::Error` | `Error::Serialization` |
+| `std::num::ParseIntError` | `Error::Parse` |
+| `std::num::ParseFloatError` | `Error::Parse` |
+| `std::str::ParseBoolError` | `Error::Parse` |
+| `uuid::Error` | `Error::Internal` |
+| `std::sync::PoisonError<T>` | `Error::Internal` |
+| `Box<dyn std::error::Error>` | `Error::Internal` |
+| `Box<dyn std::error::Error + Send + Sync>` | `Error::Contextual` |
+| `anyhow::Error` | `Error::Internal` |
+
+## Error Checking
+
+### Pattern Matching
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::error::{NotFoundError, NodeError, ResourceError};
+
+match result {
+    Ok(value) => process(value),
+    Err(Error::NotFound(NotFoundError::Topic { name })) => {
+        eprintln!("Topic not found: {}", name);
+    }
+    Err(Error::Node(node_err)) => {
+        eprintln!("Node error: {}", node_err);
+    }
+    Err(Error::Resource(ResourceError::PermissionDenied { resource, .. })) => {
+        eprintln!("Permission denied: {}", resource);
+    }
+    Err(Error::Internal { message, file, line }) => {
+        eprintln!("Internal error at {}:{}: {}", file, line, message);
+    }
+    Err(e) => {
+        eprintln!("Unexpected error: {}", e);
+        if let Some(hint) = e.help() {
+            eprintln!("  hint: {}", hint);
+        }
+    }
+}
+```
+
+## Best Practices
+
+### 1. Use Specific Error Types
+
+```rust
+// simplified
+// Good: Specific error with context
+return Err(Error::node("IMU", "I2C read failed on register 0x3B"));
+
+// Avoid: Internal without context
+return Err(horus_internal!("something went wrong"));
+```
+
+### 2. Add Context When Propagating
+
+```rust
+// simplified
+fn initialize_sensor() -> Result<()> {
+    open_i2c_bus().map_err(|e| {
+        Error::node("IMU", format!("Failed to open I2C: {}", e))
+    })?;
+
+    Ok(())
+}
+```
+
+### 3. Handle Expected Errors Gracefully
+
+```rust
+// simplified
+fn get_config() -> Result<Config> {
+    match load_config_file("config.yaml") {
+        Ok(config) => Ok(config),
+        Err(Error::NotFound(_)) => {
+            // Expected: use defaults
+            Ok(Config::default())
+        }
+        Err(e) => Err(e),  // Propagate unexpected errors
+    }
+}
+```
+
+### 4. Log Errors Before Propagating
+
+```rust
+// simplified
+use horus::prelude::*;
+
+fn critical_operation() -> Result<()> {
+    match do_something_important() {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            hlog!(error, "Critical operation failed: {}", e);
+            Err(e)
+        }
+    }
+}
+```
+
+## Node Error Handling
+
+### In Tick Methods
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    impl Node for MyNode {
+        fn tick(&mut self) {
+            // Handle errors in tick - don't propagate
+            if let Err(e) = self.process_data() {
+                hlog!(error, "Processing failed: {}", e);
+                // Optionally publish status
+                self.publish_error_status(e);
+            }
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    def my_tick(node):
+        try:
+            process_data()
+        except Exception as e:
+            node.log_error(f"Processing failed: {e}")
+            # Optionally publish status
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Initialization Errors
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    impl MyNode {
+        pub fn new(config: Config) -> Result<Self> {
+            let driver = config.driver.connect().map_err(|e| {
+                Error::node("MyNode", format!("Driver init failed: {}", e))
+            })?;
+
+            Ok(Self { driver })
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    def create_node(config):
+        try:
+            driver = config.driver.connect()
+        except Exception as e:
+            raise horus.HorusError(f"Driver init failed: {e}")
+        return horus.Node(name="MyNode", tick=my_tick)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Graceful Degradation
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    fn read_sensor(&mut self) -> Option<SensorData> {
+        match self.backend.read() {
+            Ok(data) => Some(data),
+            Err(e) => {
+                self.error_count += 1;
+                if self.error_count > 10 {
+                    hlog!(error, "Sensor failing repeatedly: {}", e);
+                }
+                None  // Return None instead of crashing
+            }
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    error_count = 0
+
+    def read_sensor(node):
+        global error_count
+        try:
+            data = backend.read()
+            error_count = 0
+            return data
+        except Exception as e:
+            error_count += 1
+            if error_count > 10:
+                node.log_error(f"Sensor failing repeatedly: {e}")
+            return None  # Return None instead of crashing
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Testing Error Handling
+
+```rust
+// simplified
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horus::prelude::*;
+
+    #[test]
+    fn test_returns_not_found_for_missing_file() {
+        let result = load_config("nonexistent.yaml");
+        assert!(matches!(result, Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn test_returns_config_error_for_invalid_yaml() {
+        let result = parse_config("invalid: [yaml");
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_error_context() {
+        let err = Error::node("TestNode", "test message");
+        let display = format!("{}", err);
+        assert!(display.contains("TestNode"));
+        assert!(display.contains("test message"));
+    }
+}
+```
+
+## Integration with anyhow
+
+For applications that prefer `anyhow`:
+
+```rust
+// simplified
+use anyhow::{Context, Result as AnyhowResult};
+use horus::prelude::*;
+
+fn load_robot() -> AnyhowResult<Robot> {
+    let config = load_config("robot.yaml")
+        .context("Failed to load robot configuration")?;
+
+    let robot = Robot::from_config(config)
+        .context("Failed to create robot from config")?;
+
+    Ok(robot)
+}
+
+// Convert back to horus::Result if needed
+fn horus_function() -> Result<Robot> {
+    load_robot().map_err(|e| Error::from(e))
+}
+```
+
+## HorusError Variants Reference
+
+The `HorusError` enum (aliased as `Error`) is `#[non_exhaustive]` and wraps structured sub-error types:
+
+| Variant | Wraps | Example sub-variants |
+|---------|-------|----------------------|
+| `Io(std::io::Error)` | std I/O error | — |
+| `Config(ConfigError)` | Config parsing/validation | `MissingField`, `ParseFailed`, `Other` |
+| `Communication(CommunicationError)` | IPC, topics, network | `TopicFull`, `TopicNotFound`, `NetworkFault` |
+| `Node(NodeError)` | Node lifecycle | `InitPanic`, `InitFailed`, `TickFailed`, `Other { node, message }` |
+| `Memory(MemoryError)` | SHM, tensor pools | `PoolExhausted`, `ShmCreateFailed`, `MmapFailed`, `AllocationFailed` |
+| `Serialization(SerializationError)` | Serde errors | `Json`, `Yaml`, `Toml`, `Binary` |
+| `NotFound(NotFoundError)` | Missing resources | `Frame`, `Topic`, `Node`, `Service`, `Parameter` |
+| `Resource(ResourceError)` | Resource lifecycle | `AlreadyExists`, `PermissionDenied`, `Unsupported` |
+| `InvalidInput(ValidationError)` | Input validation | `OutOfRange`, `InvalidFormat`, `InvalidEnum`, `MissingRequired` |
+| `Parse(ParseError)` | Parsing failures | `Int`, `Float`, `Bool`, `Custom` |
+| `InvalidDescriptor(String)` | Tensor descriptor | — |
+| `Transform(TransformError)` | TF errors | `Extrapolation`, `StaleData` |
+| `Timeout(TimeoutError)` | Timeouts | — |
+| `Internal { message, file, line }` | Debug errors | — |
+| `Contextual { message, source }` | Error chains | — |
+
+### Sub-Error Variant Details
+
+#### ConfigError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `ParseFailed` | `format: &'static str`, `reason: String` | Permanent |
+| `MissingField` | `field: String`, `context: Option<String>` | Permanent |
+| `ValidationFailed` | `field: String`, `expected: String`, `actual: String` | Permanent |
+| `InvalidValue` | `key: String`, `reason: String` | Permanent |
+| `Other(String)` | error message | Permanent |
+
+#### CommunicationError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `TopicFull` | `topic: String` | Transient |
+| `TopicNotFound` | `topic: String` | Permanent |
+| `TopicCreationFailed` | `topic: String`, `reason: String` | Permanent |
+| `NetworkFault` | `peer: String`, `reason: String` | Transient |
+| `SerializationFailed` | `reason: String` | Permanent |
+| `ActionFailed` | `reason: String` | Permanent |
+
+#### NodeError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `InitPanic` | `node: String` | Fatal |
+| `ReInitPanic` | `node: String` | Fatal |
+| `ShutdownPanic` | `node: String` | Permanent |
+| `InitFailed` | `node: String`, `reason: String` | Permanent |
+| `TickFailed` | `node: String`, `reason: String` | Permanent |
+| `Other` | `node: String`, `message: String` | Permanent |
+
+#### MemoryError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `PoolExhausted` | `reason: String` | Transient |
+| `AllocationFailed` | `reason: String` | Permanent |
+| `ShmCreateFailed` | `path: String`, `reason: String` | Permanent |
+| `MmapFailed` | `reason: String` | Permanent |
+| `DLPackImportFailed` | `reason: String` | Permanent |
+| `OffsetOverflow` | (no fields) | Permanent |
+
+#### SerializationError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `Json` | `source: serde_json::Error` | Permanent |
+| `Yaml` | `source: serde_yaml::Error` | Permanent |
+| `Toml` | `source: toml::ser::Error` | Permanent |
+| `Other` | `format: String`, `reason: String` | Permanent |
+
+#### NotFoundError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `Frame` | `name: String` | Permanent |
+| `ParentFrame` | `name: String` | Permanent |
+| `Topic` | `name: String` | Permanent |
+| `Node` | `name: String` | Permanent |
+| `Service` | `name: String` | Permanent |
+| `Action` | `name: String` | Permanent |
+| `Parameter` | `name: String` | Permanent |
+| `Other` | `kind: String`, `name: String` | Permanent |
+
+#### ResourceError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `AlreadyExists` | `resource_type: String`, `name: String` | Permanent |
+| `PermissionDenied` | `resource: String`, `required_permission: String` | Permanent |
+| `Unsupported` | `feature: String`, `reason: String` | Permanent |
+
+#### ValidationError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `OutOfRange` | `field: String`, `min: String`, `max: String`, `actual: String` | Permanent |
+| `InvalidFormat` | `field: String`, `expected_format: String`, `actual: String` | Permanent |
+| `InvalidEnum` | `field: String`, `valid_options: String`, `actual: String` | Permanent |
+| `MissingRequired` | `field: String` | Permanent |
+| `ConstraintViolation` | `field: String`, `constraint: String` | Permanent |
+| `InvalidValue` | `field: String`, `value: String`, `reason: String` | Permanent |
+| `Conflict` | `field_a: String`, `field_b: String`, `reason: String` | Permanent |
+| `Other(String)` | error message | Permanent |
+
+#### ParseError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `Int` | `input: String`, `source: ParseIntError` | Permanent |
+| `Float` | `input: String`, `source: ParseFloatError` | Permanent |
+| `Bool` | `input: String`, `source: ParseBoolError` | Permanent |
+| `Custom` | `type_name: String`, `input: String`, `reason: String` | Permanent |
+
+#### TransformError
+
+| Variant | Fields | Severity |
+|---------|--------|----------|
+| `Extrapolation` | `frame: String`, `requested_ns: u64`, `oldest_ns: u64`, `newest_ns: u64` | Permanent |
+| `Stale` | `frame: String`, `age: Duration`, `threshold: Duration` | Transient |
+
+#### TimeoutError (struct)
+
+| Field | Type |
+|-------|------|
+| `resource` | `String` |
+| `elapsed` | `Duration` |
+| `deadline` | `Option<Duration>` |
+
+Severity: Transient
+
+All sub-error enums are `#[non_exhaustive]` — new variants may be added in future releases.
+
+### Constructing Errors
+
+```rust
+// simplified
+// Named constructors (3 available)
+Error::config("Invalid YAML syntax");
+Error::node("SensorNode", "Sensor not responding");
+Error::network_fault("192.168.1.100", "Connection refused");
+
+// Internal errors (captures file and line automatically)
+horus_internal!("Unexpected state: {:?}", state);
+
+// Contextual errors (wrapping another error)
+Error::Contextual {
+    message: "Failed to initialize sensor".into(),
+    source: Box::new(io_error),
+};
+```
+
+### Type Aliases
+
+```rust
+// simplified
+pub type HorusResult<T> = Result<T, HorusError>;
+pub type Result<T> = HorusResult<T>;  // Convenience alias
+pub type Error = HorusError;          // Short name
+```
+
+## Rate and Stopwatch Utilities
+
+### Rate
+
+Drift-compensated rate limiter for controlling loop frequency:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut rate = Rate::new(100.0); // Target 100 Hz
+loop {
+    do_work();
+    rate.sleep(); // Sleeps for the remainder of the 10ms period
+}
+
+// Check actual performance
+println!("Actual: {:.1} Hz", rate.actual_hz());
+println!("Late: {}", rate.is_late());
+```
+
+| Method | Description |
+|--------|-------------|
+| `Rate::new(hz)` | Create targeting `hz` frequency |
+| `rate.sleep()` | Sleep for remainder of current period (drift-compensated) |
+| `rate.actual_hz()` | Exponentially smoothed actual frequency |
+| `rate.target_hz()` | Configured target frequency |
+| `rate.period()` | Target period as `Duration` |
+| `rate.reset()` | Reset cycle start (after long pauses) |
+| `rate.is_late()` | Whether current cycle exceeded target |
+
+### Stopwatch
+
+Simple elapsed time tracker:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut sw = Stopwatch::start();
+expensive_operation();
+println!("Took {:.2} ms", sw.elapsed_ms());
+
+// Lap: return elapsed and reset
+let lap_time = sw.lap();
+```
+
+| Method | Description |
+|--------|-------------|
+| `Stopwatch::start()` | Create and start immediately |
+| `sw.elapsed()` | Elapsed time as `Duration` |
+| `sw.elapsed_us()` | Elapsed microseconds (`u64`) |
+| `sw.elapsed_ms()` | Elapsed milliseconds (`f64`) |
+| `sw.reset()` | Reset to zero |
+| `sw.lap()` | Return elapsed and reset |
+
+## Retry Configuration
+
+### RetryConfig
+
+Configuration for automatic retry of transient errors with exponential backoff:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Default: 3 retries, 10ms initial backoff, 2x multiplier, 1s cap
+let config = RetryConfig::default();
+
+// Custom
+let config = RetryConfig::new(5, 20_u64.ms())
+    .with_max_backoff(500_u64.ms())
+    .with_multiplier(1.5);
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `RetryConfig::new(max_retries, initial_backoff)` | `Self` | Create with 2x multiplier and 1s cap |
+| `.with_max_backoff(duration)` | `Self` | Set maximum backoff duration |
+| `.with_multiplier(f64)` | `Self` | Set backoff multiplier (must be positive and finite) |
+| `max_retries()` | `u32` | Maximum retry attempts |
+| `initial_backoff()` | `Duration` | Initial backoff before first retry |
+| `max_backoff()` | `Duration` | Maximum backoff cap |
+| `backoff_multiplier()` | `f64` | Multiplier applied after each retry |
+
+Default values: 3 retries, 10ms initial backoff, 2x multiplier, 1s max backoff.
+
+### retry_transient()
+
+Generic retry function that only retries transient errors:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let config = RetryConfig::new(3, 10_u64.ms());
+
+let result = retry_transient(&config, || {
+    some_operation_that_may_fail()
+})?;
+```
+
+**Signature:**
+```rust
+// simplified
+pub fn retry_transient<T, F>(config: &RetryConfig, f: F) -> HorusResult<T>
+where
+    F: FnMut() -> HorusResult<T>,
+```
+
+**Behavior:**
+- Calls `f()` up to `max_retries + 1` times (initial attempt + retries)
+- Only `Severity::Transient` errors trigger retry (with exponential backoff)
+- `Severity::Permanent` and `Severity::Fatal` errors propagate immediately
+
+### Error Severity
+
+Each error variant has an associated severity that determines retry behavior:
+
+| Severity | Retry? | Examples |
+|----------|--------|----------|
+| `Transient` | Yes | `TopicFull`, `NetworkFault`, `PoolExhausted`, `Timeout`, `Stale` |
+| `Permanent` | No | `TopicNotFound`, `MissingField`, `PermissionDenied`, `InitFailed` |
+| `Fatal` | No | `Internal`, `Io` |
+
+`retry_transient` and `ServiceClient::call_resilient` both use this severity classification.
+
+---
+
+## Quick Recipes
+
+### Recipe: Hardware Init with Retry and Fallback
+
+```rust
+// simplified
+fn init(&mut self) -> Result<()> {
+    let config = RetryConfig::new(3, 100_u64.ms());
+
+    match retry_transient(&config, || open_hardware("/dev/ttyUSB0")) {
+        Ok(hw) => {
+            self.hardware = Some(hw);
+            hlog!(info, "Hardware connected");
+        }
+        Err(e) => {
+            hlog!(warn, "Hardware unavailable, using simulation: {}", e);
+            self.hardware = None;  // Fallback to sim mode
+        }
+    }
+    Ok(())
+}
+```
+
+### Recipe: Pattern-Match Specific Errors
+
+```rust
+// simplified
+match Topic::<Imu>::new("imu") {
+    Ok(topic) => { /* use topic */ }
+    Err(Error::Communication(CommunicationError::TopicCreationFailed { topic, reason })) => {
+        hlog!(error, "Cannot create topic '{}': {} — check SHM permissions", topic, reason);
+    }
+    Err(e) => {
+        hlog!(error, "Unexpected error: {}", e);
+    }
+}
+```
+
+### Recipe: Conditional Stop on Repeated Failures
+
+```rust
+// simplified
+fn tick(&mut self) {
+    match self.sensor.read() {
+        Ok(data) => {
+            self.consecutive_failures = 0;
+            self.process(data);
+        }
+        Err(e) => {
+            self.consecutive_failures += 1;
+            hlog!(warn, "Sensor read failed ({}/5): {}", self.consecutive_failures, e);
+            if self.consecutive_failures >= 5 {
+                hlog!(error, "Too many failures, entering safe state");
+                self.enter_safe_state();
+            }
+        }
+    }
+}
+```
+
+---
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Error::NotFound(Topic { name })` | Publishing or subscribing to a topic that does not exist | Ensure topic names match exactly (case-sensitive, use dots not slashes) |
+| `Error::Memory(ShmCreateFailed { .. })` | Shared memory permission issue or stale segment | Run `horus clean --shm`, check OS-level SHM permissions |
+| `Error::Config(MissingField { .. })` | Required field missing in `horus.toml` | Run `horus check` to identify the missing field |
+| `retry_transient` retries permanent errors | Error variant has wrong severity classification | Check that the error is truly `Transient` (network, topic full), not `Permanent` |
+| `Error::Contextual` chain too deep | Multiple layers of `.horus_context()` wrapping | Use `.horus_context()` at domain boundaries, not on every `?` |
+
+---
+
+## See Also
+
+- [Error Types Reference](/rust/api/error-types) — Complete listing of all error variants and sub-errors
+- [Nodes](/concepts/core-concepts-nodes) — Node lifecycle where error handling patterns apply
+- [Services API](/rust/api/services) — `call_resilient` uses `RetryConfig` for service calls
+- [Debugging Workflows](/development/debugging) — Runtime debugging when errors manifest as panics or deadline misses
+- [Troubleshooting](/getting-started/troubleshooting) — Common issues and environment-level solutions

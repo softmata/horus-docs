@@ -1,0 +1,719 @@
+---
+title: "Emergency Stop"
+description: "Safety-critical E-stop monitor that forces all actuators to safe state when triggered"
+order: 8
+---
+
+# Emergency Stop
+
+Every robot that moves can hurt someone. IEC 61508 (functional safety) and IEC 62061 (safety of machinery) both mandate that autonomous systems provide a reliable way to cease all hazardous motion immediately. Whether you are building a warehouse AGV, a surgical arm, or a hobby rover, an emergency stop is not optional — it is the single most important safety subsystem in your robot.
+
+HORUS provides the building blocks for a **cooperative software E-stop**: the scheduler's `enter_safe_state()` callback, `Miss::SafeMode` deadline enforcement, and shared-memory topics for cross-node signal propagation. This recipe shows you how to wire them together into a production-ready pattern with debounce, fail-safe defaults, and testable shutdown behavior.
+
+## When To Use This
+
+- Any robot with actuators (motors, servos, grippers)
+- When safety regulations require guaranteed shutdown
+- When you need sub-millisecond response to safety events
+
+**Use [Fault Tolerance](/advanced/circuit-breaker) instead** if you need graceful degradation (reduced speed, limited range of motion) rather than full shutdown.
+
+## Prerequisites
+
+- Familiarity with [Nodes](/concepts/core-concepts-nodes) and [CmdVel](/stdlib/messages/cmd-vel)
+- Understanding of [Miss policies](/rust/api/scheduler#miss-enum) and `enter_safe_state()`
+
+## Solution
+
+### horus.toml
+
+```toml
+[package]
+name = "emergency-stop"
+version = "0.1.0"
+description = "E-stop monitor with safety state handling"
+```
+
+### src/main.rs (or src/main.py)
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    /// E-stop trigger from hardware or software
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+    #[repr(C)]
+    struct EStopSignal {
+        triggered: u8,   // 0 = clear, 1 = triggered (u8 for repr(C) compat)
+        source: u8,      // 0 = hardware, 1 = software, 2 = remote
+    }
+
+    /// Status published by the E-stop monitor
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+    #[repr(C)]
+    struct SafetyStatus {
+        estop_active: u8,
+        consecutive_clears: u32,
+        uptime_ticks: u64,
+    }
+
+    struct EStopNode {
+        estop_sub: Topic<EStopSignal>,
+        cmd_pub: Topic<CmdVel>,
+        status_pub: Topic<SafetyStatus>,
+        estop_active: bool,
+        consecutive_clears: u32,
+        ticks: u64,
+    }
+
+    impl EStopNode {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                estop_sub: Topic::new("safety.estop")?,
+                cmd_pub: Topic::new("cmd_vel")?,
+                status_pub: Topic::new("safety.status")?,
+                estop_active: false,
+                consecutive_clears: 0,
+                ticks: 0,
+            })
+        }
+    }
+
+    impl Node for EStopNode {
+        fn name(&self) -> &str { "EStop" }
+
+        fn tick(&mut self) {
+            self.ticks += 1;
+
+            if let Some(signal) = self.estop_sub.recv() {
+                if signal.triggered != 0 {
+                    // SAFETY: immediately activate E-stop
+                    self.estop_active = true;
+                    self.consecutive_clears = 0;
+                } else {
+                    self.consecutive_clears += 1;
+                }
+            } else {
+                // No signal received — treat as potential fault (fail-safe)
+                self.consecutive_clears = 0;
+            }
+
+            // Require N consecutive clear signals before releasing
+            const CLEAR_THRESHOLD: u32 = 50; // 50 ticks at 100 Hz = 0.5 seconds
+            if self.estop_active && self.consecutive_clears >= CLEAR_THRESHOLD {
+                self.estop_active = false;
+            }
+
+            if self.estop_active {
+                // SAFETY: override cmd_vel with zero — stops all motion
+                self.cmd_pub.send(CmdVel::zero());
+            }
+
+            self.status_pub.send(SafetyStatus {
+                estop_active: self.estop_active as u8,
+                consecutive_clears: self.consecutive_clears,
+                uptime_ticks: self.ticks,
+            });
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            // SAFETY: zero velocity on shutdown
+            self.cmd_pub.send(CmdVel::zero());
+            Ok(())
+        }
+
+        fn enter_safe_state(&mut self) {
+            // SAFETY: called by scheduler if this node misses its deadline
+            self.estop_active = true;
+            self.cmd_pub.send(CmdVel::zero());
+        }
+
+        fn is_safe_state(&self) -> bool {
+            self.estop_active
+        }
+    }
+
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new()
+            .watchdog(500_u64.ms())
+            .max_deadline_misses(1); // aggressive — isolate after 1 miss
+
+        // E-stop runs LAST — overrides any cmd_vel from other nodes
+        scheduler.add(EStopNode::new()?)
+            .order(100)                    // after drive/planner nodes
+            .rate(100_u64.hz())            // 100 Hz safety monitoring
+            .budget(200_u64.us())          // tight budget
+            .deadline(500_u64.us())        // tight deadline
+            .on_miss(Miss::SafeMode)       // force safe state on deadline miss
+            .build()?;
+
+        scheduler.run()
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, CmdVel, run, us, ms
+
+    CLEAR_THRESHOLD = 50  # 50 ticks at 100 Hz = 0.5 seconds
+
+    def estop_init(node):
+        """Initialize E-stop state."""
+        node.state = {
+            "estop_active": False,
+            "consecutive_clears": 0,
+            "ticks": 0,
+        }
+
+    def estop_tick(node):
+        s = node.state
+        s["ticks"] += 1
+
+        signal = node.recv("safety.estop")
+        if signal is not None:
+            if signal["triggered"] != 0:
+                # SAFETY: immediately activate E-stop
+                s["estop_active"] = True
+                s["consecutive_clears"] = 0
+            else:
+                s["consecutive_clears"] += 1
+        else:
+            # No signal received — treat as potential fault (fail-safe)
+            s["consecutive_clears"] = 0
+
+        # Require N consecutive clear signals before releasing
+        if s["estop_active"] and s["consecutive_clears"] >= CLEAR_THRESHOLD:
+            s["estop_active"] = False
+
+        if s["estop_active"]:
+            # SAFETY: override cmd_vel with zero — stops all motion
+            node.send("cmd_vel", {"linear": 0.0, "angular": 0.0})
+
+        node.send("safety.status", {
+            "estop_active": 1 if s["estop_active"] else 0,
+            "consecutive_clears": s["consecutive_clears"],
+            "uptime_ticks": s["ticks"],
+        })
+
+    def estop_shutdown(node):
+        """SAFETY: zero velocity on shutdown."""
+        node.send("cmd_vel", {"linear": 0.0, "angular": 0.0})
+
+    estop = Node(
+        name="EStop",
+        init=estop_init,
+        tick=estop_tick,
+        shutdown=estop_shutdown,
+        rate=100,
+        order=100,
+        budget=200 * us,
+        subs=["safety.estop"],
+        pubs=["cmd_vel", "safety.status"],
+    )
+
+    run(estop, rt=True, watchdog_ms=500)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Understanding the Code
+
+- **`enter_safe_state()`** is called by the scheduler when this node misses its deadline — the robot stops automatically without any application logic
+- **`Miss::SafeMode`** is the strictest miss policy — any deadline overrun triggers safe state
+- **High `.order(100)`** ensures E-stop runs AFTER drive/planning nodes — it overrides their `cmd_vel` output
+- **Debounce with `CLEAR_THRESHOLD`** prevents flickering E-stop signals from bouncing
+- **No signal = fault** — if the E-stop topic stops publishing, the node treats it as triggered (fail-safe design)
+- **200 us budget** is generous for this simple node — keeps safety checks deterministic
+
+<Callout type="danger">
+The E-stop node must run on the **same scheduler** as the motor controller. If they run in separate processes, the E-stop can't override `cmd_vel` — use shared-memory topics with the E-stop node having a higher `.order()` than the motor node.
+</Callout>
+
+## Full System Example
+
+A real robot does not run the E-stop node alone. Below is a complete scheduler with three nodes — `DriveNode` (motor control), `PlannerNode` (path planning), and `EStopNode` (safety override) — showing how `enter_safe_state()` and `is_safe_state()` cooperate across the system.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// --- Messages (same EStopSignal and SafetyStatus as above) ---
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+#[repr(C)]
+struct EStopSignal {
+    triggered: u8,
+    source: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+#[repr(C)]
+struct SafetyStatus {
+    estop_active: u8,
+    consecutive_clears: u32,
+    uptime_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+#[repr(C)]
+struct WheelCmd {
+    left_rpm: f32,
+    right_rpm: f32,
+}
+
+// --- DriveNode: converts cmd_vel to wheel commands ---
+
+struct DriveNode {
+    cmd_sub: Topic<CmdVel>,
+    wheel_pub: Topic<WheelCmd>,
+}
+
+impl DriveNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd_sub: Topic::new("cmd_vel")?,
+            wheel_pub: Topic::new("wheel.cmd")?,
+        })
+    }
+}
+
+impl Node for DriveNode {
+    fn name(&self) -> &str { "Drive" }
+
+    fn tick(&mut self) {
+        if let Some(cmd) = self.cmd_sub.recv() {
+            let wheel_base = 0.3_f32;
+            let radius = 0.05_f32;
+            let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
+            let left = ((cmd.linear - cmd.angular * wheel_base / 2.0) / radius) * to_rpm;
+            let right = ((cmd.linear + cmd.angular * wheel_base / 2.0) / radius) * to_rpm;
+            self.wheel_pub.send(WheelCmd {
+                left_rpm: left.clamp(-200.0, 200.0),
+                right_rpm: right.clamp(-200.0, 200.0),
+            });
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        // Zero both motors immediately — this is the critical safety action
+        self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
+        Ok(())
+    }
+}
+
+// --- PlannerNode: publishes cmd_vel, checks path safety ---
+
+struct PlannerNode {
+    cmd_pub: Topic<CmdVel>,
+    path_clear: bool,
+}
+
+impl PlannerNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd_pub: Topic::new("cmd_vel")?,
+            path_clear: true,
+        })
+    }
+}
+
+impl Node for PlannerNode {
+    fn name(&self) -> &str { "Planner" }
+
+    fn tick(&mut self) {
+        // In production, check lidar/camera for obstacles
+        if self.path_clear {
+            self.cmd_pub.send(CmdVel::new(0.5, 0.0));
+        } else {
+            self.cmd_pub.send(CmdVel::zero());
+        }
+    }
+
+    fn is_safe_state(&self) -> bool {
+        // Scheduler queries this — if false, the safety monitor can escalate
+        !self.path_clear
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.path_clear = false;
+        self.cmd_pub.send(CmdVel::zero());
+    }
+}
+
+// --- EStopNode: same as the Solution section above ---
+// (omitted for brevity — use the full EStopNode from above)
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .watchdog(500_u64.ms())
+        .max_deadline_misses(1);
+
+    // Planner runs first — publishes cmd_vel
+    scheduler.add(PlannerNode::new()?)
+        .order(0)
+        .rate(20_u64.hz())
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    // Drive runs second — converts cmd_vel to wheel commands
+    scheduler.add(DriveNode::new()?)
+        .order(10)
+        .rate(50_u64.hz())
+        .budget(500_u64.us())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    // E-stop runs LAST — overrides cmd_vel if triggered
+    scheduler.add(EStopNode::new()?)
+        .order(100)
+        .rate(100_u64.hz())
+        .budget(200_u64.us())
+        .deadline(500_u64.us())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+The execution order matters: Planner (0) produces velocity, Drive (10) converts it to motor commands, and EStop (100) overrides `cmd_vel` with zero if triggered. Because EStop writes to the same `cmd_vel` topic _after_ Planner, the zero command propagates to Drive on the next tick.
+
+When the scheduler calls `enter_safe_state()` on DriveNode (due to a deadline miss or watchdog expiry), DriveNode zeros its wheel output independently of the E-stop signal. This gives you two layers of protection: the E-stop node zeroes the _command_, and the drive node zeroes the _output_.
+
+## Hardware GPIO Integration
+
+Physical E-stop buttons connect to GPIO pins. The pattern below reads a hardware button and publishes to the `safety.estop` topic so the `EStopNode` (running in the same or a different process) can react.
+
+<Callout type="info">
+GPIO access varies by platform. This example uses the `gpio_cdev` crate (Linux character device interface). On Raspberry Pi, you could also use `rppal`. The HORUS E-stop pattern is the same regardless of which GPIO library you choose.
+</Callout>
+
+```rust
+// simplified
+use horus::prelude::*;
+use gpio_cdev::{Chip, LineRequestFlags};
+
+struct GpioEstopPublisher {
+    estop_pub: Topic<EStopSignal>,
+    gpio_line: gpio_cdev::Line,
+    pin: u32,
+}
+
+impl GpioEstopPublisher {
+    fn new(chip_path: &str, pin: u32) -> Result<Self> {
+        let mut chip = Chip::new(chip_path)
+            .map_err(|e| horus::Error::msg(format!("GPIO chip: {e}")))?;
+        let line = chip.get_line(pin)
+            .map_err(|e| horus::Error::msg(format!("GPIO line {pin}: {e}")))?;
+        Ok(Self {
+            estop_pub: Topic::new("safety.estop")?,
+            gpio_line: line,
+            pin,
+        })
+    }
+}
+
+impl Node for GpioEstopPublisher {
+    fn name(&self) -> &str { "GpioEstop" }
+
+    fn tick(&mut self) {
+        // Request the line as input each tick (some drivers require re-request)
+        let handle = self.gpio_line
+            .request(LineRequestFlags::INPUT, 0, "horus-estop")
+            .unwrap();
+        let value = handle.get_value().unwrap_or(1); // fail-safe: default to triggered
+
+        // E-stop buttons are normally-closed (NC): pin LOW = safe, pin HIGH = triggered
+        // Wiring a NC button means a broken wire also triggers the E-stop (fail-safe)
+        self.estop_pub.send(EStopSignal {
+            triggered: value as u8,
+            source: 0, // hardware
+        });
+    }
+}
+```
+
+**Why normally-closed wiring?** A normally-closed (NC) button keeps the circuit completed when not pressed. If the wire breaks or the connector fails, the circuit opens — which reads the same as "button pressed." This is the standard industrial fail-safe pattern: any hardware fault triggers the E-stop rather than silently disabling it.
+
+## Multi-Process E-stop
+
+HORUS topics use shared memory. When two processes open `Topic::new("safety.estop")`, they share the same SHM segment. This means a hardware GPIO publisher in one process and an `EStopNode` in another process see the same signal with zero serialization overhead.
+
+The pattern for multi-process E-stop:
+
+```rust
+// simplified
+// Process 1: Hardware monitor (publishes E-stop from GPIO)
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(GpioEstopPublisher::new("/dev/gpiochip0", 17)?)
+        .order(0)
+        .rate(200_u64.hz())   // sample GPIO at 200 Hz for fast response
+        .budget(100_u64.us())
+        .build()?;
+    scheduler.run()
+}
+
+// Process 2: Main robot controller (subscribes to E-stop)
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .watchdog(500_u64.ms())
+        .max_deadline_misses(1);
+
+    scheduler.add(PlannerNode::new()?)
+        .order(0)
+        .rate(20_u64.hz())
+        .build()?;
+
+    scheduler.add(DriveNode::new()?)
+        .order(10)
+        .rate(50_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    // E-stop reads from SHM — sees GPIO publisher's writes
+    scheduler.add(EStopNode::new()?)
+        .order(100)
+        .rate(100_u64.hz())
+        .budget(200_u64.us())
+        .deadline(500_u64.us())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+Every process that controls actuators should subscribe to `safety.estop`. The publisher only needs to exist once (in the hardware monitor process), but any number of subscribers can react to it. Because SHM is lock-free, the E-stop signal propagates in under 1 microsecond regardless of how many subscribers exist.
+
+<Callout type="warn">
+If the hardware monitor process crashes, subscribers stop receiving new messages. The `EStopNode` already handles this: no signal received = `consecutive_clears` resets to zero, which prevents release of an active E-stop. For the initial case (E-stop not yet active), consider starting with `estop_active: true` and requiring the first clear signal before allowing motion.
+</Callout>
+
+## Testing E-stop
+
+Use `tick_once()` to verify E-stop behavior deterministically without running the full scheduler loop. Each call to `tick_once()` executes exactly one tick of every node in order.
+
+```rust
+// simplified
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn motor_runs_when_estop_clear() {
+        let mut scheduler = Scheduler::new();
+
+        scheduler.add(DriveNode::new().unwrap())
+            .order(10)
+            .build().unwrap();
+
+        scheduler.add(EStopNode::new().unwrap())
+            .order(100)
+            .build().unwrap();
+
+        // Publish a clear E-stop signal
+        let estop_pub: Topic<EStopSignal> = Topic::new("safety.estop").unwrap();
+        estop_pub.send(EStopSignal { triggered: 0, source: 0 });
+
+        // Publish a velocity command
+        let cmd_pub: Topic<CmdVel> = Topic::new("cmd_vel").unwrap();
+        cmd_pub.send(CmdVel::new(1.0, 0.0));
+
+        // Tick once — Drive should produce non-zero wheel output
+        scheduler.tick_once();
+
+        let wheel_sub: Topic<WheelCmd> = Topic::new("wheel.cmd").unwrap();
+        let wheel = wheel_sub.recv().unwrap();
+        assert!(wheel.left_rpm.abs() > 0.0, "motor should be running");
+        assert!(wheel.right_rpm.abs() > 0.0, "motor should be running");
+    }
+
+    #[test]
+    fn motor_stops_when_estop_triggered() {
+        let mut scheduler = Scheduler::new();
+
+        scheduler.add(DriveNode::new().unwrap())
+            .order(10)
+            .build().unwrap();
+
+        scheduler.add(EStopNode::new().unwrap())
+            .order(100)
+            .build().unwrap();
+
+        // Publish a triggered E-stop
+        let estop_pub: Topic<EStopSignal> = Topic::new("safety.estop").unwrap();
+        estop_pub.send(EStopSignal { triggered: 1, source: 1 });
+
+        // Publish a velocity command — E-stop should override it
+        let cmd_pub: Topic<CmdVel> = Topic::new("cmd_vel").unwrap();
+        cmd_pub.send(CmdVel::new(1.0, 0.0));
+
+        // Tick once — EStopNode overwrites cmd_vel with zero
+        scheduler.tick_once();
+
+        // Tick again — DriveNode reads the zeroed cmd_vel
+        scheduler.tick_once();
+
+        let wheel_sub: Topic<WheelCmd> = Topic::new("wheel.cmd").unwrap();
+        let wheel = wheel_sub.recv().unwrap();
+        assert_eq!(wheel.left_rpm, 0.0, "motor must be stopped");
+        assert_eq!(wheel.right_rpm, 0.0, "motor must be stopped");
+    }
+
+    #[test]
+    fn estop_requires_debounce_to_clear() {
+        let mut scheduler = Scheduler::new();
+
+        scheduler.add(EStopNode::new().unwrap())
+            .order(100)
+            .build().unwrap();
+
+        let estop_pub: Topic<EStopSignal> = Topic::new("safety.estop").unwrap();
+        let status_sub: Topic<SafetyStatus> = Topic::new("safety.status").unwrap();
+
+        // Trigger E-stop
+        estop_pub.send(EStopSignal { triggered: 1, source: 0 });
+        scheduler.tick_once();
+
+        let status = status_sub.recv().unwrap();
+        assert_eq!(status.estop_active, 1, "should be active after trigger");
+
+        // Send a single clear — should NOT release (need 50 consecutive)
+        estop_pub.send(EStopSignal { triggered: 0, source: 0 });
+        scheduler.tick_once();
+
+        let status = status_sub.recv().unwrap();
+        assert_eq!(status.estop_active, 1, "should still be active — debounce not met");
+    }
+
+    #[test]
+    fn no_signal_keeps_estop_active() {
+        let mut scheduler = Scheduler::new();
+
+        scheduler.add(EStopNode::new().unwrap())
+            .order(100)
+            .build().unwrap();
+
+        let estop_pub: Topic<EStopSignal> = Topic::new("safety.estop").unwrap();
+        let status_sub: Topic<SafetyStatus> = Topic::new("safety.status").unwrap();
+
+        // Trigger E-stop, then stop publishing entirely
+        estop_pub.send(EStopSignal { triggered: 1, source: 0 });
+        scheduler.tick_once();
+
+        // Tick without publishing — simulates publisher crash
+        scheduler.tick_once();
+
+        let status = status_sub.recv().unwrap();
+        assert_eq!(status.estop_active, 1, "no signal = fault = stay active");
+    }
+}
+```
+
+These tests run in milliseconds and cover the four critical scenarios: normal operation, triggered stop, debounce behavior, and publisher failure.
+
+## Safety Standards Note
+
+<Callout type="danger">
+HORUS provides **cooperative software safety**. The E-stop pattern in this recipe is a software-level safety layer — it depends on the scheduler running, the process being alive, and shared memory being accessible. This is necessary but **not sufficient** for safety-critical systems.
+</Callout>
+
+For systems that must meet **SIL (Safety Integrity Level)** ratings under IEC 61508 or performance levels under ISO 13849:
+
+- **Hardware E-stop circuit**: A physical relay that cuts power to actuators independently of software. This is the primary safety system. The relay must be rated for the motor's stall current and must be fail-safe (normally-closed contacts).
+- **Software E-stop (this recipe)**: A secondary layer that provides faster response (sub-millisecond vs. relay switching time of 5-20 ms) and richer behavior (debounce, status reporting, coordinated shutdown). It monitors the same physical button and coordinates the software stack.
+- **Watchdog timer**: A hardware watchdog (e.g., on the microcontroller or SBC) that resets the system if software stops sending heartbeats. HORUS's `.watchdog()` is a software watchdog — pair it with a hardware one for defense in depth.
+
+The layered approach: hardware relay catches catastrophic failures (software crash, kernel panic, power brownout), software E-stop handles the 99% case with better UX (status reporting, coordinated shutdown, logging).
+
+## Design Decisions
+
+**Why fail-safe (no signal = fault)?** If the E-stop publisher crashes, the subscriber stops receiving messages. A "fail-dangerous" design would interpret silence as "all clear" — the robot keeps moving with no safety monitoring. The fail-safe design treats silence as a fault and activates the E-stop. This is the same principle as a dead man's switch: you must actively assert safety, not passively assume it.
+
+**Why debounce on clear (not on trigger)?** Triggering the E-stop must be instant — any delay could mean the robot travels further into a hazard. But releasing the E-stop can afford 0.5 seconds of delay. Debounce on clear prevents a flickering signal (e.g., a loose wire on the GPIO pin) from rapidly cycling the robot between motion and stop, which can damage motors and gearboxes.
+
+**Why same-scheduler ordering instead of priority?** HORUS uses cooperative scheduling with deterministic ordering, not preemptive priorities. The `.order(100)` guarantee means the E-stop node always runs after drive nodes within the same tick. This is simpler to reason about than preemptive priority inversion, and the worst-case latency is bounded by the tick period (10 ms at 100 Hz) rather than being unbounded.
+
+**Why `u8` instead of `bool` for `triggered`?** The `#[repr(C)]` attribute ensures the struct has a predictable memory layout for zero-copy SHM transport. The Rust `bool` type has no guaranteed `#[repr(C)]` size across all platforms. Using `u8` makes the wire format explicit: 0 = clear, 1 = triggered.
+
+## Trade-offs
+
+| Approach | Latency | Reliability | Complexity | When to use |
+|----------|---------|-------------|------------|-------------|
+| Same-scheduler E-stop (this recipe) | &lt;1 tick (10 ms at 100 Hz) | High — deterministic ordering | Low | Single-process robots, most use cases |
+| Multi-process SHM E-stop | &lt;1 us propagation + subscriber tick period | High — survives publisher crash via fail-safe | Medium | Multi-process architectures |
+| Event-driven `.on("safety.estop")` | &lt;1 us (wake on signal) | Medium — no periodic checking | Low | When lowest latency matters more than periodic monitoring |
+| Hardware relay only (no software) | 5-20 ms relay switching | Very high — independent of software | Very low | Certification requirement, last-resort backup |
+| Hardware relay + software E-stop | &lt;1 tick software, 5-20 ms hardware backup | Highest — defense in depth | Medium | Production robots, SIL-rated systems |
+
+## Variations
+
+<Details title="Wireless E-Stop">
+
+Subscribe to a network topic instead of local GPIO. Add a heartbeat timeout:
+
+```rust
+// simplified
+if self.ticks_since_heartbeat > 100 {
+    // 1 second without heartbeat = trigger E-stop
+    self.estop_active = true;
+}
+```
+
+</Details>
+
+<Details title="Multi-Zone E-Stop">
+
+Separate E-stop nodes per actuator group (arms, wheels, gripper). Each publishes to its own `cmd_vel` topic:
+
+```rust
+// simplified
+let arm_cmd: Topic<CmdVel> = Topic::new("arm.cmd_vel")?;
+let wheel_cmd: Topic<CmdVel> = Topic::new("wheel.cmd_vel")?;
+```
+
+</Details>
+
+<Details title="Event-Driven E-Stop">
+
+Use `.on("safety.estop")` instead of `.rate()` to wake only when a signal arrives:
+
+```rust
+// simplified
+scheduler.add(EStopNode::new()?)
+    .order(0)
+    .on("safety.estop")  // wake on signal, not on clock
+    .build()?;
+```
+
+Trades guaranteed periodic checking for lower latency on the signal path.
+
+</Details>
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| E-stop doesn't override motors | E-stop `.order()` lower than motor node | Set E-stop `.order()` HIGHER than motor node |
+| Motors resume after E-stop | Only sending zero once | Send `CmdVel::zero()` every tick while active |
+| E-stop flickers on/off | No debounce on clear signal | Use `CLEAR_THRESHOLD` consecutive clears |
+| System continues after deadline miss | Using `Miss::Warn` instead of `Miss::SafeMode` | Set `.on_miss(Miss::SafeMode)` |
+| E-stop never releases | `CLEAR_THRESHOLD` too high or no clear signals | Verify upstream publishes clear signals |
+| GPIO reads inverted | Button wired normally-open instead of normally-closed | Invert the logic or rewire as NC for fail-safe |
+| Multi-process E-stop has lag | Subscriber tick rate too low | Increase E-stop node `.rate()` or use event-driven |
+
+## See Also
+
+- [Safety Monitor](/advanced/safety-monitor) — Graduated degradation and watchdog
+- [Fault Tolerance](/advanced/circuit-breaker) — Circuit breaker pattern for graceful degradation
+- [CmdVel](/stdlib/messages/cmd-vel) — Velocity command type
+- [Miss Enum](/rust/api/scheduler#miss-enum) — All deadline miss policies
+- [Differential Drive](/recipes/differential-drive) — Motor control node that pairs with E-stop

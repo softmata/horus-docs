@@ -1,0 +1,413 @@
+name: Verify Documentation Code
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - 'content/**/*.mdx'
+      - 'content/**/*.md'
+      - 'scripts/extract-code-blocks.mjs'
+      - 'scripts/verify-*.mjs'
+      - 'docker/**'
+      - '.github/workflows/verify-docs.yml'
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - 'content/**/*.mdx'
+      - 'content/**/*.md'
+      - 'scripts/extract-code-blocks.mjs'
+      - 'scripts/verify-*.mjs'
+      - 'docker/**'
+      - '.github/workflows/verify-docs.yml'
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Filter blocks by ID pattern (regex)'
+        required: false
+        type: string
+      rust_only:
+        description: 'Only verify Rust blocks'
+        required: false
+        type: boolean
+        default: false
+      python_only:
+        description: 'Only verify Python blocks'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  extract-blocks:
+    name: Extract Code Blocks
+    runs-on: ubuntu-latest
+    outputs:
+      rust-count: ${{ steps.count.outputs.rust }}
+      python-count: ${{ steps.count.outputs.python }}
+      total-count: ${{ steps.count.outputs.total }}
+    steps:
+      - name: Checkout documentation
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Extract code blocks
+        run: npm run extract:code
+
+      - name: Count blocks
+        id: count
+        run: |
+          RUST=$(jq '[.blocks[] | select(.language == "rust" and .verifiable)] | length' extracted-code-blocks.json)
+          PYTHON=$(jq '[.blocks[] | select(.language == "python" and .verifiable)] | length' extracted-code-blocks.json)
+          TOTAL=$(jq '.totalBlocks' extracted-code-blocks.json)
+          echo "rust=$RUST" >> $GITHUB_OUTPUT
+          echo "python=$PYTHON" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "📊 Found $TOTAL code blocks ($RUST Rust, $PYTHON Python verifiable)"
+
+      - name: Upload extracted blocks
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-code-blocks
+          path: extracted-code-blocks.json
+          retention-days: 1
+
+  verify-rust:
+    name: Verify Rust Blocks
+    needs: extract-blocks
+    if: needs.extract-blocks.outputs.rust-count > 0 && !inputs.python_only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout documentation
+        uses: actions/checkout@v4
+
+      - name: Download extracted blocks
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-code-blocks
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Clone HORUS
+        run: git clone --depth 1 https://github.com/softmata/horus.git ../horus
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ../horus/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('../horus/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Pre-build HORUS dependencies
+        run: |
+          cd ../horus
+          cargo check --release || true
+
+      - name: Verify Rust code blocks
+        id: verify
+        run: |
+          ARGS="--horus-path ../horus"
+          if [ -n "${{ inputs.filter }}" ]; then
+            ARGS="$ARGS --filter ${{ inputs.filter }}"
+          fi
+          node scripts/verify-rust-local.mjs $ARGS --verbose 2>&1 | tee rust-verification.log
+        continue-on-error: true
+
+      - name: Upload Rust results
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-verification-log
+          path: rust-verification.log
+          retention-days: 7
+
+      - name: Check Rust verification status
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "❌ Rust verification failed"
+          exit 1
+
+  verify-python:
+    name: Verify Python Blocks
+    needs: extract-blocks
+    if: needs.extract-blocks.outputs.python-count > 0 && !inputs.rust_only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout documentation
+        uses: actions/checkout@v4
+
+      - name: Download extracted blocks
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-code-blocks
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Rust (for maturin)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install maturin and build horus-robotics
+        run: |
+          pip install maturin
+          git clone --depth 1 https://github.com/softmata/horus.git ../horus
+          cd ../horus/horus_py
+          maturin build --release
+          pip install target/wheels/*.whl
+        continue-on-error: true
+
+      - name: Verify Python code blocks
+        id: verify
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.filter }}" ]; then
+            ARGS="$ARGS --filter ${{ inputs.filter }}"
+          fi
+          node scripts/verify-python-local.mjs $ARGS --verbose 2>&1 | tee python-verification.log
+        continue-on-error: true
+
+      - name: Upload Python results
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-verification-log
+          path: python-verification.log
+          retention-days: 7
+
+      - name: Check Python verification status
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "❌ Python verification failed"
+          exit 1
+
+  verify-ai-readability:
+    name: Verify AI Readability Artifacts
+    needs: extract-blocks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout documentation
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build AI artifacts
+        run: npm run build:all-ai
+
+      - name: Verify llms.txt exists with required sections
+        run: |
+          test -f public/llms.txt || (echo "FAIL: llms.txt missing" && exit 1)
+          grep -q "Safety Rules" public/llms.txt || (echo "FAIL: llms.txt missing Safety Rules section" && exit 1)
+          grep -q "Core Concepts" public/llms.txt || (echo "FAIL: llms.txt missing Core Concepts section" && exit 1)
+          SIZE=$(wc -c < public/llms.txt)
+          echo "llms.txt: $SIZE bytes"
+          [ "$SIZE" -ge 5000 ] || (echo "FAIL: llms.txt too small ($SIZE bytes)" && exit 1)
+          echo "✅ llms.txt verified"
+
+      - name: Verify llms-full.txt exists with 100+ pages
+        run: |
+          test -f public/llms-full.txt || (echo "FAIL: llms-full.txt missing" && exit 1)
+          PAGE_COUNT=$(grep -c "^## " public/llms-full.txt || true)
+          echo "Found $PAGE_COUNT page sections in llms-full.txt"
+          [ "$PAGE_COUNT" -ge 100 ] || (echo "FAIL: llms-full.txt has only $PAGE_COUNT pages (need 100+)" && exit 1)
+          SIZE=$(wc -c < public/llms-full.txt)
+          echo "llms-full.txt: $SIZE bytes, $PAGE_COUNT pages"
+          echo "✅ llms-full.txt verified"
+
+      - name: Verify search index
+        run: |
+          test -f public/search-index.json || (echo "FAIL: search-index.json missing" && exit 1)
+          SIZE=$(wc -c < public/search-index.json)
+          echo "search-index.json: $SIZE bytes"
+          [ "$SIZE" -ge 100000 ] || (echo "FAIL: search-index.json too small ($SIZE bytes)" && exit 1)
+          echo "✅ search-index.json verified"
+
+      - name: Verify extracted code blocks
+        run: |
+          test -f extracted-code-blocks.json || (echo "FAIL: extracted-code-blocks.json missing" && exit 1)
+          TOTAL=$(node -e "const d=JSON.parse(require('fs').readFileSync('extracted-code-blocks.json','utf8')); console.log(d.totalBlocks)")
+          echo "extracted-code-blocks.json: $TOTAL blocks"
+          [ "$TOTAL" -ge 50 ] || (echo "FAIL: only $TOTAL code blocks found (need 50+)" && exit 1)
+          echo "✅ extracted-code-blocks.json verified ($TOTAL blocks)"
+
+  report:
+    name: Generate Report
+    needs: [extract-blocks, verify-rust, verify-python, verify-ai-readability]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout documentation
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate summary
+        run: |
+          echo "# Documentation Verification Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Code Blocks" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total blocks**: ${{ needs.extract-blocks.outputs.total-count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Verifiable Rust**: ${{ needs.extract-blocks.outputs.rust-count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Verifiable Python**: ${{ needs.extract-blocks.outputs.python-count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # AI readability status
+          if [ "${{ needs.verify-ai-readability.result }}" == "success" ]; then
+            echo "## ✅ AI Readability: PASSED" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.verify-ai-readability.result }}" == "failure" ]; then
+            echo "## ❌ AI Readability: FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "llms.txt, llms-full.txt, or search-index.json failed validation." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.verify-ai-readability.result }}" == "skipped" ]; then
+            echo "## ⏭️ AI Readability: SKIPPED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Rust status
+          if [ "${{ needs.verify-rust.result }}" == "success" ]; then
+            echo "## ✅ Rust Verification: PASSED" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.verify-rust.result }}" == "failure" ]; then
+            echo "## ❌ Rust Verification: FAILED" >> $GITHUB_STEP_SUMMARY
+            if [ -f artifacts/rust-verification-log/rust-verification.log ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "<details><summary>Show failures</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              grep -A 5 "FAIL" artifacts/rust-verification-log/rust-verification.log >> $GITHUB_STEP_SUMMARY || true
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [ "${{ needs.verify-rust.result }}" == "skipped" ]; then
+            echo "## ⏭️ Rust Verification: SKIPPED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Python status
+          if [ "${{ needs.verify-python.result }}" == "success" ]; then
+            echo "## ✅ Python Verification: PASSED" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.verify-python.result }}" == "failure" ]; then
+            echo "## ❌ Python Verification: FAILED" >> $GITHUB_STEP_SUMMARY
+            if [ -f artifacts/python-verification-log/python-verification.log ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "<details><summary>Show failures</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              grep -A 5 "FAIL" artifacts/python-verification-log/python-verification.log >> $GITHUB_STEP_SUMMARY || true
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [ "${{ needs.verify-python.result }}" == "skipped" ]; then
+            echo "## ⏭️ Python Verification: SKIPPED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && (needs.verify-rust.result == 'failure' || needs.verify-python.result == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let body = '## ❌ Documentation Code Verification Failed\n\n';
+            body += 'Some code blocks in the documentation failed to compile or execute.\n\n';
+
+            const rustResult = '${{ needs.verify-rust.result }}';
+            const pythonResult = '${{ needs.verify-python.result }}';
+
+            if (rustResult === 'failure') {
+              body += '### Rust Failures\n';
+              try {
+                const log = fs.readFileSync('artifacts/rust-verification-log/rust-verification.log', 'utf8');
+                const failures = log.match(/Failed blocks:[\s\S]*?(?=\n\n|$)/);
+                if (failures) {
+                  body += '```\n' + failures[0] + '\n```\n\n';
+                }
+              } catch (e) {
+                body += 'See workflow logs for details.\n\n';
+              }
+            }
+
+            if (pythonResult === 'failure') {
+              body += '### Python Failures\n';
+              try {
+                const log = fs.readFileSync('artifacts/python-verification-log/python-verification.log', 'utf8');
+                const failures = log.match(/Failed blocks:[\s\S]*?(?=\n\n|$)/);
+                if (failures) {
+                  body += '```\n' + failures[0] + '\n```\n\n';
+                }
+              } catch (e) {
+                body += 'See workflow logs for details.\n\n';
+              }
+            }
+
+            body += '---\n';
+            body += '*Generated by [Documentation Verification](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  final-status:
+    name: Final Status
+    needs: [verify-rust, verify-python, verify-ai-readability]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check overall status
+        run: |
+          RUST_RESULT="${{ needs.verify-rust.result }}"
+          PYTHON_RESULT="${{ needs.verify-python.result }}"
+          AI_RESULT="${{ needs.verify-ai-readability.result }}"
+
+          if [ "$RUST_RESULT" == "failure" ] || [ "$PYTHON_RESULT" == "failure" ] || [ "$AI_RESULT" == "failure" ]; then
+            echo "❌ Documentation verification failed"
+            [ "$AI_RESULT" == "failure" ] && echo "  - AI readability artifacts failed"
+            [ "$RUST_RESULT" == "failure" ] && echo "  - Rust code blocks failed"
+            [ "$PYTHON_RESULT" == "failure" ] && echo "  - Python code blocks failed"
+            exit 1
+          fi
+
+          echo "✅ Documentation verification passed (code + AI readability)"

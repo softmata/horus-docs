@@ -1,0 +1,547 @@
+---
+title: "Real Hardware"
+description: "Complete working examples with real I2C IMU and serial motor controller using crates.io and pip libraries — no stubs"
+order: 1
+---
+
+# Real Hardware
+
+Other recipes use `read_hardware()` stubs you need to replace. This recipe shows the **complete working path** — real libraries, real I/O, no placeholders. Use this as a starting point for your robot.
+
+## When To Use This
+
+- You have a real robot with I2C sensors and/or serial actuators
+- You want to see how crates.io / pip libraries integrate with HORUS
+- You want a copy-paste starting point that actually talks to hardware
+
+## Example 1: I2C IMU (MPU6050)
+
+Reads an MPU6050 accelerometer + gyroscope over I2C at 100 Hz. Publishes `Imu` messages.
+
+<LanguageTabs>
+  <LangTab language="Rust">
+
+**horus.toml**
+
+```toml
+[package]
+name = "imu-mpu6050"
+version = "0.1.0"
+
+[dependencies]
+i2cdev = { version = "0.6", source = "crates.io" }
+```
+
+**src/main.rs**
+
+```rust
+// simplified
+use horus::prelude::*;
+use i2cdev::core::I2CDevice;
+use i2cdev::linux::LinuxI2CDevice;
+
+const MPU6050_ADDR: u16 = 0x68;
+const ACCEL_XOUT_H: u8 = 0x3B;
+const PWR_MGMT_1: u8 = 0x6B;
+const ACCEL_SCALE: f64 = 16384.0; // ±2g
+const GYRO_SCALE: f64 = 131.0;    // ±250°/s
+
+struct Mpu6050Node {
+    i2c: LinuxI2CDevice,
+    imu_pub: Topic<Imu>,
+}
+
+impl Mpu6050Node {
+    fn new(bus: &str) -> Result<Self> {
+        let mut i2c = LinuxI2CDevice::new(bus, MPU6050_ADDR)
+            .map_err(|e| Error::from(ConfigError::Other(
+                format!("failed to open {}: {}", bus, e)
+            )))?;
+
+        // Wake the sensor (it starts in sleep mode)
+        i2c.smbus_write_byte_data(PWR_MGMT_1, 0x00)
+            .map_err(|e| Error::from(ConfigError::Other(
+                format!("failed to wake MPU6050: {}", e)
+            )))?;
+
+        Ok(Self {
+            i2c,
+            imu_pub: Topic::new("imu.raw")?,
+        })
+    }
+
+    fn read_sensor(&mut self) -> Option<Imu> {
+        let mut buf = [0u8; 14];
+        // Read 14 bytes starting at ACCEL_XOUT_H
+        // (accel XYZ 6 bytes + temp 2 bytes + gyro XYZ 6 bytes)
+        if self.i2c.smbus_write_byte(ACCEL_XOUT_H).is_err() {
+            return None;
+        }
+        if self.i2c.read(&mut buf).is_err() {
+            return None;
+        }
+
+        let ax = i16::from_be_bytes([buf[0], buf[1]]) as f64 / ACCEL_SCALE * 9.81;
+        let ay = i16::from_be_bytes([buf[2], buf[3]]) as f64 / ACCEL_SCALE * 9.81;
+        let az = i16::from_be_bytes([buf[4], buf[5]]) as f64 / ACCEL_SCALE * 9.81;
+        let gx = i16::from_be_bytes([buf[8], buf[9]]) as f64 / GYRO_SCALE;
+        let gy = i16::from_be_bytes([buf[10], buf[11]]) as f64 / GYRO_SCALE;
+        let gz = i16::from_be_bytes([buf[12], buf[13]]) as f64 / GYRO_SCALE;
+
+        let mut imu = Imu::new();
+        imu.linear_acceleration = [ax, ay, az];
+        imu.angular_velocity = [gx.to_radians(), gy.to_radians(), gz.to_radians()];
+        Some(imu)
+    }
+}
+
+impl Node for Mpu6050Node {
+    fn name(&self) -> &str { "Mpu6050" }
+
+    fn tick(&mut self) {
+        if let Some(imu) = self.read_sensor() {
+            if imu.is_valid() {
+                self.imu_pub.send(imu);
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    scheduler.add(Mpu6050Node::new("/dev/i2c-1")?)
+        .order(0)
+        .rate(100_u64.hz())
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+  </LangTab>
+  <LangTab language="Python">
+
+**horus.toml**
+
+```toml
+[package]
+name = "imu-mpu6050"
+version = "0.1.0"
+language = "python"
+
+[dependencies]
+smbus2 = { version = ">=0.4", source = "pypi" }
+```
+
+**src/main.py**
+
+```python
+import horus
+from horus import Node, Imu, run
+import smbus2
+import struct
+import math
+
+MPU6050_ADDR = 0x68
+ACCEL_XOUT_H = 0x3B
+PWR_MGMT_1 = 0x6B
+ACCEL_SCALE = 16384.0  # ±2g
+GYRO_SCALE = 131.0     # ±250°/s
+
+def imu_init(node):
+    bus = smbus2.SMBus(1)
+    # Wake the sensor (it starts in sleep mode)
+    bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0x00)
+    node.state = {"bus": bus}
+
+def imu_tick(node):
+    bus = node.state["bus"]
+
+    # Read 14 bytes: accel XYZ (6) + temp (2) + gyro XYZ (6)
+    try:
+        data = bus.read_i2c_block_data(MPU6050_ADDR, ACCEL_XOUT_H, 14)
+    except OSError:
+        return  # skip on I2C error
+
+    ax, ay, az = struct.unpack(">hhh", bytes(data[0:6]))
+    gx, gy, gz = struct.unpack(">hhh", bytes(data[8:14]))
+
+    imu = Imu(
+        accel_x=ax / ACCEL_SCALE * 9.81,
+        accel_y=ay / ACCEL_SCALE * 9.81,
+        accel_z=az / ACCEL_SCALE * 9.81,
+        gyro_x=math.radians(gx / GYRO_SCALE),
+        gyro_y=math.radians(gy / GYRO_SCALE),
+        gyro_z=math.radians(gz / GYRO_SCALE),
+    )
+
+    # Skip corrupted readings
+    if any(math.isnan(v) or math.isinf(v) for v in [
+        imu.accel_x, imu.accel_y, imu.accel_z,
+        imu.gyro_x, imu.gyro_y, imu.gyro_z,
+    ]):
+        return
+
+    node.send("imu.raw", imu)
+
+imu_node = Node(
+    name="Mpu6050",
+    init=imu_init,
+    tick=imu_tick,
+    rate=100,
+    order=0,
+    pubs=["imu.raw"],
+)
+
+run(imu_node, rt=True)
+```
+
+  </LangTab>
+</LanguageTabs>
+
+---
+
+## Example 2: Serial Motor Controller (VESC / Generic UART)
+
+Subscribes to `CmdVel`, converts to left/right wheel speeds, sends commands over serial UART. Publishes odometry feedback.
+
+<LanguageTabs>
+  <LangTab language="Rust">
+
+**horus.toml**
+
+```toml
+[package]
+name = "serial-motors"
+version = "0.1.0"
+
+[dependencies]
+serialport = { version = "4.7", source = "crates.io" }
+```
+
+**src/main.rs**
+
+```rust
+// simplified
+use horus::prelude::*;
+use std::io::Write;
+use std::time::Duration;
+
+const WHEEL_BASE: f32 = 0.3;  // meters between wheels
+const MAX_RPM: f32 = 200.0;
+
+struct MotorNode {
+    port: Box<dyn serialport::SerialPort>,
+    cmd_sub: Topic<CmdVel>,
+    odom_pub: Topic<Odometry>,
+    x: f64,
+    y: f64,
+    theta: f64,
+}
+
+impl MotorNode {
+    fn new(port_name: &str, baud: u32) -> Result<Self> {
+        let port = serialport::new(port_name, baud)
+            .timeout(Duration::from_millis(10))
+            .open()
+            .map_err(|e| Error::from(ConfigError::Other(
+                format!("failed to open {}: {}", port_name, e)
+            )))?;
+
+        Ok(Self {
+            port,
+            cmd_sub: Topic::new("cmd_vel")?,
+            odom_pub: Topic::new("odom")?,
+            x: 0.0,
+            y: 0.0,
+            theta: 0.0,
+        })
+    }
+
+    fn send_motor_command(&mut self, left_rpm: f32, right_rpm: f32) {
+        // Protocol: "L<rpm>,R<rpm>\n" — adapt to your motor controller
+        let cmd = format!("L{:.1},R{:.1}\n", left_rpm, right_rpm);
+        let _ = self.port.write_all(cmd.as_bytes());
+    }
+}
+
+impl Node for MotorNode {
+    fn name(&self) -> &str { "Motors" }
+
+    fn tick(&mut self) {
+        let dt = 1.0 / 50.0_f32; // 50 Hz control loop
+
+        if let Some(vel) = self.cmd_sub.recv() {
+            // Differential drive kinematics
+            let v_left = vel.linear - vel.angular * WHEEL_BASE / 2.0;
+            let v_right = vel.linear + vel.angular * WHEEL_BASE / 2.0;
+
+            // Convert m/s to RPM (assuming 0.05m wheel radius)
+            let left_rpm = (v_left / 0.05 * 60.0 / (2.0 * std::f32::consts::PI))
+                .clamp(-MAX_RPM, MAX_RPM);
+            let right_rpm = (v_right / 0.05 * 60.0 / (2.0 * std::f32::consts::PI))
+                .clamp(-MAX_RPM, MAX_RPM);
+
+            self.send_motor_command(left_rpm, right_rpm);
+
+            // Dead-reckoning odometry
+            let dt = dt as f64;
+            self.theta += vel.angular as f64 * dt;
+            self.x += vel.linear as f64 * dt * self.theta.cos();
+            self.y += vel.linear as f64 * dt * self.theta.sin();
+        }
+
+        let mut odom = Odometry::default();
+        odom.pose = Pose2D {
+            x: self.x,
+            y: self.y,
+            theta: self.theta,
+            ..Default::default()
+        };
+        self.odom_pub.send(odom);
+    }
+
+    fn enter_safe_state(&mut self) {
+        // SAFETY: stop both motors immediately
+        self.send_motor_command(0.0, 0.0);
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.send_motor_command(0.0, 0.0);
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    scheduler.add(MotorNode::new("/dev/ttyUSB0", 115200)?)
+        .order(10)
+        .rate(50_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+  </LangTab>
+  <LangTab language="Python">
+
+**horus.toml**
+
+```toml
+[package]
+name = "serial-motors"
+version = "0.1.0"
+language = "python"
+
+[dependencies]
+pyserial = { version = ">=3.5", source = "pypi" }
+```
+
+**src/main.py**
+
+```python
+import horus
+from horus import Node, run, us
+import serial
+import math
+
+WHEEL_BASE = 0.3   # meters between wheels
+MAX_RPM = 200.0
+
+def motor_init(node):
+    port = serial.Serial("/dev/ttyUSB0", 115200, timeout=0.01)
+    node.state = {
+        "port": port,
+        "x": 0.0,
+        "y": 0.0,
+        "theta": 0.0,
+    }
+
+def send_motor_command(port, left_rpm, right_rpm):
+    """Protocol: 'L<rpm>,R<rpm>\n' — adapt to your motor controller."""
+    cmd = f"L{left_rpm:.1f},R{right_rpm:.1f}\n"
+    try:
+        port.write(cmd.encode())
+    except serial.SerialException:
+        pass
+
+def motor_tick(node):
+    s = node.state
+    dt = 1.0 / 50.0  # 50 Hz
+
+    vel = node.recv("cmd_vel")
+    if vel is not None:
+        linear = vel.get("linear", 0.0)
+        angular = vel.get("angular", 0.0)
+
+        # Differential drive kinematics
+        v_left = linear - angular * WHEEL_BASE / 2.0
+        v_right = linear + angular * WHEEL_BASE / 2.0
+
+        # Convert m/s to RPM (0.05m wheel radius)
+        left_rpm = max(-MAX_RPM, min(MAX_RPM,
+            v_left / 0.05 * 60.0 / (2.0 * math.pi)))
+        right_rpm = max(-MAX_RPM, min(MAX_RPM,
+            v_right / 0.05 * 60.0 / (2.0 * math.pi)))
+
+        send_motor_command(s["port"], left_rpm, right_rpm)
+
+        # Dead-reckoning odometry
+        s["theta"] += angular * dt
+        s["x"] += linear * dt * math.cos(s["theta"])
+        s["y"] += linear * dt * math.sin(s["theta"])
+
+    node.send("odom", {
+        "x": s["x"],
+        "y": s["y"],
+        "theta": s["theta"],
+    })
+
+def motor_shutdown(node):
+    # SAFETY: stop both motors
+    send_motor_command(node.state["port"], 0.0, 0.0)
+    node.state["port"].close()
+
+motor = Node(
+    name="Motors",
+    init=motor_init,
+    tick=motor_tick,
+    shutdown=motor_shutdown,
+    rate=50,
+    order=10,
+    on_miss="safe_mode",
+    subs=["cmd_vel"],
+    pubs=["odom"],
+)
+
+run(motor, rt=True)
+```
+
+  </LangTab>
+</LanguageTabs>
+
+---
+
+## Example 3: Both Together
+
+Run the IMU and motor controller as a single robot. The scheduler handles ordering, timing, and safe shutdown for both.
+
+<LanguageTabs>
+  <LangTab language="Rust">
+
+```rust
+// simplified
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .tick_rate(100_u64.hz());
+
+    // Sensor runs first — read IMU
+    scheduler.add(Mpu6050Node::new("/dev/i2c-1")?)
+        .order(0)
+        .rate(100_u64.hz())
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    // Actuator runs after — write motors
+    scheduler.add(MotorNode::new("/dev/ttyUSB0", 115200)?)
+        .order(10)
+        .rate(50_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+  </LangTab>
+  <LangTab language="Python">
+
+```python
+imu_node = Node(
+    name="Mpu6050",
+    init=imu_init,
+    tick=imu_tick,
+    rate=100, order=0,
+    pubs=["imu.raw"],
+)
+
+motor = Node(
+    name="Motors",
+    init=motor_init,
+    tick=motor_tick,
+    shutdown=motor_shutdown,
+    rate=50, order=10,
+    on_miss="safe_mode",
+    subs=["cmd_vel"],
+    pubs=["odom"],
+)
+
+run(imu_node, motor, tick_rate=100, rt=True)
+```
+
+  </LangTab>
+</LanguageTabs>
+
+---
+
+## Adding Dependencies
+
+HORUS projects pull hardware libraries from crates.io and PyPI through `horus.toml`:
+
+```toml
+[dependencies]
+# Rust crates (from crates.io)
+serialport = { version = "4.7", source = "crates.io" }
+i2cdev = { version = "0.6", source = "crates.io" }
+rppal = { version = "0.19", source = "crates.io" }
+
+# Python packages (from PyPI)
+smbus2 = { version = ">=0.4", source = "pypi" }
+pyserial = { version = ">=3.5", source = "pypi" }
+```
+
+Or via the CLI:
+
+```bash
+horus add serialport --source crates.io
+horus add smbus2 --source pypi
+```
+
+HORUS generates the native build files (`.horus/Cargo.toml`, `.horus/pyproject.toml`) from these entries. You never edit them directly.
+
+## Common Hardware Libraries
+
+| Hardware | Rust (crates.io) | Python (PyPI) |
+|----------|-----------------|---------------|
+| Serial/UART | `serialport` | `pyserial` |
+| I2C | `i2cdev` | `smbus2` |
+| SPI | `spidev` | `spidev` |
+| GPIO | `rppal` (RPi) or `gpio-cdev` | `RPi.GPIO` or `gpiod` |
+| CAN bus | `socketcan` | `python-can` |
+| USB | `nusb` or `rusb` | `pyusb` |
+| Cameras | `v4l2` or `nokhwa` | `opencv-python` |
+| Bluetooth | `btleplug` | `bleak` |
+
+## Key Points
+
+- **No special driver API needed** — use any crates.io or pip library inside your Node
+- **`horus.toml [dependencies]`** with `source = "crates.io"` or `source = "pypi"` pulls the library
+- **The Node trait** is the integration point: `init()` opens hardware, `tick()` reads/writes, `shutdown()` stops
+- **The scheduler** handles timing, RT priority, deadline enforcement, and ordered shutdown
+- **Topics** connect your hardware nodes to the rest of the system with zero-copy IPC
+- **All other recipes** use `read_hardware()` stubs — replace them with the patterns shown here
+
+---
+
+## See Also
+
+- [IMU Reader](/recipes/imu-reader) — IMU recipe with orientation estimation (uses stubs)
+- [Servo Controller](/recipes/servo-controller) — Multi-servo bus recipe (uses stubs)
+- [Differential Drive](/recipes/differential-drive) — Full kinematics + odometry
+- [Driver API](/rust/api/drivers) — Config-based driver loading (optional convenience)
+- [Configuration Reference](/package-management/configuration) — `horus.toml` dependency syntax

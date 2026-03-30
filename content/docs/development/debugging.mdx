@@ -1,0 +1,320 @@
+---
+title: "Debugging Workflows"
+description: "Step-by-step debugging for deadline misses, panics, and performance bottlenecks"
+order: 7
+---
+
+# Debugging Workflows
+
+Your robot is misbehaving at runtime: motors stutter, nodes panic, or the system cannot keep up with its tick rate. Here are three step-by-step workflows to diagnose and fix the most common issues.
+
+## When To Use This
+
+- A motor or actuator stutters or responds inconsistently (deadline misses)
+- A node crashes with a panic and you need to find the root cause
+- The system runs but cannot maintain its target tick rate (performance)
+
+**Use [Testing](/development/testing) instead** if you are writing tests before deployment, not debugging a live system.
+
+**Use [Monitor](/development/monitor) instead** if you want a visual dashboard for ongoing observation rather than targeted debugging.
+
+## Prerequisites
+
+- A HORUS application that reproduces the problem
+- Familiarity with [Nodes](/concepts/core-concepts-nodes) and [Execution Classes](/concepts/execution-classes)
+- Access to a terminal on the robot (or SSH)
+
+## Workflow 1: "My Motor Stutters"
+
+Stuttering usually means deadline misses — the control loop is not completing within its budget.
+
+### Step 1: Check Scheduler Output
+
+Enable monitoring and look for deadline miss warnings in stderr:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .verbose(true)
+        .tick_rate(1000_u64.hz());
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    scheduler = horus.Scheduler(tick_rate=1000, verbose=True)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+The scheduler prints a timing report on shutdown. Look for lines like:
+
+```
+[WARN] motor_ctrl: 12 deadline misses (worst: 2.3ms, budget: 1.0ms)
+```
+
+### Step 2: Profile Tick Timing
+
+Use `profile()` to get percentile statistics:
+
+```rust
+// simplified
+let report = scheduler.profile(5000)?;
+println!("{report}");
+
+// Check per-node budget utilization
+for node in &report.nodes {
+    if let Some(used) = node.budget_used {
+        if used > 0.8 {
+            println!("WARNING: {} using {:.0}% of budget", node.name, used * 100.0);
+        }
+    }
+}
+```
+
+If `p99` exceeds the budget, the node has latency spikes. If `p99` is much higher than `median`, the node's execution time is inconsistent.
+
+### Step 3: Use Blackbox to Find the Exact Tick
+
+Enable the blackbox to record the last N ticks per node:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .verbose(true)
+        .with_blackbox(64)
+        .tick_rate(1000_u64.hz());
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    scheduler = horus.Scheduler(tick_rate=1000, verbose=True, blackbox_mb=64)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+After a miss, inspect the blackbox to find what happened on the tick that exceeded the budget. The blackbox records tick duration, input values, and events.
+
+### Step 4: Fix Common Causes
+
+| Cause | Symptom | Fix |
+|-------|---------|-----|
+| Allocation in `tick()` | Sporadic spikes | Pre-allocate buffers in `init()` |
+| Blocking I/O | Consistent high latency | Move to `.async_io()` node |
+| Lock contention | Spikes correlated with other nodes | Use `try_lock()` or lock-free channels |
+| Large computation | Always near budget | Move to `.compute()` with a longer budget |
+
+```rust
+// simplified
+// Bad: allocating every tick
+fn tick(&mut self) {
+    let data: Vec<f64> = self.sensor.read_all(); // allocates
+    self.process(&data);
+}
+
+// Good: pre-allocate, reuse buffer
+fn init(&mut self) -> Result<()> {
+    self.buffer = vec![0.0; 128]; // allocate once
+    Ok(())
+}
+fn tick(&mut self) {
+    self.sensor.read_into(&mut self.buffer); // reuse
+    self.process(&self.buffer);
+}
+```
+
+## Workflow 2: "My Node Panicked"
+
+A node panic is caught by the scheduler. The node is marked `Unhealthy` and `on_error()` is called.
+
+### Step 1: Check on_error() Output
+
+Implement `on_error()` on your node to log the error:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    impl Node for MotorCtrl {
+        fn on_error(&mut self, error: &str) {
+            eprintln!("MotorCtrl error: {error}");
+            // Optionally: enter safe state, publish error topic
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    def motor_tick(node):
+        try:
+            # Motor control logic
+            pass
+        except Exception as e:
+            node.log_error(f"MotorCtrl error: {e}")
+            # Optionally: enter safe state
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Step 2: Get a Full Backtrace
+
+```bash
+RUST_BACKTRACE=1 ./target/release/my_robot
+```
+
+### Step 3: Reproduce with Deterministic Mode
+
+Use deterministic mode and `tick_once()` to replay the exact scenario:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .deterministic(true)
+        .tick_rate(100_u64.hz());
+
+    scheduler.add(MotorCtrl::new()).build()?;
+
+    // Step through ticks one at a time
+    for i in 0..1000 {
+        println!("tick {i}");
+        scheduler.tick_once(); // panics are reproducible
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    scheduler = horus.Scheduler(tick_rate=100, deterministic=True)
+    scheduler.add(horus.Node(tick=motor_tick))
+
+    # Step through ticks one at a time
+    for i in range(1000):
+        print(f"tick {i}")
+        scheduler.tick_once()  # exceptions are reproducible
+    ```
+  </LangTab>
+</LanguageTabs>
+
+Use `tick(&["motor_ctrl"])` to isolate a single node.
+
+### Step 4: Fix the Panic
+
+Fix the bug directly if it is in your code. For panics in third-party code, wrap with `catch_unwind`:
+
+```rust
+// simplified
+fn tick(&mut self) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        self.flaky_library.update();
+    }));
+    if let Err(e) = result {
+        eprintln!("Library panicked: {e:?}");
+    }
+}
+```
+
+## Workflow 3: "My System Is Slow"
+
+The system runs but cannot keep up with its tick rate.
+
+### Step 1: Find the Slowest Node
+
+```rust
+// simplified
+let report = scheduler.profile(1000)?;
+println!("{report}");
+
+// Nodes are listed with median and p99 timing
+// The node with the highest p99 is your bottleneck
+for node in &report.nodes {
+    println!("{}: median={:?} p99={:?}", node.name, node.median, node.p99);
+}
+```
+
+Sort by `p99` to find the node causing the most delay.
+
+### Step 2: Check Execution Classes
+
+A common mistake is running heavy work as `BestEffort` (the default), which blocks the main thread:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    // Bad: heavy computation blocks the main loop
+    scheduler.add(PathPlanner::new()).build()?;
+
+    // Good: run on a compute thread pool
+    scheduler.add(PathPlanner::new())
+        .compute()
+        .build()?;
+
+    // Good: run blocking I/O on an async thread
+    scheduler.add(CameraDriver::new())
+        .async_io()
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    # Bad: heavy computation blocks the main loop
+    scheduler.add(horus.Node(tick=planner_fn))
+
+    # Good: mark heavy nodes for proper scheduling
+    scheduler.add(horus.Node(tick=planner_fn, order=50))
+    scheduler.add(horus.Node(tick=camera_fn, order=100))
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Step 3: Check CPU and Profile
+
+```bash
+# Per-core CPU usage — if one core is 100% while others idle, use .compute()
+mpstat -P ALL 1 5
+
+# Profile with perf to find hot functions
+perf record -g ./target/release/my_robot && perf report
+```
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| One core at 100% | Work not distributed | Use `.compute()`, `.cores(&[...])` |
+| Periodic spikes ~1s | Allocator pressure | Use `jemalloc`, pre-allocate |
+| Latency grows over time | Memory leak | Monitor RSS, fix leaking buffers |
+| Random multi-ms stalls | Page faults | `.require_rt()` calls `mlockall` |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Motor stutters periodically | Deadline misses in control node | Profile with `scheduler.profile()`, increase `.budget()` or move allocations to `init()` |
+| Node marked `Unhealthy` | Panic caught by scheduler | Implement `on_error()`, run with `RUST_BACKTRACE=1`, reproduce with `tick_once()` |
+| System cannot keep tick rate | Bottleneck node blocking main thread | Profile to find slowest node, use `.compute()` or `.async_io()` for heavy work |
+| Sporadic latency spikes ~1s apart | Allocator pressure (malloc) | Pre-allocate buffers in `init()`, consider `jemalloc` |
+| Latency grows over time | Memory leak in a node | Monitor RSS over time, fix leaking buffers or growing collections |
+| Random multi-ms stalls | Page faults from virtual memory | Use `.require_rt()` which calls `mlockall` to lock pages |
+
+---
+
+## See Also
+
+- [Logging](/development/logging) — Structured logging with `hlog!`, `hlog_once!`, and `hlog_every!`
+- [BlackBox Flight Recorder](/advanced/blackbox) — Post-mortem tick analysis and anomaly filtering
+- [Monitor](/development/monitor) — Real-time visual debugging with web and TUI dashboards
+- [Execution Classes](/concepts/execution-classes) — Understanding Rt, Compute, Event, AsyncIo, and BestEffort
+- [Troubleshooting](/getting-started/troubleshooting) — Common issues and solutions

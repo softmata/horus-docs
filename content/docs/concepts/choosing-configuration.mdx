@@ -1,0 +1,370 @@
+---
+title: "Choosing Your Configuration"
+description: "A progressive guide to HORUS scheduler and node settings — from prototyping to production"
+order: 4
+---
+
+# Choosing Your Configuration
+
+HORUS has dozens of configuration options: tick rates, budgets, deadlines, execution classes, miss policies, watchdogs, CPU pinning, flight recorders. If you try to learn them all at once, you'll drown in complexity before building anything.
+
+The good news: you don't need any of them to get started. Defaults work. This guide adds configuration in layers — you only move to the next level when your project needs it.
+
+## Level 0: Just Getting Started
+
+You need **nothing**. Defaults work:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    let mut scheduler = Scheduler::new();
+    scheduler.add(MyNode::new()).build()?;
+    scheduler.run()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    node = horus.Node(name="my_node", tick=my_tick, rate=30)
+    horus.run(node)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+This gives you: 100Hz tick rate, best-effort scheduling, no RT, no safety monitor. Good enough for learning and prototyping.
+
+## Level 1: Setting Tick Rates
+
+When you know how fast your nodes should run:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .tick_rate(100_u64.hz());         // scheduler runs at 100Hz
+
+    scheduler.add(sensor)
+        .order(0)                          // runs first
+        .rate(100_u64.hz())                // ticks at 100Hz
+        .build()?;
+
+    scheduler.add(controller)
+        .order(1)                          // runs second
+        .rate(100_u64.hz())
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    sensor = horus.Node(name="sensor", tick=read_sensor, order=0, rate=100)
+    controller = horus.Node(name="controller", tick=control, order=1, rate=100)
+
+    sched = horus.Scheduler(tick_rate=100)
+    horus.run(sensor, controller)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**When to add `.order()`**: When execution order matters. Sensor before controller. Controller before motor driver. Lower number = runs first.
+
+**When to add `.rate()`**: When your node needs a specific frequency. A camera at 30Hz. A motor controller at 1kHz. Without `.rate()`, the node ticks at the scheduler's global rate.
+
+## Level 2: Separating Workloads
+
+When you have both fast control and slow computation:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    // Fast motor control — dedicated RT thread
+    scheduler.add(motor_ctrl)
+        .order(0)
+        .rate(1000_u64.hz())               // auto-RT at 1kHz
+        .build()?;
+
+    // Slow path planning — separate compute pool
+    scheduler.add(planner)
+        .order(5)
+        .compute()                         // won't block motor control
+        .build()?;
+
+    // Network upload — async I/O pool
+    scheduler.add(telemetry)
+        .order(100)
+        .async_io()                        // won't block anything
+        .rate(1_u64.hz())
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    # Fast motor control — dedicated RT thread
+    motor_ctrl = horus.Node(name="motor_ctrl", tick=control_motor,
+                            order=0, rate=1000)           # auto-RT at 1kHz
+
+    # Slow path planning — separate compute pool
+    planner = horus.Node(name="planner", tick=plan_path,
+                         order=5, compute=True)           # won't block motor control
+
+    # Network upload — async I/O pool
+    async def upload(node):
+        await send_telemetry()
+
+    telemetry = horus.Node(name="telemetry", tick=upload,
+                           order=100, async_io=True, rate=1)  # won't block anything
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**When to add `.compute()`**: For CPU-heavy work (SLAM, planning, ML inference) that takes more than a few milliseconds. Keeps it off the RT thread.
+
+**When to add `.async_io()`**: For I/O-bound work (network, files, database). Never blocks anything.
+
+**When to add `.on("topic")`**: When a node should only run when new data arrives on a topic, not on a fixed schedule.
+
+## Level 3: Safety for Real Robots
+
+When deploying on physical hardware:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .tick_rate(500_u64.hz())
+        .prefer_rt()                       // try SCHED_FIFO + mlockall
+        .watchdog(500_u64.ms());           // detect frozen nodes
+
+    scheduler.add(motor_ctrl)
+        .order(0)
+        .rate(500_u64.hz())
+        .on_miss(Miss::SafeMode)           // enter safe state on deadline miss
+        .build()?;
+
+    scheduler.add(sensor_driver)
+        .order(1)
+        .rate(100_u64.hz())
+        .failure_policy(FailurePolicy::restart(3, 100_u64.ms()))  // restart on crash
+        .build()?;
+
+    scheduler.add(logger)
+        .order(100)
+        .async_io()
+        .failure_policy(FailurePolicy::Ignore)  // never crash for logging
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    motor_ctrl = horus.Node(
+        name="motor_ctrl", tick=control_motor,
+        order=0, rate=500, on_miss="safe_mode",
+    )
+    sensor_driver = horus.Node(
+        name="sensor_driver", tick=read_sensor,
+        order=1, rate=100, failure_policy="restart",
+    )
+    logger = horus.Node(
+        name="logger", tick=log_data,
+        order=100, async_io=True, failure_policy="ignore",
+    )
+
+    sched = horus.Scheduler(tick_rate=500, watchdog_ms=500, rt=True)
+    horus.run(motor_ctrl, sensor_driver, logger)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**When to add `.prefer_rt()`**: When running on a real robot. Enables OS-level RT features for better timing.
+
+**When to add `.watchdog()`**: When you need to detect nodes that hang or deadlock.
+
+**When to add `.on_miss()`**: For safety-critical nodes. What happens when a motor controller misses its deadline?
+
+| Policy | Use When |
+|--------|----------|
+| `Miss::Warn` | Default. Non-critical nodes. |
+| `Miss::Skip` | Video encoding, logging. Drop a frame, keep going. |
+| `Miss::SafeMode` | Motor controllers. Reduce speed or hold position. |
+| `Miss::Stop` | Emergency systems. Stop everything. |
+
+**When to add `.failure_policy()`**: To control what happens when `tick()` panics or errors.
+
+| Policy | Use When |
+|--------|----------|
+| `Fatal` | Motor control, safety. Stop if broken. |
+| `Restart(n, backoff)` | Sensor drivers. Reconnect after crash. |
+| `Skip(n, cooldown)` | Logging, telemetry. Tolerate failures. |
+| `Ignore` | Debug output. Partial results are fine. |
+
+## Level 4: Production Deployment
+
+For robots running unattended:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .tick_rate(500_u64.hz())
+        .prefer_rt()
+        .watchdog(500_u64.ms())
+        .blackbox(64)                      // 64MB crash recorder
+        .max_deadline_misses(50);          // emergency stop after 50 misses
+
+    scheduler.add(safety_monitor)
+        .order(0)
+        .rate(1000_u64.hz())
+        .priority(99)                      // highest OS priority
+        .core(2)                           // pinned to CPU core 2
+        .watchdog(5_u64.ms())              // tight per-node watchdog
+        .on_miss(Miss::Stop)
+        .failure_policy(FailurePolicy::Fatal)
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    safety_monitor = horus.Node(
+        name="safety_monitor", tick=check_safety,
+        order=0, rate=1000, priority=99, core=2,
+        watchdog=5 * horus.ms, on_miss="stop", failure_policy="fatal",
+    )
+
+    sched = horus.Scheduler(
+        tick_rate=500, watchdog_ms=500, blackbox=64,
+        max_deadline_misses=50, rt=True,
+    )
+    horus.run(safety_monitor)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**When to add `.blackbox()`**: For crash forensics. "Why did the robot stop at 3 AM?"
+
+**When to add `.priority()`**: When you need OS-level thread priority (SCHED_FIFO). Only for RT nodes.
+
+**When to add `.core()`**: When you need CPU pinning. Prevents cache thrashing on multi-core systems.
+
+**When to add per-node `.watchdog()`**: When different nodes need different timeout tolerances. A safety monitor needs 5ms. A logger can tolerate 5 seconds.
+
+## Level 5: Simulation and Testing
+
+For deterministic, reproducible behavior:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .deterministic(true)               // virtual clock + dependency ordering
+        .tick_rate(100_u64.hz());
+
+    // Use horus::dt() instead of Instant::now()
+    // Use horus::rng() instead of rand::random()
+    // Same code works in both normal and deterministic mode
+
+    for _ in 0..1000 {
+        scheduler.tick_once()?;            // exact same output every run
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    sched = horus.Scheduler(tick_rate=100, deterministic=True)
+
+    # Use horus.dt() instead of time.time()
+    # Same code works in both normal and deterministic mode
+
+    for _ in range(1000):
+        sched.tick_once()                  # exact same output every run
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**When to add `.deterministic(true)`**: Simulation, testing, CI pipelines. NOT for real robots (virtual time can't drive hardware).
+
+**When to add `.with_recording()`**: To capture a session for later replay and debugging.
+
+## Decision Flowchart
+
+```
+Are you learning / prototyping?
+  → Level 0: Scheduler::new(), no options
+
+Do you have multiple nodes at different rates?
+  → Level 1: add .order() and .rate()
+
+Do you have slow compute (SLAM, planning) alongside fast control?
+  → Level 2: add .compute() for heavy work
+
+Are you running on a physical robot?
+  → Level 3: add .prefer_rt(), .watchdog(), .on_miss(), .failure_policy()
+
+Is the robot running unattended / in production?
+  → Level 4: add .blackbox(), .priority(), .core()
+
+Do you need reproducible tests or simulation?
+  → Level 5: add .deterministic(true)
+```
+
+## Quick Reference: All Options
+
+### Scheduler
+
+| Method | Level | What It Does |
+|--------|-------|-------------|
+| `.tick_rate(freq)` | 1 | Global tick rate |
+| `.prefer_rt()` | 3 | Enable OS RT features |
+| `.require_rt()` | 4 | Panic if RT unavailable |
+| `.watchdog(Duration)` | 3 | Detect frozen nodes |
+| `.blackbox(size_mb)` | 4 | Crash recorder |
+| `.max_deadline_misses(n)` | 4 | Emergency stop threshold |
+| `.cores(&[usize])` | 4 | CPU core pinning |
+| `.deterministic(bool)` | 5 | Reproducible execution |
+| `.with_recording()` | 5 | Record for replay |
+| `.verbose(bool)` | 3 | Control log output |
+| `.telemetry(endpoint)` | 4 | Export metrics |
+
+### Node Builder
+
+| Method | Level | What It Does |
+|--------|-------|-------------|
+| `.order(u32)` | 1 | Execution priority |
+| `.rate(Frequency)` | 1 | Tick rate (auto-RT) |
+| `.compute()` | 2 | CPU-bound thread pool |
+| `.async_io()` | 2 | I/O-bound async pool |
+| `.on("topic")` | 2 | Event-triggered |
+| `.on_miss(Miss)` | 3 | Deadline miss response (warned if no deadline) |
+| `.failure_policy(Policy)` | 3 | Crash recovery |
+| `.budget(Duration)` | 3 | Override tick budget (RT only — rejected on non-RT) |
+| `.deadline(Duration)` | 3 | Override deadline (RT only — rejected on non-RT) |
+| `.priority(i32)` | 4 | OS thread priority (RT only — warned if non-RT) |
+| `.core(usize)` | 4 | CPU core pinning (RT only — warned if non-RT) |
+| `.watchdog(Duration)` | 4 | Per-node watchdog |
+| `.build()` | 0 | Validate & finalize (always needed) |
+
+> **Tip:** `.build()` catches common mistakes — see [Validation & Conflicts](/concepts/execution-classes#validation--conflicts) for what's rejected vs warned.
+
+## Design Decisions
+
+**Why progressive levels instead of a single "best practices" page?**
+A beginner reading about CPU pinning and SCHED_FIFO priorities before they've written their first node will be overwhelmed and conclude HORUS is complex. The progressive structure matches complexity to experience: Level 0 is a single function call, Level 4 is production deployment. Each level adds only what that stage of development needs.
+
+**Why are defaults deliberately simple?**
+`Scheduler::new()` creates a 100 Hz best-effort scheduler with no RT, no watchdog, no safety monitor. This is intentional — a beginner should be able to run their first robot with zero configuration. Adding `.prefer_rt()` or `.watchdog()` is a conscious decision made when the developer understands why they need it.
+
+## See Also
+
+- [Builder Composition Guide](/concepts/builder-composition) — How builder methods interact, override, and compose
+- [Execution Classes](/concepts/execution-classes) — The 5 classes and when to use each
+- [Scheduler — Full Reference](/concepts/core-concepts-scheduler) — Deep dive into all scheduler features
+- [Scheduler API](/rust/api/scheduler) — Builder method reference
+- [Real-Time Systems](/concepts/real-time) — Understanding timing requirements
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Advanced tuning

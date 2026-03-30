@@ -1,0 +1,809 @@
+---
+title: Performance Optimization
+description: Get maximum performance from HORUS
+order: 22
+category: "advanced"
+---
+
+# Performance Optimization
+
+HORUS is already fast by default. This guide helps you squeeze out extra performance when needed.
+
+## Problem Statement
+
+Your HORUS application works correctly but you need to reduce latency, increase throughput, or meet real-time deadlines for production deployment.
+
+## When To Use
+
+- Your node `tick()` exceeds 1ms and you need to find the bottleneck
+- You are deploying to resource-constrained hardware (Raspberry Pi, Jetson Nano)
+- You need bounded latency for safety-critical control loops
+- Your throughput doesn't meet requirements for high-frequency sensors
+
+## Prerequisites
+
+- A working HORUS application (optimize correctness first, then performance)
+- Release builds (`horus run --release`) -- debug builds are 10-100x slower
+- Basic understanding of [Nodes](/concepts/core-concepts-nodes) and [Scheduler](/concepts/core-concepts-scheduler)
+
+---
+
+## Cross-Platform Philosophy
+
+HORUS is designed for **development on any OS** with **production deployment on Linux**:
+
+| Phase | Supported Platforms | Performance |
+|-------|---------------------|-------------|
+| **Development** | Windows, macOS, Linux | Good (standard IPC) |
+| **Testing** | Windows, macOS, Linux | Good (standard IPC) |
+| **Production** | Linux (recommended) | Best (sub-100ns with RT) |
+
+All performance features use **graceful degradation** — your code runs everywhere, with maximum performance on Linux. Advanced features like `.prefer_rt()` (which enables SCHED_FIFO and mlockall on Linux) and SIMD acceleration automatically fall back to safe defaults on unsupported platforms.
+
+## Why HORUS is Fast
+
+### Shared Memory Architecture
+
+**Zero network overhead**: Data written to shared memory, read directly by subscribers
+
+HORUS automatically selects the optimal shared memory backend for your platform (Linux, macOS, Windows). No configuration needed.
+
+**Zero serialization**: Fixed-size structs copied directly to shared memory
+
+**Zero-copy loan pattern**: Publishers write directly to shared memory slots
+
+### Data Path
+
+Where does latency actually go? This diagram shows the publish-to-subscribe path:
+
+```
+publish()
+   │
+   ▼
+┌─────────────────────┐
+│ POD type?           │
+│  yes → memcpy       │ ◄── ~6ns
+│  no  → serialize    │ ◄── 50-500ns
+└─────────────────────┘
+   │
+   ▼
+┌─────────────────────┐
+│ Ring buffer slot    │  (shared memory)
+└─────────────────────┘
+   │
+   │  atomic index update ◄── ~2ns
+   │
+   ▼
+recv()
+   │
+   ▼
+┌─────────────────────┐
+│ POD → memcpy        │
+│ else → deserialize  │
+└─────────────────────┘
+```
+
+**Where time is spent:**
+- **POD path** (fixed-size `Copy` types): ~11ns for the memcpy, ~3ns for the atomic — total **14ns** same-thread (measured via RDTSC on i9-14900K)
+- **Serde path** (types with `Vec`, `String`, etc.): serialization dominates, typically 50-500ns depending on size
+- **Cross-thread overhead**: cache-line transfer adds ~68ns for SPSC, ~164ns for contended MPMC
+
+This is why fixed-size types matter: they skip serialization entirely.
+
+### Optimized Data Structures
+
+HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — same-thread paths achieve **14ns**, cross-thread SPSC achieves **82ns**, and cross-process achieves **162ns** with only 99ns overhead over the 63ns hardware floor.
+
+## Benchmark Results
+
+Measured on **Intel i9-14900K (32 cores), WSL2, release mode, RDTSC timing**. Run `cargo run --release -p horus_benchmarks --bin all_paths_latency` to reproduce on your hardware.
+
+For detailed methodology and raw data, see the dedicated **[Benchmarks](/performance/benchmarks)** page.
+
+### IPC Latency (All Backend Paths)
+
+| Scenario | Backend | p50 | p99 | p99.9 | max |
+|----------|---------|-----|-----|-------|-----|
+| Same thread | DirectChannel | **12ns** | 13ns | 13ns | 13ns |
+| Cross-thread 1:1 | SpscIntra | **91ns** | 107ns | 125ns | 125ns |
+| Cross-thread 1:N | SpmcIntra | **80ns** | 92ns | 94ns | 94ns |
+| Cross-thread N:1 | MpscIntra | **187ns** | 372ns | 458ns | 464ns |
+| Cross-thread N:N | FanoutIntra | **150ns** | 307ns | 322ns | 322ns |
+| Cross-process 1:1 | SpscShm | **171ns** | 192ns | 195ns | 195ns |
+| Cross-process MPMC | FanoutShm | **91ns** | 230ns | — | — |
+| Cross-process broadcast | PodShm | **152ns** | 227ns | 254ns | 254ns |
+| Hardware floor (raw SHM atomic) | — | **57ns** | — | — | — |
+
+Framework overhead: ~99ns over the 63ns hardware floor for cross-process 1:1.
+
+### Robotics Message Types
+
+| Message | Size | Median | p99 | Throughput |
+|---------|------|--------|-----|-----------|
+| CmdVel | 16B | **89ns** | 91ns | 11.1M msg/s |
+| Imu | 304B | **119ns** | 150ns | 7.8M msg/s |
+| LaserScan | 1,480B | **151ns** | 184ns | 6.3M msg/s |
+| JointCommand | 928B | **128ns** | 157ns | 8.1M msg/s |
+
+All message types pass real-time suitability: CmdVel at 10kHz (p99=91ns), Imu at 500Hz (p99=150ns), LaserScan at 40Hz (p99=184ns).
+
+### Python Binding Performance
+
+| Operation | p50 | p99 | Throughput | Overhead vs Rust |
+|-----------|-----|-----|-----------|-----------------|
+| CmdVel send+recv (typed) | **1.7μs** | 2.4μs | 2.7M msg/s | 78x (GIL + PyO3) |
+| Pose2D send+recv (typed) | **1.7μs** | 3.0μs | 2.7M msg/s | 76x |
+| Imu send+recv (typed) | **1.9μs** | 4.2μs | 2.4M msg/s | 63x |
+| dict send+recv (1 key) | **6.2μs** | 19.9μs | 714K msg/s | 284x |
+| dict send+recv (4 keys) | **12.4μs** | 34.2μs | 382K msg/s | 564x |
+| dict send+recv (50 keys) | **111μs** | 196μs | 42K msg/s | 5,065x |
+| Image.to_numpy (640x480) | **3.0μs** | 14.7μs | 1.5M/s | — |
+| np.from_dlpack (640x480) | **1.1μs** | 3.9μs | 3.5M/s | Zero-copy |
+
+**Key takeaway**: Typed Python topics (`Topic(CmdVel)`) achieve **1.7μs** — fast enough for 30Hz ML inference pipelines. Generic dict topics are 4-60x slower due to serialization. DLPack gives true zero-copy image access at **1.1μs**.
+
+**Scheduler tick overhead**: Python GIL acquire adds ~11μs per tick (Rust→Python→Rust). At 10kHz target, achieved 5,932 Hz — GIL is the bottleneck. For high-frequency control, use Rust nodes.
+
+### HORUS vs Competition
+
+| Transport | Size | p50 | Throughput | Speedup |
+|-----------|------|-----|-----------|---------|
+| **HORUS SHM** | 8B | **23ns** | 100M+ msg/s | — |
+| Raw UDP | 8B | 1,235ns | 3.9M msg/s | **54x slower** |
+| **HORUS SHM** | 32B | **23ns** | 101M+ msg/s | — |
+| Raw UDP | 32B | 1,122ns | 4.1M msg/s | **49x slower** |
+
+### Scalability
+
+| Topology | Throughput |
+|----------|-----------|
+| 1 pub, 1 sub | 2.4M msg/s |
+| 2 pub, 1 sub | 7.2M msg/s |
+| 4 pub, 1 sub | 11.8M msg/s |
+| 4 pub, 4 sub | 11.2M msg/s |
+| 8 pub, 8 sub | 8.4M msg/s |
+| Peak (6 pub, 1 sub) | **13.5M msg/s** |
+
+### Real-Time Determinism
+
+| Metric | Value |
+|--------|-------|
+| Median latency | 86ns |
+| p99 | 109ns |
+| p99.9 | 112ns |
+| Std dev | 7.9ns |
+| Deadline misses at 1μs | 0.02% (212/1M) |
+
+### Hardware Baselines (Raw Operations)
+
+| Operation | Size | Median |
+|-----------|------|--------|
+| memcpy | 8B | 11ns |
+| memcpy | 1KB | 17ns |
+| memcpy | 8KB | 49ns |
+| memcpy | 64KB | 811ns |
+| Atomic store+load | 8B | 11ns |
+| mmap write+read | 8B | 11ns |
+
+### Running Benchmarks
+
+```bash
+# All backend paths (main benchmark, ~2 min)
+cargo run --release -p horus_benchmarks --bin all_paths_latency
+
+# Robotics message types (CmdVel, Imu, LaserScan)
+cargo run --release -p horus_benchmarks --bin robotics_messages_benchmark
+
+# HORUS vs UDP comparison
+cargo run --release -p horus_benchmarks --bin competitor_comparison
+
+# Scalability (thread count sweep)
+cargo run --release -p horus_benchmarks --bin scalability_benchmark
+
+# Hardware floor baselines
+cargo run --release -p horus_benchmarks --bin raw_baselines
+
+# RT determinism analysis
+cargo run --release -p horus_benchmarks --bin determinism_benchmark
+
+# Full suite (~30 min)
+./benchmarks/research/run_all.sh
+```
+
+## Build Optimization
+
+### Always Use Release Mode
+
+Debug builds are **10-100x slower**:
+
+```bash
+# SLOW: Debug build (50us/tick)
+horus run
+
+# FAST: Release build (500ns/tick)
+horus run --release
+```
+
+Always use `--release` for benchmarks and production. There is no scenario where profiling debug builds gives useful results.
+
+### Link-Time Optimization (LTO)
+
+Enable LTO in your `Cargo.toml` for additional 10-20% speedup:
+
+```toml
+# Cargo.toml
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+```
+
+**Warning**: Slower compilation, but faster execution.
+
+### Target CPU Features
+
+**CPU-Specific Optimizations:**
+
+HORUS compiles with Rust compiler optimizations enabled in release mode. For advanced CPU-specific tuning, the framework is optimized for modern x86-64 and ARM64 processors.
+
+**Gains**: 5-15% from CPU-specific SIMD instructions (automatically enabled in release builds).
+
+### Hardware Acceleration
+
+HORUS automatically uses hardware-accelerated memory operations when available (e.g., SIMD on x86_64). No configuration needed — your code runs on any platform, with extra performance on supported hardware.
+
+For maximum performance, compile targeting your specific CPU:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+## Message Optimization
+
+### Use Fixed-Size Types
+
+```rust
+// simplified
+// FAST: Fixed-size array
+pub struct LaserScan {
+    pub ranges: [f32; 360],  // Stack-allocated
+}
+
+// SLOW: Dynamic vector
+pub struct BadLaserScan {
+    pub ranges: Vec<f32>,  // Heap-allocated
+}
+```
+
+**Impact**: Fixed-size avoids heap allocations in hot path.
+
+### Choose Typed Messages Over Generic
+
+```rust
+// simplified
+// FAST: Small, fixed-size struct
+let topic: Topic<Pose2D> = Topic::new("pose")?;
+topic.send(Pose2D { x: 1.0, y: 2.0, theta: 0.5 });
+// IPC latency: ~23-155ns depending on topology
+
+// SLOWER: Larger struct with more data
+let topic: Topic<SensorBundle> = Topic::new("sensors")?;
+// Latency scales linearly with message size
+```
+
+**Rule**: Use the smallest struct that represents your data. Avoid padding and unused fields.
+
+### Choose Appropriate Precision
+
+```rust
+// simplified
+// f32 (single precision) - sufficient for most robotics
+pub struct FastPose {
+    pub x: f32,  // 4 bytes
+    pub y: f32,  // 4 bytes
+}
+
+// f64 (double precision) - scientific applications
+pub struct PrecisePose {
+    pub x: f64,  // 8 bytes
+    pub y: f64,  // 8 bytes
+}
+```
+
+**Rule**: Use `f32` unless you need scientific precision.
+
+### Minimize Message Size
+
+Every byte adds latency — message size is the single biggest factor after backend selection.
+
+```rust
+// simplified
+// GOOD: 8 bytes — fast memcpy
+struct CompactCmd {
+    linear: f32,   // 4 bytes
+    angular: f32,  // 4 bytes
+}
+
+// BAD: 1KB+ — unnecessary bulk
+struct BloatedCmd {
+    linear: f32,
+    angular: f32,
+    metadata: [u8; 256],    // Unused
+    debug_info: [u8; 768],  // Unused
+}
+```
+
+For genuinely large data (images, point clouds), compress before publishing:
+
+```rust
+// simplified
+// Large raw image: 1MB per message
+pub struct RawImage {
+    pixels: [u8; 1_000_000],
+}
+
+// Compressed: ~50KB per message (20x smaller)
+pub struct CompressedImage {
+    data: Vec<u8>,  // JPEG compressed
+}
+```
+
+Compression adds CPU cost but dramatically reduces IPC time for large payloads. Profile to find the crossover point for your use case (typically around 10KB+).
+
+### Batch Small Messages
+
+Instead of sending 100 separate f32 values:
+
+```rust
+// simplified
+// SLOW: 100 separate messages
+for value in values {
+    topic.send(value);  // 100 IPC operations
+}
+
+// FAST: One batched message
+pub struct BatchedData {
+    values: [f32; 100],
+}
+topic.send(batched);  // 1 IPC operation
+```
+
+**Speedup**: 50-100x for batched operations.
+
+## Node Optimization
+
+### Keep tick() Fast
+
+Target: **&lt;1ms per tick** for real-time control.
+
+```rust
+// simplified
+// GOOD: Fast tick
+fn tick(&mut self) {
+    let data = self.read_sensor();     // Quick read
+    self.process_pub.send(data);  // ~500ns
+}
+
+// BAD: Slow tick
+fn tick(&mut self) {
+    let data = std::fs::read_to_string("config.yaml").unwrap();  // 1-10ms!
+    // ...
+}
+```
+
+**File I/O, network calls, sleeps = slow**. Do these in `init()` or use `.async_io()` execution class for I/O-bound nodes.
+
+### Pre-Allocate in init()
+
+Heap allocations in `tick()` are one of the most common performance killers. The allocator may need to request memory from the OS, which can take microseconds and is unpredictable.
+
+```rust
+// simplified
+struct MyNode {
+    buffer: Vec<f32>,  // Pre-allocated storage
+    device: Device,
+    config: Config,
+}
+
+fn init(&mut self) -> Result<()> {
+    // Pre-allocate buffers
+    self.buffer = vec![0.0; 10000];
+
+    // Open connections
+    self.device = Device::open()?;
+
+    // Load configuration
+    self.config = Config::from_file("config.yaml")?;
+
+    Ok(())
+}
+
+fn tick(&mut self) {
+    // Use pre-allocated resources — no allocations here!
+    self.buffer[0] = self.device.read();
+    // Reuse self.buffer instead of creating new Vecs
+}
+```
+
+Common hidden allocations to watch for: `format!()`, `String::from()`, `Vec::push()` past capacity, `collect()`, `to_string()`.
+
+### Avoid Unnecessary Cloning
+
+```rust
+// simplified
+// BAD: Unnecessary clone
+fn tick(&mut self) {
+    if let Some(data) = self.sub.recv() {
+        let copy = data.clone();  // Unnecessary!
+        self.process(copy);
+    }
+}
+
+// GOOD: Direct use
+fn tick(&mut self) {
+    if let Some(data) = self.sub.recv() {
+        self.process(data);  // Already cloned by recv()
+    }
+}
+```
+
+`Topic::recv()` already clones data. Don't clone again.
+
+### Minimize Logging in Hot Paths
+
+Logging involves formatting strings (allocation), writing to a sink (I/O), and often acquiring a lock. In a 1kHz control loop, that overhead adds up fast.
+
+```rust
+// simplified
+// BAD: Logging every tick at 60Hz = 60 format! + write calls/sec
+fn tick(&mut self) {
+    hlog!(debug, "Tick #{}", self.counter);  // Slow!
+    self.counter += 1;
+}
+
+// GOOD: Conditional logging — 1 log per 1000 ticks
+fn tick(&mut self) {
+    if self.counter % 1000 == 0 {
+        hlog!(info, "Reached tick #{}", self.counter);
+    }
+    self.counter += 1;
+}
+```
+
+**Rule**: Log sparingly in hot paths. Use `horus monitor` for real-time metrics instead of printf-style debugging.
+
+## Scheduler Optimization
+
+### Understanding Tick Rate
+
+The default scheduler runs at 100 Hz (10ms per tick). Use `.tick_rate()` to change it:
+
+```rust
+// simplified
+// Default: 100 Hz
+let scheduler = Scheduler::new();
+
+// 10kHz for high-performance control loops
+let scheduler = Scheduler::new().tick_rate(10000_u64.hz());
+```
+
+**Key Point**: Keep individual node tick() methods fast (ideally &lt;1ms) to maintain the target tick rate.
+
+### Use Priority Levels
+
+```rust
+// simplified
+// Critical tasks run first (order 0 = highest)
+scheduler.add(safety).order(0).build()?;
+
+// Logging runs last (order 100 = lowest)
+scheduler.add(logger).order(100).build()?;
+```
+
+**Predictable execution order** = better performance. Use lower numbers for higher priority tasks.
+
+### Minimize Node Count
+
+```rust
+// simplified
+// BAD: 50 small nodes
+for i in 0..50 {
+    scheduler.add(TinyNode::new(i)).order(50).build()?;
+}
+
+// GOOD: One aggregated node
+scheduler.add(AggregatedNode::new()).order(50).build()?;
+```
+
+**Fewer nodes** = less scheduling overhead.
+
+## Ultra-Low-Latency Networking (Linux)
+
+HORUS provides optional kernel bypass networking for sub-microsecond latency requirements.
+
+### Transport Options
+
+| Transport | Latency (send+recv) | Throughput | Requirements |
+|-----------|---------|------------|--------------|
+| Shared Memory (same thread) | **14ns** | 100M+ msg/s | Local only |
+| Shared Memory (cross thread, 1:1) | **82ns** | 13M+ msg/s | Local only |
+| io_uring | 2-3us | 500K+ msg/s | Linux 5.1+ |
+| Batch UDP | 3-5us | 300K+ msg/s | Linux 3.0+ |
+| Standard UDP | 5-10us | 200K+ msg/s | Cross-platform |
+
+### Enable io_uring Transport
+
+io_uring eliminates syscalls on the send path using kernel-side polling:
+
+```bash
+# Build with io_uring support (Cargo feature flag)
+cargo build --release --features io-uring-net
+```
+
+**Requirements:**
+- Linux 5.1+ (5.6+ recommended for SQ polling)
+- CAP_SYS_NICE capability for SQ_POLL mode
+
+### Batch UDP and Combined Features
+
+Batch UDP (`sendmmsg`/`recvmmsg`) is automatically enabled on Linux 3.0+ with no extra flags. To enable all ultra-low-latency features together (io_uring + batch UDP):
+
+```bash
+cargo build --release --features ultra-low-latency
+```
+
+### Smart Transport Selection
+
+For network topics, HORUS automatically selects the best transport based on available system features and kernel version. Configure network endpoints through topic configuration rather than the `Topic::new()` API (which creates local shared memory topics). See [Network Backends](/advanced/network-backends) for details.
+
+## Shared Memory Optimization
+
+HORUS uses platform-native shared memory managed by `horus_sys` — you never need to manage paths manually.
+
+- **Check space**: `horus doctor` includes a shared memory space check. On Linux, tmpfs defaults to 50% of RAM — increase it if messages are being dropped.
+- **Cleanup**: `horus clean --shm` removes stale topics (rarely needed — cleanup is automatic).
+- **Memory footprint**: Each topic slot is proportional to message size (`Topic<CmdVel>` = 16B/slot, `Topic<PointCloud>` = 120KB/slot). Smaller messages = lower total shared memory usage.
+
+## Profiling and Measurement
+
+### Built-In Metrics
+
+HORUS automatically tracks node performance metrics. Use `horus monitor` to view real-time performance data including tick duration, messages sent, and CPU usage.
+
+**Available metrics** (on `NodeMetrics`):
+- `total_ticks`: Total number of ticks
+- `avg_tick_duration_ms`: Average tick time in milliseconds
+- `max_tick_duration_ms`: Worst-case tick time in milliseconds
+- `messages_sent`: Messages published
+- `messages_received`: Messages received
+- `errors_count`: Total error count
+- `uptime_seconds`: Node uptime in seconds
+
+### IPC Latency Logging
+
+HORUS automatically tracks IPC timing for each topic operation. The `horus monitor` web interface displays per-log-entry metrics:
+
+```
+Tick: 12us | IPC: 296ns
+```
+
+Each log entry includes `tick_us` (node tick time in microseconds) and `ipc_ns` (IPC write time in nanoseconds).
+
+### CPU Profiling with perf and Flamegraphs
+
+`perf` is the standard Linux profiler. Combined with flamegraphs, it pinpoints exactly where CPU time goes.
+
+**Step 1: Record a profile**
+
+```bash
+# Profile your HORUS application for 30 seconds
+perf record -g --call-graph dwarf -- horus run --release
+# Or profile an already-running process
+perf record -g --call-graph dwarf -p $(pidof horus) -- sleep 30
+```
+
+The `-g --call-graph dwarf` flags capture full call stacks using DWARF debug info. If your binary is stripped, use `--call-graph fp` instead (requires frame pointers).
+
+**Step 2: Generate a flamegraph**
+
+```bash
+# Install the tools (one-time)
+cargo install inferno
+
+# Convert perf data to a flamegraph
+perf script | inferno-collapse-perf | inferno-flamegraph > flame.svg
+```
+
+Open `flame.svg` in a browser — it is interactive (click to zoom).
+
+**Step 3: Read the flamegraph**
+
+- **Width of a bar** = proportion of total CPU time in that function. Wide bars are hot.
+- **Stack depth** (vertical) = call chain. Read bottom-to-top: `main` at bottom, leaf functions at top.
+- **Look for**: `alloc::`, `__GI___libc_malloc` — allocator calls in hot paths. `syscall`, `__kernel_` — unexpected kernel transitions. Your `tick()` function — is it the widest bar? If not, something else dominates.
+- **Ignore**: `perf-` artifacts, idle/sleep functions.
+
+**Alternative: cargo-flamegraph**
+
+For a simpler workflow that wraps `perf` automatically:
+
+```bash
+cargo install flamegraph
+# Generate flamegraph directly
+cargo flamegraph --bin horus -- run --release
+# Output: flamegraph.svg
+```
+
+### Memory Profiling
+
+CPU profiling catches slow code; memory profiling catches hidden allocations that cause latency spikes and unbounded growth.
+
+**heaptrack** traces every allocation with full call stacks and low overhead (~2x slowdown, much less than Valgrind):
+
+```bash
+# Install (Debian/Ubuntu)
+sudo apt install heaptrack heaptrack-gui
+
+# Profile your application
+heaptrack horus run --release
+
+# Analyze results (GUI)
+heaptrack_gui heaptrack.horus.*.zst
+
+# Or analyze in terminal
+heaptrack_print heaptrack.horus.*.zst
+```
+
+**What to look for:**
+- **Peak allocation**: Total heap high-water mark. If this grows over time, you have a leak.
+- **Allocation rate during steady-state**: After `init()` completes, allocations should drop to near-zero. If you see steady allocation in `tick()`, something is allocating per-tick (format strings, Vec growth, String building).
+- **Top allocation sites**: Sort by count, not size. Thousands of small allocations hurt latency more than one large allocation.
+- **Flamegraph tab**: heaptrack_gui has a flamegraph view filtered to allocations only — this directly shows which call paths allocate.
+
+For production monitoring, `horus monitor` reports per-node memory metrics without profiling overhead.
+
+### Manual Timing in Code
+
+For targeted measurement, time specific operations directly:
+
+```rust
+// simplified
+fn tick(&mut self) {
+    let start = Instant::now();
+    self.expensive_operation();
+    let elapsed = start.elapsed();
+    // Log periodically, not every tick
+    if self.tick_count % 1000 == 0 {
+        hlog!(info, "Operation: {:?}", elapsed);
+    }
+}
+```
+
+For round-trip latency: timestamp before `send()`, check elapsed after `recv()` on the return path. For throughput: count messages over a fixed time window using `Instant::elapsed()`.
+
+## Common Performance Pitfalls
+
+### Pitfall: Synchronous I/O in tick()
+
+```rust
+// simplified
+// BAD: Blocking I/O
+fn tick(&mut self) {
+    let data = std::fs::read("data.txt").unwrap();  // Blocks!
+}
+
+// GOOD: Async or pre-loaded
+fn init(&mut self) -> Result<()> {
+    self.data = std::fs::read("data.txt")?;  // Load once
+    Ok(())
+}
+```
+
+**Fix**: Move I/O to `init()` or use `.async_io()` execution class.
+
+> For other common pitfalls (allocations in tick, excessive logging, oversized messages, debug builds), see the detailed guidance in [Node Optimization](#node-optimization), [Message Optimization](#message-optimization), and [Build Optimization](#build-optimization) above.
+
+## Design Decisions
+
+Understanding *why* HORUS is built this way helps you work with the architecture instead of against it.
+
+### Why Ring Buffers, Not Channels
+
+Channels (`mpsc`, `crossbeam`) require heap allocation per message, involve lock contention on the queue, and cannot be shared across processes. Ring buffers in shared memory provide:
+
+- **Fixed memory footprint**: No per-message allocation. The buffer is allocated once at topic creation and reused forever.
+- **Cross-process communication**: Shared memory works between any processes on the same machine, not just threads within one process.
+- **Predictable latency**: No allocator jitter, no lock contention. The write path is a memcpy plus an atomic store.
+- **Natural backpressure**: If the subscriber falls behind, old messages are overwritten. For real-time systems, stale data is worse than dropped data.
+
+The trade-off is that subscribers must keep up or lose messages. This is deliberate — a safety-critical motor controller should always read the *latest* command, not process a queue of stale ones.
+
+### Why Automatic Backend Selection
+
+HORUS detects your message type at compile time and selects the fastest available transport:
+
+- **POD types** (no pointers, no heap data, `Copy` + fixed-size): direct `memcpy` into shared memory. No serialization.
+- **Non-POD types** (contains `Vec`, `String`, `Box`, etc.): Serde serialization into shared memory.
+- **Large messages** (above internal threshold on x86_64): SIMD-accelerated memcpy using AVX2/SSE2.
+
+This means you write `topic.send(msg)` and get the fastest path automatically. No configuration flags, no "zero-copy mode" toggle. The type system determines the backend.
+
+### Why SIMD for Large Messages
+
+For messages above ~256 bytes on x86_64, HORUS uses SIMD (AVX2/SSE2) for memory copies instead of the standard `memcpy`. On most platforms the compiler's built-in memcpy already uses SIMD, but HORUS's implementation is tuned for the specific access patterns of ring-buffer slots (aligned, known-size, non-overlapping). The result is consistent throughput for large sensor data (point clouds, images) without relying on the platform's libc quality.
+
+On platforms without SIMD (ARM32, older hardware), this falls back to standard `memcpy` with zero code changes.
+
+### Why POD Auto-Detection
+
+Rather than requiring users to annotate messages with `#[zero_copy]` or `#[serde]`, HORUS inspects the type at compile time. If a struct is `Copy`, has no pointers, and has a fixed layout, it is automatically treated as POD and copied directly. Otherwise, Serde kicks in.
+
+This eliminates a class of bugs where users forget to annotate a message type and unknowingly get slow-path serialization, or annotate a non-POD type as zero-copy and get UB. The compiler makes the decision — the user just writes structs.
+
+## Trade-offs
+
+Every design choice in HORUS sacrifices something. Understanding these trade-offs helps you make informed decisions about when to work within the defaults and when to reach for alternatives.
+
+| Decision | Benefit | Cost | When the cost matters |
+|----------|---------|------|-----------------------|
+| **Ring buffer (overwrite-oldest)** | Constant memory, always-fresh data, no backpressure stalls | Slow subscribers lose messages | Logging, recording, or batch processing that needs every message |
+| **Fixed ring capacity** | Predictable memory usage, no allocator calls at runtime | Must choose capacity at topic creation; too small = lost messages, too large = wasted memory | High-burst topics where message rate varies 100x between peaks and steady-state |
+| **POD auto-detection** | Zero-config zero-copy for simple types, no annotation burden | Cannot force zero-copy for types that contain `Vec`/`String` even if you know the layout is stable | Rarely — if you need zero-copy for dynamic types, redesign the message as fixed-size |
+| **SIMD memcpy** | ~15-30% faster large-message throughput on x86_64 | Binary is x86_64-specific when enabled; no benefit on ARM NEON (falls back) | Cross-compiling for ARM targets; SIMD is a no-op there but binary still works |
+| **Automatic backend selection** | Users never pick wrong backend, no configuration surface | Cannot override backend per-topic (e.g., force Serde for a POD type) | Debugging serialization issues — workaround: wrap POD in a newtype with `Vec` |
+| **Shared memory IPC** | Sub-microsecond latency, zero syscalls on hot path | Same-machine only; need network transport for distributed systems | Multi-machine deployments — use network backends (io_uring, batch UDP) for those topics |
+
+## Performance Checklist
+
+Before deployment, verify:
+
+- [ ] Build in release mode (`--release`)
+- [ ] Profile with `perf` or flamegraph — identify actual hotspots before optimizing
+- [ ] tick() completes in &lt;1ms
+- [ ] No allocations in tick() (verify with heaptrack)
+- [ ] Messages use fixed-size types where possible
+- [ ] Logging is rate-limited in hot paths
+- [ ] Shared memory has sufficient space (`horus doctor`)
+- [ ] IPC latency is &lt;10us
+- [ ] Priority levels set correctly
+
+## Real-Time Configuration
+
+For hard real-time applications requiring bounded latency, use the Scheduler builder API:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .tick_rate(1000_u64.hz())
+    .require_rt()               // Enables mlockall, SCHED_FIFO (Linux only)
+    .cores(&[2, 3]);            // Pin to isolated CPU cores
+
+scheduler.add(MotorController::new())
+    .order(0)
+    .rate(1000_u64.hz())        // Auto-derives budget + deadline, auto-enables RT
+    .priority(80)               // SCHED_FIFO priority (1-99)
+    .core(2)                    // Pin this node's thread to core 2
+    .build()?;
+```
+
+> **Linux only**: RT features (`SCHED_FIFO`, `mlockall`, CPU pinning) require a Linux kernel. On other platforms, `.prefer_rt()` degrades gracefully to best-effort scheduling.
+
+For detailed configuration options, see the [Scheduler Configuration](/advanced/scheduler-configuration).
+
+## Next Steps
+
+- Apply these optimizations to your [Examples](/rust/examples/basic-examples)
+- Configure [Scheduler Settings](/advanced/scheduler-configuration) for bounded latency
+- Learn about [Multi-Language Support](/concepts/multi-language)
+- Read the [Core Concepts](/concepts/core-concepts-nodes) for deeper understanding
+- Check the [CLI Reference](/development/cli-reference) for build options
+
+---
+
+## See Also
+
+- [Benchmarks](/performance/benchmarks) — Measured latency and throughput
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Tick rate tuning
+- [RT Setup](/advanced/rt-setup) — Real-time kernel setup

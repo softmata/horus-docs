@@ -1,0 +1,363 @@
+---
+title: Services
+description: Synchronous request/response RPC between nodes
+order: 12
+---
+
+# Services
+
+> **Beta**: The Services API is functional in Rust but still maturing. Python bindings are not yet available. The API may change in future releases.
+
+Your SLAM node needs a map region from the map server. It can't continue until it gets the data. Your arm planner needs to know joint limits before computing a trajectory. Your calibration routine needs to trigger sensor calibration and wait for the result.
+
+These are **request/response** problems. Topics can't solve them — they're fire-and-forget with no reply. Actions are overkill — these operations finish in milliseconds.
+
+**Use services when:**
+- You need a response before continuing (parameter queries, map data, joint limits)
+- The operation completes quickly (within milliseconds)
+- You need guaranteed delivery with error reporting
+
+**Use topics instead** for continuous data streams. **Use actions instead** for long-running tasks with feedback.
+
+## How It Works
+
+A service is a named RPC channel with a defined request type and response type. One server listens for requests and produces responses. One or more clients send requests and wait for responses.
+
+Under the hood, every service creates two internal topics:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    C["Client"] -->|"ServiceRequest"| REQ["{name}.request<br/>Topic"]
+    REQ --> S["Server"]
+    S -->|"ServiceResponse"| RES["{name}.response<br/>Topic"]
+    RES --> C
+
+    style REQ fill:#3b82f6,stroke:#2563eb,color:#fff
+    style RES fill:#22c55e,stroke:#16a34a,color:#000
+`}
+  caption="Services use two topics internally — one for requests, one for responses. All shared-memory optimizations apply."
+/>
+
+- Requests include a monotonically-increasing `request_id` for correlation
+- Multiple clients can call the same server concurrently
+- Each client filters responses by matching its `request_id`
+- Communication uses shared memory (zero-copy IPC)
+
+## Defining a Service
+
+Use the `service!` macro to define Request and Response types:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    service! {
+        GetMapRegion {
+            request {
+                x_min: f64,
+                y_min: f64,
+                x_max: f64,
+                y_max: f64,
+                resolution: f64,
+            }
+            response {
+                width: u32,
+                height: u32,
+                data: Vec<u8>,
+                timestamp: u64,
+            }
+        }
+    }
+    ```
+
+    This generates `GetMapRegionRequest` and `GetMapRegionResponse` structs, ready to use with clients and servers.
+  </LangTab>
+  <LangTab language="Python">
+    <Callout type="warn">
+    Services are currently available in Rust only. Python support is planned.
+    </Callout>
+  </LangTab>
+</LanguageTabs>
+
+---
+
+## Service Server
+
+The server listens for requests and returns responses. It runs in a background thread.
+
+```rust
+// simplified
+let server = ServiceServerBuilder::<GetMapRegion>::new()
+    .on_request(|req| {
+        if req.resolution <= 0.0 {
+            return Err("Resolution must be positive".into());
+        }
+        if req.x_max <= req.x_min || req.y_max <= req.y_min {
+            return Err("Invalid region bounds".into());
+        }
+
+        let map = generate_map(req.x_min, req.y_min, req.x_max, req.y_max, req.resolution);
+        Ok(GetMapRegionResponse {
+            width: map.width,
+            height: map.height,
+            data: map.data,
+            timestamp: horus::timestamp_now(),
+        })
+    })
+    .poll_interval(Duration::from_millis(1))  // How often to check for requests (default: 5ms)
+    .build()?;
+
+// Server runs in a background thread — it's active until dropped
+```
+
+### Stopping a Server
+
+The server stops when dropped, or explicitly:
+
+```rust
+// simplified
+server.stop();
+```
+
+---
+
+## Service Client
+
+### Blocking Client
+
+The simplest way to call a service:
+
+```rust
+// simplified
+let mut client = ServiceClient::<GetMapRegion>::new()?;
+
+let response = client.call(
+    GetMapRegionRequest {
+        x_min: 0.0, y_min: 0.0,
+        x_max: 10.0, y_max: 10.0,
+        resolution: 0.05,
+    },
+    Duration::from_secs(1),
+)?;
+
+println!("Map: {}x{} pixels", response.width, response.height);
+```
+
+#### Resilient Calls (Auto-Retry)
+
+Use `call_resilient` for production code that needs automatic retries on transient failures:
+
+```rust
+// simplified
+// Auto-retry with default settings (3 retries, exponential backoff from 10ms)
+let response = client.call_resilient(request, Duration::from_secs(5))?;
+
+// Custom retry configuration
+use horus::prelude::RetryConfig;
+
+let response = client.call_resilient_with(
+    request,
+    Duration::from_secs(5),
+    RetryConfig::new(5, Duration::from_millis(20)),  // 5 retries, 20ms initial backoff
+)?;
+```
+
+`call_resilient` retries on `Timeout` and `Transport` errors. `ServiceFailed` and `NoServer` errors are not retried since they indicate permanent failures.
+
+#### Optional Response
+
+Use `call_optional` when the server may not be running:
+
+```rust
+// simplified
+match client.call_optional(request, Duration::from_millis(100))? {
+    Some(response) => println!("Map: {}x{}", response.width, response.height),
+    None => println!("No server available"),
+}
+```
+
+### Async Client
+
+For non-blocking calls, use `AsyncServiceClient`:
+
+```rust
+// simplified
+let mut client = AsyncServiceClient::<GetMapRegion>::new()?;
+
+// Start the call (non-blocking)
+let mut pending = client.call_async(
+    GetMapRegionRequest { x_min: 0.0, y_min: 0.0, x_max: 5.0, y_max: 5.0, resolution: 0.1 },
+    Duration::from_secs(1),
+);
+
+// Do other work...
+
+// Check if response is ready (non-blocking)
+match pending.check()? {
+    Some(response) => println!("Map: {}x{}", response.width, response.height),
+    None => println!("Still waiting..."),
+}
+
+// Check if the call has timed out
+if pending.is_expired() {
+    println!("Service call timed out");
+}
+
+// Or block until done
+let response = pending.wait()?;
+```
+
+### Client Configuration
+
+```rust
+// simplified
+// Custom poll interval for faster response detection
+let mut client = ServiceClient::<GetMapRegion>::with_poll_interval(
+    Duration::from_micros(500),  // Default: 1ms
+)?;
+```
+
+---
+
+## Error Handling
+
+```rust
+// simplified
+match client.call(request, Duration::from_secs(1)) {
+    Ok(response) => { /* success */ }
+    Err(ServiceError::Timeout) => { /* server didn't respond in time */ }
+    Err(ServiceError::ServiceFailed(msg)) => { /* handler returned Err */ }
+    Err(ServiceError::NoServer) => { /* no server found */ }
+    Err(ServiceError::Transport(msg)) => { /* IPC error */ }
+}
+```
+
+| Error | Cause | Retried by `call_resilient`? |
+|-------|-------|------------------------------|
+| `Timeout` | Server didn't respond within the timeout duration | Yes |
+| `ServiceFailed(msg)` | Server handler returned `Err(msg)` | No (permanent) |
+| `NoServer` | No service server is running | No (permanent) |
+| `Transport(msg)` | IPC/shared memory communication failure | Yes |
+
+---
+
+## Complete Example
+
+A service that looks up robot joint limits by name:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+    use std::collections::HashMap;
+
+    // Define the service
+    service! {
+        GetJointLimits {
+            request {
+                joint_name: String,
+            }
+            response {
+                min_position: f64,
+                max_position: f64,
+                max_velocity: f64,
+                max_effort: f64,
+            }
+        }
+    }
+
+    fn main() -> Result<()> {
+        // Joint limits database
+        let limits: HashMap<String, (f64, f64, f64, f64)> = HashMap::from([
+            ("shoulder".into(), (-3.14, 3.14, 2.0, 100.0)),
+            ("elbow".into(), (0.0, 2.61, 2.0, 80.0)),
+            ("wrist".into(), (-1.57, 1.57, 3.0, 40.0)),
+        ]);
+
+        // Start server
+        let _server = ServiceServerBuilder::<GetJointLimits>::new()
+            .on_request(move |req| {
+                match limits.get(&req.joint_name) {
+                    Some(&(min, max, vel, effort)) => Ok(GetJointLimitsResponse {
+                        min_position: min,
+                        max_position: max,
+                        max_velocity: vel,
+                        max_effort: effort,
+                    }),
+                    None => Err(format!("Unknown joint: {}", req.joint_name)),
+                }
+            })
+            .build()?;
+
+        // Client usage
+        let mut client = ServiceClient::<GetJointLimits>::new()?;
+
+        let resp = client.call(
+            GetJointLimitsRequest { joint_name: "elbow".into() },
+            Duration::from_secs(1),
+        )?;
+
+        println!("Elbow limits: [{:.2}, {:.2}] rad", resp.min_position, resp.max_position);
+
+        Ok(())
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    <Callout type="warn">
+    Services are currently available in Rust only. Python support is planned.
+    </Callout>
+  </LangTab>
+</LanguageTabs>
+
+---
+
+## CLI Commands
+
+```bash
+# List active services
+horus service list
+```
+
+---
+
+## Design Decisions
+
+**Why build services on top of topics instead of a separate IPC mechanism?**
+Topics already solve all the hard shared-memory problems: cross-process communication, automatic backend selection based on topology, live migration when processes split or join, and zero-copy for large data. Building a separate RPC transport would mean reimplementing all of that infrastructure — and maintaining two code paths. By using topics internally (`{name}.request` and `{name}.response`), services inherit every topic optimization for free. It also means `horus topic list` shows service traffic alongside regular topic traffic, giving you a single debugging tool for all communication.
+
+**Why poll-based servers instead of interrupt-driven wakeups?**
+The server thread checks for new requests at a configurable interval (default: 5 ms). An alternative would be to use OS-level signaling (futex, eventfd) to wake the server immediately when a request arrives. HORUS uses polling because it produces predictable, bounded CPU usage — the server wakes at known intervals, does bounded work, and sleeps. Interrupt-driven wakeups create unpredictable timing spikes that interfere with real-time nodes sharing the same system. The 5 ms default means worst-case response latency is 5 ms plus handler execution time, which is fast enough for the configuration-query and data-lookup use cases services are designed for.
+
+**Why both sync and async clients?**
+`ServiceClient` blocks the calling thread until a response arrives — simple but it stalls your node's `tick()` for the duration of the call. `AsyncServiceClient` returns immediately with a `PendingResponse` handle that you check later. Two clients because two usage patterns: inside a scheduler node, use async to avoid blocking the tick loop. In a standalone script or initialization code, use sync for simplicity. Providing only async would force unnecessary complexity on simple scripts. Providing only sync would make services unusable inside real-time scheduler nodes.
+
+**Why `call_resilient` as a separate method instead of building retries into `call`?**
+Retrying a failed request is not always the right thing to do. If the caller has a tight deadline, spending time on retries could cause a deadline miss. If the request has side effects (triggering a calibration), retrying could trigger it twice. Making retries explicit via `call_resilient` means the developer consciously opts in, and the default `call` method has the simplest possible behavior: try once, succeed or fail.
+
+**Why `call_optional` for missing servers?**
+During system startup, nodes initialize in order but the server might not be ready when a client starts. `call_optional` returns `None` instead of an error when no server exists, making it trivial to write startup-tolerant code without `match` on error variants. This is a common enough pattern (especially in tests and gradual-startup deployments) that it deserved a dedicated method rather than requiring error-handling boilerplate.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| **Built on topics** — inherits all shared-memory optimizations and debugging tools | Service traffic mixes with topic traffic in `horus topic list` (distinguishable by `.request`/`.response` suffix) |
+| **Poll-based server** — predictable timing, no interrupt spikes | Worst-case 5 ms added latency (configurable via `poll_interval`) |
+| **Blocking `call()`** — simple, no callbacks, no futures | Stalls the caller's thread; do not use inside tight RT loops |
+| **Async client** — non-blocking, works inside scheduler nodes | More complex API (`call_async` + `pending.check()` loop) |
+| **Auto-retry via `call_resilient`** — handles transient failures automatically | Retries add latency; not suitable for side-effecting or time-critical calls |
+| **Request ID correlation** — multiple clients can share one server | Small overhead per request (monotonic counter + ID matching on response) |
+| **Rust-only** — full type safety, compile-time request/response checking | Python bindings not yet available |
+
+## See Also
+
+- [Services API](/rust/api/services) — Full Rust API reference with per-method documentation
+- [Communication Overview](/concepts/communication-overview) — When to use topics vs services vs actions
+- [Actions](/concepts/actions) — Long-running tasks with feedback and cancellation
+- [Topics — Full Reference](/concepts/core-concepts-topic) — The pub/sub primitive that services are built on
+- [Topic API](/rust/api/topic) — Topic method reference (services use topics internally)

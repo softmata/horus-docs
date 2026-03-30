@@ -1,0 +1,513 @@
+---
+title: "Message Design (Python)"
+description: "Choose the right message strategy for Python HORUS nodes — dict topics, typed topics, pool-backed types, and custom messages"
+order: 11
+---
+
+# Message Design (Python)
+
+HORUS gives you two fundamentally different ways to send data between nodes: **dict topics** (flexible, serialized) and **typed topics** (fast, zero-copy). Choosing the right one for each topic in your system is one of the most important design decisions you will make.
+
+```python
+# simplified
+import horus
+
+# Dict topic — any Python dict, serialized via MessagePack
+node.send("status", {"battery": 85.0, "mode": "autonomous"})
+
+# Typed topic — fixed-layout struct, zero-copy via shared memory
+node.send("cmd_vel", horus.CmdVel(linear=1.0, angular=0.5))
+```
+
+Both approaches share the same `node.send()` / `node.recv()` API. The difference is what happens underneath.
+
+---
+
+## Dict Topics (GenericMessage)
+
+Pass a Python dict as the message payload. HORUS serializes it via MessagePack into a `GenericMessage` with a 4KB maximum payload.
+
+```python
+# simplified
+import horus
+
+def sensor_tick(node):
+    node.send("environment", {
+        "temperature": 22.5,
+        "humidity": 65.0,
+        "light_level": 800,
+        "room": "lab_3",
+    })
+
+def logger_tick(node):
+    if node.has_msg("environment"):
+        data = node.recv("environment")
+        print(f"Temp: {data['temperature']}C in {data['room']}")
+
+sensor = horus.Node("sensor", pubs=["environment"], tick=sensor_tick, rate=10)
+logger = horus.Node("logger", subs=["environment"], tick=logger_tick, rate=10)
+horus.run(sensor, logger)
+```
+
+### What dict topics support
+
+- Primitive types: `int`, `float`, `str`, `bool`, `None`
+- Collections: `list`, `dict` (nested)
+- Bytes: `bytes`, `bytearray`
+
+### What dict topics do not support
+
+- Custom class instances (unless you convert to dict first)
+- NumPy arrays (convert with `.tolist()` first)
+- Payloads larger than 4KB (use pool-backed types instead)
+
+### When to use dict topics
+
+- **Prototyping** -- evolve your message schema without restarting
+- **Low-frequency data** -- status updates, configuration, logs
+- **Variable structure** -- messages where fields change between sends
+- **Quick experiments** -- send arbitrary data to see what works
+
+---
+
+## Typed Topics
+
+Pass a HORUS message type (Pod struct) as the payload. The message is written directly into shared memory with no serialization. The receiver reads the same bytes -- zero-copy.
+
+```python
+# simplified
+import horus
+
+def drive_tick(node):
+    node.send("cmd_vel", horus.CmdVel(linear=0.5, angular=0.1))
+
+def motor_tick(node):
+    if node.has_msg("cmd_vel"):
+        cmd = node.recv("cmd_vel")  # CmdVel object, zero-copy
+        apply_motor(cmd.linear, cmd.angular)
+
+driver = horus.Node("driver", pubs=[horus.CmdVel], tick=drive_tick, rate=50)
+motor = horus.Node("motor", subs=[horus.CmdVel], tick=motor_tick, rate=50)
+horus.run(driver, motor)
+```
+
+### Declaring typed topics
+
+Declare typed topics in `pubs` and `subs` by passing the message class:
+
+```python
+# simplified
+# Single typed topic — auto-derives topic name from the type
+node = horus.Node("ctrl", pubs=[horus.CmdVel], tick=my_tick, rate=50)
+# Publishes on "cmd_vel" (derived from CmdVel.__topic_name__)
+
+# Multiple typed topics
+node = horus.Node("nav",
+    pubs=[horus.CmdVel, horus.Pose2D],
+    subs=[horus.LaserScan, horus.Imu],
+    tick=my_tick,
+    rate=50,
+)
+
+# Mixed: typed + dict topics in the same node
+node = horus.Node("hybrid",
+    pubs=[horus.CmdVel, "debug_log"],    # typed + dict
+    subs=[horus.LaserScan, "config"],     # typed + dict
+    tick=my_tick,
+    rate=50,
+)
+```
+
+### Override topic name
+
+By default, typed topics use the name from the type's `__topic_name__` attribute (e.g., `CmdVel` maps to `"cmd_vel"`). Override with dict syntax:
+
+```python
+# simplified
+node = horus.Node("ctrl",
+    pubs={"my_velocity": horus.CmdVel},   # publishes on "my_velocity", not "cmd_vel"
+    tick=my_tick,
+    rate=50,
+)
+node.send("my_velocity", horus.CmdVel(linear=1.0, angular=0.0))
+```
+
+### When to use typed topics
+
+- **High-frequency data** -- sensor streams, control commands, anything above 50Hz
+- **Cross-language systems** -- binary-compatible with other HORUS language bindings
+- **Production deployments** -- type safety catches mismatches at connection time
+- **Performance-critical paths** -- ~1.5us vs ~5-50us for dict topics
+
+---
+
+## Performance Comparison
+
+| Approach | Latency | Throughput | Max Payload | Serialization |
+|----------|---------|------------|-------------|---------------|
+| **Typed (Pod)** | ~1.5us | ~650K msgs/sec | Fixed-size struct | None (zero-copy) |
+| **Dict (GenericMessage)** | ~5-50us | ~20-200K msgs/sec | 4KB | MessagePack |
+| **Pool-backed (Image, Tensor)** | ~3-5us | ~300K descriptors/sec | Unlimited (pool) | Descriptor only (64-168B) |
+| **Custom Runtime** | ~20-40us | ~25K msgs/sec | Fixed-size struct | Python `struct` module |
+| **Custom Compiled** | ~3-5us | ~200K msgs/sec | Fixed-size struct | None (zero-copy) |
+
+Dict latency varies with payload size: a 50-byte dict serializes in ~5us; a 3KB dict takes ~50us.
+
+---
+
+## Built-in Typed Messages
+
+HORUS provides 55+ typed message classes. All are importable from `horus`:
+
+```python
+# simplified
+from horus import CmdVel, LaserScan, Imu, Odometry, Image, Pose2D
+```
+
+### Common message types by use case
+
+| Use Case | Messages | Typical Rate |
+|----------|----------|--------------|
+| Mobile robot drive | `CmdVel`, `Odometry` | 50-100Hz |
+| LiDAR processing | `LaserScan` | 10-40Hz |
+| IMU integration | `Imu` | 100-1000Hz |
+| Camera pipeline | `Image`, `DepthImage` | 30-60Hz |
+| Object detection | `Detection`, `BoundingBox2D` | 10-30Hz |
+| Robot arm control | `JointState`, `JointCommand` | 100-1000Hz |
+| Navigation | `NavGoal`, `NavPath`, `OccupancyGrid` | 1-10Hz |
+| System health | `Heartbeat`, `DiagnosticStatus`, `BatteryState` | 1-10Hz |
+
+### Creating typed messages
+
+```python
+# simplified
+# Constructors use keyword arguments
+cmd = horus.CmdVel(linear=1.0, angular=0.5)
+pose = horus.Pose2D(x=1.0, y=2.0, theta=0.785)
+imu = horus.Imu(
+    accel_x=0.0, accel_y=0.0, accel_z=9.81,
+    gyro_x=0.0, gyro_y=0.0, gyro_z=0.0,
+)
+
+# Access fields directly
+print(cmd.linear)    # 1.0
+print(pose.theta)    # 0.785
+
+# All messages include a nanosecond timestamp
+print(cmd.timestamp_ns)
+```
+
+---
+
+## Pool-Backed Types: Image, PointCloud, DepthImage, Tensor
+
+For large data (camera frames, LiDAR scans, ML tensors), HORUS uses pool-backed shared memory. Only a small descriptor travels through the ring buffer; the actual data stays in a shared memory pool.
+
+```python
+# simplified
+import horus
+import numpy as np
+
+# Image — camera frames
+img = horus.Image(480, 640, "rgb8")           # create empty
+img = horus.Image.from_numpy(pixels)           # from NumPy (one copy into pool)
+arr = img.to_numpy()                           # to NumPy (zero-copy view)
+
+# PointCloud — LiDAR scans
+cloud = horus.PointCloud(10000, 3)             # 10k points, XYZ
+cloud = horus.PointCloud.from_numpy(points)
+
+# DepthImage — depth maps
+depth = horus.DepthImage(480, 640)             # F32 meters by default
+
+# Tensor — arbitrary array data
+tensor = horus.Tensor([1000, 1000], dtype="float32")  # costmap
+tensor = horus.Tensor.from_numpy(np_array)
+```
+
+### NumPy interop
+
+All pool-backed types convert to and from NumPy arrays:
+
+```python
+# simplified
+# to_numpy() — zero-copy view into shared memory
+arr = img.to_numpy()             # shape=(480, 640, 3), dtype=uint8
+arr = cloud.to_numpy()           # shape=(10000, 3), dtype=float32
+arr = depth.to_numpy()           # shape=(480, 640), dtype=float32
+arr = tensor.numpy()             # shape matches creation shape
+
+# from_numpy() — one copy into shared memory pool
+img = horus.Image.from_numpy(np_array)
+cloud = horus.PointCloud.from_numpy(np_array)
+tensor = horus.Tensor.from_numpy(np_array)
+```
+
+`to_numpy()` is zero-copy (~3us) because it returns a view into the existing shared memory. `from_numpy()` copies once because the data must be placed into a specific pool slot for cross-process sharing.
+
+### PyTorch and JAX interop (DLPack)
+
+```python
+# simplified
+import torch
+
+# Image to PyTorch (zero-copy via DLPack)
+pt_tensor = torch.from_dlpack(img.as_tensor())
+
+# Tensor to PyTorch
+pt_tensor = torch.from_dlpack(tensor)
+
+# JAX (zero-copy via DLPack)
+jax_array = img.to_jax()
+```
+
+### Sending pool-backed types
+
+```python
+# simplified
+def camera_tick(node):
+    pixels = capture_frame()                    # numpy array
+    img = horus.Image.from_numpy(pixels)        # copy into SHM pool
+    node.send("camera.rgb", img)                # sends 64B descriptor
+
+def vision_tick(node):
+    if node.has_msg("camera.rgb"):
+        img = node.recv("camera.rgb")           # receives descriptor
+        frame = img.to_numpy()                  # zero-copy into numpy
+        # 6MB of pixel data never moved — only the 64B descriptor did
+```
+
+### When to use pool-backed types
+
+- **Camera frames** -- `Image` for RGB/BGR/grayscale/Bayer
+- **LiDAR scans** -- `PointCloud` for XYZ, XYZI, XYZRGB point data
+- **Depth cameras** -- `DepthImage` for F32 meter or U16 millimeter depth maps
+- **ML data** -- `Tensor` for costmaps, feature maps, CNN outputs, RL observations
+- **Any large array** -- anything bigger than a few KB benefits from pool-backed transport
+
+---
+
+## GenericMessage for Dynamic Data
+
+When you send a dict, HORUS wraps it in a `GenericMessage` automatically. You can also use `GenericMessage` explicitly for more control:
+
+```python
+# simplified
+import horus
+
+# Implicit — just send a dict
+node.send("data", {"x": 1.0, "y": 2.0, "label": "waypoint"})
+
+# Receive — comes back as a dict
+data = node.recv("data")  # {"x": 1.0, "y": 2.0, "label": "waypoint"}
+```
+
+`GenericMessage` uses MessagePack serialization with a 4KB maximum payload. For small messages (256 bytes or fewer), it uses an inline buffer with no heap allocation.
+
+### Nested structures
+
+```python
+# simplified
+node.send("state", {
+    "position": {"x": 1.0, "y": 2.0, "z": 0.0},
+    "velocity": {"linear": 0.5, "angular": 0.1},
+    "sensors": {
+        "battery": 85.0,
+        "temperature": 42.3,
+    },
+    "flags": [True, False, True],
+})
+```
+
+### Limitations
+
+- Maximum 4KB serialized payload
+- No NumPy arrays (use `.tolist()` to convert first)
+- No custom class instances (convert to dict first)
+- No type checking at connection time -- a subscriber sees whatever the publisher sends
+
+---
+
+## Custom Messages
+
+When built-in types don't fit your data model, create custom messages.
+
+### Runtime messages (no build step)
+
+Use `horus.msggen` to define custom binary-serialized messages at runtime:
+
+```python
+# simplified
+from horus.msggen import define_message
+
+# Define a custom message type
+RobotStatus = define_message('RobotStatus', 'robot.status', [
+    ('battery_level', 'f32'),
+    ('error_code', 'i32'),
+    ('is_active', 'bool'),
+    ('motor_temp', 'f32'),
+])
+
+# Create, serialize, send
+status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, motor_temp=42.3)
+node.send("robot.status", status.to_bytes())
+
+# Receive, deserialize
+raw = node.recv("robot.status")
+status = RobotStatus.from_bytes(raw)
+print(status.battery_level)  # 85.0
+```
+
+Runtime messages use Python's `struct` module for fixed-layout binary serialization. They support only primitive types (`f32`, `f64`, `i32`, `u64`, `bool`, etc.) -- no nested objects or variable-length arrays.
+
+### Compiled messages (production)
+
+For maximum performance, compile custom messages via `horus.msggen`. This generates code that produces the same Pod types as built-in messages:
+
+```python
+# simplified
+from horus.msggen import register_message, build_messages
+
+register_message('RobotStatus', 'robot.status', [
+    ('battery_level', 'f32'),
+    ('error_code', 'i32'),
+    ('is_active', 'bool'),
+])
+
+build_messages()  # generates code and rebuilds
+
+# After build, use like any built-in type
+from horus import RobotStatus, Topic
+topic = Topic(RobotStatus)
+topic.send(RobotStatus(battery_level=85.0, error_code=0, is_active=True))
+```
+
+See [Custom Messages](/python/api/custom-messages) for the full API.
+
+---
+
+## Choosing the Right Approach
+
+### Decision flowchart
+
+**Is it a standard robotics type?** (CmdVel, LaserScan, Imu, Pose2D, etc.)
+- Yes: Use the built-in typed message. Done.
+
+**Is it large array data?** (camera frames, point clouds, feature maps)
+- Yes: Use pool-backed types (Image, PointCloud, DepthImage, Tensor). Done.
+
+**Is the schema stable and performance-critical?**
+- Yes: Define a custom compiled message via `horus.msggen`. Done.
+
+**Is this for prototyping or low-frequency data?**
+- Yes: Use a dict topic. Done.
+
+### Recommendation by project phase
+
+| Phase | Approach | Why |
+|-------|----------|-----|
+| **Prototyping** | Dict topics for everything | Iterate fast, change schemas freely |
+| **Early development** | Dict for custom data, typed for standard robotics types | Get type safety where it matters |
+| **Pre-production** | Migrate high-frequency dict topics to typed or custom compiled | Performance optimization |
+| **Production** | Typed for all fixed-schema data, dict only for truly dynamic data | Maximum performance and type safety |
+
+---
+
+## Cross-Language Compatibility
+
+Typed messages and pool-backed types are binary-compatible across all HORUS language bindings. A `CmdVel` published in one language is received as the same struct in any other language. Field names, types, and memory layout are identical.
+
+```python
+# simplified
+# Python publishes
+node.send("cmd_vel", horus.CmdVel(linear=1.0, angular=0.5))
+
+# Any HORUS language binding receives the same CmdVel
+# with linear=1.0, angular=0.5 — same bytes in shared memory
+```
+
+Dict topics (GenericMessage) are also cross-language compatible. The MessagePack serialization format is language-agnostic.
+
+Pool-backed types (Image, PointCloud, Tensor) share the same memory pool across languages. A compiled process publishes an Image; a Python process reads it with `img.to_numpy()` -- zero-copy.
+
+---
+
+## Complete Example: Multi-Topic Node
+
+A single node that uses dict topics, typed topics, and pool-backed types together:
+
+```python
+# simplified
+import horus
+import numpy as np
+
+def robot_tick(node):
+    # Receive typed sensor data
+    if node.has_msg("imu"):
+        imu = node.recv("imu")
+        roll, pitch = estimate_orientation(imu)
+
+    # Receive pool-backed camera frame
+    if node.has_msg("camera.rgb"):
+        img = node.recv("camera.rgb")
+        frame = img.to_numpy()
+        detections = detect_objects(frame)
+
+        # Send dict topic (variable structure)
+        node.send("detections", {
+            "count": len(detections),
+            "objects": [{"class": d.label, "conf": d.confidence} for d in detections],
+        })
+
+    # Send typed command
+    node.send("cmd_vel", horus.CmdVel(linear=0.5, angular=0.0))
+
+    # Send pool-backed costmap
+    costmap = horus.Tensor([100, 100], dtype="float32")
+    costmap.numpy()[:] = compute_costmap()
+    node.send("nav.costmap", costmap)
+
+robot = horus.Node(
+    name="robot_brain",
+    subs=[horus.Imu, horus.Image, "config"],
+    pubs=[horus.CmdVel, "detections", "nav.costmap"],
+    tick=robot_tick,
+    rate=30,
+)
+horus.run(robot)
+```
+
+---
+
+## Design Decisions
+
+**Why two message paths (dict vs typed) instead of a unified format?** Flexibility and performance are at odds. Dict topics give maximum flexibility -- send any Python dict, change the schema at will, no compilation needed. Typed topics give maximum performance -- zero-copy shared memory, no serialization, compile-time type safety. A single format would compromise one or the other. The dual-path design lets you prototype with dicts and migrate to typed messages for production, topic by topic.
+
+**Why MessagePack for GenericMessage instead of JSON or protobuf?** MessagePack is compact (30-50% smaller than JSON), fast to serialize/deserialize, and produces deterministic output. JSON is human-readable but slower and larger. Protobuf requires a schema definition file and a compilation step, which defeats the purpose of a flexible dict-based format. The tradeoff is that MessagePack is not human-readable in raw form, but `horus topic echo` handles display.
+
+**Why Pod (Plain Old Data) for typed messages instead of protobuf or FlatBuffers?** Pod types are fixed-size structs with no pointers, no heap allocation, and no serialization. They can be placed directly in shared memory and read by any process without parsing. Protobuf and FlatBuffers require a deserialization step, even if minimal. For robotics control loops running at 1kHz+, the difference between "deserialize then use" and "just use" matters. The cost is that Pod types cannot contain variable-length fields (strings, arrays) -- those use GenericMessage or pool-backed types.
+
+**Why pool-backed transport for large data instead of serializing into the ring buffer?** A 1080p RGB image is ~6MB. Copying 6MB through a ring buffer wastes bandwidth and adds milliseconds of latency. Pool-backed types keep the data in a shared memory pool and send only a 64-168 byte descriptor through the ring buffer. The receiver gets a zero-copy view into the pool. This makes camera and LiDAR pipelines practical at full sensor frame rates.
+
+**Why `from_numpy()` copies but `to_numpy()` does not?** Publishing requires placing data into a specific pool slot. A NumPy array at an arbitrary heap address cannot be shared across processes. So `from_numpy()` copies once into the shared memory pool. `to_numpy()` returns a view into the already-shared memory -- no copy needed. This asymmetry is intentional: one copy on publish, zero copies on receive.
+
+## Trade-offs
+
+| Area | Benefit | Cost |
+|------|---------|------|
+| **Dict topics** | Any Python dict; no schema; evolve freely | Serialization overhead (~5-50us); no type checking; 4KB limit |
+| **Typed topics** | Zero-copy (~1.5us); type safety; cross-language compatible | Fixed schema; only primitive fields; must use built-in or compiled types |
+| **Pool-backed types** | Zero-copy for megabytes of data; NumPy/PyTorch interop | One copy on `from_numpy()`; pool slot management; descriptors add indirection |
+| **Custom runtime messages** | No build step; instant iteration | Slower (~20-40us); primitive types only; manual `to_bytes()`/`from_bytes()` |
+| **Custom compiled messages** | Same performance as built-in types; cross-language | Requires `maturin develop` build step; primitive types only |
+| **GenericMessage inline buffer** | No heap allocation for small messages (256B or less) | 4KB maximum; overflow to heap above 256B |
+
+---
+
+## See Also
+
+- [Python Message Library](/python/library/python-message-library) -- All 55+ built-in message types
+- [Custom Messages](/python/api/custom-messages) -- Define your own typed messages
+- [Memory Types](/python/api/memory-types) -- Image, PointCloud, DepthImage, Tensor deep reference
+- [Multi-Process Architecture (Python)](/python/multi-process) -- Running nodes across separate processes
+- [Tensor](/python/api/tensor) -- General-purpose shared memory tensor for ML data

@@ -1,0 +1,596 @@
+---
+title: "Scheduler — Full Reference"
+description: "Deep dive into the HORUS scheduler: execution model, real-time enforcement, safety monitoring, and deterministic mode"
+order: 7
+---
+
+# Scheduler — Full Reference
+
+A warehouse robot runs 15 nodes: LiDAR, cameras, motor controllers, safety monitors, path planners, and loggers. The motor controller must run every millisecond — miss a deadline and the robot overshoots into a shelf. The path planner needs 50 ms of CPU time — if it runs on the same thread as the motor controller, it blocks 50 ticks. The safety monitor must run *before* the motor controller every cycle — if it runs after, a collision is detected one cycle too late. And when someone presses the emergency stop, all 15 nodes must shut down in the right order: motors stop before sensors disconnect.
+
+Writing this coordination by hand is the single largest source of bugs in robotics software. Thread pools, priority queues, signal handlers, deadline monitors, watchdog timers — each one is a weekend of debugging, and they all interact in non-obvious ways.
+
+HORUS's scheduler handles all of this. You add nodes, configure their order and timing, and call `run()`. The scheduler manages execution order, tick rates, deadline enforcement, safety monitoring, graceful shutdown, and recording — across five different execution classes, each optimized for a different workload type.
+
+For a gentler introduction, start with [Scheduler: Running Your Nodes](/concepts/scheduler-beginner). For multi-process orchestration (mixed languages, process isolation), see [Launch System](/concepts/launch-system).
+
+## The Execution Model
+
+### How a Tick Works
+
+Every tick cycle, the scheduler does the following:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart TD
+    A["Start tick cycle"] --> B["For each node in order:"]
+    B --> C{"Should this node tick?<br/>(rate limiter check)"}
+    C -->|No — not due yet| B
+    C -->|Yes| D["Start timer"]
+    D --> E["Call node.tick()"]
+    E --> F["Stop timer"]
+    F --> G{"Exceeded budget?"}
+    G -->|No| H["Record metrics"]
+    G -->|Yes| I["Apply Miss policy"]
+    I --> H
+    H --> B
+    B -->|All nodes done| J["Sleep to maintain tick rate"]
+    J --> A
+
+    style I fill:#ef4444,stroke:#dc2626,color:#fff
+`}
+  caption="Each tick: rate-check every node, time it, enforce budgets, sleep to maintain rate"
+/>
+
+**Key details**:
+- Nodes execute **sequentially in order** within the BestEffort class. RT, Compute, Event, and AsyncIo nodes run on their own threads and are synchronized at tick boundaries.
+- Rate limiting is per-node: a 10 Hz node inside a 1 kHz scheduler only has `tick()` called every 100th cycle.
+- Budget enforcement happens *after* `tick()` returns — the scheduler doesn't preempt mid-tick. It records the overrun and applies the `Miss` policy.
+
+### Initialization
+
+When you call `scheduler.run()`, initialization happens **lazily** — not when nodes are added:
+
+1. All pending node configurations are finalized (execution class inference, budget/deadline auto-derivation)
+2. `init()` is called on every node, in order
+3. If a node's `init()` returns `Err`, that node enters Error state and is excluded from ticking. Other nodes continue.
+4. The main tick loop begins
+
+This lazy initialization means you can configure nodes in any order and the scheduler resolves dependencies at startup.
+
+### Shutdown
+
+When the scheduler receives a stop signal (Ctrl+C, SIGINT, SIGTERM, or `.stop()`):
+
+1. The main loop exits
+2. `shutdown()` is called on every node in **reverse order** — last-added first
+3. RT threads are given 3 seconds to exit cleanly; stalled threads are detached
+4. Errors during shutdown are logged but don't prevent other nodes from cleaning up
+5. Shared memory is cleaned up
+
+Reverse-order shutdown ensures dependent nodes stop before their dependencies. The motor controller (order 1) shuts down before the sensor (order 0) that feeds it.
+
+## Configuring the Scheduler
+
+### Builder Methods
+
+`Scheduler::new()` creates a minimal scheduler with capability detection (~30–100 µs) but no OS-level features applied. Use builder methods to opt in:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    let mut scheduler = Scheduler::new()
+        .tick_rate(1000_u64.hz())        // 1 kHz global tick rate
+        .watchdog(500_u64.ms())          // Detect frozen nodes
+        .blackbox(64)                    // 64 MB flight recorder
+        .max_deadline_misses(50)         // Emergency stop after 50 misses
+        .prefer_rt();                    // Request RT features (degrade gracefully)
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    scheduler = horus.Scheduler(
+        tick_rate=1000,            # 1 kHz global tick rate
+        watchdog_ms=500,           # Detect frozen nodes
+        blackbox=64,               # 64 MB flight recorder
+        max_deadline_misses=50,    # Emergency stop after 50 misses
+        rt=True,                   # Request RT features (degrade gracefully)
+    )
+    ```
+  </LangTab>
+</LanguageTabs>
+
+| Builder | What it enables | When to use |
+|---------|----------------|-------------|
+| `.tick_rate(freq)` | Global tick rate (default: 100 Hz) | Always — match your fastest node |
+| `.watchdog(duration)` | Frozen node detection with graduated degradation | Production robots |
+| `.blackbox(size_mb)` | Flight recorder for post-mortem debugging | Production, testing |
+| `.max_deadline_misses(n)` | Emergency stop threshold (default: 100) | Safety-critical systems |
+| `.prefer_rt()` | Request RT features, degrade gracefully if unavailable | Most production deployments |
+| `.require_rt()` | Require RT features — **panics** if unavailable | Hard real-time systems |
+| `.deterministic(true)` | Dependency-driven execution order for reproducible results | Simulation, testing |
+| `.verbose(false)` | Suppress non-emergency logging | Quieter production |
+| `.with_recording()` | Enable session record/replay | Data collection |
+| `.cores(&[0, 1])` | Pin scheduler to specific CPU cores | Dedicated-core deployments |
+
+### Adding Nodes
+
+The fluent builder API configures each node:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    // Minimal — just order
+    scheduler.add(logger).order(200).build()?;
+
+    // With per-node rate — auto-derives budget (80%) and deadline (95%)
+    scheduler.add(motor_ctrl)
+        .order(5)
+        .rate(1000_u64.hz())           // 1 kHz → budget=800µs, deadline=950µs
+        .on_miss(Miss::SafeMode)       // Enter safe state on deadline miss
+        .build()?;
+
+    // Explicit budget and deadline (override auto-derivation)
+    scheduler.add(safety_monitor)
+        .order(0)
+        .budget(100_u64.us())          // Must finish in 100 µs
+        .deadline(200_u64.us())        // Hard wall at 200 µs
+        .on_miss(Miss::Stop)           // Stop everything if safety monitor misses
+        .build()?;
+
+    // CPU-heavy work on thread pool
+    scheduler.add(path_planner).order(50).compute().build()?;
+
+    // Event-driven — wakes when topic receives data
+    scheduler.add(estop_handler).order(0).on("emergency.stop").build()?;
+
+    // Async I/O — network, HTTP, database
+    scheduler.add(cloud_uploader).order(200).async_io().build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    # Minimal — just a tick function
+    logger = horus.Node("Logger", tick=logger_tick)
+
+    # With per-node rate — auto-derives budget (80%) and deadline (95%)
+    motor_ctrl = horus.Node(
+        "MotorCtrl",
+        tick=motor_tick,
+        rate=1000,                           # 1 kHz → budget=800µs, deadline=950µs
+        budget=800 * horus.us,               # Or set explicitly
+        deadline=950 * horus.us,
+    )
+
+    # Explicit budget and deadline (override auto-derivation)
+    safety_monitor = horus.Node(
+        "SafetyMonitor",
+        tick=safety_tick,
+        budget=100 * horus.us,               # Must finish in 100 µs
+        deadline=200 * horus.us,             # Hard wall at 200 µs
+    )
+
+    # CPU-heavy work on thread pool
+    path_planner = horus.Node("PathPlanner", tick=plan_tick, compute=True)
+
+    # Event-driven — wakes when topic receives data
+    estop_handler = horus.Node("EStop", tick=estop_tick, on="emergency.stop")
+
+    # Async I/O — network, HTTP, database
+    cloud_uploader = horus.Node("CloudUploader", tick=upload_tick, async_io=True)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Per-Node Configuration Reference
+
+| Method | Description |
+|--------|-------------|
+| `.order(n)` | Execution order — lower runs first. 0–9 critical, 10–49 high, 50–99 normal, 100–199 low, 200+ background |
+| `.rate(freq)` | Per-node tick rate. Auto-derives budget (80% of period) and deadline (95%). Auto-marks as RT |
+| `.budget(duration)` | Max expected tick duration. Auto-marks as RT |
+| `.deadline(duration)` | Hard deadline — `Miss` policy fires when exceeded. Auto-marks as RT |
+| `.on_miss(miss)` | Deadline miss policy: `Warn`, `Skip`, `SafeMode`, `Stop` (default: `Warn`) |
+| `.compute()` | Runs on thread pool — for CPU-heavy work |
+| `.on("topic")` | Event-driven — ticks only when named topic receives a message |
+| `.async_io()` | Runs on tokio runtime — for network/file I/O |
+| `.priority(n)` | OS thread priority (SCHED_FIFO 1–99) — requires RT capabilities |
+| `.core(cpu_id)` | Pin to specific CPU core |
+| `.watchdog(duration)` | Per-node watchdog timeout (overrides global) |
+| `.failure_policy(policy)` | What to do when `tick()` panics: `Fatal`, `Restart`, `Skip`, `Ignore` |
+| `.build()` | Finalize and register — returns `Result` |
+
+## Execution Classes
+
+The scheduler assigns each node an **execution class** based on its configuration. Each class uses a different executor optimized for its workload:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart TD
+    A["Node configuration"] -->|".rate() or .budget() or .deadline()"| B["Rt<br/>Dedicated thread<br/>Budget enforcement"]
+    A -->|".compute()"| C["Compute<br/>Thread pool<br/>No timing guarantees"]
+    A -->|".on(topic)"| D["Event<br/>Sleeps until message<br/>Wakes on publish"]
+    A -->|".async_io()"| E["AsyncIo<br/>Tokio runtime<br/>Non-blocking I/O"]
+    A -->|"default"| F["BestEffort<br/>Main loop<br/>Sequential"]
+
+    style B fill:#ef4444,stroke:#dc2626,color:#fff
+    style C fill:#3b82f6,stroke:#2563eb,color:#fff
+    style D fill:#22c55e,stroke:#16a34a,color:#000
+    style E fill:#a855f7,stroke:#9333ea,color:#fff
+    style F fill:#6b7280,stroke:#4b5563,color:#fff
+`}
+  caption="Five execution classes — auto-detected from node configuration"
+/>
+
+| Class | Thread model | Timing | Best for |
+|-------|-------------|--------|----------|
+| **BestEffort** | Sequential in main loop | No guarantees | Logging, telemetry, display |
+| **Rt** | Dedicated thread per node | Budget + deadline enforced | Motor control, safety, sensor fusion |
+| **Compute** | Shared thread pool | None — CPU time only | Path planning, SLAM, image processing |
+| **Event** | Sleeps until topic message | None — latency from publish to tick | Emergency stop, command handlers |
+| **AsyncIo** | Tokio runtime | None — I/O bound | Cloud upload, HTTP, database |
+
+<Callout type="info">
+**RT is auto-detected.** There is no `.rt()` method. Setting `.rate()`, `.budget()`, or `.deadline()` on a node automatically assigns the `Rt` execution class. This maps developer intent ("this node needs to run at 1 kHz") to the right executor without requiring framework knowledge.
+</Callout>
+
+### Deferred Finalization
+
+Execution class inference happens at `.build()` time, not when individual methods are called. This means `.rate(100_u64.hz()).compute()` and `.compute().rate(100_u64.hz())` behave identically — the last mutually-exclusive setter wins. Specifically:
+
+- `.rate()` / `.budget()` / `.deadline()` → Rt
+- `.compute()` → Compute (overrides Rt)
+- `.on(topic)` → Event (overrides Rt and Compute)
+- `.async_io()` → AsyncIo (overrides everything)
+
+If none are set, the default is BestEffort.
+
+## Real-Time Enforcement
+
+### Budget and Deadline Auto-Derivation
+
+When you set `.rate(freq)`, the scheduler auto-derives:
+- **Budget** = 80% of the period (e.g., 1000 Hz → 800 µs budget)
+- **Deadline** = 95% of the period (e.g., 1000 Hz → 950 µs deadline)
+
+You can override either with explicit `.budget()` or `.deadline()`.
+
+### The Miss Enum
+
+When a node exceeds its deadline, the `Miss` policy fires:
+
+| Policy | What happens | Use when |
+|--------|-------------|----------|
+| `Miss::Warn` | Log warning, continue normally | Non-critical nodes (default) |
+| `Miss::Skip` | Skip this node's next tick to recover | High-frequency nodes that can afford one skipped cycle |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node | Motor controllers, actuators |
+| `Miss::Stop` | Stop the entire scheduler | Safety monitor, last resort |
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.add(motor_ctrl)
+        .order(5)
+        .rate(1000_u64.hz())
+        .on_miss(Miss::SafeMode)  // Enter safe state on deadline miss
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    motor_ctrl = horus.Node(
+        "MotorCtrl",
+        tick=motor_tick,
+        rate=1000,
+        budget=800 * horus.us,       # SafeMode on deadline miss
+        deadline=950 * horus.us,
+    )
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Graduated Watchdog
+
+When `.watchdog(duration)` is set, the scheduler monitors every node with a graduated response:
+
+| Timeout | Health State | Response |
+|---------|-------------|----------|
+| 1× watchdog | Warning | Log warning |
+| 2× watchdog | Unhealthy | Skip tick, log error |
+| 3× watchdog on critical node | Isolated | Remove from tick loop, call `enter_safe_state()` |
+
+This prevents a single frozen node from stalling the entire system.
+
+### `.require_rt()` vs `.prefer_rt()`
+
+| Method | RT scheduling | Memory locking | CPU affinity | On failure |
+|--------|--------------|----------------|--------------|------------|
+| `.prefer_rt()` | Tries SCHED_FIFO | Tries mlockall | Tries isolated CPUs | Logs degradation, continues |
+| `.require_rt()` | Requires SCHED_FIFO | Requires mlockall | Requires isolated CPUs | **Panics** |
+
+Use `.prefer_rt()` for most deployments — it applies what it can and logs what it can't. Use `.require_rt()` only for hard real-time systems where degraded mode is unacceptable.
+
+## Running the Scheduler
+
+### Continuous Mode
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.run()?;  // Run until Ctrl+C
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    horus.run(motor_ctrl, safety_monitor, logger)  # Run until Ctrl+C
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Single-Tick Mode (Testing/Simulation)
+
+Execute exactly one tick cycle, then return:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.tick_once()?;  // Init lazily on first call, tick all nodes once
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    scheduler.tick_once()  # Init lazily on first call, tick all nodes once
+    ```
+  </LangTab>
+</LanguageTabs>
+
+This is invaluable for testing — create a scheduler, add nodes, call `tick_once()`, and assert on topic output. No threads, no timing, fully deterministic.
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    // In a test
+    let mut sched = Scheduler::new();
+    sched.add(my_node).order(0).build()?;
+
+    sched.tick_once()?;  // Init + one tick
+    assert_eq!(output_topic.recv(), Some(expected_value));
+
+    sched.tick_once()?;  // Second tick
+    assert_eq!(output_topic.recv(), Some(next_expected_value));
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    # In a test
+    scheduler = horus.Scheduler(tick_rate=100)
+    scheduler.add(my_node)
+
+    scheduler.tick_once()  # Init + one tick
+    assert my_node.recv("output") == expected_value
+
+    scheduler.tick_once()  # Second tick
+    assert my_node.recv("output") == next_expected_value
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Deterministic Mode
+
+Enable dependency-driven execution order for reproducible results:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .deterministic(true);
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    scheduler = horus.Scheduler(tick_rate=100, deterministic=True)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+In deterministic mode, the scheduler uses a dependency graph (inferred from topic connections) to determine execution order instead of relying on OS thread scheduling. This guarantees identical results across runs — essential for simulation and regression testing.
+
+### Duration-Limited
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.run_for(std::time::Duration::from_secs(30))?;  // Run for 30 seconds
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    scheduler.run_for(duration_secs=30)  # Run for 30 seconds
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## DurationExt and Frequency
+
+HORUS provides ergonomic extension methods for creating `Duration` and `Frequency` values:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    // Duration helpers
+    200_u64.us()     // 200 microseconds
+    5_u64.ms()       // 5 milliseconds
+    1_u64.secs()     // 1 second
+    500_u64.ns()     // 500 nanoseconds
+
+    // Frequency
+    100_u64.hz()     // 100 Hz
+    1000_u64.hz()    // 1 kHz
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    # Duration helpers
+    200 * horus.us     # 200 microseconds
+    5 * horus.ms       # 5 milliseconds
+
+    # Frequency — plain integers
+    rate = 100         # 100 Hz
+    rate = 1000        # 1 kHz
+    ```
+  </LangTab>
+</LanguageTabs>
+
+`Frequency` validates at construction — `0_u64.hz()`, `f64::NAN.hz()`, `f64::INFINITY.hz()`, and negative values all panic immediately rather than producing silent bugs later.
+
+A `Frequency` auto-derives timing parameters:
+- `.period()` → `Duration` (1/freq)
+- `.budget_default()` → 80% of period
+- `.deadline_default()` → 95% of period
+
+## Recording and Replay
+
+Enable recording through the builder API:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .blackbox(16)          // 16 MB flight recorder
+        .with_recording();     // Enable session recording
+
+    scheduler.run()?;          // All ticks recorded
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    scheduler = horus.Scheduler(
+        tick_rate=100,
+        blackbox=16,           # 16 MB flight recorder
+        recording=True,        # Enable session recording
+    )
+
+    horus.run(node_a, node_b)  # All ticks recorded
+    ```
+  </LangTab>
+</LanguageTabs>
+
+Replay a recorded session:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut replay = Scheduler::replay_from("~/.horus/recordings/session".into())?;
+    replay.run()?;  // Replays exact tick sequence
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    replay = horus.Scheduler.replay_from("~/.horus/recordings/session")
+    replay.run()  # Replays exact tick sequence
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Performance Monitoring
+
+### Programmatic
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let metrics = scheduler.metrics();
+    for m in &metrics {
+        println!("{}: avg={:.2}ms, max={:.2}ms, misses={}",
+            m.name(), m.avg_tick_duration_ms(), m.max_tick_duration_ms(), m.failed_ticks());
+    }
+
+    if let Some(safety) = scheduler.safety_stats() {
+        println!("Budget overruns: {}, Watchdog expirations: {}",
+            safety.budget_overruns, safety.watchdog_expirations);
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    metrics = scheduler.metrics()
+    for m in metrics:
+        print(f"{m.name}: avg={m.avg_tick_duration_ms:.2f}ms, "
+              f"max={m.max_tick_duration_ms:.2f}ms, misses={m.failed_ticks}")
+
+    safety = scheduler.safety_stats()
+    if safety:
+        print(f"Budget overruns: {safety.budget_overruns}, "
+              f"Watchdog expirations: {safety.watchdog_expirations}")
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### CLI Tools
+
+```bash
+horus monitor --tui         # Interactive dashboard with per-node timing
+horus node list             # List all registered nodes
+horus node info MotorCtrl   # Detailed stats for a specific node
+```
+
+## Design Decisions
+
+**Why a single Scheduler instead of per-node threads?**
+Per-node threads give each node independence, but they lose deterministic ordering. If the sensor and motor controller run on separate threads, you can't guarantee the sensor publishes before the motor controller reads. The scheduler gives you the best of both: sequential ordering for BestEffort nodes (deterministic), dedicated threads for RT nodes (timing guarantees), and thread pools for Compute nodes (parallelism) — all coordinated.
+
+**Why auto-detect RT instead of requiring explicit configuration?**
+Developers think "this node needs to run at 1 kHz," not "this node needs SCHED_FIFO priority 80 on an isolated CPU core." Auto-detection from `.rate()`, `.budget()`, and `.deadline()` maps intent to implementation. The developer describes *what* the node needs; the scheduler figures out *how* to deliver it.
+
+**Why graduated watchdog instead of instant kill?**
+A single late tick might be a transient spike (GC in a Python node, page fault). Killing the node immediately is too aggressive. Graduated response (warn → skip → isolate) gives transient problems time to resolve while still catching truly frozen nodes. Only after 3× the watchdog timeout on a critical node does the scheduler isolate it.
+
+**Why reverse-order shutdown?**
+Nodes are typically added in dependency order: sensors → controllers → loggers. Reverse-order shutdown means controllers stop motors before sensors disconnect, and loggers record the shutdown sequence before they themselves stop. This prevents the dangerous scenario where a sensor disconnects while a motor controller is still running with the last received command.
+
+**Why lazy initialization?**
+`init()` runs when `scheduler.run()` is called, not when `scheduler.add()` is called. This means you can configure all nodes, set global scheduler settings, and defer hardware initialization until the system is truly ready to start. It also means the scheduler's clock, RT configuration, and recording state are all finalized before any node initializes.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| **Deterministic ordering** — nodes always execute in the configured sequence | Must specify `.order()` for every node |
+| **Five execution classes** — each workload gets the right executor | More complex scheduler internals (transparent to users) |
+| **Automatic RT detection** — `.rate()` implies dedicated thread + timing | Less explicit control (override with `.compute()` or `.on()`) |
+| **Budget/deadline enforcement** — catches timing regressions automatically | ~µs measurement overhead per monitored node |
+| **Graduated watchdog** — frozen nodes are isolated, not killed instantly | 3× timeout before isolation on critical nodes |
+| **Graceful shutdown** — guaranteed `shutdown()` call on all nodes | Nodes must implement `shutdown()` for hardware cleanup |
+| **tick_once()** — fully deterministic single-step execution for tests | Not suitable for production (no rate control) |
+
+## See Also
+
+- [Scheduler: Running Your Nodes](/concepts/scheduler-beginner) — Beginner introduction
+- [Execution Classes](/concepts/execution-classes) — Deep dive into the 5 classes
+- [Scheduler API](/rust/api/scheduler) — Complete API reference with every method signature
+- [Nodes — Full Reference](/concepts/core-concepts-nodes) — The components the scheduler runs
+- [Safety Monitor](/advanced/safety-monitor) — Watchdog, budget enforcement, graduated degradation
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Advanced tuning
+- [Python Scheduler API](/python/api/python-bindings) — Scheduler from Python

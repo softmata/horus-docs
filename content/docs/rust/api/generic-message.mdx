@@ -1,0 +1,238 @@
+---
+title: "GenericMessage"
+description: "Cross-language binary message for Rust-Python interop"
+weight: 65
+---
+
+# GenericMessage
+
+Send arbitrary data between nodes when standard message types don't fit — especially useful for Rust-to-Python communication and bridging external systems.
+
+**When to use**
+
+- Dynamic message types where the schema isn't known at compile time
+- Bridge nodes that forward messages between different schemas
+- Prototyping before defining a concrete message type
+
+**When NOT to use**
+
+- Performance-critical paths — GenericMessage uses MessagePack serialization (~1us overhead)
+- Messages larger than 4KB — use pool-backed types (Image, PointCloud, Tensor) instead
+- Production code with stable schemas — define a concrete type with `message!` macro
+
+**Quick example** — bridge JSON data from an external API into HORUS:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Rust side: pack JSON from external system
+let detection_json = r#"{"class": "box", "confidence": 0.95, "x": 120, "y": 340}"#;
+let detection: serde_json::Value = serde_json::from_str(detection_json)?;
+let msg = GenericMessage::from_value(&detection)?;
+
+let topic: Topic<GenericMessage> = Topic::new("external.detections")?;
+topic.send(msg);
+```
+
+```python
+# Python side: receive and parse
+topic = Topic(GenericMessage, "external.detections")
+msg = topic.recv()
+data = msg.to_dict()  # {"class": "box", "confidence": 0.95, ...}
+```
+
+## When to Use
+
+Use `GenericMessage` when standard types (`CmdVel`, `Imu`, `LaserScan`, etc.) don't cover your data:
+
+- Sending structured data from Rust to Python (or vice versa)
+- Prototyping a custom message before defining a dedicated type
+- Bridging external systems that produce arbitrary payloads
+
+**Prefer typed messages whenever possible.** Typed POD messages achieve ~200ns latency via zero-copy shared memory. `GenericMessage` requires MessagePack serialization, which adds overhead (~4us). Use it only when you need the flexibility.
+
+## Constructors
+
+### From Raw Bytes
+
+```rust
+// simplified
+let data: Vec<u8> = vec![0x01, 0x02, 0x03];
+let msg = GenericMessage::new(data)?;
+```
+
+Maximum payload is **4,096 bytes** (4KB). Returns an error if exceeded.
+
+### With Metadata
+
+```rust
+// simplified
+let data: Vec<u8> = sensor_bytes.to_vec();
+let msg = GenericMessage::with_metadata(data, "lidar_raw".to_string())?;
+```
+
+Metadata is an optional string label (max **255 bytes**). Useful for tagging the content type so the receiver knows how to interpret the payload.
+
+### From a Serializable Value
+
+```rust
+// simplified
+use std::collections::HashMap;
+
+let mut config = HashMap::new();
+config.insert("gain", 1.5_f64);
+config.insert("offset", 0.3);
+
+let msg = GenericMessage::from_value(&config)?;
+```
+
+Serializes any `T: Serialize` via MessagePack into the payload bytes.
+
+## Methods
+
+| Method | Return Type | Description |
+|--------|-------------|-------------|
+| `data()` | `Vec<u8>` | Get the raw payload bytes |
+| `metadata()` | `Option<String>` | Get the metadata string, if set |
+| `to_value::<T>()` | `Result<T>` | Deserialize payload from MessagePack into `T` |
+
+## Examples
+
+### Rust to Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CalibrationData {
+    offsets: Vec<f32>,
+    scale: f64,
+    label: String,
+}
+
+// Sender
+let cal = CalibrationData {
+    offsets: vec![0.1, -0.05, 0.02],
+    scale: 1.001,
+    label: "imu_0".into(),
+};
+
+let topic: Topic<GenericMessage> = Topic::new("calibration")?;
+topic.send(GenericMessage::from_value(&cal)?);
+
+// Receiver
+if let Some(msg) = topic.recv() {
+    let cal: CalibrationData = msg.to_value()?;
+    println!("Scale: {}, offsets: {:?}", cal.scale, cal.offsets);
+}
+```
+
+### Rust to Python
+
+A Rust node publishes config data that a Python node consumes:
+
+```rust
+// simplified
+// Rust sender
+use std::collections::HashMap;
+
+let mut params = HashMap::new();
+params.insert("kp", 1.2_f64);
+params.insert("ki", 0.01);
+params.insert("kd", 0.5);
+
+let topic: Topic<GenericMessage> = Topic::new("controller.params")?;
+let msg = GenericMessage::with_metadata(
+    GenericMessage::from_value(&params)?.data(),
+    "pid_gains".to_string(),
+)?;
+topic.send(msg);
+```
+
+```python
+# Python receiver
+import horus
+
+topic = horus.Topic(horus.GenericMessage, endpoint="controller.params")
+
+msg = topic.recv()
+if msg is not None:
+    params = msg.to_dict()  # Deserializes MessagePack
+    print(f"PID gains: kp={params['kp']}, ki={params['ki']}, kd={params['kd']}")
+
+    if msg.metadata == "pid_gains":
+        controller.update_gains(**params)
+```
+
+### With Metadata Tagging
+
+```rust
+// simplified
+// Tag messages so the receiver can dispatch by type
+let msg = GenericMessage::with_metadata(
+    GenericMessage::from_value(&sensor_reading)?.data(),
+    "temperature".to_string(),
+)?;
+topic.send(msg);
+
+// Receiver dispatches based on metadata
+if let Some(msg) = topic.recv() {
+    match msg.metadata().as_deref() {
+        Some("temperature") => {
+            let temp: f64 = msg.to_value()?;
+            hlog!(info, "Temperature: {:.1} C", temp);
+        }
+        Some("humidity") => {
+            let hum: f64 = msg.to_value()?;
+            hlog!(info, "Humidity: {:.1}%", hum);
+        }
+        _ => {
+            hlog!(warn, "Unknown message type");
+        }
+    }
+}
+```
+
+## Performance
+
+`GenericMessage` uses MessagePack serialization, which adds overhead compared to typed POD messages:
+
+| Payload Size | GenericMessage Latency | Typed Message Latency |
+|-------------|----------------------|----------------------|
+| Small (up to 256 bytes) | ~4.0 us | ~200 ns |
+| Large (up to 4 KB) | ~4.4 us | ~200 ns |
+
+The 20x difference comes from serialization/deserialization. For high-frequency data (IMU at 1 kHz, motor commands at 500 Hz), always use typed messages. `GenericMessage` is appropriate for lower-frequency data like configuration updates, calibration parameters, or diagnostic payloads.
+
+## Limits
+
+| Constraint | Value |
+|-----------|-------|
+| Maximum payload | 4,096 bytes (4 KB) |
+| Maximum metadata | 255 bytes |
+| Serialization format | MessagePack |
+
+The 4KB limit keeps `GenericMessage` as a fixed-size type suitable for shared memory transport. For larger payloads, use `Topic<Tensor>` with [Tensor API](/rust/api/tensor) instead.
+
+## Pitfalls
+
+**No compile-time type safety.** Unlike `Topic<CmdVel>`, `Topic<GenericMessage>` can carry any data. A publisher sending `{"velocity": 1.0}` and a subscriber expecting `{"speed": 1.0}` will silently fail — the key name mismatch is only caught at runtime.
+
+**Debugging is harder.** GenericMessage shows as raw bytes in the monitor. Typed messages show structured fields. Prefer typed messages for anything you'll need to debug.
+
+**Not for high-frequency data.** The 20x latency overhead (4μs vs 200ns) matters at 1kHz+. Use typed messages (`CmdVel`, `Imu`, etc.) for control loops and sensor streams.
+
+**When to use GenericMessage:**
+- Python↔Python communication with arbitrary dicts
+- Configuration updates at low frequency
+- Prototyping before defining a typed message
+- Cross-language payloads where defining a shared struct isn't worth it
+
+## See Also
+
+- [Standard Messages](/rust/api/messages) -- All built-in message types
+- [TensorPool API](/rust/api/tensor) -- For payloads larger than 4KB
+- [message! Macro](/rust/api/macros#message) -- Define custom typed messages

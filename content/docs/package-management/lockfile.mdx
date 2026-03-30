@@ -1,0 +1,247 @@
+---
+title: "Lockfile & Reproducibility"
+description: "How horus.lock pins dependencies for reproducible builds across machines and platforms"
+order: 31
+---
+
+# Lockfile & Reproducibility
+
+`horus.lock` is the single file that ensures every machine builds with identical dependencies. It pins exact versions for packages, toolchains, and system libraries.
+
+```
+horus.toml   → what you WANT (version ranges, declarative)
+horus.lock   → what you GOT  (exact pins, reproducible)
+```
+
+This is the same pattern as `Cargo.lock`, `package-lock.json`, or `uv.lock`.
+
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| Generate lockfile | `horus lock` |
+| Validate lockfile | `horus lock --check` |
+| Build (auto-verifies lockfile) | `horus build` |
+| Check system deps | `horus doctor` |
+
+---
+
+## How It Works
+
+```bash
+# First build: resolves dependencies, creates horus.lock
+horus build
+
+# Subsequent builds: uses pinned versions from horus.lock
+horus build
+
+# Teammate clones repo, gets identical deps
+git clone <repo> && cd <repo> && horus build
+```
+
+`horus build` handles everything:
+1. Reads `horus.toml` (your dependency declarations)
+2. Reads `horus.lock` (pinned versions) — creates it if missing
+3. Checks toolchain versions (Rust, Python) and warns on mismatches
+4. Checks system dependencies via `pkg-config` and suggests install commands
+5. Installs language packages (crates.io, PyPI, registry)
+6. Compiles the project
+
+## The Lockfile Format (v4)
+
+```toml
+version = 4
+config_hash = "sha256:a1b2c3..."
+
+[toolchain]
+rust = "1.78.0"
+python = "3.12.3"
+
+features = ["monitor"]
+
+[[package]]
+name = "horus_library"
+version = "0.1.9"
+source = "registry"
+checksum = "sha256:abc..."
+
+[[package]]
+name = "serde"
+version = "1.0.215"
+source = "crates.io"
+checksum = "sha256:def..."
+
+[[package]]
+name = "numpy"
+version = "1.26.4"
+source = "pypi"
+
+[[system]]
+name = "opencv"
+version = "4.8.1"
+pkg_config = "opencv4"
+apt = "libopencv-dev"
+brew = "opencv"
+pacman = "opencv"
+```
+
+### Sections
+
+| Section | Purpose |
+|---------|---------|
+| `version` | Schema version (currently 4) |
+| `config_hash` | SHA-256 of `horus.toml` for staleness detection |
+| `[toolchain]` | Pinned Rust/Python/CMake versions |
+| `features` | Active feature flags at lock time |
+| `[[package]]` | Pinned package versions (registry, crates.io, PyPI) |
+| `[[system]]` | System dependencies with cross-platform package names |
+
+## Cross-Platform System Dependencies
+
+Each `[[system]]` entry includes package names for multiple platforms:
+
+```toml
+[[system]]
+name = "opencv"
+version = "4.8.1"
+pkg_config = "opencv4"      # How to detect (cross-platform)
+apt = "libopencv-dev"        # Debian/Ubuntu
+brew = "opencv"              # macOS (Homebrew)
+pacman = "opencv"            # Arch Linux
+choco = "opencv"             # Windows (Chocolatey)
+```
+
+When `horus build` detects a missing system dependency, it prints the correct install command for your platform:
+
+```bash
+# On Ubuntu:
+  ✗ opencv — install with: sudo apt install -y libopencv-dev
+
+# On macOS:
+  ✗ opencv — install with: brew install opencv
+
+# On Arch:
+  ✗ opencv — install with: sudo pacman -S opencv
+```
+
+## Commands
+
+### `horus lock`
+
+Regenerate `horus.lock` from `horus.toml`:
+
+```bash
+horus lock
+# [✓] Generated horus.lock v4 (12 packages)
+```
+
+### `horus lock --check`
+
+Verify the lockfile is valid and check system dependencies:
+
+```bash
+horus lock --check
+# [✓] horus.lock v4 is valid (12 packages, 2 system deps)
+#   ⚠ Rust version mismatch: lockfile pins 1.78.0, you have 1.79.0
+#   ✗ opencv — install with: sudo apt install -y libopencv-dev
+```
+
+### `horus build`
+
+Build the project. Automatically verifies the lockfile first:
+
+```bash
+horus build
+# Lockfile verification:
+#   ⚠ Python version mismatch: lockfile pins 3.12.3, you have 3.11.0
+# [i] Building project in debug mode...
+```
+
+## Workflows
+
+### Team Development
+
+```bash
+# Developer A: adds a dependency
+horus add numpy --source pypi
+horus build                    # updates horus.lock
+git add horus.toml horus.lock
+git commit -m "add numpy dependency"
+git push
+
+# Developer B: gets identical deps
+git pull
+horus build                    # reads horus.lock, installs exact versions
+```
+
+### Robot Deployment
+
+```bash
+# On dev machine:
+horus build --release
+scp -r . robot@192.168.1.5:~/project/
+
+# On robot:
+cd ~/project
+horus build --release          # horus.lock ensures identical deps
+```
+
+### CI/CD
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - name: Install horus
+    run: curl -fsSL https://raw.githubusercontent.com/softmata/horus/release/install.sh | bash
+  - name: Build
+    run: horus build --release
+  - name: Test
+    run: horus test
+```
+
+The lockfile in the repo ensures CI builds match local builds exactly.
+
+## Version Checking
+
+The `[toolchain]` section records which Rust/Python versions were used when the lockfile was generated. On `horus build`, version mismatches produce warnings (not errors):
+
+- **Same major.minor** (e.g., 1.78.0 vs 1.78.5): no warning
+- **Different minor** (e.g., 1.78.0 vs 1.79.0): warning printed
+- **Different major** (e.g., 3.12 vs 2.7): warning printed
+
+Warnings don't block the build — they inform you that behavior may differ.
+
+## Backward Compatibility
+
+- `horus.lock` v3 files (packages only) are still readable
+- Missing sections (`[toolchain]`, `[[system]]`, `features`) default to empty
+- On the next `horus lock` or `horus build`, the file is upgraded to v4
+
+## Best Practices
+
+1. **Commit `horus.lock` to git** — this is the reproducibility mechanism
+2. **Don't edit `horus.lock` manually** — use `horus lock` to regenerate
+3. **Run `horus lock --check` in CI** — catch dependency drift early
+4. **Update lockfile when adding deps** — `horus add` + `horus build` updates it automatically
+5. **Pin toolchain versions** — `horus doctor --fix` installs missing toolchains/system deps and pins their versions to `[toolchain]` and `[[system]]`
+
+## Common Errors
+
+### "Lockfile is stale"
+
+The `config_hash` in `horus.lock` doesn't match the current `horus.toml`. Run `horus lock` to regenerate.
+
+### Toolchain version mismatch warnings
+
+Warnings like "Rust version mismatch: lockfile pins 1.78.0, you have 1.79.0" are informational and don't block the build. Update the lockfile with `horus lock` to record your current toolchain versions.
+
+### Missing system dependency
+
+When `horus build` reports a missing system library, install it using the platform-specific command shown in the output (e.g., `sudo apt install -y libopencv-dev`).
+
+---
+
+## See Also
+
+- [Package Management](/package-management/package-management) — Dependency management
+- [Configuration](/package-management/configuration) — Registry configuration

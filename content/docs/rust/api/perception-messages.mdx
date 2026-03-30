@@ -1,0 +1,626 @@
+---
+title: "Perception Messages"
+description: "3D perception, point cloud, depth, landmark, tracking, and segmentation message types"
+weight: 50
+---
+
+# Perception Messages
+
+HORUS provides message types for 3D perception tasks. These include:
+
+- **Pool-backed RAII types**: `PointCloud`, `DepthImage` — zero-copy shared memory backed, managed via global tensor pool
+- **Serde types**: `PointField`, `PlaneDetection` — flexible, support serialization
+- **Zero-copy types**: `PointXYZ`, `Landmark`, `TrackedObject`, `SegmentationMask` — fixed-size, suitable for shared memory transport with zero serialization overhead
+
+## PointCloud
+
+Pool-backed RAII point cloud type with zero-copy shared memory transport. PointCloud allocates from a global tensor pool.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create XYZ point cloud (10000 points, 3 floats per point)
+let mut cloud = PointCloud::from_xyz(&points)?;  // 10000 points
+
+// Copy point data
+let point_data: Vec<u8> = vec![0; 10000 * 3 * 4]; // 10000 points * 3 floats * 4 bytes
+cloud.copy_from(&point_data);
+
+// Set metadata (method chaining)
+cloud.set_frame_id("lidar_front").set_timestamp_ns(1234567890);
+
+// Access properties
+println!("Points: {}", cloud.point_count());
+println!("Fields per point: {}", cloud.fields_per_point());
+println!("Is XYZ: {}", cloud.is_xyz());
+
+// Zero-copy data access
+let data: &[u8] = cloud.data();
+
+// Extract XYZ coordinates as Vec<[f32; 3]>
+if let Some(points) = cloud.extract_xyz() {
+    for p in &points[..3] {
+        println!("({:.2}, {:.2}, {:.2})", p[0], p[1], p[2]);
+    }
+}
+
+// Access individual point
+if let Some(point_bytes) = cloud.point_at(0) {
+    println!("Point 0: {} bytes", point_bytes.len());
+}
+```
+
+**PointCloud methods:**
+
+PointCloud is an RAII type — fields are private, accessed through methods. Mutation methods return `&mut Self` for chaining.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(num_points, fields_per_point, dtype)` | `Result<PointCloud>` | Create point cloud (allocates from global pool) |
+| `data()` | `&[u8]` | Zero-copy access to raw point data |
+| `data_mut()` | `&mut [u8]` | Mutable access to point data |
+| `copy_from(src)` | `&mut Self` | Copy data into point cloud |
+| `point_at(idx)` | `Option<&[u8]>` | Get bytes for the i-th point |
+| `extract_xyz()` | `Option<Vec<[f32; 3]>>` | Extract XYZ as float arrays (F32 only) |
+| `point_count()` | `u64` | Number of points |
+| `fields_per_point()` | `u32` | Floats per point (3=XYZ, 4=XYZI, 6=XYZRGB) |
+| `dtype()` | `TensorDtype` | Data type of point components |
+| `is_xyz()` | `bool` | Whether this is a plain XYZ cloud |
+| `has_intensity()` | `bool` | Whether cloud has intensity field |
+| `set_frame_id(id)` | `&mut Self` | Set sensor frame identifier |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds |
+
+### PointField
+
+Describes a field within point cloud data (serde type, used for custom point formats):
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create custom field
+let intensity = PointField::new("intensity", 12, TensorDtype::F32, 1);
+println!("Field: {}, size: {} bytes", intensity.name_str(), intensity.field_size());
+```
+
+**PointField** uses `TensorDtype` (available via prelude) for its `datatype` field. See [TensorDtype values](/rust/api/tensor#tensordtype) for the full list.
+
+## Point Types (Zero-Copy)
+
+Fixed-size point types suitable for zero-copy shared memory transport.
+
+### PointXYZ
+
+Basic 3D point (12 bytes).
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let point = PointXYZ::new(1.0, 2.0, 3.0);
+
+println!("Distance from origin: {:.2}m", point.distance());
+
+let other = PointXYZ::new(4.0, 6.0, 3.0);
+println!("Distance between: {:.2}m", point.distance_to(&other));
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x` | `f32` | X coordinate (meters) |
+| `y` | `f32` | Y coordinate (meters) |
+| `z` | `f32` | Z coordinate (meters) |
+
+### PointXYZRGB
+
+3D point with RGB color (16 bytes). Common for RGB-D cameras like Intel RealSense.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let point = PointXYZRGB::new(1.0, 2.0, 3.0, 255, 0, 0); // Red point
+
+// Convert from PointXYZ (defaults to white)
+let xyz = PointXYZ::new(1.0, 2.0, 3.0);
+let colored = PointXYZRGB::from_xyz(xyz);
+
+// Get packed RGB as u32 (0xRRGGBBAA)
+let packed = point.rgb_packed();
+
+// Convert back to PointXYZ (drop color)
+let xyz_only = point.xyz();
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters) |
+| `r`, `g`, `b` | `u8` | Color components (0-255) |
+| `a` | `u8` | Alpha/padding (255 default) |
+
+### PointXYZI
+
+3D point with intensity (16 bytes). Common for LiDAR sensors (Velodyne, Ouster, Livox).
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let point = PointXYZI::new(1.0, 2.0, 3.0, 128.0);
+
+// Convert from PointXYZ (zero intensity)
+let xyz = PointXYZ::new(1.0, 2.0, 3.0);
+let with_intensity = PointXYZI::from_xyz(xyz);
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters) |
+| `intensity` | `f32` | Reflectance (typically 0-255) |
+
+### PointCloudHeader
+
+Header for array transmission of point clouds (64 bytes). Sent before the point data array via IPC.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create header for different point types
+let header = PointCloudHeader::xyz(10000)
+    .with_frame_id("lidar_front")
+    .with_timestamp(timestamp_ns);
+
+// Or for colored points
+let header = PointCloudHeader::xyzrgb(5000);
+
+// Calculate total data size
+println!("Data size: {} bytes", header.data_size());
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `num_points` | `u64` | Number of points |
+| `point_type` | `u32` | 0=XYZ, 1=XYZRGB, 2=XYZI |
+| `point_stride` | `u32` | Bytes per point |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `seq` | `u64` | Sequence number |
+| `frame_id` | `[u8; 32]` | Sensor/coordinate frame |
+
+## DepthImage
+
+Pool-backed RAII depth image with zero-copy shared memory transport. Supports both F32 (meters) and U16 (millimeters) formats.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create F32 depth image (meters)
+let mut depth = DepthImage::meters(640, 480)?;
+
+// Or U16 depth image (millimeters)
+let mut depth_u16 = DepthImage::millimeters(640, 480)?;
+
+// Set metadata (method chaining)
+depth.set_frame_id("depth_camera").set_timestamp_ns(1234567890);
+
+// Access depth at pixel (always returns meters as f32)
+if let Some(d) = depth.get_depth(320, 240) {
+    println!("Depth at center: {:.3}m", d);
+}
+
+// Set depth at pixel (value in meters)
+depth.set_depth(100, 100, 1.5);
+
+// Get raw U16 value for millimeter-format images
+if let Some(mm) = depth_u16.get_depth_u16(320, 240) {
+    println!("Raw depth: {}mm", mm);
+}
+
+// Get statistics (min, max, mean in meters)
+if let Some((min, max, mean)) = depth.depth_statistics() {
+    println!("Depth range: {:.2}-{:.2}m, mean: {:.2}m", min, max, mean);
+}
+
+// Zero-copy data access
+let data: &[u8] = depth.data();
+println!("Image: {}x{}, {} bytes", depth.width(), depth.height(), data.len());
+```
+
+**DepthImage methods:**
+
+DepthImage is an RAII type — fields are private, accessed through methods. Mutation methods return `&mut Self` for chaining.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(width, height, dtype)` | `Result<DepthImage>` | Create depth image (F32 or U16) |
+| `data()` | `&[u8]` | Zero-copy access to raw depth data |
+| `data_mut()` | `&mut [u8]` | Mutable access to depth data |
+| `get_depth(x, y)` | `Option<f32>` | Get depth in meters at pixel |
+| `set_depth(x, y, value)` | `&mut Self` | Set depth in meters at pixel |
+| `get_depth_u16(x, y)` | `Option<u16>` | Get raw U16 value (millimeter format only) |
+| `depth_statistics()` | `Option<(f32, f32, f32)>` | Get (min, max, mean) of valid depths in meters |
+| `width()` | `u32` | Image width in pixels |
+| `height()` | `u32` | Image height in pixels |
+| `set_frame_id(id)` | `&mut Self` | Set camera frame identifier |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds |
+
+## PlaneDetection
+
+Detected planar surface.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create plane detection (floor plane)
+let coefficients = [0.0, 0.0, 1.0, 0.0];  // ax + by + cz + d = 0
+let center = Point3::new(0.0, 0.0, 0.0);
+let normal = Vector3::new(0.0, 0.0, 1.0);
+
+let plane = PlaneDetection::new(coefficients, center, normal)
+    .with_type("floor");
+
+// Check distance from point to plane
+let test_point = Point3::new(1.0, 2.0, 0.1);
+let distance = plane.distance_to_point(&test_point);
+
+// Check if point is on plane (within tolerance)
+if plane.contains_point(&test_point, 0.05) {
+    println!("Point is on the plane");
+}
+
+println!("Plane type: {}", plane.plane_type_str());
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `coefficients` | `[f64; 4]` | Plane equation [a, b, c, d] |
+| `center` | `Point3` | Plane center point |
+| `normal` | `Vector3` | Plane normal vector |
+| `size` | `[f64; 2]` | Plane bounds (width, height) |
+| `inlier_count` | `u32` | Number of inlier points |
+| `confidence` | `f32` | Detection confidence (0-1) |
+| `plane_type` | `[u8; 16]` | Type label ("floor", "wall", etc.) |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+
+### PlaneArray
+
+Array of detected planes (max 16).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `planes` | `[PlaneDetection; 16]` | Array of plane detections |
+| `count` | `u8` | Number of valid planes |
+| `frame_id` | `[u8; 32]` | Source sensor frame |
+| `algorithm` | `[u8; 32]` | Detection algorithm used |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+
+## Landmark (Zero-Copy)
+
+2D landmark/keypoint for pose estimation, facial landmarks, hand tracking. Fixed-size (16 bytes).
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create landmark with visibility
+let nose = Landmark::new(320.0, 240.0, 0.95, 0);  // (x, y, visibility, index)
+
+// Create visible landmark (visibility = 1.0)
+let eye = Landmark::visible(300.0, 220.0, 1);  // left_eye
+
+// Check visibility
+if nose.is_visible(0.5) {
+    println!("Nose detected at ({}, {})", nose.x, nose.y);
+}
+
+// Distance between landmarks
+let distance = nose.distance_to(&eye);
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x` | `f32` | X coordinate (pixels or normalized 0-1) |
+| `y` | `f32` | Y coordinate (pixels or normalized 0-1) |
+| `visibility` | `f32` | Visibility/confidence (0.0-1.0) |
+| `index` | `u32` | Landmark index (joint ID) |
+
+### Landmark3D
+
+3D landmark for 3D pose estimation, MediaPipe-style landmarks. Fixed-size (20 bytes).
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let landmark = Landmark3D::new(0.5, 0.3, 0.8, 0.95, 0);
+
+// Project to 2D (drops Z)
+let landmark_2d = landmark.to_2d();
+
+// 3D distance
+let other = Landmark3D::visible(0.6, 0.4, 0.9, 1);
+let dist = landmark.distance_to(&other);
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y`, `z` | `f32` | Coordinates (meters or normalized) |
+| `visibility` | `f32` | Visibility/confidence (0.0-1.0) |
+| `index` | `u32` | Landmark index |
+
+### LandmarkArray
+
+Header for landmark array transmission. Fixed-size (40 bytes). Includes presets for common formats.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Standard pose estimation formats
+let coco = LandmarkArray::coco_pose();           // 17 2D landmarks
+let mp_pose = LandmarkArray::mediapipe_pose();    // 33 3D landmarks
+let mp_hand = LandmarkArray::mediapipe_hand();    // 21 3D landmarks
+let mp_face = LandmarkArray::mediapipe_face();    // 468 3D landmarks
+
+// Custom array with metadata
+let header = LandmarkArray::new_2d(17)
+    .with_confidence(0.92)
+    .with_bbox(100.0, 50.0, 200.0, 300.0);
+
+println!("Data size: {} bytes", header.data_size());
+```
+
+**COCO Pose landmark indices** (available as constants in `landmark::coco`):
+
+| Index | Landmark | Index | Landmark |
+|-------|----------|-------|----------|
+| 0 | Nose | 9 | Left wrist |
+| 1 | Left eye | 10 | Right wrist |
+| 2 | Right eye | 11 | Left hip |
+| 3 | Left ear | 12 | Right hip |
+| 4 | Right ear | 13 | Left knee |
+| 5 | Left shoulder | 14 | Right knee |
+| 6 | Right shoulder | 15 | Left ankle |
+| 7 | Left elbow | 16 | Right ankle |
+| 8 | Right elbow | | |
+
+## TrackedObject (Zero-Copy)
+
+Multi-object tracking result with Kalman filter prediction. Fixed-size (96 bytes).
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create tracked object
+let bbox = TrackingBBox::new(100.0, 100.0, 50.0, 50.0);
+let mut track = TrackedObject::new(1, bbox, 0, 0.95);
+track.set_class_name("person");
+
+// Track lifecycle
+assert!(track.is_tentative());  // New tracks start tentative
+
+track.confirm();                 // Promote to confirmed
+assert!(track.is_confirmed());
+
+// Update with new detection
+track.update(TrackingBBox::new(110.0, 105.0, 50.0, 50.0), 0.93);
+println!("Velocity: ({}, {})", track.velocity_x, track.velocity_y);
+println!("Speed: {:.1}", track.speed());
+println!("Heading: {:.2} rad", track.heading());
+
+// Handle missed detection
+track.mark_missed();
+println!("Predicted position: ({}, {})",
+    track.predicted_bbox.x, track.predicted_bbox.y);
+```
+
+**TrackedObject fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bbox` | `TrackingBBox` | Current bounding box |
+| `predicted_bbox` | `TrackingBBox` | Predicted next position (Kalman) |
+| `track_id` | `u64` | Persistent tracking ID |
+| `confidence` | `f32` | Detection confidence (0.0-1.0) |
+| `class_id` | `u32` | Class ID |
+| `velocity_x`, `velocity_y` | `f32` | Velocity (pixels/frame or m/s) |
+| `accel_x`, `accel_y` | `f32` | Acceleration |
+| `age` | `u32` | Frames since first detection |
+| `hits` | `u32` | Frames with detection |
+| `time_since_update` | `u32` | Consecutive frames without detection |
+| `state` | `u32` | 0=tentative, 1=confirmed, 2=deleted |
+| `class_name` | `[u8; 16]` | Class name (max 15 chars) |
+
+**TrackedObject methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(track_id, bbox, class_id, confidence)` | `TrackedObject` | Create a new tracked object |
+| `class_name()` | `&str` | Get class name as string |
+| `set_class_name(name)` | — | Set class name |
+| `is_tentative()` | `bool` | True if track is tentative (state=0) |
+| `is_confirmed()` | `bool` | True if track is confirmed (state=1) |
+| `is_deleted()` | `bool` | True if track is deleted (state=2) |
+| `confirm()` | — | Confirm the track |
+| `delete()` | — | Mark for deletion |
+| `update(bbox, confidence)` | — | Update with new detection |
+| `mark_missed()` | — | Mark a missed frame |
+| `speed()` | `f32` | Estimated speed |
+| `heading()` | `f32` | Estimated heading (radians) |
+
+**TrackingHeader methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(num_tracks, frame_id)` | `TrackingHeader` | Create a new header |
+| `with_timestamp(timestamp_ns)` | `Self` | Builder: set timestamp |
+| `data_size()` | `usize` | Size of tracking data buffer |
+
+**TrackingBBox fields (16 bytes):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `x`, `y` | `f32` | Top-left corner (pixels) |
+| `width`, `height` | `f32` | Dimensions (pixels) |
+
+**TrackingHeader fields (32 bytes):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `num_tracks` | `u32` | Number of tracked objects |
+| `frame_id` | `u32` | Frame number |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `total_tracks` | `u64` | Total tracks created |
+| `active_tracks` | `u32` | Active confirmed tracks |
+
+## SegmentationMask (Zero-Copy)
+
+Header for segmentation masks. Fixed-size (64 bytes). The mask pixel data follows the header as a raw byte array.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Semantic segmentation (class ID per pixel)
+let mask = SegmentationMask::semantic(1920, 1080, 80)
+    .with_frame_id("camera_front")
+    .with_timestamp(timestamp_ns);
+
+println!("Data size: {} bytes", mask.data_size());  // 1920*1080
+
+// Instance segmentation
+let mask = SegmentationMask::instance(640, 480);
+
+// Panoptic segmentation
+let mask = SegmentationMask::panoptic(640, 480, 80);
+
+// Check type
+if mask.is_panoptic() {
+    println!("Panoptic mask, u16 data: {} bytes", mask.data_size_u16());
+}
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `width` | `u32` | Image width |
+| `height` | `u32` | Image height |
+| `num_classes` | `u32` | Number of classes (semantic/panoptic) |
+| `mask_type` | `u32` | 0=semantic, 1=instance, 2=panoptic |
+| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| `seq` | `u64` | Sequence number |
+| `frame_id` | `[u8; 32]` | Camera/coordinate frame |
+
+**Common COCO class IDs** (available as constants in `segmentation::classes`):
+`BACKGROUND(0)`, `PERSON(1)`, `BICYCLE(2)`, `CAR(3)`, `MOTORCYCLE(4)`, `BUS(6)`, `TRAIN(7)`, `TRUCK(8)`
+
+## Perception Pipeline Example
+
+```rust
+// simplified
+use horus::prelude::*;
+
+struct PerceptionNode {
+    depth_sub: Topic<DepthImage>,
+    cloud_pub: Topic<PointCloud>,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+}
+
+impl Node for PerceptionNode {
+    fn name(&self) -> &str { "PerceptionNode" }
+
+    fn tick(&mut self) {
+        if let Some(depth) = self.depth_sub.recv() {
+            // Read depth values and build point cloud
+            let w = depth.width();
+            let h = depth.height();
+            let num_points = (w * h) as u32;
+
+            if let Ok(mut cloud) = PointCloud::new(num_points, 3, TensorDtype::F32) {
+                // Depth-to-pointcloud conversion would fill cloud data here
+                // using camera intrinsics (fx, fy, cx, cy)
+                self.cloud_pub.send(cloud);
+            }
+        }
+    }
+}
+```
+
+## PointField
+
+Describes a single field within a point cloud's point structure. Used to define custom point formats beyond XYZ.
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `[u8; 16]` | Field name (e.g., "x", "y", "z", "intensity", "rgb") |
+| `offset` | `u32` | Byte offset within the point data structure |
+| `datatype` | `TensorDtype` | Data type (F32, U8, etc.) |
+| `count` | `u32` | Number of elements (1 for scalar, 3 for vector) |
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let fields = vec![
+    PointField::new("x", 0, TensorDtype::F32, 1),
+    PointField::new("y", 4, TensorDtype::F32, 1),
+    PointField::new("z", 8, TensorDtype::F32, 1),
+    PointField::new("intensity", 12, TensorDtype::F32, 1),
+];
+```
+
+## PlaneArray
+
+Collection of detected planes (up to 16). Typically output from plane segmentation algorithms (RANSAC, region growing).
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `planes` | `[PlaneDetection; 16]` | Array of detected planes |
+| `count` | `u8` | Number of valid planes (0-16) |
+| `frame_id` | `[u8; 32]` | Source sensor coordinate frame |
+| `algorithm` | `[u8; 32]` | Detection algorithm name |
+| `timestamp_ns` | `u64` | Timestamp in nanoseconds since epoch |
+
+## TrackingHeader
+
+Metadata header for multi-object tracking. Accompanies tracked object lists with frame-level statistics.
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `num_tracks` | `u32` | Number of tracked objects in this frame |
+| `frame_id` | `u32` | Sequential frame number |
+| `timestamp_ns` | `u64` | Timestamp in nanoseconds since epoch |
+| `total_tracks` | `u64` | Total tracks ever created (for unique ID generation) |
+| `active_tracks` | `u32` | Currently confirmed active tracks |
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let header = TrackingHeader::new(5, 42);  // 5 tracks, frame 42
+println!("Active: {}, Total created: {}", header.active_tracks, header.total_tracks);
+```
+
+## See Also
+
+- [Vision Messages](/rust/api/vision-messages) - Image, CameraInfo, Detection, Detection3D
+- [Message Types](/concepts/message-types) - Standard message type overview
+- [Sensor Messages](/rust/api/sensor-messages) - Sensor data types

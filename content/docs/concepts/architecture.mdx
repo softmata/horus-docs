@@ -1,0 +1,223 @@
+---
+title: Architecture Overview
+description: Understanding HORUS — the node model, communication patterns, scheduling, and memory system
+order: 25
+---
+
+# Architecture Overview
+
+A warehouse robot picks orders from shelves. Its camera captures 30 frames per second, each frame 6 megabytes. A vision model detects items. A planner computes a path around obstacles. A motor controller executes the path at 1 kHz. A safety monitor watches for collisions.
+
+These components have fundamentally different timing requirements — the safety monitor must never be late, the vision model needs GPU time, the planner needs CPU time, and the motor controller needs sub-millisecond predictability. They also share large data: the camera frame must reach the vision model without being copied, and the planner's velocity commands must reach the motor controller in nanoseconds, not milliseconds.
+
+HORUS solves this with four primitives: **Nodes** (isolated components), **Topics** (zero-copy communication), a **Scheduler** (priority-based orchestration), and a **Memory System** (shared memory pools for large data).
+
+## How It Works
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 20}}}%%
+flowchart TB
+    subgraph CONCEPTS["Core Primitives"]
+        direction TB
+        N["<b>Nodes</b><br/>Isolated components with tick lifecycle"]
+        C["<b>Topics</b><br/>Zero-copy pub/sub channels"]
+        S["<b>Scheduler</b><br/>Priority-based orchestration"]
+        M["<b>Memory</b><br/>Shared memory pools"]
+    end
+
+    N <--> C
+    C <--> S
+    S <--> M
+    M <--> N
+`}
+  caption="The four primitives of HORUS"
+/>
+
+### Nodes
+
+Everything in HORUS is a **Node** — an independent component with a well-defined lifecycle. Each node implements `tick()`, which the scheduler calls repeatedly:
+
+```rust
+// simplified
+fn tick(&mut self) {
+    if let Some(sensor_data) = self.sensor_topic.recv() {
+        let command = self.compute_response(sensor_data);
+        self.command_topic.send(command);
+    }
+}
+```
+
+The tick model enables deterministic timing (know exactly when each node runs), profiling (measure how long each tick takes), and scheduling intelligence (the scheduler can optimize execution order).
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    U["Uninitialized"] --> I["init()"]
+    I --> R["tick() loop"]
+    R --> S["shutdown()"]
+    S --> D["Stopped"]
+    R -.-> E["Error"]
+    E --> R
+    E --> S
+`}
+  caption="Node lifecycle"
+/>
+
+### Topics
+
+Nodes communicate through **Topics** — named shared-memory channels. You always use the same `Topic::new()` call; HORUS automatically selects the fastest backend based on topology:
+
+```rust
+// simplified
+let topic: Topic<Image> = Topic::new("camera.image")?;
+topic.send(&frame);        // publisher
+let frame = topic.recv();  // subscriber (another node)
+```
+
+| Backend | Latency | When selected |
+|---------|---------|---------------|
+| Same-thread | ~14 ns | Publisher and subscriber on same thread |
+| Same-process | ~82–182 ns | Same process, different threads |
+| Cross-process | ~162–165 ns | Different processes, shared memory |
+
+No configuration needed — the backend upgrades transparently as participants join or leave.
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart TB
+    subgraph P1["Process A"]
+        N1["Vision Node"]
+    end
+
+    subgraph SHM["Shared Memory"]
+        T["detections"]
+    end
+
+    subgraph P2["Process B"]
+        N2["Planner Node"]
+    end
+
+    N1 -->|"publish"| T -->|"subscribe"| N2
+`}
+  caption="Transparent cross-process communication"
+/>
+
+### Scheduler
+
+The scheduler orchestrates node execution with priority-based ordering, five execution classes, deadline monitoring, and graceful degradation:
+
+| Feature | Purpose |
+|---------|---------|
+| **Execution order** | `.order(n)` — lower runs first each tick |
+| **5 execution classes** | BestEffort, Rt, Compute, Event, AsyncIo — auto-detected from node config |
+| **Deadline enforcement** | `.budget()`, `.deadline()`, `.on_miss()` — graduated response to overruns |
+| **Watchdog** | Detects frozen nodes with graduated degradation (warn → reduce rate → isolate → safe state) |
+| **BlackBox** | Flight recorder for post-crash forensics |
+
+### Memory System
+
+Large data (images, point clouds, tensors) uses shared memory pools for zero-copy transfer:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
+flowchart LR
+    subgraph POOL["Shared Memory"]
+        T["Image Data<br/>1920x1080x3"]
+    end
+
+    CAM["Camera"] -->|"write once"| T
+    T -->|"read"| V1["Vision 1"]
+    T -->|"read"| V2["Vision 2"]
+    T -->|"read"| V3["Vision 3"]
+`}
+  caption="Zero-copy: write once, read many"
+/>
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut img = Image::new(1920, 1080, ImageEncoding::Rgb8)?;
+    camera.capture_into(img.data_mut());
+
+    let topic: Topic<Image> = Topic::new("camera.rgb")?;
+    topic.send(&img);  // zero-copy — only a descriptor crosses the ring buffer
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    tensor = topic.recv()
+    array = np.array(tensor, copy=False)  # zero-copy numpy view
+    result = model.predict(array)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Data Flow Example
+
+A typical perception-to-action pipeline:
+
+<MermaidDiagram
+  chart={`%%{init: {'flowchart': {'padding': 20}}}%%
+flowchart LR
+    CAM["<b>Camera</b><br/>30 Hz"]
+    DET["<b>Detector</b><br/>compute()"]
+    NAV["<b>Planner</b><br/>10 Hz"]
+    CTRL["<b>Controller</b><br/>1 kHz RT"]
+    MOT["<b>Motors</b><br/>Hardware"]
+
+    CAM -->|"Image<br/>(zero-copy)"| DET
+    DET -->|"Detections<br/>(Topic)"| NAV
+    NAV -->|"CmdVel<br/>(Topic)"| CTRL
+    CTRL -->|"PWM<br/>(Topic)"| MOT
+`}
+  caption="Perception → Planning → Control pipeline"
+/>
+
+Total message-passing latency: under 1 microsecond (same-process backends).
+
+## Design Decisions
+
+**Why nodes instead of functions?**
+Robotics systems need isolation. A crashing camera driver shouldn't bring down the motor controller. Nodes provide fault boundaries — the scheduler can isolate a failing node while the rest of the system continues. Functions in a monolith share a call stack and a single point of failure.
+
+**Why a single Topic API instead of separate in-process and cross-process APIs?**
+During development, you run everything in one process. In production, you split across processes for isolation. If the communication API changed between these modes, you'd have to rewrite code for deployment. The single `Topic::new()` API means the same code works in both modes — HORUS selects the optimal backend automatically.
+
+**Why a tick model instead of threads?**
+Threads are hard to reason about: priority inversion, lock contention, non-deterministic scheduling. The tick model gives the scheduler full control over execution order. For nodes that genuinely need their own thread (RT, Compute, AsyncIo), the scheduler creates one — but it manages the lifecycle, not the application.
+
+**Why shared memory instead of message passing?**
+A 4K RGB image is 24 MB. Serializing, copying, and deserializing it through a socket costs milliseconds. Shared memory costs nanoseconds — the subscriber reads directly from the publisher's memory. For small messages (`CmdVel`, `Imu`), the difference is less dramatic but still 300x faster than DDS.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| Sub-microsecond IPC via shared memory | Single-machine only — no built-in cross-network transport |
+| Deterministic execution order via scheduler | All interacting nodes must be in the same scheduler (or use cross-process topics) |
+| Zero-copy large data (images, point clouds) | Fixed-size ring buffers — must choose capacity at topic creation |
+| Automatic backend selection (in-process vs SHM) | Can't force a specific backend — the system chooses |
+| Five execution classes for different workload types | More complex scheduler internals |
+| Node isolation with fault boundaries | Node crashes still lose that node's state — no automatic restart by default |
+
+## Performance Summary
+
+| Metric | Value |
+|--------|-------|
+| Same-thread topic | ~14 ns |
+| Same-process topic | ~82–182 ns |
+| Cross-process topic | ~162–165 ns |
+| Scheduler tick overhead | ~50–100 ns |
+| Shared memory allocation | ~100 ns |
+| Framework memory overhead | ~2 MB |
+
+See [Benchmarks](/performance/benchmarks) for exact measured numbers.
+
+## See Also
+
+- [What is HORUS?](/concepts/what-is-horus) — Overview and positioning
+- [Nodes (Concept)](/concepts/core-concepts-nodes) — Deep dive into the node model
+- [Topic (Concept)](/concepts/core-concepts-topic) — Communication architecture
+- [Scheduler (Concept)](/concepts/core-concepts-scheduler) — Tick loop and execution classes
+- [Execution Classes](/concepts/execution-classes) — The 5 classes and when to use each

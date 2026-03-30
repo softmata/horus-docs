@@ -1,0 +1,359 @@
+---
+title: "Tutorial 5: Hardware Drivers"
+description: "Connect your robot's hardware — configure devices in horus.toml, load them as nodes, and schedule them"
+order: 50
+---
+
+# Tutorial 5: Hardware Drivers
+
+<Callout type="info">Looking for the **Python version**? See [Tutorial 5: Hardware & Real-Time (Python)](/tutorials/05-hardware-and-rt-python).</Callout>
+
+Every robot needs to talk to hardware — servos, LiDARs, cameras, IMUs. In HORUS, **a driver is a node**. You declare what hardware you have in `horus.toml`, call `hardware::load()`, and get back ready-to-use nodes you can add straight to a scheduler.
+
+**Prerequisites:** [Tutorial 1](/tutorials/01-sensor-node) completed.
+
+**What you'll learn:**
+- Declare devices in `horus.toml [hardware]`
+- Load devices as nodes with `hardware::load()`
+- Read device parameters with `NodeParams`
+- Write custom drivers with `register_driver!`
+- Swap real hardware for simulation with `sim = true`
+
+**Time:** 15 minutes
+
+---
+
+## Core Idea: A Driver Is a Node
+
+There is one concept to remember: every hardware device becomes a `Node`. It publishes sensor data, subscribes to commands, and runs inside the scheduler like any other node. No special handle types, no wrapper layers — just nodes.
+
+```
+horus.toml [hardware]  ──▶  hardware::load()  ──▶  Vec<(String, Box<dyn Node>)>  ──▶  scheduler.add()
+```
+
+---
+
+## Step 1: Declare Devices in horus.toml
+
+Add a `[hardware]` section. Each device has a name and a `use` field that tells HORUS which driver to load:
+
+```toml
+[package]
+name = "my-robot"
+version = "0.1.0"
+language = "rust"
+
+[hardware.arm]
+use = "dynamixel"
+port = "/dev/ttyUSB0"
+baudrate = 1000000
+servo_ids = [1, 2, 3, 4, 5]
+
+[hardware.lidar]
+use = "rplidar"
+port = "/dev/ttyUSB1"
+baudrate = 256000
+
+[hardware.conveyor]
+use = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+The `use` field is the only required key. Everything else becomes a typed parameter accessible via `NodeParams`.
+
+<Callout type="info">
+`use` resolves in order: registered local driver, installed package, then Terra HAL. You do not need to specify which source a driver comes from — HORUS figures it out.
+</Callout>
+
+---
+
+## Step 2: Load Devices as Nodes
+
+Call `hardware::load()` to parse the `[hardware]` section. It returns a list of `(name, node)` pairs:
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware;
+
+fn main() -> Result<()> {
+    let devices = hardware::load()?;
+
+    for (name, _node) in &devices {
+        println!("Loaded device: {}", name);
+    }
+    // → Loaded device: arm
+    // → Loaded device: conveyor
+    // → Loaded device: lidar
+
+    Ok(())
+}
+```
+
+Each entry is a `(String, Box<dyn Node>)` — add them directly to a scheduler:
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware;
+
+fn main() -> Result<()> {
+    let devices = hardware::load()?;
+
+    let mut scheduler = Scheduler::new().tick_rate(100_u64.hz());
+
+    for (name, node) in devices {
+        println!("Adding {} to scheduler", name);
+        scheduler.add(node).build()?;
+    }
+
+    scheduler.run()
+}
+```
+
+That is a complete hardware-loading program. Twelve lines.
+
+---
+
+## Step 3: Build a Custom Driver
+
+A driver is any struct that implements `Node`. Use `NodeParams` to read configuration from `horus.toml`:
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware::NodeParams;
+use horus::register_driver;
+
+struct ConveyorDriver {
+    speed: f64,
+    publisher: Topic<CmdVel>,
+}
+
+impl ConveyorDriver {
+    fn from_params(params: &NodeParams) -> Result<Self> {
+        let speed: f64 = params.get_or("speed", 1.0);
+
+        Ok(Self {
+            speed,
+            publisher: Topic::new("conveyor.velocity")?,
+        })
+    }
+}
+
+impl Node for ConveyorDriver {
+    fn name(&self) -> &str { "ConveyorDriver" }
+
+    fn tick(&mut self) {
+        self.publisher.send(CmdVel::new(self.speed as f32, 0.0));
+    }
+}
+
+// Register so [hardware.conveyor] use = "ConveyorDriver" works
+register_driver!(ConveyorDriver, ConveyorDriver::from_params);
+```
+
+The corresponding config:
+
+```toml
+[hardware.conveyor]
+use = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+When `hardware::load()` encounters `use = "ConveyorDriver"`, it finds the registered factory and calls `from_params()` with the config. The result is a `Box<dyn Node>` ready for the scheduler.
+
+---
+
+## Step 4: Add Configuration to a Driver
+
+For more complex drivers, read multiple typed params and wire up topics:
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware::NodeParams;
+use horus::register_driver;
+
+struct ArmController {
+    servo_ids: Vec<u8>,
+    port: String,
+    state_pub: Topic<JointState>,
+    cmd_sub: Topic<JointCommand>,
+}
+
+impl ArmController {
+    fn from_params(params: &NodeParams) -> Result<Self> {
+        let servo_ids: Vec<u8> = params.get("servo_ids")?;
+        let port: String = params.get("port")?;
+
+        println!("ArmController: {} servos on {}", servo_ids.len(), port);
+
+        Ok(Self {
+            servo_ids,
+            port,
+            state_pub: Topic::new("arm.state")?,
+            cmd_sub: Topic::new("arm.command")?,
+        })
+    }
+}
+
+impl Node for ArmController {
+    fn name(&self) -> &str { "ArmController" }
+
+    fn tick(&mut self) {
+        if let Some(cmd) = self.cmd_sub.recv() {
+            // Send command to hardware using self.port
+            // Read back state and publish
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        // Stop all servos
+    }
+}
+
+register_driver!(ArmController, ArmController::from_params);
+```
+
+Then schedule it with real-time constraints:
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware;
+
+fn main() -> Result<()> {
+    let devices = hardware::load()?;
+
+    let mut scheduler = Scheduler::new().tick_rate(100_u64.hz());
+
+    for (name, node) in devices {
+        match name.as_str() {
+            "arm" => {
+                scheduler.add(node)
+                    .order(0)
+                    .rate(500_u64.hz())
+                    .on_miss(Miss::SafeMode)
+                    .build()?;
+            }
+            _ => {
+                scheduler.add(node).build()?;
+            }
+        }
+    }
+
+    scheduler.run()
+}
+```
+
+### NodeParams API Quick Reference
+
+| Method | Returns | Use |
+|--------|---------|-----|
+| `params.get::<T>(key)` | `Result<T>` | Required param (errors if missing) |
+| `params.get_or(key, default)` | `T` | Optional param with fallback |
+| `params.has(key)` | `bool` | Check if key exists |
+| `params.keys()` | `Iterator<&str>` | List all param names |
+| `params.raw(key)` | `Option<&toml::Value>` | Raw TOML value |
+
+Supported types for `get::<T>()`: `String`, `bool`, `i32`, `i64`, `u8`, `u32`, `u64`, `f32`, `f64`, `Vec<T>`.
+
+---
+
+## Step 5: Simulation Swap
+
+Add `sim = true` to any device entry. When running in simulation mode, HORUS loads the sim variant of that driver instead of the real one:
+
+```toml
+[hardware.arm]
+use = "dynamixel"
+port = "/dev/ttyUSB0"
+baudrate = 1000000
+servo_ids = [1, 2, 3, 4, 5]
+sim = true
+
+[hardware.lidar]
+use = "rplidar"
+port = "/dev/ttyUSB1"
+baudrate = 256000
+sim = true
+
+[hardware.conveyor]
+use = "ConveyorDriver"
+speed = 0.5
+```
+
+The conveyor has no `sim = true` — it uses the same driver in both modes. The arm and lidar swap to simulated versions automatically. Your application code does not change at all:
+
+```rust
+// simplified — identical to Step 2, works with real or sim hardware
+let devices = hardware::load()?;
+
+let mut scheduler = Scheduler::new().tick_rate(100_u64.hz());
+for (_name, node) in devices {
+    scheduler.add(node).build()?;
+}
+scheduler.run()
+```
+
+<Callout type="info">
+`sim = true` is per-device. You can mix real and simulated hardware in the same config — useful when you have some hardware on hand but not all of it.
+</Callout>
+
+---
+
+## Step 6: Testing Without Hardware
+
+Use `hardware::load_from()` to load from a test config file instead of the project's `horus.toml`:
+
+```rust
+// simplified
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horus::hardware;
+
+    #[test]
+    fn arm_controller_from_config() {
+        std::fs::write("test_hardware.toml", r#"
+            [hardware.arm]
+            use = "ArmController"
+            port = "/dev/null"
+            servo_ids = [1, 2, 3]
+        "#).unwrap();
+
+        let devices = hardware::load_from("test_hardware.toml").unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].0, "arm");
+
+        std::fs::remove_file("test_hardware.toml").ok();
+    }
+}
+```
+
+---
+
+## Key Takeaways
+
+- **A driver is a node.** No special types — `hardware::load()` returns `Vec<(String, Box<dyn Node>)>`
+- **`horus.toml [hardware]`** separates hardware config from code — swap devices without recompiling
+- **`use = "..."`** is the one field that identifies a driver. HORUS resolves it automatically
+- **`register_driver!`** connects your custom struct to the `[hardware]` config system
+- **`sim = true`** swaps individual devices to simulated versions without changing code
+- **`NodeParams`** gives typed access to config values via `params.get::<T>(key)`
+
+## Next Steps
+
+- [Hardware API Reference](/rust/api/hardware) — full API documentation
+- [Real-Time Control](/tutorials/realtime-control) — scheduling drivers with RT guarantees
+- [Deployment](/operations) — deploying hardware configs to a robot
+
+---
+
+## See Also
+
+- [Hardware & RT (Python)](/tutorials/05-hardware-and-rt-python) — Python version
+- [Hardware API](/rust/api/hardware) — hardware loading reference

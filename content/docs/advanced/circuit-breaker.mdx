@@ -1,0 +1,382 @@
+---
+title: "Fault Tolerance"
+description: "Per-node failure policies for preventing cascading failures — Fatal, Restart, Skip, Ignore with real robotics examples"
+weight: 32
+---
+
+# Fault Tolerance
+
+You need to prevent a single crashing node from killing your entire robot. HORUS failure policies let you define per-node behavior on failure: stop the system, restart with backoff, skip temporarily, or ignore entirely.
+
+## When To Use This
+
+- Any robot with more than one node (which is every production robot)
+- Sensor drivers that may disconnect (USB, serial, network)
+- Systems with non-critical nodes (logging, telemetry) that should not bring down the system
+- Safety-critical deployments where you need explicit failure contracts per node
+
+**Use [Safety Monitor](/advanced/safety-monitor) instead** if you need watchdog timers, deadline enforcement, or graduated degradation. Failure policies and safety monitoring are complementary -- use both in production.
+
+## Prerequisites
+
+- Familiarity with [Nodes](/concepts/core-concepts-nodes) and the [Scheduler Configuration](/advanced/scheduler-configuration) node builder API
+- Understanding of which nodes are critical vs non-critical in your system
+
+## The Problem
+
+Without failure policies, one crashing node kills the entire system:
+
+```
+Tick 100: sensor_driver panics (USB disconnected)
+Tick 100: scheduler stops
+Tick 100: motor_controller stops receiving commands
+Result: robot stops moving in the middle of a task
+```
+
+With failure policies, the system adapts:
+
+```
+Tick 100: sensor_driver panics (USB disconnected)
+Tick 100: FailurePolicy::Restart → re-init sensor_driver (10ms backoff)
+Tick 101: sensor_driver panics again → restart (20ms backoff)
+Tick 102: USB reconnects → sensor_driver.init() succeeds → normal operation
+Result: robot paused briefly, then resumed automatically
+```
+
+## The Four Policies
+
+### Fatal — Stop Everything
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.add(motor_controller)
+        .order(0)
+        .rate(1000_u64.hz())
+        .failure_policy(FailurePolicy::Fatal)
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    motor = horus.Node(tick=motor_fn, rate=1000, order=0, failure_policy="fatal")
+    scheduler.add(motor)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+First failure stops the scheduler immediately. Use for nodes where continued operation after failure is **unsafe**:
+
+- Motor controllers (stale commands = uncontrolled motion)
+- Safety monitors (can't monitor safety if the monitor is broken)
+- Emergency stop handlers
+
+**When it triggers**: `node.tick()` raises an exception (Python) or panics (Rust). The scheduler calls `stop()` and shuts down all nodes cleanly.
+
+### Restart — Re-Initialize with Backoff
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.add(lidar_driver)
+        .order(1)
+        .rate(100_u64.hz())
+        .failure_policy(FailurePolicy::restart(3, 50_u64.ms()))
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    lidar = horus.Node(tick=lidar_fn, rate=100, order=1, failure_policy="restart")
+    scheduler.add(lidar)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+Re-initializes the node with exponential backoff. After `max_restarts` exhausted, escalates to fatal stop.
+
+```
+failure 1 → restart, wait 50ms
+failure 2 → restart, wait 100ms (2x backoff)
+failure 3 → restart, wait 200ms (2x backoff)
+failure 4 → max_restarts exceeded → fatal stop
+```
+
+After a successful tick, the backoff timer clears. Use for nodes that can recover from transient failures:
+
+- Sensor drivers (hardware reconnection)
+- Network clients (server temporarily unavailable)
+- Camera nodes (USB reset)
+
+### Skip — Tolerate with Cooldown
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.add(telemetry_uploader)
+        .order(200)
+        .async_io()
+        .failure_policy(FailurePolicy::skip(5, 1_u64.secs()))
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    telemetry = horus.Node(tick=telemetry_fn, rate=1, order=200, failure_policy="skip")
+    scheduler.add(telemetry)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+After `max_failures` consecutive failures, the node is **suppressed** for the cooldown period. After cooldown, the node is allowed again and the failure counter resets.
+
+```
+failure 1 → continue
+failure 2 → continue
+failure 3 → continue
+failure 4 → continue
+failure 5 → node suppressed for 1 second
+... 1 second passes ...
+node allowed again, failure count = 0
+```
+
+Use for nodes whose absence doesn't affect core robot operation:
+
+- Logging and telemetry upload
+- Diagnostics reporting
+- Cloud sync
+- Non-critical monitoring
+
+### Ignore — Swallow Failures
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    scheduler.add(stats_collector)
+        .order(100)
+        .failure_policy(FailurePolicy::Ignore)
+        .build()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    stats = horus.Node(tick=stats_fn, rate=10, order=100, failure_policy="ignore")
+    scheduler.add(stats)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+Failures are completely ignored. The node keeps ticking every cycle regardless of errors. Use only when partial results are acceptable:
+
+- Statistics collectors (missing one sample is fine)
+- Best-effort visualization
+- Debug output nodes
+
+## Severity-Aware Handling
+
+HORUS errors carry severity levels that can **override** the configured policy:
+
+| Severity | Effect |
+|----------|--------|
+| **Fatal** (e.g., shared memory corruption) | Always stops the scheduler, even with `Ignore` policy |
+| **Transient** (e.g., topic full, network timeout) | De-escalates `Fatal` policy to `Restart` (transient errors are recoverable) |
+| **Permanent** (e.g., invalid configuration) | Follows the configured policy |
+
+This means a safety-critical node with `Fatal` policy won't kill the system on a transient network glitch — it'll restart instead. But a shared-memory corruption always stops, even on an `Ignore` node.
+
+## Complete Robot Example
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new()
+            .tick_rate(500_u64.hz())
+            .prefer_rt()
+            .watchdog(500_u64.ms());
+
+        // CRITICAL: Motor controller — stop if it fails
+        scheduler.add(MotorController::new())
+            .order(0)
+            .rate(500_u64.hz())
+            .on_miss(Miss::SafeMode)
+            .failure_policy(FailurePolicy::Fatal)
+            .build()?;
+
+        // RECOVERABLE: Lidar driver — restart on USB disconnect
+        scheduler.add(LidarDriver::new())
+            .order(1)
+            .rate(100_u64.hz())
+            .failure_policy(FailurePolicy::restart(5, 100_u64.ms()))
+            .build()?;
+
+        // RECOVERABLE: Camera — restart up to 3 times
+        scheduler.add(CameraNode::new())
+            .order(2)
+            .rate(30_u64.hz())
+            .failure_policy(FailurePolicy::restart(3, 200_u64.ms()))
+            .build()?;
+
+        // NON-CRITICAL: Path planner — skip if it fails repeatedly
+        scheduler.add(PathPlanner::new())
+            .order(5)
+            .compute()
+            .failure_policy(FailurePolicy::skip(3, 2_u64.secs()))
+            .build()?;
+
+        // BEST-EFFORT: Telemetry — ignore failures
+        scheduler.add(TelemetryUploader::new())
+            .order(200)
+            .async_io()
+            .rate(1_u64.hz())
+            .failure_policy(FailurePolicy::Ignore)
+            .build()?;
+
+        scheduler.run()
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, Scheduler
+
+    scheduler = Scheduler(tick_rate=500, rt=True, watchdog_ms=500)
+
+    # CRITICAL: Motor controller — stop if it fails
+    scheduler.add(Node(tick=motor_fn, rate=500, order=0,
+                       on_miss="safe_mode", failure_policy="fatal"))
+
+    # RECOVERABLE: Lidar driver — restart on USB disconnect
+    scheduler.add(Node(tick=lidar_fn, rate=100, order=1,
+                       failure_policy="restart"))
+
+    # RECOVERABLE: Camera — restart up to 3 times
+    scheduler.add(Node(tick=camera_fn, rate=30, order=2,
+                       failure_policy="restart"))
+
+    # NON-CRITICAL: Path planner — skip if it fails repeatedly
+    scheduler.add(Node(tick=planner_fn, order=5,
+                       failure_policy="skip"))
+
+    # BEST-EFFORT: Telemetry — ignore failures
+    scheduler.add(Node(tick=telemetry_fn, rate=1, order=200,
+                       failure_policy="ignore"))
+
+    scheduler.run()
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Choosing the Right Policy
+
+| Node Type | Policy | Why |
+|-----------|--------|-----|
+| Motor control, safety | `Fatal` | Unsafe to continue without these |
+| Sensor drivers | `Restart(3-5, 50-200ms)` | Hardware reconnects are common |
+| Perception pipelines | `Restart(3, 100ms)` or `Skip(5, 2s)` | Can recover or degrade gracefully |
+| Logging, telemetry | `Skip(5, 1s)` or `Ignore` | Non-critical, absence is tolerable |
+| Debug/visualization | `Ignore` | Partial results are fine |
+
+## Python Error Handlers
+
+Use the `on_error` callback to handle failures in Python nodes:
+
+```python
+import horus
+
+def my_error_handler(node, exception):
+    node.log_error(f"Node failed: {exception}")
+    # Optionally take corrective action
+    if "USB" in str(exception):
+        node.log_warning("USB disconnected — will retry on restart")
+
+def sensor_tick(node):
+    data = read_hardware()  # May raise OSError
+    node.send("sensor", data)
+
+sensor = horus.Node(
+    name="sensor",
+    tick=sensor_tick,
+    on_error=my_error_handler,
+    failure_policy="restart",
+    rate=100,
+    pubs=["sensor"],
+)
+horus.run(sensor)
+```
+
+The `on_error` callback runs after the failure policy processes the error. It receives the node and the exception object. Use it for logging, alerting, or state cleanup before the next restart.
+
+---
+
+## Monitoring Failures
+
+Failure events are recorded in the [BlackBox](/advanced/blackbox) flight recorder:
+
+```bash
+# View failure events from the blackbox
+horus blackbox show --filter errors
+
+# Monitor live
+horus log -f --level error
+```
+
+In code:
+
+```rust
+// simplified
+// Inspect anomalies via CLI: horus blackbox --anomalies
+if let Some(bb) = scheduler.get_blackbox() {
+    for record in bb.lock().expect("blackbox lock").anomalies() {
+        println!("[tick {}] {:?}", record.tick, record.event);
+    }
+}
+```
+
+## Design Decisions
+
+**Why per-node policies instead of a global failure mode?**
+
+Different nodes have fundamentally different failure characteristics. A motor controller failure is safety-critical -- you must stop. A telemetry uploader failure is harmless -- you can ignore it. Per-node policies match the failure contract to the node's role in the system.
+
+**Why severity-aware handling?**
+
+A transient network timeout on a `Fatal` node should not kill the system -- it should restart. But shared memory corruption on an `Ignore` node must always stop -- it indicates fundamental system failure. Severity-aware handling prevents both over-reaction (killing the system on a glitch) and under-reaction (ignoring corruption).
+
+**Why exponential backoff on Restart?**
+
+A sensor driver that fails once probably has a transient issue (USB reset). A sensor driver that fails 5 times in rapid succession has a permanent problem. Exponential backoff gives transient issues time to resolve while quickly escalating persistent failures.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| One crashing node does not kill the system | Must think about failure contracts per node |
+| Restart with backoff handles transient hardware issues | Backoff adds latency during recovery |
+| Skip prevents non-critical failures from cascading | Skipped nodes produce no output during cooldown |
+| Severity overrides prevent both over- and under-reaction | Behavior depends on error severity, not just configured policy |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| System stops on a transient network error | `Fatal` policy on a node with transient failures | Use `Restart` for nodes that can recover, or rely on severity-aware de-escalation |
+| Node restarts endlessly | `max_restarts` set too high, or the failure is permanent | Lower `max_restarts` and check logs for the root cause |
+| Non-critical node drags down performance | `Skip` cooldown too short, node fails immediately after cooldown | Increase cooldown duration or investigate the root cause |
+| `Fatal` node did not stop the system | Error was classified as `Transient` severity, de-escalated to Restart | Expected behavior. Truly fatal errors (e.g., SHM corruption) always stop regardless |
+| Cannot find failure events after crash | No BlackBox configured | Add `.blackbox(64)` to the scheduler for crash forensics |
+
+## See Also
+
+- [Safety Monitor](/advanced/safety-monitor) — Watchdog timers and graduated degradation
+- [BlackBox Recorder](/advanced/blackbox) — Crash forensics and post-mortem debugging
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Per-node builder API and execution classes
+- [Nodes](/concepts/core-concepts-nodes) — Node lifecycle and trait methods

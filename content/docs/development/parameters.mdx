@@ -1,0 +1,902 @@
+---
+title: Parameters Guide
+description: Configure and tune your HORUS applications with runtime parameters, validation, and persistence
+order: 18
+---
+
+# Parameters Guide
+
+You need to adjust robot behavior (speeds, gains, thresholds) without recompiling code. HORUS runtime parameters let you change values on-the-fly via code, CLI, or the web monitor, with validation, persistence, and versioning built in.
+
+## When To Use This
+
+- Tuning PID gains, speed limits, or sensor thresholds while the robot runs
+- Loading different configuration presets for different environments (lab vs. field)
+- Enabling or disabling features at runtime without recompilation
+- Persisting tuned values across restarts via YAML files
+
+**Use [horus.toml](/concepts/horus-toml) instead** for build-time configuration that does not change at runtime (project name, dependencies, workspace members).
+
+**Use [Topics](/concepts/core-concepts-topic) instead** for high-frequency data exchange between nodes. Parameters are for configuration, not message passing.
+
+## Prerequisites
+
+- A HORUS project with `use horus::prelude::*;`
+- Familiarity with [Nodes](/concepts/core-concepts-nodes) (parameters are typically accessed in `init()` and `tick()`)
+
+## Solution
+
+**Without parameters** (hardcoded, requires recompile to change):
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let max_speed = 1.5;
+    let pid_kp = 1.0;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    max_speed = 1.5
+    pid_kp = 1.0
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**With parameters** (dynamic, change at runtime via monitor or CLI):
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let max_speed = self.params.get_or("max_speed", 1.5);
+    let pid_kp = self.params.get_or("pid_kp", 1.0);
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    max_speed = params.get("max_speed", 1.5)
+    pid_kp = params.get("pid_kp", 1.0)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+**Key benefits:**
+- **No recompilation** — Change values without rebuilding
+- **Live tuning** — Adjust while robot is running
+- **Persistence** — Save/load from YAML files
+- **Validation** — Range, regex, enum, and read-only constraints
+- **Versioning** — Optimistic locking for concurrent edits
+
+## Core Concepts
+
+### Parameter Storage
+
+Parameters are stored in a **thread-safe map**:
+
+```rust
+// simplified
+Arc<RwLock<BTreeMap<String, Value>>>
+```
+
+**Location:** `.horus/config/params.yaml` (relative to your project directory)
+
+**Format:**
+```yaml
+# Flat key-value pairs (keys are plain strings)
+tick_rate: 30
+max_memory_mb: 512
+max_speed: 1.0
+max_angular_speed: 1.0
+acceleration_limit: 0.5
+lidar_rate: 10
+camera_fps: 30
+sensor_timeout_ms: 1000
+emergency_stop_distance: 0.3
+collision_threshold: 0.5
+pid_kp: 1.0
+pid_ki: 0.1
+pid_kd: 0.05
+```
+
+### Parameter Types
+
+HORUS supports all JSON-compatible types:
+
+- **Numbers** - `f64`, `i64`, `u64` (stored as `Value::Number`)
+- **Strings** - `String` (stored as `Value::String`)
+- **Booleans** - `bool` (stored as `Value::Bool`)
+- **Arrays** - `Vec<T>` (stored as `Value::Array`)
+- **Objects** - `HashMap<String, T>` (stored as `Value::Object`)
+
+### Key Organization
+
+Keys are stored as **flat strings** in a `BTreeMap` (sorted alphabetically). Use descriptive names with underscores:
+
+```rust
+// simplified
+// Descriptive flat keys
+self.params.get_or("max_speed", 1.5);
+self.params.get_or("pid_kp", 1.0);
+self.params.get_or("lidar_rate", 10);
+```
+
+You can use dot notation as a naming convention for grouping, but note that dots are treated as literal characters — there is no automatic hierarchy:
+
+```rust
+// simplified
+// Dot notation is a naming convention, not a hierarchy
+self.params.get_or("motion.max_speed", 1.5);
+self.params.get_or("control.pid.kp", 1.0);
+```
+
+## Using Parameters in Nodes
+
+### Accessing Parameters
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    Store a `RuntimeParams` instance as a field on your node struct:
+
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    pub struct VelocityController {
+        params: RuntimeParams,
+        max_speed: f64,
+        acceleration: f64,
+    }
+
+    impl VelocityController {
+        fn new() -> Result<Self> {
+            let params = RuntimeParams::init()?;
+            let max_speed = params.get_or("max_speed", 1.5);
+            let acceleration = params.get_or("acceleration_limit", 0.5);
+            Ok(Self { params, max_speed, acceleration })
+        }
+    }
+
+    impl Node for VelocityController {
+        fn name(&self) -> &str { "velocity_controller" }
+
+        fn init(&mut self) -> Result<()> {
+            self.max_speed = self.params.get_or("max_speed", 1.5);
+            self.acceleration = self.params.get_or("acceleration_limit", 0.5);
+            hlog!(info, "Max speed: {} m/s", self.max_speed);
+            hlog!(info, "Acceleration: {} m/s²", self.acceleration);
+            Ok(())
+        }
+
+        fn tick(&mut self) {
+            let target_velocity = self.max_speed;
+            // Use parameters...
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    Access parameters using `horus.params`:
+
+    ```python
+    import horus
+
+    max_speed = 1.5
+    acceleration = 0.5
+
+    def velocity_tick(node):
+        global max_speed
+        # Use parameters in your tick function
+        target_velocity = max_speed
+        node.log_info(f"Target velocity: {target_velocity} m/s")
+
+    # Load parameters at startup
+    params = horus.RuntimeParams()
+    max_speed = params.get("max_speed", 1.5)
+    acceleration = params.get("acceleration_limit", 0.5)
+
+    velocity = horus.Node(
+        name="velocity_controller",
+        tick=velocity_tick,
+        rate=100,
+    )
+    horus.run(velocity)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+### Parameter Methods
+
+**Generic get with default (`get_or`):**
+```rust
+// simplified
+let speed = self.params.get_or("max_speed", 1.5);            // f64
+let enabled = self.params.get_or("auto_mode", false);         // bool
+let rate = self.params.get_or("update_rate", 60);          // i32
+let name = self.params.get_or("node_name", "default");        // String
+```
+
+**Generic get (returns `Option<T>`):**
+```rust
+// simplified
+// Returns None if parameter doesn't exist or type doesn't match
+if let Some(speed) = self.params.get::<f64>("max_speed") {
+    self.max_speed = speed;
+}
+```
+
+**Generic get with default:**
+```rust
+// simplified
+// Returns default if parameter doesn't exist
+let rate: i32 = self.params.get_or("update_rate", 60);
+```
+
+**Set parameter:**
+```rust
+// simplified
+// Update parameter value (validates against metadata if set)
+self.params.set("max_speed", 2.0)?;
+
+// Set complex types
+self.params.set("camera_resolution", vec![1920, 1080])?;
+```
+
+**Query methods:**
+```rust
+// simplified
+self.params.has("max_speed");           // bool — check if key exists
+self.params.list_keys();                // Vec<String> — all parameter keys
+self.params.get_all();                  // BTreeMap<String, Value> — all params
+self.params.remove("old_key");          // Option<Value> — remove and return
+self.params.reset()?;                   // Reset all params to defaults
+```
+
+**Persistence:**
+```rust
+// simplified
+// Save current params to .horus/config/params.yaml
+self.params.save_to_disk()?;
+
+// Load params from a specific YAML file
+self.params.load_from_disk(Path::new("my_params.yaml"))?;
+```
+
+### Live Reloading
+
+**Check for updates every tick:**
+```rust
+// simplified
+pub struct AdaptiveController {
+    params: RuntimeParams,
+    max_speed: f64,
+    tick_count: u64,
+}
+
+impl Node for AdaptiveController {
+    fn name(&self) -> &str { "adaptive_controller" }
+
+    fn tick(&mut self) {
+        // Check every 60 ticks (~1 second at 60 Hz)
+        if self.tick_count % 60 == 0 {
+            let new_speed = self.params.get_or("max_speed", 1.5);
+
+            if new_speed != self.max_speed {
+                hlog!(info, "Speed updated: {} → {}", self.max_speed, new_speed);
+                self.max_speed = new_speed;
+            }
+        }
+
+        self.tick_count += 1;
+    }
+}
+```
+
+**Performance note:** Parameter access is fast (~80-350ns via `Arc<RwLock>`), but avoid reading hundreds of parameters every tick. Cache values and reload periodically.
+
+### Complex Parameter Types
+
+**Arrays:**
+```rust
+// simplified
+// Set array
+self.params.set("waypoints", vec![1.0, 2.5, 3.0, 4.5])?;
+
+// Get array
+let waypoints: Vec<f64> = self.params
+    .get::<Vec<serde_json::Value>>("waypoints")
+    .map(|v| v.iter().filter_map(|x| x.as_f64()).collect())
+    .unwrap_or_default();
+```
+
+**Objects:**
+```rust
+// simplified
+use serde_json::json;
+
+// Set nested object
+let config = json!({
+    "ip": "192.168.1.100",
+    "port": 8080,
+    "timeout_ms": 5000
+});
+self.params.set("network_config", config)?;
+
+// Get the object back
+if let Some(config) = self.params.get::<serde_json::Map<String, serde_json::Value>>("network_config") {
+    let ip = config.get("ip").and_then(|v| v.as_str()).unwrap_or("localhost");
+    let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(8080);
+}
+```
+
+## Default Parameters
+
+When `RuntimeParams::init()` is called and no `.horus/config/params.yaml` file exists, HORUS provides these defaults:
+
+```yaml
+# .horus/config/params.yaml (auto-generated defaults)
+
+# System
+tick_rate: 30
+max_memory_mb: 512
+
+# Motion
+max_speed: 1.0
+max_angular_speed: 1.0
+acceleration_limit: 0.5
+
+# Sensors
+lidar_rate: 10
+camera_fps: 30
+sensor_timeout_ms: 1000
+
+# Safety
+emergency_stop_distance: 0.3
+collision_threshold: 0.5
+
+# PID
+pid_kp: 1.0
+pid_ki: 0.1
+pid_kd: 0.05
+```
+
+**Customization:**
+1. Defaults are loaded if no params file exists in the project
+2. Edit the YAML file directly, use the monitor, or use `horus param set`
+3. Call `params.reset()` to restore defaults
+4. Call `params.save_to_disk()` to persist changes
+
+## Managing Parameters
+
+### Via Monitor
+
+**Web interface** (easiest method):
+
+```bash
+# Start monitor
+horus monitor
+
+# Navigate to Parameters tab
+#  View all parameters
+#  Edit values inline
+#  Changes auto-save to disk
+```
+
+**Features:**
+- Live editing with validation
+- Type indicators (number/string/boolean)
+- Export entire parameter set
+- Import from YAML/JSON
+- Delete individual parameters
+
+See [Monitor Guide](/development/monitor#tune-parameters-live) for API details.
+
+### Via Code
+
+**Save to disk:**
+```rust
+// simplified
+// Parameters are NOT auto-saved on set() — you must save explicitly
+self.params.save_to_disk()?;
+```
+
+**Load from disk:**
+```rust
+// simplified
+use std::path::Path;
+
+// Load from a specific file
+self.params.load_from_disk(Path::new(".horus/config/params.yaml"))?;
+```
+
+### Via CLI
+
+Use `horus param` to manage parameters from the command line:
+
+```bash
+# List all parameters
+horus param list
+horus param list --verbose    # Include metadata
+horus param list --json       # JSON output
+
+# Get/set values
+horus param get max_speed
+horus param set max_speed 2.0
+horus param set enabled true
+
+# Delete a parameter
+horus param delete old_key
+
+# Reset all parameters to defaults
+horus param reset
+horus param reset --force     # Skip confirmation
+
+# Save/load from files
+horus param save -o my_preset.yaml
+horus param load my_preset.yaml
+
+# Dump all parameters as YAML to stdout
+horus param dump
+```
+
+### Via File Edit
+
+**Direct YAML editing:**
+
+```bash
+# Edit parameters file (project-relative)
+vim .horus/config/params.yaml
+
+# Changes take effect on next RuntimeParams::init() or load_from_disk()
+```
+
+**Format:**
+```yaml
+# Use spaces (2 or 4), not tabs
+max_speed: 2.0            # number
+mode: "auto"              # string (quotes optional for simple strings)
+enabled: true             # boolean
+rates: [10, 30, 100]      # array
+
+# Comments are preserved
+pid_kp: 1.0    # Proportional gain
+pid_ki: 0.1    # Integral gain
+pid_kd: 0.05   # Derivative gain
+```
+
+## Common Patterns
+
+### PID Controller Tuning
+
+```rust
+// simplified
+use horus::prelude::*;
+
+pub struct PIDController {
+    params: RuntimeParams,
+    kp: f64,
+    ki: f64,
+    kd: f64,
+    integral: f64,
+    last_error: f64,
+}
+
+impl Node for PIDController {
+    fn name(&self) -> &str { "pid_controller" }
+
+    fn init(&mut self) -> Result<()> {
+        self.kp = self.params.get_or("pid_kp", 1.0);
+        self.ki = self.params.get_or("pid_ki", 0.1);
+        self.kd = self.params.get_or("pid_kd", 0.05);
+        hlog!(info, "PID: Kp={}, Ki={}, Kd={}", self.kp, self.ki, self.kd);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let error = self.compute_error();
+        self.integral += error;
+        let derivative = error - self.last_error;
+
+        let output = self.kp * error + self.ki * self.integral + self.kd * derivative;
+        self.last_error = error;
+
+        // Use output...
+    }
+}
+
+impl PIDController {
+    fn compute_error(&self) -> f64 {
+        // Your error calculation
+        0.0
+    }
+}
+```
+
+**Tuning workflow:**
+1. Start robot with default gains
+2. Open monitor → Parameters
+3. Adjust `pid_kp`/`pid_ki`/`pid_kd` while robot runs
+4. Observe behavior in monitor metrics
+5. Repeat until satisfactory
+6. Save with `horus param save` or `params.save_to_disk()`
+
+### Feature Flags
+
+```rust
+// simplified
+pub struct AdvancedController {
+    params: RuntimeParams,
+    enable_obstacle_avoidance: bool,
+    enable_path_planning: bool,
+    enable_localization: bool,
+}
+
+impl Node for AdvancedController {
+    fn name(&self) -> &str { "advanced_controller" }
+
+    fn init(&mut self) -> Result<()> {
+        self.enable_obstacle_avoidance = self.params.get_or("obstacle_avoidance", false);
+        self.enable_path_planning = self.params.get_or("path_planning", false);
+        self.enable_localization = self.params.get_or("localization", true);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        if self.enable_localization {
+            self.update_localization();
+        }
+        if self.enable_obstacle_avoidance {
+            self.avoid_obstacles();
+        }
+        if self.enable_path_planning {
+            self.plan_path();
+        }
+    }
+}
+
+impl AdvancedController {
+    fn update_localization(&mut self) { /* ... */ }
+    fn avoid_obstacles(&mut self) { /* ... */ }
+    fn plan_path(&mut self) { /* ... */ }
+}
+```
+
+### Environment-Specific Config
+
+```rust
+// simplified
+pub struct NetworkNode {
+    params: RuntimeParams,
+    server_url: String,
+    timeout_ms: u64,
+}
+
+impl Node for NetworkNode {
+    fn name(&self) -> &str { "network_node" }
+
+    fn init(&mut self) -> Result<()> {
+        let env: String = self.params.get_or("environment", "development".to_string());
+
+        match env.as_str() {
+            "production" => {
+                self.server_url = self.params.get_or("prod_url", "prod.example.com:8080".to_string());
+                self.timeout_ms = self.params.get_or("prod_timeout_ms", 3000_i64) as u64;
+            },
+            "staging" => {
+                self.server_url = self.params.get_or("staging_url", "staging.example.com:8080".to_string());
+                self.timeout_ms = self.params.get_or("staging_timeout_ms", 5000_i64) as u64;
+            },
+            _ => {
+                self.server_url = self.params.get_or("dev_url", "localhost:8080".to_string());
+                self.timeout_ms = self.params.get_or("dev_timeout_ms", 10000_i64) as u64;
+            }
+        }
+
+        hlog!(info, "Connecting to {} (timeout: {}ms)", self.server_url, self.timeout_ms);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        // Network logic...
+    }
+}
+```
+
+### Rate Limiting
+
+```rust
+// simplified
+pub struct SensorPublisher {
+    params: RuntimeParams,
+    publish_rate: u64,
+    last_publish: std::time::Instant,
+}
+
+impl Node for SensorPublisher {
+    fn name(&self) -> &str { "sensor_publisher" }
+
+    fn init(&mut self) -> Result<()> {
+        self.publish_rate = self.params.get_or("publish_rate", 10_i64) as u64;
+        hlog!(info, "Publishing at {} Hz", self.publish_rate);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let interval = std::time::Duration::from_millis(1000 / self.publish_rate);
+
+        if self.last_publish.elapsed() >= interval {
+            self.publish_data();
+            self.last_publish = std::time::Instant::now();
+        }
+    }
+}
+
+impl SensorPublisher {
+    fn publish_data(&mut self) {
+        // Publishing logic
+    }
+}
+```
+
+## Best Practices
+
+### Naming Conventions
+
+**Use descriptive names:**
+```yaml
+# Good
+lidar_scan_rate: 10
+camera_resolution_width: 1920
+
+# Bad
+rate: 10
+w: 1920
+```
+
+**Use consistent snake_case:**
+```yaml
+# Good (snake_case)
+max_speed: 1.5
+acceleration_limit: 0.5
+
+# Bad (mixed casing)
+maxSpeed: 1.5
+acceleration_limit: 0.5
+```
+
+### Always Provide Defaults
+
+**Never crash on missing parameters:**
+
+```rust
+// simplified
+// Good - provides fallback
+let speed = self.params.get_or("max_speed", 1.5);
+
+// Bad - panics if missing
+let speed = self.params.get::<f64>("max_speed").unwrap();
+```
+
+**Use sensible defaults:**
+```rust
+// simplified
+// Good - safe defaults
+let emergency_stop = self.params.get_or("emergency_stop", true);     // Default to safe state
+let max_speed = self.params.get_or("max_speed", 1.0);               // Default to slow
+
+// Bad - unsafe defaults
+let emergency_stop = self.params.get_or("emergency_stop", false);    // Unsafe!
+let max_speed = self.params.get_or("max_speed", 100.0);             // Too fast!
+```
+
+### Document Parameters
+
+**Add comments in YAML:**
+```yaml
+# Maximum linear velocity in m/s (default: 1.0)
+max_speed: 1.0
+
+# Maximum angular velocity in rad/s (default: 1.0)
+max_angular_speed: 1.0
+
+# Proportional gain - affects responsiveness (range: 0.1-10.0)
+pid_kp: 1.0
+
+# Integral gain - affects steady-state error (range: 0.01-1.0)
+pid_ki: 0.1
+
+# Derivative gain - affects damping (range: 0.001-0.1)
+pid_kd: 0.05
+```
+
+**Add documentation in code:**
+```rust
+// simplified
+fn init(&mut self) -> Result<()> {
+    // Load PID gains (tuning range: Kp=0.1-10, Ki=0.01-1, Kd=0.001-0.1)
+    self.kp = self.params.get_or("pid_kp", 1.0);
+    self.ki = self.params.get_or("pid_ki", 0.1);
+    self.kd = self.params.get_or("pid_kd", 0.05);
+    Ok(())
+}
+```
+
+### Validate Parameter Values
+
+**Use built-in validation rules:**
+
+RuntimeParams supports metadata with validation rules that are checked on `set()`:
+
+```rust
+// simplified
+use horus::prelude::*; // Provides RuntimeParams, ParamMetadata, ValidationRule
+
+let params = RuntimeParams::init()?;
+
+// Set validation rules for a parameter
+params.set_metadata("max_speed", ParamMetadata {
+    description: Some("Maximum robot speed".to_string()),
+    unit: Some("m/s".to_string()),
+    validation: vec![ValidationRule::Range(0.0, 5.0)],
+    read_only: false,
+})?;
+
+// This succeeds:
+params.set("max_speed", 2.0)?;
+
+// This returns an error (out of range):
+params.set("max_speed", 10.0)?; // Error!
+```
+
+**Available validation rules:**
+
+| Rule | Description |
+|------|-------------|
+| `MinValue(f64)` | Minimum numeric value |
+| `MaxValue(f64)` | Maximum numeric value |
+| `Range(f64, f64)` | Numeric range (min, max) |
+| `RegexPattern(String)` | String must match regex |
+| `Enum(Vec<String>)` | Value must be one of allowed strings |
+| `MinLength(usize)` | Minimum string/array length |
+| `MaxLength(usize)` | Maximum string/array length |
+| `RequiredKeys(Vec<String>)` | Object must contain these keys |
+
+**Read-only parameters:**
+
+```rust
+// simplified
+params.set_metadata("version", ParamMetadata {
+    description: Some("System version".to_string()),
+    unit: None,
+    validation: vec![],
+    read_only: true,
+})?;
+
+// This returns an error:
+params.set("version", "1.0.0")?; // Error: Parameter 'version' is read-only
+```
+
+**Manual bounds checking in code:**
+```rust
+// simplified
+fn init(&mut self) -> Result<()> {
+    let speed = self.params.get_or("max_speed", 1.5);
+
+    // Clamp to safe range
+    self.max_speed = speed.max(0.0).min(5.0);
+
+    if speed != self.max_speed {
+        hlog!(warn, "max_speed {} out of range, clamped to {}", speed, self.max_speed);
+    }
+    Ok(())
+}
+```
+
+### Export Parameter Sets
+
+**Create presets for different scenarios:**
+
+```bash
+# Save current parameters to a preset file
+horus param save -o aggressive_tuning.yaml
+
+# Backup current params and switch to a different preset
+cp .horus/config/params.yaml .horus/config/params_backup.yaml
+horus param load aggressive_tuning.yaml
+
+# Dump current params to stdout for inspection
+horus param dump
+```
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Parameters show default values despite YAML file existing | YAML syntax error, wrong file location, or file permissions | Validate with `yamllint .horus/config/params.yaml`, check `ls -la .horus/config/params.yaml`, verify with `horus param list` |
+| Changes via `set()` do not persist after restart | `set()` only updates in-memory storage | Call `self.params.save_to_disk()?` explicitly, or use `horus param save` from CLI |
+| Type mismatch error (`expected f64, got String`) | YAML value quoted as string (`"1.5"` instead of `1.5`) | Remove quotes in YAML: use `max_speed: 1.5` not `max_speed: "1.5"` |
+| Parameters reset to defaults after update | `.horus/config/params.yaml` was deleted or is empty | Backup with `horus param save -o params_backup.yaml` before updates, restore with `horus param load params_backup.yaml` |
+| Validation error on `set()` | Value violates metadata rules (range, regex, read-only) | Check metadata with `horus param list --verbose`, adjust value to match constraints |
+| Parameter not found by other nodes | Nodes using different `RuntimeParams` instances | All nodes should call `RuntimeParams::init()` which shares the same backing store |
+
+## Performance Considerations
+
+### Access Speed
+
+Parameters use `Arc<RwLock<BTreeMap>>`:
+
+- **Read**: ~80-350ns (read lock + BTreeMap lookup)
+- **Write**: ~100-500ns (write lock + BTreeMap insert + potential save)
+- **Thread-safe**: Multiple nodes can read simultaneously
+
+**Fast enough for:**
+- Loading parameters in `init()` (one-time)
+- Checking parameters every tick (60 Hz)
+- Checking parameters every 100 ticks (~1 second)
+
+**Too slow for:**
+- Reading hundreds of parameters every tick
+- Using as real-time message passing (use buffered `Topic` instead)
+
+### Caching Strategy
+
+**Good: Cache and reload periodically**
+```rust
+// simplified
+fn tick(&mut self) {
+    // Reload every 60 ticks (~1 second)
+    if self.reload_counter % 60 == 0 {
+        self.max_speed = self.params.get_or("max_speed", 1.5);
+    }
+    self.reload_counter += 1;
+
+    // Use cached value
+    let velocity = calculate_velocity(self.max_speed);
+}
+```
+
+**Bad: Read every tick unnecessarily**
+```rust
+// simplified
+fn tick(&mut self) {
+    // Wasteful - reads same value 60 times per second
+    let max_speed = self.params.get_or("max_speed", 1.5);
+}
+```
+
+## Version Tracking
+
+RuntimeParams includes an optimistic locking system for concurrent edit protection:
+
+```rust
+// simplified
+// Get current version of a parameter
+let version = self.params.get_version("max_speed");
+
+// Set with version check — fails if another writer changed it
+self.params.set_with_version("max_speed", 2.0, version)?;
+```
+
+This prevents lost updates when multiple processes or threads modify the same parameter simultaneously.
+
+## Audit Logging
+
+Parameter changes are automatically logged to `.horus/logs/param_changes.log`:
+
+```
+[2025-01-15 14:30:00] max_speed: 1.0 -> 2.0
+[2025-01-15 14:31:15] pid_kp: 1.0 -> 1.5
+```
+
+This provides a history of all runtime parameter modifications for debugging and tuning review.
+
+---
+
+## See Also
+
+- [RuntimeParams API](/rust/api/runtime-params) — Complete API reference for `RuntimeParams` methods
+- [CLI Reference: horus param](/development/cli-reference) — Command-line parameter management (get, set, list, save, load)
+- [Monitor](/development/monitor) — Live parameter tuning via web interface Parameters tab
+- [horus.toml](/concepts/horus-toml) — Build-time project configuration (complementary to runtime parameters)
+- [Nodes](/concepts/core-concepts-nodes) — Node lifecycle where parameters are typically accessed

@@ -1,0 +1,483 @@
+---
+title: Benchmarks
+description: Measured IPC latency, throughput, and real-time performance on real hardware
+order: 26
+---
+
+# Benchmarks
+
+All numbers on this page are **measured values** from the HORUS benchmark suite, not estimates. Run on **Intel i9-14900K (32 cores), WSL2, release mode, RDTSC cycle-accurate timing** on 2026-03-22.
+
+Reproduce on your hardware:
+```bash
+cargo run --release -p horus_benchmarks --bin all_paths_latency
+```
+
+---
+
+## Quick Reference
+
+| Transport | p50 | Throughput | Use Case |
+|-----------|-----|-----------|----------|
+| Same-thread | **12ns** | 100M+ msg/s | In-process pipeline |
+| Cross-thread 1:1 | **91ns** | 13M+ msg/s | Multi-threaded nodes |
+| Cross-thread N:N | **150ns** | 8M+ msg/s | Multi-producer/consumer |
+| Cross-process 1:1 | **171ns** | 5M+ msg/s | Multi-process systems |
+| Cross-process MPMC | **91ns** | 10M+ msg/s | Multi-process multi-participant |
+| Cross-process broadcast | **152ns** | 5M+ msg/s | Latest-value broadcast |
+| CmdVel (16B) | **89ns** | 11.1M msg/s | Motor control at 1kHz+ |
+| Imu (304B) | **119ns** | 7.8M msg/s | Sensor fusion at 500Hz+ |
+| LaserScan (1.5KB) | **151ns** | 6.3M msg/s | Lidar at 10-40Hz |
+| Python typed msg | **1.7μs** | 2.7M msg/s | ML inference nodes |
+| HORUS vs iceoryx2 | **1.4–6.3x faster** | — | Beats on every IPC path |
+
+---
+
+## IPC Latency — All Backend Paths
+
+Measured with `all_paths_latency`: 100,000 iterations per scenario, RDTSC timing with 6ns overhead subtracted, Tukey IQR outlier removal, bootstrap 95% confidence intervals.
+
+<IPCBackendChart />
+
+### Intra-Process
+
+| Scenario | Backend | p50 | p95 | p99 | p99.9 | max | CV |
+|----------|---------|-----|-----|-----|-------|-----|----|
+| Same thread | DirectChannel | **12ns** | 12ns | 13ns | 13ns | 13ns | 0.047 |
+| Cross-thread 1:1 | SpscIntra | **91ns** | 105ns | 107ns | 125ns | 125ns | 0.077 |
+| Cross-thread 1:N | SpmcIntra | **80ns** | 88ns | 92ns | 94ns | 94ns | 0.053 |
+| Cross-thread N:1 | MpscIntra | **187ns** | 312ns | 372ns | 458ns | 464ns | 0.313 |
+| Cross-thread N:N | FanoutIntra | **150ns** | 270ns | 307ns | 322ns | 322ns | 0.354 |
+
+### Cross-Process
+
+| Scenario | Backend | p50 | p95 | p99 | p99.9 | max |
+|----------|---------|-----|-----|-----|-------|-----|
+| 1 pub, 1 sub | SpscShm | **171ns** | 186ns | 192ns | 195ns | 195ns |
+| 2 pub, 1 sub | MpscShm | **158ns** | 182ns | 190ns | 200ns | 200ns |
+| 2 pub, 2 sub (MPMC) | FanoutShm | **91ns** | — | 230ns | — | — |
+| Broadcast (POD) | PodShm | **152ns** | 203ns | 227ns | 254ns | 254ns |
+
+### Hardware Floor
+
+| Operation | p50 | What it measures |
+|-----------|-----|------------------|
+| Raw SHM atomic (cross-process) | **63ns** | Kernel/hardware minimum for cross-process |
+| Raw memcpy 8B | **11ns** | Cache-to-cache copy |
+| Raw memcpy 1KB | **17ns** | L1 cache bandwidth |
+| Raw memcpy 8KB | **49ns** | L2 cache bandwidth |
+| Raw memcpy 64KB | **811ns** | RAM bandwidth |
+| Atomic store+load | **11ns** | Single atomic round-trip |
+
+### Framework Overhead
+
+| Path | Total | Hardware floor | HORUS overhead |
+|------|-------|---------------|----------------|
+| Cross-process 1:1 (SpscShm) | 171ns | 57ns | **114ns** |
+| Cross-process MPMC (FanoutShm) | 91ns | 57ns | **34ns** |
+| Cross-process broadcast (PodShm) | 152ns | 57ns | **95ns** |
+
+HORUS adds 34–114ns over the hardware minimum for cross-process IPC. FanoutShm achieves the lowest overhead because its contention-free SPSC channel matrix eliminates CAS operations on the hot path.
+
+---
+
+## Robotics Message Types
+
+Measured with `robotics_messages_benchmark`: 50,000 iterations, cross-thread producer/consumer on separate cores.
+
+<MessagePerformanceChart />
+
+| Message | Size | Median | p99 | Throughput | Typical Rate | Headroom |
+|---------|------|--------|-----|-----------|-------------|----------|
+| **CmdVel** | 16B | **89ns** | 91ns | 11.1M msg/s | 1,000 Hz | 11,100x |
+| **Imu** | 304B | **119ns** | 150ns | 7.8M msg/s | 500 Hz | 15,600x |
+| **JointCommand** | 928B | **128ns** | 157ns | 8.1M msg/s | 500 Hz | 16,200x |
+| **LaserScan** | 1,480B | **151ns** | 184ns | 6.3M msg/s | 40 Hz | 157,500x |
+
+### Real-Time Suitability
+
+| Control Rate | Budget | Worst-Case (p99) | Result |
+|-------------|--------|-------------------|--------|
+| 1 kHz (motor control) | 1ms | CmdVel 91ns | **PASS** (11,000x headroom) |
+| 10 kHz (servo control) | 100μs | CmdVel 91ns | **PASS** (1,100x headroom) |
+| 500 Hz (sensor fusion) | 2ms | Imu 150ns | **PASS** (13,300x headroom) |
+| 40 Hz (lidar) | 25ms | LaserScan 184ns | **PASS** (135,000x headroom) |
+
+All message types pass real-time suitability at their typical robotics frequencies.
+
+---
+
+## HORUS vs Competition
+
+Measured with `competitor_comparison`: 5 seconds sustained per transport, same machine.
+
+<HorusVsUDPChart />
+
+| Transport | Size | p50 | p95 | p99 | Throughput |
+|-----------|------|-----|-----|-----|-----------|
+| **HORUS SHM** | 8B | **23ns** | 25ns | 29ns | 100M+ msg/s |
+| Raw UDP | 8B | 1,235ns | 1,328ns | 1,558ns | 3.9M msg/s |
+| **HORUS SHM** | 32B | **23ns** | 25ns | 29ns | 101M+ msg/s |
+| Raw UDP | 32B | 1,122ns | 1,246ns | 2,129ns | 4.1M msg/s |
+
+**Speedup: 54x** (8B), **49x** (32B) over raw UDP on the same machine.
+
+HORUS eliminates the kernel network stack entirely. UDP requires `sendto()` + `recvfrom()` system calls (~1,100ns of kernel overhead). HORUS uses direct shared memory access (~23ns total).
+
+### HORUS vs iceoryx2
+
+<HorusVsIceoryxChart />
+
+[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) is Eclipse's lock-free zero-copy IPC middleware. Measured with `iceoryx2_comparison` and `fanout_shm_bench`: same machine, same message types, release mode.
+
+| Scenario | HORUS | iceoryx2 | Speedup |
+|----------|-------|----------|---------|
+| Same-thread | 11 ns | 69 ns | **6.3x** |
+| Cross-thread 1:1 | 95 ns | 182 ns | **1.9x** |
+| Cross-process 1:1 | 170 ns | 361 ns | **2.1x** |
+| Cross-process MPMC 2P/2S | 96 ns | 135 ns | **1.4x** |
+| Throughput (u64) | 95 M/s | 22 M/s | **4.3x** |
+
+HORUS beats iceoryx2 on every IPC path. The cross-process MPMC advantage comes from FanoutShm — a contention-free SPSC channel matrix that eliminates all CAS operations on the hot path.
+
+```bash
+# Reproduce (requires iceoryx2 feature)
+cargo run --release -p horus_benchmarks --bin iceoryx2_comparison --features iceoryx2
+
+# HORUS-only cross-process MPMC
+cargo run --release -p horus_benchmarks --bin fanout_shm_bench
+```
+
+---
+
+## Scalability
+
+Measured with `scalability_benchmark`: sustained throughput with varying producer/consumer thread counts.
+
+<ThreadScalingChart />
+
+### Thread Scaling
+
+| Producers | Consumers | Throughput | Per-Thread | Scaling Efficiency |
+|-----------|-----------|-----------|------------|-------------------|
+| 1 | 1 | 2.4M msg/s | 1.20M | baseline |
+| 2 | 1 | 7.2M msg/s | 2.40M | 300% |
+| 4 | 1 | 11.8M msg/s | 2.35M | 489% |
+| 1 | 2 | 3.5M msg/s | 1.17M | 146% |
+| 1 | 4 | 2.9M msg/s | 0.58M | 122% |
+| 2 | 2 | 6.8M msg/s | 1.70M | 141% |
+| 4 | 4 | 11.2M msg/s | 1.41M | 117% |
+| 8 | 8 | 8.4M msg/s | 0.52M | 44% |
+
+### Producer Scaling (1 Consumer)
+
+```
+1 producer:   3.0 M/s  ████████████
+2 producers:  8.7 M/s  ██████████████████████████████████
+3 producers: 11.5 M/s  ████████████████████████████████████████████
+4 producers: 11.9 M/s  ████████████████████████████████████████████
+6 producers: 13.5 M/s  █████████████████████████████████████████████████  ← peak
+8 producers: 11.5 M/s  ████████████████████████████████████████████
+```
+
+Peak throughput at 6 producers (13.5M msg/s). Beyond 6, contention on the atomic head pointer causes slight degradation.
+
+### Consumer Scaling (1 Producer)
+
+```
+1 consumer:  2.8 M/s  ███████████
+2 consumers: 4.8 M/s  ██████████████████
+4 consumers: 4.8 M/s  ██████████████████
+8 consumers: 3.7 M/s  ██████████████
+```
+
+Consumer scaling plateaus at 2 — the ring buffer uses broadcast semantics (all consumers read the same data), so adding consumers doesn't increase total throughput.
+
+---
+
+## Real-Time Determinism
+
+Measured with `determinism_benchmark`: 10 runs of 100,000 iterations each, CPU-pinned to cores 0 and 1.
+
+<DeterminismChart />
+
+| Metric | Value |
+|--------|-------|
+| Mean latency | 87.0ns |
+| Median latency | 86.0ns |
+| Std dev | 7.9ns |
+| Min | 61ns |
+| Max | 112ns |
+| p95 | 102ns |
+| p99 | 109ns |
+| p99.9 | 112ns |
+| p99.99 | 112ns |
+| Run-to-run CV | 0.060 |
+| Deadline misses at 1μs | 212 / 1,000,000 (0.02%) |
+
+**Interpretation**: The 7.9ns standard deviation and 0.06 run-to-run coefficient of variation indicate highly deterministic behavior. The 0.02% deadline miss rate at the extremely aggressive 1μs deadline is due to OS scheduling jitter in WSL2 — on a bare-metal Linux system with `PREEMPT_RT` kernel and `isolcpus`, expect zero misses.
+
+---
+
+## Python Binding Performance
+
+Measured with `research_bench_python.py`: 5 seconds sustained per test, Python 3.12, PyO3 bindings v0.1.9.
+
+### Typed Message IPC (Zero-Copy Pod Path)
+
+| Message | p50 | p95 | p99 | p999 | Throughput |
+|---------|-----|-----|-----|------|-----------|
+| CmdVel send+recv | **1.7μs** | 1.8μs | 2.4μs | 15.2μs | 2.7M msg/s |
+| Pose2D send+recv | **1.7μs** | 1.9μs | 3.0μs | 18.2μs | 2.7M msg/s |
+| Imu send+recv | **1.9μs** | 2.0μs | 4.2μs | 21.1μs | 2.4M msg/s |
+
+### Generic Message IPC (Serialization Path)
+
+| Payload | p50 | p95 | p99 | Throughput |
+|---------|-----|-----|-----|-----------|
+| dict \{v: 1.0\} | **6.2μs** | 7.9μs | 19.9μs | 714K msg/s |
+| dict \{x,y,z,w\} | **12.4μs** | 15.3μs | 34.2μs | 382K msg/s |
+| dict 50 keys (~1KB) | **111μs** | 143μs | 196μs | 42K msg/s |
+
+**Typed messages are 4-65x faster than dicts** because they bypass serialization and use direct Pod memcpy through the Rust layer.
+
+### Image Zero-Copy
+
+<PythonZeroCopyChart />
+
+| Operation | p50 | Throughput | Notes |
+|-----------|-----|-----------|-------|
+| Image.to_numpy (640x480) | **3.0μs** | 1.5M/s | Returns view into SHM pool |
+| np.from_dlpack (640x480) | **1.1μs** | 3.5M/s | DLPack protocol, true zero-copy |
+| np.copy (640x480) baseline | **14.0μs** | 334K/s | For comparison (actual copy) |
+
+`np.from_dlpack()` is **13x faster** than `np.copy()` — it returns a numpy array backed by the shared memory pool with no data movement.
+
+### FFI Overhead Attribution
+
+<PythonFFIOverheadChart />
+
+| Operation | Rust (ns) | Python (ns) | Overhead | Factor |
+|-----------|-----------|-------------|----------|--------|
+| CmdVel | 14 | 1,712 | 1,698ns | 122x |
+| Pose2D | 14 | 1,682 | 1,668ns | 120x |
+| Imu | 14 | 1,884 | 1,870ns | 135x |
+| dict (small) | 14 | 6,246 | 6,232ns | 446x |
+
+The ~1.7μs Python overhead comes from: PyO3 boundary crossing (~500ns), GIL acquisition (~500ns), and Python object allocation (~700ns). This overhead is **constant** regardless of message size.
+
+### Scheduler Tick Overhead
+
+| Metric | Value |
+|--------|-------|
+| Target rate | 10,000 Hz |
+| Achieved rate | **5,932 Hz** |
+| Per-tick overhead | ~11μs (Rust→Python→Rust) |
+| GC dip (worst second) | 96 fewer ticks |
+
+The GIL is the bottleneck for Python tick rate. For control loops above ~5kHz, use Rust nodes.
+
+### When to Use Python vs Rust
+
+| Use Case | Recommended | Why |
+|----------|-------------|-----|
+| ML inference (PyTorch, YOLO) | **Python** | 1.7μs overhead negligible vs 10-200ms inference |
+| Data science, prototyping | **Python** | Developer velocity matters more than latency |
+| Motor control at 1kHz+ | **Rust** | 89ns vs 1,700ns — 19x difference |
+| Safety monitors | **Rust** | Deterministic timing, no GIL |
+| Sensor fusion at 500Hz+ | **Rust** | Predictable p99 latency |
+
+---
+
+## C++ Binding Performance
+
+Measured with `cpp_benchmark`: release mode, g++ -O2, 10,000 iterations per test, `high_resolution_clock` timing with warmup.
+
+### FFI Boundary Cost
+
+| Operation | Min | Median | P99 | P999 | Max | Stddev |
+|-----------|-----|--------|-----|------|-----|--------|
+| FFI call (abi_version) | **15ns** | **16ns** | 17ns | 17ns | 5.0μs | 49ns |
+| Atomic read (is_running) | **16ns** | **17ns** | 18ns | 18ns | 33ns | 0.6ns |
+
+The raw cost of crossing the Rust-C++ boundary is **15-17ns** — comparable to a C++ virtual function call.
+
+### Scheduler Tick from C++
+
+| Scenario | Min | Median | P99 | P999 | Max |
+|----------|-----|--------|-----|------|-----|
+| Empty scheduler | **35ns** | **37ns** | 45ns | 49ns | 1.6μs |
+| 1 node + callback | **243ns** | **250ns** | 10.5μs | 11.3μs | 13.8μs |
+| 10 nodes | **2.1μs** | **2.2μs** | 102μs | 109μs | 127μs |
+| 50 nodes | **10.7μs** | **11.0μs** | 515μs | 549μs | 597μs |
+
+Per-node overhead is ~220ns, which includes `catch_unwind` safety wrapper + closure dispatch through the FFI boundary.
+
+### Throughput
+
+| Metric | Value |
+|--------|-------|
+| Ticks/second (1 node) | **2,844,911** |
+| Time per tick | **0.35μs** |
+| CPU overhead at 1kHz | **0.035%** of one core |
+
+### Scalability
+
+| Nodes | Median Tick | Per-Node Cost |
+|-------|-------------|---------------|
+| 1 | 250ns | 250ns |
+| 10 | 2.2μs | 220ns |
+| 50 | 11.0μs | 220ns |
+
+Linear scaling — per-node cost is constant at ~220ns regardless of node count.
+
+### C++ vs Rust vs Python Overhead
+
+| Language | 1-Node Tick | Overhead vs Rust | Notes |
+|----------|-------------|-----------------|-------|
+| **Rust** (native) | ~89ns | baseline | Direct scheduler call |
+| **C++** (FFI) | ~250ns | +161ns (1.8x) | extern "C" + catch_unwind |
+| **Python** (PyO3) | ~1,700ns | +1,611ns (19x) | GIL + PyO3 + object alloc |
+
+C++ adds **161ns** over native Rust — the cost of the `extern "C"` boundary and panic safety wrapper. For perspective, this is 0.16 microseconds — invisible at any practical control rate.
+
+### Memory Safety
+
+Validated with AddressSanitizer (`g++ -fsanitize=address`):
+
+| Test | Iterations | ASAN Errors |
+|------|-----------|-------------|
+| Scheduler create/destroy | 1,000 | **0** |
+| Sustained ticks | 5,000 | **0** |
+| 50 concurrent nodes | 5,000 ticks | **0** |
+| Null pointer calls | 10,000 | **0** |
+
+Zero memory safety violations across the entire FFI surface.
+
+### Running C++ Benchmarks
+
+```bash
+# Build release
+cargo build --release --no-default-features -p horus_cpp
+
+# Compile benchmark
+g++ -std=c++17 -O2 -o cpp_benchmark \
+    horus_cpp/tests/cpp_benchmark.cpp \
+    -L target/release -lhorus_cpp -lpthread -ldl -lm
+
+# Run
+LD_LIBRARY_PATH=target/release ./cpp_benchmark
+
+# With ASAN
+g++ -std=c++17 -O2 -fsanitize=address -fno-omit-frame-pointer \
+    -o cpp_stress_asan horus_cpp/tests/cpp_stress_test.cpp \
+    -L target/release -lhorus_cpp -lpthread -ldl -lm
+LD_LIBRARY_PATH=target/release ./cpp_stress_asan
+```
+
+---
+
+## Running Benchmarks
+
+### Rust Benchmarks
+
+```bash
+# Main benchmark: all 10 backend paths (~2 min)
+cargo run --release -p horus_benchmarks --bin all_paths_latency
+
+# Robotics message types: CmdVel, Imu, LaserScan, JointCommand
+cargo run --release -p horus_benchmarks --bin robotics_messages_benchmark
+
+# HORUS vs UDP comparison
+cargo run --release -p horus_benchmarks --bin competitor_comparison
+
+# Scalability: thread count sweep
+cargo run --release -p horus_benchmarks --bin scalability_benchmark
+
+# RT determinism: jitter analysis
+cargo run --release -p horus_benchmarks --bin determinism_benchmark
+
+# Hardware floor: raw memcpy, atomic, mmap
+cargo run --release -p horus_benchmarks --bin raw_baselines
+
+# Cross-process: true inter-process IPC
+cargo run --release -p horus_benchmarks --bin cross_process_benchmark
+
+# Full research suite (~30 min)
+./benchmarks/research/run_all.sh
+
+# Quick validation (~3 min)
+./benchmarks/research/run_all.sh --quick
+```
+
+### Python Benchmarks
+
+```bash
+cd horus_py
+
+# Quick validation (2s per test)
+PYTHONPATH=. python3 benchmarks/research_bench_python.py --duration 2
+
+# Full research run (10s per test)
+PYTHONPATH=. python3 benchmarks/research_bench_python.py --duration 10 --csv results.csv
+
+# JSON summary for CI
+PYTHONPATH=. python3 benchmarks/research_bench_python.py --json summary.json
+```
+
+### Criterion Micro-Benchmarks
+
+```bash
+# All criterion benches (HTML reports in target/criterion/)
+cargo bench -p horus_benchmarks
+
+# Filter by name
+cargo bench -p horus_benchmarks -- topic_latency
+```
+
+---
+
+## Methodology
+
+### Timing
+
+- **RDTSC** (x86_64) with serializing fences (`lfence` + `mfence`), calibrated per-run (~3.37 GHz on test machine)
+- **Overhead**: ~6ns per measurement, subtracted from all samples
+- **Fallback**: `Instant::now()` (~11ns) on non-x86
+
+### Statistical Analysis
+
+- **Percentiles**: p1, p5, p25, p50, p75, p95, p99, p99.9, p99.99
+- **Confidence intervals**: Bootstrap with 10,000 resamples, 95% level
+- **Outlier filtering**: Tukey IQR (1.5x fence)
+- **Determinism metrics**: Coefficient of variation, run-to-run variance
+
+### Environment Control
+
+- **CPU governor**: Performance mode recommended (numbers above measured with `powersave` in WSL2)
+- **CPU affinity**: Producer and consumer pinned to separate physical cores
+- **Warmup**: 5,000-10,000 iterations discarded before measurement
+- **Measurement**: 50,000-100,000 iterations per test
+- **Turbo boost**: Disabled recommended for reproducibility
+
+### Reproducing These Numbers
+
+Your numbers will differ based on CPU, OS, governor, and VM/bare-metal:
+
+| Factor | Impact |
+|--------|--------|
+| `performance` governor vs `powersave` | 2-5x faster latencies |
+| Bare-metal Linux vs WSL2 | 10-30% faster, fewer outliers |
+| `PREEMPT_RT` kernel | Near-zero deadline misses |
+| `isolcpus` for benchmark cores | Lower jitter, tighter p99 |
+| Older CPU (i5 vs i9) | 1.5-3x slower |
+| ARM (Raspberry Pi, Jetson) | 3-10x slower, still sub-microsecond |
+
+---
+
+## See Also
+
+- [Performance Optimization](/performance/performance) — How to write fast HORUS code
+- [Shared Memory](/concepts/shared-memory) — SHM architecture and ring buffer details
+- [Scheduler API](/rust/api/scheduler) — Timing configuration and execution classes
+- [Python API](/python/api) — Python binding overhead and usage patterns

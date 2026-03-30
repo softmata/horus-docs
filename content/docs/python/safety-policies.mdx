@@ -1,0 +1,877 @@
+---
+title: "Safety & Policies (Python)"
+description: "Watchdog monitoring, deadline miss policies, failure policies, and safety patterns for Python HORUS nodes"
+order: 9
+---
+
+# Safety and Policies
+
+A warehouse robot runs Python nodes for ML-based obstacle detection, path planning, and telemetry. The obstacle detector runs a YOLO model at 30 Hz -- if inference takes too long, the robot drives blind. The path planner occasionally crashes when it receives malformed scan data. The telemetry uploader fails when the network drops. Each failure mode needs a different response: the detector needs to know it missed its timing window, the planner needs to restart, and the telemetry node should keep trying without bringing down the system.
+
+HORUS provides three complementary safety systems in Python:
+
+- **Miss policies** handle timing violations -- what happens when a node takes too long
+- **Failure policies** handle execution errors -- what happens when a node raises an exception
+- **Watchdogs** detect frozen nodes -- graduated response when a node stops responding entirely
+
+All three are configured through `Node()` constructor parameters and `Scheduler()` settings. They work together: a node can have a miss policy for deadline overruns, a failure policy for exceptions, and fall under the scheduler's watchdog for freeze detection.
+
+## Miss Policies
+
+When a node has a `budget` or `deadline` set and exceeds it, the miss policy determines what happens next. Set it with the `on_miss` parameter on `Node()`:
+
+```python
+# simplified
+import horus
+
+node = horus.Node(
+    name="detector",
+    tick=detect_fn,
+    rate=30,
+    budget=0.030,        # 30 ms budget
+    on_miss="warn",      # What to do when budget is exceeded
+)
+```
+
+There are four miss policies:
+
+### warn (default)
+
+Log a warning, continue running normally. The node keeps ticking at its configured rate.
+
+```python
+# simplified
+detector = horus.Node(
+    name="detector",
+    tick=run_yolo,
+    rate=30,
+    budget=0.030,
+    on_miss="warn",       # Log but keep going
+    pubs=["detections"],
+    subs=["camera.rgb"],
+)
+```
+
+**When to use**: Development and testing. Non-critical nodes where timing overruns are informational. Nodes you are actively profiling -- run with `"warn"` first to understand your timing distribution before tightening to `"skip"` or `"stop"`.
+
+### skip
+
+Skip the next tick to let the system recover timing. If a 30 Hz node takes 50 ms instead of 33 ms, it skips the following tick to avoid falling further behind.
+
+```python
+# simplified
+planner = horus.Node(
+    name="planner",
+    tick=plan_path,
+    rate=10,
+    budget=0.080,
+    on_miss="skip",       # Skip next tick to recover
+    subs=["map", "pose"],
+    pubs=["path"],
+)
+```
+
+**When to use**: High-frequency nodes where occasional dropped ticks are acceptable. Sensor fusion, path planning, and perception pipelines where using slightly stale data for one cycle is better than accumulating latency. If the node is running at 100 Hz and misses one tick, the system gets 99 ticks that cycle instead of 100 -- much better than all subsequent ticks starting late.
+
+### safe_mode
+
+Trigger the safety mechanism on the node.
+
+```python
+# simplified
+motor = horus.Node(
+    name="motor_ctrl",
+    tick=drive_motors,
+    rate=100,
+    budget=0.008,
+    on_miss="safe_mode",  # Enter safe state on miss
+    subs=["cmd_vel"],
+    pubs=["motor.status"],
+)
+```
+
+<Callout type="warn">
+**Python limitation**: Python nodes cannot customize what happens in safe mode. The `is_safe_state()` and `enter_safe_state()` callbacks exist only in the Rust `Node` trait. When `on_miss="safe_mode"` fires on a Python node, the scheduler invokes the default safe-state mechanism on the Rust side, but Python code cannot define what "safe" means for that specific node. See the [Workaround Patterns](#workaround-patterns-for-safety-in-python) section for practical alternatives.
+</Callout>
+
+**When to use**: Motor controllers, actuators, and any node where continued operation after a timing violation could be physically dangerous. In practice, use this policy on Rust nodes that implement `enter_safe_state()`, or pair it with a Python-side try/except pattern (see below).
+
+### stop
+
+Stop the entire scheduler immediately. All nodes receive their `shutdown()` callback.
+
+```python
+# simplified
+safety_monitor = horus.Node(
+    name="safety",
+    tick=check_safety,
+    rate=200,
+    budget=0.003,
+    on_miss="stop",       # Kill everything if safety check is late
+    order=0,              # Run first every cycle
+)
+```
+
+**When to use**: Safety-critical nodes where a late result means the safety guarantee is void. If your safety monitor must complete within 3 ms and it takes 5 ms, the system can no longer guarantee safe operation -- stopping is the correct response. Also appropriate as a last resort for nodes where `"safe_mode"` is insufficient.
+
+### Choosing a Miss Policy
+
+| Node role | Policy | Reasoning |
+|-----------|--------|-----------|
+| Safety monitor | `"stop"` | Late safety check = no safety guarantee |
+| Motor controller | `"safe_mode"` | Stop motors on timing violation |
+| Sensor fusion | `"skip"` | One stale cycle is acceptable |
+| Path planner | `"skip"` | Can use previous path for one cycle |
+| ML inference | `"warn"` | Timing varies with input; log and profile |
+| Telemetry | `"warn"` | Non-critical; timing overruns are informational |
+
+## Failure Policies
+
+When a node's `tick()` function raises an exception, the failure policy determines the response. Set it with the `failure_policy` parameter on `Node()`:
+
+```python
+# simplified
+node = horus.Node(
+    name="sensor",
+    tick=read_sensor,
+    rate=100,
+    failure_policy="restart",
+)
+```
+
+### fatal (default)
+
+Stop the entire scheduler on the first exception. This is the safest default -- an unhandled exception means the system is in an unknown state.
+
+```python
+# simplified
+motor = horus.Node(
+    name="motor_ctrl",
+    tick=drive_motors,
+    rate=100,
+    failure_policy="fatal",
+    subs=["cmd_vel"],
+)
+```
+
+**When to use**: Motor controllers, safety monitors, and any node where a crash indicates a state that is unsafe to continue from. If `drive_motors()` raises an exception, the motor may be in an unknown state -- continuing could mean uncontrolled motion.
+
+### restart
+
+Re-initialize the node with exponential backoff. The `init()` callback runs again, then ticking resumes. After the maximum retry count, escalates to a fatal stop.
+
+```python
+# simplified
+lidar = horus.Node(
+    name="lidar",
+    tick=read_lidar,
+    init=connect_lidar,
+    rate=10,
+    failure_policy="restart",
+    pubs=["scan"],
+)
+```
+
+Configure retry behavior with additional keyword arguments:
+
+```python
+# simplified
+camera = horus.Node(
+    name="camera",
+    tick=capture_frame,
+    init=open_camera,
+    rate=30,
+    failure_policy="restart",
+    max_retries=5,          # Give up after 5 restarts
+    backoff_ms=100,         # Start with 100 ms between retries
+    pubs=["camera.rgb"],
+)
+```
+
+The backoff doubles on each consecutive failure: 100 ms, 200 ms, 400 ms, 800 ms, 1600 ms. After the 5th failure, the scheduler stops. A successful tick resets the counter and backoff.
+
+**When to use**: Hardware drivers that may disconnect (USB sensors, serial devices, network cameras). Nodes that depend on external services that may be temporarily unavailable. Any node where re-running `init()` has a reasonable chance of fixing the problem.
+
+### skip
+
+Ignore the failed tick and continue. After `max_failures` consecutive failures, suppress the node for a cooldown period, then try again.
+
+```python
+# simplified
+telemetry = horus.Node(
+    name="telemetry",
+    tick=upload_telemetry,
+    rate=1,
+    failure_policy="skip",
+    max_failures=5,         # After 5 consecutive failures
+    cooldown_ms=2000,       # Suppress for 2 seconds
+    pubs=["telemetry.status"],
+)
+```
+
+**When to use**: Non-critical nodes whose absence does not affect core operation. Logging, telemetry upload, visualization, diagnostics. The robot should keep running even if telemetry fails for a few seconds.
+
+### ignore
+
+Swallow all exceptions completely. The node keeps ticking every cycle regardless of errors.
+
+```python
+# simplified
+stats = horus.Node(
+    name="stats",
+    tick=collect_stats,
+    rate=1,
+    failure_policy="ignore",
+)
+```
+
+**When to use**: Best-effort nodes where partial results are acceptable. Statistics collectors, debug output, optional monitoring. Use sparingly -- silently swallowing errors can mask real problems.
+
+### Choosing a Failure Policy
+
+| Node role | Policy | Why |
+|-----------|--------|-----|
+| Motor controller | `"fatal"` | Unknown state after crash is unsafe |
+| Safety monitor | `"fatal"` | Cannot monitor safety if monitor is broken |
+| LiDAR driver | `"restart"` | USB reconnect often fixes it |
+| Camera node | `"restart"` | Hardware reset recovers most failures |
+| Path planner | `"skip"` | System can coast on last known path |
+| Cloud upload | `"skip"` | Network outages are transient |
+| Telemetry | `"skip"` or `"ignore"` | Non-critical data collection |
+| Debug logger | `"ignore"` | Missing log entries are acceptable |
+
+## Watchdog
+
+The watchdog detects frozen nodes -- nodes whose `tick()` function never returns. This catches deadlocks, infinite loops, and hardware calls that block indefinitely.
+
+### Global Watchdog
+
+Set a global watchdog timeout on the `Scheduler`. Every node must complete its tick within this window:
+
+```python
+# simplified
+scheduler = horus.Scheduler(
+    tick_rate=100,
+    watchdog_ms=500,        # 500 ms global watchdog
+)
+```
+
+Or pass it through `horus.run()`:
+
+```python
+# simplified
+horus.run(sensor, controller, logger, watchdog_ms=500)
+```
+
+### Per-Node Watchdog
+
+Override the global timeout for specific nodes:
+
+```python
+# simplified
+# Safety-critical node: tight watchdog
+safety = horus.Node(
+    name="safety",
+    tick=check_safety,
+    rate=200,
+    watchdog=0.050,         # 50 ms -- must respond quickly
+    order=0,
+)
+
+# ML inference node: loose watchdog
+detector = horus.Node(
+    name="detector",
+    tick=run_yolo,
+    rate=10,
+    watchdog=2.0,           # 2 seconds -- inference can be slow
+    order=5,
+    compute=True,
+)
+
+scheduler = horus.Scheduler(tick_rate=200, watchdog_ms=500)
+scheduler.add(safety)       # Uses its own 50 ms watchdog
+scheduler.add(detector)     # Uses its own 2 s watchdog
+```
+
+### Critical Nodes
+
+Mark a node as critical with `add_critical_node()` to enforce a tight watchdog and trigger an emergency stop if it goes unresponsive:
+
+```python
+# simplified
+scheduler = horus.Scheduler(tick_rate=1000, watchdog_ms=500)
+
+scheduler.add(sensor)
+scheduler.add(controller)
+
+# This node gets a 5 ms watchdog -- emergency stop if it freezes
+scheduler.add_critical_node("safety_monitor", timeout_ms=5)
+```
+
+Critical nodes bypass the graduated degradation ladder. If a critical node exceeds its timeout, the scheduler stops immediately rather than escalating through Warning and Unhealthy states.
+
+### Graduated Degradation
+
+For non-critical nodes, the watchdog uses a graduated response based on how many timeout multiples have elapsed:
+
+| Elapsed time | Health state | Scheduler response |
+|-------------|-------------|-------------------|
+| Within timeout | Healthy | Normal operation |
+| 1x timeout | Warning | Log warning, keep ticking |
+| 2x timeout | Unhealthy | Skip this node's tick |
+| 3x timeout | Isolated | Remove from tick loop |
+
+This prevents a single late tick from triggering a drastic response. A 500 ms watchdog means:
+
+- At 500 ms without a tick: warning logged
+- At 1000 ms: node skipped (other nodes keep running)
+- At 1500 ms: node isolated entirely
+
+Recovery is automatic. If a Warning node completes a tick successfully, it transitions back to Healthy immediately.
+
+### Monitoring Safety Statistics
+
+Inspect watchdog triggers, deadline misses, and node health at runtime:
+
+```python
+# simplified
+scheduler = horus.Scheduler(tick_rate=100, watchdog_ms=500)
+scheduler.add(sensor)
+scheduler.add(controller)
+scheduler.run(duration=30.0)
+
+# After run completes, check what happened
+stats = scheduler.safety_stats()
+if stats:
+    print(f"Deadline misses:     {stats.get('deadline_misses', 0)}")
+    print(f"Budget overruns:     {stats.get('budget_overruns', 0)}")
+    print(f"Watchdog triggers:   {stats.get('watchdog_expirations', 0)}")
+```
+
+For per-node inspection:
+
+```python
+# simplified
+node_stats = scheduler.get_node_stats("controller")
+print(f"Total ticks:   {node_stats['total_ticks']}")
+print(f"Failed ticks:  {node_stats['failed_ticks']}")
+print(f"Avg duration:  {node_stats.get('avg_tick_duration_ms', 0):.2f} ms")
+print(f"Max duration:  {node_stats.get('max_tick_duration_ms', 0):.2f} ms")
+```
+
+### Max Deadline Misses
+
+Set an emergency stop threshold -- after N consecutive deadline misses across the system, the scheduler stops:
+
+```python
+# simplified
+scheduler = horus.Scheduler(
+    tick_rate=100,
+    watchdog_ms=500,
+    max_deadline_misses=50,   # Emergency stop after 50 consecutive misses
+)
+```
+
+Or via `horus.run()`:
+
+```python
+# simplified
+horus.run(sensor, controller, max_deadline_misses=50, watchdog_ms=500)
+```
+
+This is a system-wide backstop. Individual nodes handle their own misses via `on_miss`, but if the entire system is consistently falling behind, `max_deadline_misses` triggers a clean shutdown before the situation degrades further.
+
+## Python Safety Limitations
+
+Python nodes have a meaningful gap compared to their Rust counterparts: there is no Python-side equivalent of `is_safe_state()` or `enter_safe_state()`.
+
+In Rust, you implement these methods on your Node trait:
+
+```python
+# simplified
+# This is what Rust can do — Python CANNOT:
+#
+# impl Node for MotorController {
+#     fn enter_safe_state(&mut self) {
+#         self.velocity = 0.0;
+#         self.disable_motor();
+#     }
+#
+#     fn is_safe_state(&self) -> bool {
+#         self.velocity == 0.0
+#     }
+# }
+```
+
+When `on_miss="safe_mode"` fires on a Python node, the scheduler invokes the default Rust-side safe-state mechanism, but Python cannot define what "entering safe state" means for that specific node. The node cannot report back that it has reached a safe state.
+
+This is an intentional design constraint. The safe-state mechanism requires lock-free, deterministic execution that Python's GIL and garbage collector cannot guarantee. A Python `enter_safe_state()` that triggers a GC pause defeats the purpose.
+
+### What Still Works
+
+- `on_miss="warn"`, `"skip"`, and `"stop"` all work identically in Python and Rust
+- All failure policies (`"fatal"`, `"restart"`, `"skip"`, `"ignore"`) work identically
+- Watchdog monitoring, graduated degradation, and `add_critical_node()` all work identically
+- `safety_stats()` reports the same data regardless of node language
+
+The limitation is narrow: only `on_miss="safe_mode"` has reduced functionality in Python.
+
+## Workaround Patterns for Safety in Python
+
+### Pattern 1: Safety Logic in tick()
+
+Handle safety directly in your tick function with try/except. This gives you explicit control over what "safe" means:
+
+```python
+# simplified
+import horus
+
+class MotorState:
+    def __init__(self):
+        self.velocity = 0.0
+        self.safe = False
+
+    def tick(self, node):
+        try:
+            if node.has_msg("cmd_vel"):
+                cmd = node.recv("cmd_vel")
+                self.velocity = cmd["linear"]
+
+            # Check timing budget
+            remaining = horus.budget_remaining()
+            if remaining < 0.001:  # Less than 1 ms left
+                self.enter_safe_state(node)
+                return
+
+            node.send("motor.cmd", {"velocity": self.velocity})
+
+        except Exception as e:
+            node.log_error(f"Motor error: {e}")
+            self.enter_safe_state(node)
+
+    def enter_safe_state(self, node):
+        self.velocity = 0.0
+        self.safe = True
+        node.send("motor.cmd", {"velocity": 0.0})
+        node.log_warning("Entered safe state — motors stopped")
+
+state = MotorState()
+motor = horus.Node(
+    name="motor",
+    tick=state.tick,
+    rate=100,
+    budget=0.008,
+    on_miss="warn",         # Log the overrun; safety handled in tick()
+    subs=["cmd_vel"],
+    pubs=["motor.cmd"],
+)
+horus.run(motor)
+```
+
+This pattern gives you full control but places the safety burden on your code. The scheduler's `on_miss` still fires for monitoring, but the actual safe-state transition is managed in Python.
+
+### Pattern 2: Dedicated Safety Node
+
+Run a separate node whose only job is monitoring other nodes and triggering emergency stops:
+
+```python
+# simplified
+import horus
+
+def safety_tick(node):
+    """Check system health every tick"""
+    # Check for stale motor commands
+    if node.has_msg("motor.status"):
+        status = node.recv("motor.status")
+        age_ms = (horus.timestamp_ns() - status.get("timestamp_ns", 0)) / 1e6
+        if age_ms > 100:
+            node.log_error(f"Motor status stale: {age_ms:.0f} ms")
+            node.send("emergency.stop", {"reason": "stale_motor_data"})
+            node.request_stop()
+            return
+
+    # Check sensor health
+    if not node.has_msg("sensor.heartbeat"):
+        node.send("motor.override", {"velocity": 0.0})
+        node.log_warning("Sensor heartbeat missing — motors zeroed")
+
+safety = horus.Node(
+    name="safety_monitor",
+    tick=safety_tick,
+    rate=200,
+    budget=0.003,
+    on_miss="stop",           # If safety monitor is late, stop everything
+    failure_policy="fatal",   # If safety monitor crashes, stop everything
+    order=0,                  # Run before all other nodes
+    subs=["motor.status", "sensor.heartbeat"],
+    pubs=["emergency.stop", "motor.override"],
+)
+```
+
+This node runs at high frequency, checks system invariants, and calls `node.request_stop()` or publishes override commands when something is wrong. Use `on_miss="stop"` on the safety node itself -- if the monitor cannot keep up, the system cannot guarantee safety.
+
+### Pattern 3: Mixed Python and Rust
+
+For genuinely safety-critical systems, write the safety-critical node in Rust (with proper `enter_safe_state()` and `is_safe_state()`) and keep Python nodes for perception, planning, and telemetry:
+
+```python
+# simplified
+# Python: ML inference node (non-safety-critical)
+import horus
+
+def detect(node):
+    if node.has_msg("camera.rgb"):
+        img = node.recv("camera.rgb")
+        detections = run_model(img)
+        node.send("detections", detections)
+
+detector = horus.Node(
+    name="detector",
+    tick=detect,
+    rate=30,
+    compute=True,
+    failure_policy="skip",    # Non-critical — skip on failure
+    on_miss="warn",           # Inference time varies
+    subs=["camera.rgb"],
+    pubs=["detections"],
+)
+
+horus.run(detector)
+```
+
+Meanwhile, a Rust process runs the motor controller with full safe-state support:
+
+```bash
+# Run both in the same session — they share topics automatically
+horus run safety_controller detector.py
+```
+
+This architecture plays to each language's strengths: Rust for deterministic, safety-critical control; Python for ML inference and high-level logic. Both communicate through the same shared-memory topics.
+
+## GIL and Garbage Collection Gotchas
+
+Python's Global Interpreter Lock (GIL) and garbage collector create timing challenges that do not exist in Rust. Understanding these is essential for setting realistic budgets and interpreting deadline misses.
+
+### GC Pauses Cause False Deadline Misses
+
+Python's garbage collector runs periodically and can pause your tick function for 1--10 ms, depending on the number of live objects. A node with a 5 ms budget may miss its deadline not because the tick logic is slow, but because the GC ran mid-tick.
+
+```python
+# simplified
+import gc
+
+def ml_tick(node):
+    # Disable GC during time-critical work
+    gc.disable()
+    try:
+        if node.has_msg("input"):
+            data = node.recv("input")
+            result = run_inference(data)     # Time-critical
+            node.send("output", result)
+    finally:
+        gc.enable()
+
+ml_node = horus.Node(
+    name="inference",
+    tick=ml_tick,
+    rate=30,
+    budget=0.030,
+    on_miss="warn",
+    subs=["input"],
+    pubs=["output"],
+)
+```
+
+<Callout type="warn">
+Disabling the GC during every tick prevents pause-induced misses but increases memory pressure. Only do this for nodes with tight budgets. For nodes running at 10 Hz or slower, GC pauses are rarely a problem.
+</Callout>
+
+### GIL Contention with Multiple Nodes
+
+When multiple Python nodes run in the same process, they share the GIL. Only one node's tick function executes Python bytecode at a time. This means:
+
+- Two 100 Hz Python nodes cannot both sustain 100 Hz in the same process
+- Nodes using C extensions that release the GIL (NumPy, PyTorch, OpenCV) are unaffected during the C call
+- Use `compute=True` on nodes that call GIL-releasing C extensions to run them on the thread pool
+
+```python
+# simplified
+# This node releases the GIL during PyTorch inference
+detector = horus.Node(
+    name="detector",
+    tick=run_pytorch_inference,
+    rate=30,
+    compute=True,            # Runs on thread pool — GIL released during inference
+    budget=0.030,
+    on_miss="warn",
+)
+
+# This node holds the GIL for pure Python work
+logger = horus.Node(
+    name="logger",
+    tick=log_data,
+    rate=10,
+    # No compute=True — runs on main thread
+)
+```
+
+### Setting Realistic Budgets
+
+Python tick functions are orders of magnitude slower than Rust. Set budgets accordingly:
+
+| Operation | Typical Python time | Suggested budget |
+|-----------|-------------------|-----------------|
+| Simple dict processing | 0.1--0.5 ms | 2 ms |
+| NumPy array operations | 0.5--5 ms | 10 ms |
+| ML inference (ONNX) | 5--50 ms | 80 ms |
+| ML inference (PyTorch) | 10--100 ms | 150 ms |
+| HTTP request (async) | 50--500 ms | Use async node, not budget |
+
+A budget of 800 microseconds makes sense for a Rust motor controller. The same budget on a Python node would trigger `on_miss` on nearly every tick, flooding your logs with false alarms. Start with generous budgets during development (use `on_miss="warn"`) and tighten after profiling real-world performance.
+
+## Complete Example: Safety-Critical Robot
+
+A warehouse robot with Python nodes for perception and planning, using all three safety systems together:
+
+```python
+# simplified
+import horus
+import gc
+
+# --- Sensor node: reads LiDAR data ---
+def lidar_tick(node):
+    if node.has_msg("scan.raw"):
+        scan = node.recv("scan.raw")
+        # Filter and validate scan data
+        if scan and len(scan.get("ranges", [])) > 0:
+            node.send("scan.filtered", scan)
+        else:
+            node.log_warning("Invalid scan data — skipping")
+
+lidar = horus.Node(
+    name="lidar_filter",
+    tick=lidar_tick,
+    rate=30,
+    budget=0.010,               # 10 ms budget
+    on_miss="skip",             # Skip one cycle if filtering is slow
+    failure_policy="restart",   # Restart on crash (sensor reconnect)
+    max_retries=5,
+    backoff_ms=200,
+    order=1,
+    subs=["scan.raw"],
+    pubs=["scan.filtered"],
+)
+
+# --- Safety monitor: checks system invariants ---
+class SafetyState:
+    def __init__(self):
+        self.missed_heartbeats = 0
+        self.max_missed = 10
+
+    def tick(self, node):
+        # Check motor heartbeat
+        if node.has_msg("motor.heartbeat"):
+            node.recv("motor.heartbeat")
+            self.missed_heartbeats = 0
+        else:
+            self.missed_heartbeats += 1
+
+        if self.missed_heartbeats >= self.max_missed:
+            node.log_error(
+                f"Motor heartbeat lost for {self.missed_heartbeats} cycles"
+            )
+            node.send("emergency.stop", {"reason": "motor_heartbeat_lost"})
+            node.request_stop()
+            return
+
+        # Check scan freshness
+        if node.has_msg("scan.age"):
+            age = node.recv("scan.age")
+            if age > 0.5:  # Scan older than 500 ms
+                node.log_warning(f"Scan data stale: {age*1000:.0f} ms")
+                node.send("motor.override", {"velocity": 0.0, "angular": 0.0})
+
+safety_state = SafetyState()
+safety = horus.Node(
+    name="safety_monitor",
+    tick=safety_state.tick,
+    rate=200,
+    budget=0.003,               # 3 ms — must be fast
+    on_miss="stop",             # If safety is late, stop everything
+    failure_policy="fatal",     # If safety crashes, stop everything
+    order=0,                    # Always runs first
+    subs=["motor.heartbeat", "scan.age"],
+    pubs=["emergency.stop", "motor.override"],
+)
+
+# --- ML detector: runs YOLO on camera images ---
+def detect_tick(node):
+    gc.disable()
+    try:
+        if node.has_msg("camera.rgb"):
+            img = node.recv("camera.rgb")
+            detections = run_yolo(img)
+            node.send("detections", detections)
+    finally:
+        gc.enable()
+
+detector = horus.Node(
+    name="detector",
+    tick=detect_tick,
+    rate=10,
+    budget=0.080,               # 80 ms — ML inference is slow
+    on_miss="warn",             # Inference time varies; just log
+    failure_policy="skip",      # Skip on crash; not safety-critical
+    max_failures=3,
+    cooldown_ms=5000,
+    compute=True,               # Thread pool (releases GIL during inference)
+    order=5,
+    subs=["camera.rgb"],
+    pubs=["detections"],
+)
+
+# --- Planner: computes paths from detections and scans ---
+def plan_tick(node):
+    if node.has_msg("scan.filtered") and node.has_msg("detections"):
+        scan = node.recv("scan.filtered")
+        dets = node.recv("detections")
+        path = compute_path(scan, dets)
+        node.send("cmd_vel", path)
+
+planner = horus.Node(
+    name="planner",
+    tick=plan_tick,
+    rate=10,
+    budget=0.050,               # 50 ms budget
+    on_miss="skip",             # Skip if planning takes too long
+    failure_policy="restart",   # Restart on crash
+    max_retries=3,
+    backoff_ms=100,
+    order=10,
+    subs=["scan.filtered", "detections"],
+    pubs=["cmd_vel"],
+)
+
+# --- Telemetry: uploads metrics to cloud ---
+async def telemetry_tick(node):
+    import aiohttp
+    try:
+        stats = {
+            "tick": horus.tick(),
+            "elapsed": horus.elapsed(),
+        }
+        async with aiohttp.ClientSession() as session:
+            await session.post(
+                "http://telemetry.local/api/metrics",
+                json=stats,
+                timeout=aiohttp.ClientTimeout(total=2.0),
+            )
+    except Exception:
+        pass  # Best-effort; failure_policy handles the rest
+
+telemetry = horus.Node(
+    name="telemetry",
+    tick=telemetry_tick,        # async — auto-detected
+    rate=1,
+    failure_policy="ignore",   # Never bring down the system for telemetry
+    order=200,
+)
+
+# --- Assemble and run ---
+scheduler = horus.Scheduler(
+    tick_rate=200,
+    watchdog_ms=500,            # Detect frozen nodes
+    rt=True,                    # Request RT scheduling
+)
+
+scheduler.add(safety)           # order=0, runs first
+scheduler.add(lidar)            # order=1
+scheduler.add(detector)         # order=5, compute pool
+scheduler.add(planner)          # order=10
+scheduler.add(telemetry)        # order=200, async
+
+# Mark safety monitor as critical — emergency stop on freeze
+scheduler.add_critical_node("safety_monitor", timeout_ms=5)
+
+scheduler.run()
+
+# Post-run diagnostics
+stats = scheduler.safety_stats()
+if stats:
+    print(f"\n--- Safety Report ---")
+    print(f"Deadline misses:   {stats.get('deadline_misses', 0)}")
+    print(f"Budget overruns:   {stats.get('budget_overruns', 0)}")
+    print(f"Watchdog triggers: {stats.get('watchdog_expirations', 0)}")
+
+for name in scheduler.get_node_names():
+    ns = scheduler.get_node_stats(name)
+    print(f"  {name}: {ns['total_ticks']} ticks, "
+          f"{ns['failed_ticks']} failed, "
+          f"avg={ns.get('avg_tick_duration_ms', 0):.2f} ms")
+```
+
+This example shows all three safety systems working together:
+
+- **Safety monitor** uses `on_miss="stop"` and `failure_policy="fatal"` -- if the safety node itself is compromised, stop everything
+- **LiDAR filter** uses `on_miss="skip"` and `failure_policy="restart"` -- skip slow ticks, restart on crashes
+- **ML detector** uses `on_miss="warn"` and `failure_policy="skip"` with `compute=True` -- non-critical, variable timing
+- **Planner** uses `on_miss="skip"` and `failure_policy="restart"` -- skip slow ticks, restart on bad data
+- **Telemetry** uses `failure_policy="ignore"` -- best-effort, never brings down the system
+- **Global watchdog** at 500 ms catches any frozen node
+- **Critical node** designation on the safety monitor bypasses graduated degradation
+
+## Design Decisions
+
+**Why are miss policies strings instead of an enum?**
+
+Python does not enforce enum types at the boundary between Python and Rust (PyO3). Using strings (`"warn"`, `"skip"`, `"safe_mode"`, `"stop"`) avoids requiring an import for a four-value enum. The strings are validated at node construction time -- a typo like `on_miss="wrn"` raises an error immediately, not at runtime.
+
+**Why is the default miss policy `"warn"` and not `"skip"` or `"stop"`?**
+
+Most deadline misses during development are caused by untuned budgets, not real problems. Defaulting to `"warn"` means a new user who sets `budget=0.001` on a Python node sees warnings in the logs rather than nodes silently skipping ticks or the scheduler stopping. Once budgets are tuned, the developer switches to `"skip"` or `"stop"` deliberately.
+
+**Why is the default failure policy `"fatal"` and not `"restart"`?**
+
+An unhandled exception in a robotics node often means hardware is in an unknown state. Restarting by default could re-initialize hardware mid-operation (e.g., re-homing a motor while the robot is moving). `"fatal"` forces the developer to make an explicit decision about which nodes can safely restart.
+
+**Why can't Python nodes implement `enter_safe_state()`?**
+
+The safe-state mechanism must execute deterministically within microseconds. Python's GIL and garbage collector cannot provide this guarantee. A Python `enter_safe_state()` that triggers a 5 ms GC pause while the robot needs to stop its motors within 1 ms is worse than no safe-state callback at all. The workaround patterns (try/except in `tick()`, dedicated safety node, mixed Python/Rust) provide equivalent functionality with honest timing characteristics.
+
+**Why graduated watchdog degradation instead of immediate kill?**
+
+A single late tick in Python is often caused by a GC pause or GIL contention -- not a deadlock. Immediately killing the node would cause false positives in Python-heavy systems. Graduated degradation (warn at 1x, skip at 2x, isolate at 3x) gives transient pauses time to resolve while still catching genuinely frozen nodes.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| Per-node miss policies match safety requirements to node criticality | Must configure each node individually |
+| Per-node failure policies prevent cascading crashes | Must reason about failure contracts per node |
+| Graduated watchdog tolerates GC pauses | A genuinely frozen node takes 3x timeout to isolate |
+| String-based policy configuration requires no imports | Typos caught at construction, not at load time |
+| `"fatal"` default prevents unsafe automatic restarts | Requires explicit opt-in to restart on every recoverable node |
+| Python-side safety workarounds give explicit control | No automatic safe-state integration with the scheduler |
+| `add_critical_node()` bypasses graduated degradation for safety nodes | Critical nodes get no grace period for transient issues |
+| GC-disable pattern prevents pause-induced misses | Increases memory pressure; must re-enable GC promptly |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Every tick triggers `on_miss` | Budget too tight for Python | Increase `budget` -- Python ticks take milliseconds, not microseconds |
+| Node silently stops ticking | `failure_policy="skip"` with low `max_failures` | Increase `max_failures` or fix the underlying exception |
+| Scheduler stops on network timeout | `failure_policy="fatal"` on a network-dependent node | Use `"restart"` or `"skip"` for nodes with external dependencies |
+| `on_miss="safe_mode"` has no visible effect | Python nodes cannot implement `enter_safe_state()` | Use try/except in `tick()` or a dedicated safety node |
+| Watchdog triggers during startup | Node's `init()` takes longer than watchdog timeout | Increase `watchdog_ms` or make `init()` faster |
+| False deadline misses in bursts | Python GC pause during tick | Disable GC during tight-budget ticks with `gc.disable()` / `gc.enable()` |
+| Two Python nodes cannot both sustain 100 Hz | GIL contention in same process | Use `compute=True` on nodes that call GIL-releasing C extensions, or run nodes in separate processes via `horus run` |
+| `add_critical_node` raises an error | Node not yet added to the scheduler | Call `scheduler.add(node)` before `scheduler.add_critical_node()` |
+
+## See Also
+
+- [Python Bindings](/python/api/python-bindings) -- Core Python API reference
+- [Async Nodes](/python/api/async-nodes) -- async/await patterns for I/O-bound nodes
+- [Safety Monitor](/advanced/safety-monitor) -- Detailed watchdog and graduated degradation reference
+- [Fault Tolerance](/advanced/circuit-breaker) -- Failure policy deep dive with severity-aware handling
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) -- How the scheduler manages node execution

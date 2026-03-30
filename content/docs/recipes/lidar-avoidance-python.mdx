@@ -1,0 +1,164 @@
+---
+title: "Recipe: LiDAR Obstacle Avoidance (Python)"
+description: "Reactive obstacle avoidance in Python using LaserScan data to generate safe CmdVel velocity commands."
+order: 5
+---
+
+## LiDAR Obstacle Avoidance (Python)
+
+Subscribes to `LaserScan` from a 2D LiDAR, splits the scan into three zones (left, center, right), identifies the closest obstacle in each, and publishes reactive `CmdVel` commands. Stops if an obstacle is too close.
+
+### Problem
+
+You need a Python node to avoid obstacles in real time using 2D LiDAR scan data without a map.
+
+### When To Use
+
+- Mobile robots navigating unknown environments
+- Reactive safety layer underneath a path planner
+- Quick prototyping of autonomous navigation in Python
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/getting-started/installation))
+- A LiDAR driver publishing `LaserScan` to `lidar.scan`
+
+### horus.toml
+
+```toml
+[package]
+name = "lidar-avoidance-py"
+version = "0.1.0"
+description = "Reactive obstacle avoidance from LaserScan (Python)"
+language = "python"
+```
+
+### Complete Code
+
+```python
+#!/usr/bin/env python3
+"""Reactive LiDAR obstacle avoidance — three-zone split with safety stop."""
+
+import math
+import horus
+from horus import Node, CmdVel, LaserScan, us, ms
+
+# ── Safety zones (meters) ────────────────────────────────────
+
+STOP_DISTANCE = 0.3     # emergency stop
+SLOW_DISTANCE = 0.8     # reduce speed
+CRUISE_SPEED = 0.5      # m/s forward
+TURN_SPEED = 0.8        # rad/s turning
+
+# ── Helpers ──────────────────────────────────────────────────
+
+def min_range(ranges, start, end):
+    """Find minimum valid range in a slice of the scan."""
+    valid = [r for r in ranges[start:end]
+             if math.isfinite(r) and r > 0.01]
+    return min(valid) if valid else float("inf")
+
+# ── Node callbacks ───────────────────────────────────────────
+
+def avoidance_tick(node):
+    # IMPORTANT: always recv() every tick to drain the buffer
+    scan = node.recv("lidar.scan")
+    if scan is None:
+        return  # no data yet — skip this tick
+
+    ranges = scan.ranges
+    n = len(ranges)
+    if n == 0:
+        return
+
+    # Split scan into three zones: left, center, right
+    third = n // 3
+    left_min = min_range(ranges, 0, third)
+    center_min = min_range(ranges, third, 2 * third)
+    right_min = min_range(ranges, 2 * third, n)
+
+    # Reactive behavior
+    if center_min < STOP_DISTANCE:
+        # WARNING: obstacle dead ahead — emergency stop
+        cmd = CmdVel(linear=0.0, angular=0.0)
+    elif center_min < SLOW_DISTANCE:
+        # Obstacle ahead — turn toward the more open side
+        angular = TURN_SPEED if left_min > right_min else -TURN_SPEED
+        cmd = CmdVel(linear=0.1, angular=angular)
+    elif left_min < SLOW_DISTANCE:
+        # Obstacle on left — veer right
+        cmd = CmdVel(linear=CRUISE_SPEED * 0.7, angular=-TURN_SPEED * 0.5)
+    elif right_min < SLOW_DISTANCE:
+        # Obstacle on right — veer left
+        cmd = CmdVel(linear=CRUISE_SPEED * 0.7, angular=TURN_SPEED * 0.5)
+    else:
+        # Clear — cruise forward
+        cmd = CmdVel(linear=CRUISE_SPEED, angular=0.0)
+
+    node.send("cmd_vel", cmd)
+
+def avoidance_shutdown(node):
+    # SAFETY: stop the robot on exit
+    node.send("cmd_vel", CmdVel(linear=0.0, angular=0.0))
+    print("Avoidance: shutdown — robot stopped")
+
+# ── Main ─────────────────────────────────────────────────────
+
+avoidance_node = Node(
+    name="Avoidance",
+    tick=avoidance_tick,
+    shutdown=avoidance_shutdown,
+    rate=20,                       # 20 Hz — match typical LiDAR rate
+    order=0,
+    subs=["lidar.scan"],
+    pubs=["cmd_vel"],
+    on_miss="warn",
+)
+
+if __name__ == "__main__":
+    horus.run(avoidance_node)
+```
+
+### Expected Output
+
+```text
+[HORUS] Scheduler running — tick_rate: 1000 Hz
+[HORUS] Node "Avoidance" started (20 Hz)
+^C
+Avoidance: shutdown — robot stopped
+[HORUS] Shutting down...
+[HORUS] Node "Avoidance" shutdown complete
+```
+
+### Key Points
+
+- **Three-zone split** (left/center/right) is the simplest reactive architecture — extend to N zones for smoother behavior
+- **`min_range()` filters** invalid readings (`NaN`, `Inf`, near-zero) before comparison
+- **`STOP_DISTANCE`** is the hard safety limit — tune to your robot's stopping distance at cruise speed
+- **`shutdown()` sends zero velocity** — robot stops even if killed mid-avoidance
+- **20 Hz matches most 2D LiDARs** (RPLiDAR A1/A2, Hokuyo URG) — no benefit running faster than the sensor
+- **Pair with a differential drive node** — this publishes `cmd_vel`, the drive node subscribes to it
+
+### Variations
+
+- **N-zone split**: Divide the scan into more zones (e.g., 8) for smoother steering gradients
+- **Speed scaling**: Scale `CRUISE_SPEED` proportionally to nearest obstacle distance
+- **Rear sensor**: Add a second `LaserScan` subscriber for rear obstacle detection during reversing
+- **Hysteresis**: Add state tracking to prevent oscillating between turn directions
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot stops but nothing is nearby | `NaN`/`Inf` in scan ranges not filtered | Check `min_range()` filters invalid readings |
+| Robot turns in circles | `STOP_DISTANCE` too large for the environment | Reduce `STOP_DISTANCE` or increase `SLOW_DISTANCE` gap |
+| Robot hits obstacles | `STOP_DISTANCE` too small for braking distance | Increase `STOP_DISTANCE` to match max speed stopping distance |
+| No velocity commands published | No `LaserScan` on `lidar.scan` | Verify LiDAR driver is running with `horus monitor` |
+| Jittery steering | Scan data noisy or rate too high | Add temporal smoothing or reduce `rate` to match LiDAR rate |
+
+---
+
+## See Also
+
+- [LiDAR Obstacle Avoidance (Rust)](/recipes/lidar-obstacle-avoidance) — Rust version of this recipe
+- [Emergency Stop (Python)](/recipes/emergency-stop-python) — Safety stop pattern

@@ -1,0 +1,573 @@
+---
+title: "Telemetry Export"
+description: "Export runtime metrics to HTTP, UDP, file, or stdout for external monitoring and dashboards"
+order: 9
+---
+
+# Telemetry Export
+
+You need to send HORUS runtime metrics (node tick durations, message counts, deadline misses) to an external monitoring system like Grafana, Prometheus, or a custom dashboard. Here is how to enable telemetry export with a single builder method.
+
+## When To Use This
+
+- Sending scheduler metrics to Grafana, InfluxDB, or Prometheus via an HTTP receiver
+- Logging metrics to a file for offline analysis
+- Streaming metrics over UDP to a LAN monitoring tool
+- Debugging performance with stdout metric output
+
+**Use [Monitor](/development/monitor) instead** if you want a built-in web/TUI dashboard without external tooling.
+
+**Use [Logging](/development/logging) instead** if you need text-based diagnostic messages, not numeric metrics.
+
+## Prerequisites
+
+- A HORUS Rust project with `use horus::prelude::*;`
+- The `telemetry` feature enabled on `horus_core` (enabled by default)
+- For HTTP export: a running HTTP endpoint that accepts JSON POST requests
+
+## Quick Start
+
+Enable telemetry with a single builder method:
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    let mut scheduler = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .telemetry("http://localhost:9090/metrics");  // HTTP POST endpoint
+
+    scheduler.add(MyNode::new()?).order(0).rate(100_u64.hz()).build()?;
+    scheduler.run()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    scheduler = horus.Scheduler(
+        tick_rate=100,
+        telemetry="http://localhost:9090/metrics",  # HTTP POST endpoint
+    )
+    scheduler.add(horus.Node(tick=my_tick, rate=100, order=0))
+    scheduler.run()
+    ```
+  </LangTab>
+</LanguageTabs>
+
+The scheduler exports a JSON snapshot every 1 second (default interval).
+
+---
+
+## Architecture
+
+Telemetry in HORUS is designed around one constraint: **the scheduler tick loop must never block on I/O**. The architecture achieves this with a three-stage pipeline that decouples metric collection from serialization and delivery.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Scheduler Tick Loop  (RT thread)                           │
+│                                                             │
+│   for each node:                                            │
+│     tick() → measure duration → record in Profiler          │
+│                                                             │
+│   if export_interval elapsed:                               │
+│     Profiler.node_stats → TelemetryManager.gauge/counter    │
+│     TelemetryManager.build_snapshot()                       │
+│     TelemetryManager.export()                               │
+│       ├─ HTTP  → try_send(snapshot) on bounded channel ──┐  │
+│       ├─ UDP   → sendto() (single syscall, fire-forget)  │  │
+│       ├─ File  → write_all() (buffered, local disk)      │  │
+│       └─ Stdout→ println() (debugging only)              │  │
+└──────────────────────────────────────────────────────┬───┘  │
+                                                       │      │
+                 ┌─────────────────────────────────────┘      │
+                 │  Bounded Channel (capacity: 4)             │
+                 │  try_send() — non-blocking                 │
+                 │  If full → snapshot silently dropped        │
+                 └──────────────┬──────────────────────────────┘
+                                │
+                 ┌──────────────▼──────────────────────────────┐
+                 │  Background Thread  ("horus-telemetry-http") │
+                 │                                              │
+                 │  loop:                                       │
+                 │    snapshot = rx.recv()                      │
+                 │    TcpStream::connect(url)                   │
+                 │    HTTP POST (JSON body)                     │
+                 │    read status line (200/201/204 = ok)       │
+                 │                                              │
+                 │  On Drop: sender dropped → recv returns Err  │
+                 │           → thread exits, handle.join()      │
+                 └──────────────────────────────────────────────┘
+```
+
+### Data flow step by step
+
+1. **Collect** -- The scheduler tick loop executes each node's `tick()` and records timing data in the internal `Profiler`. This is just a `HashMap` update per node, with no allocation on the hot path.
+
+2. **Package** -- At the configured export interval (default: 1 second), `TelemetryManager` reads the profiler stats and calls `gauge_with_labels()` / `counter_with_labels()` for each node. It then calls `build_snapshot()`, which clones the accumulated `HashMap<String, Metric>` into a `TelemetrySnapshot` struct.
+
+3. **Deliver** -- `export()` dispatches the snapshot to the configured endpoint:
+   - **HTTP**: The snapshot is sent via `try_send()` on a bounded `mpsc::sync_channel(4)`. If the background thread is busy with a slow POST and the channel is full, the snapshot is silently dropped. The scheduler thread returns immediately in all cases.
+   - **UDP**: A single `sendto()` syscall. The socket is pre-bound at startup and cached.
+   - **File**: `File::create()` + `write_all()` with pretty-printed JSON.
+   - **Stdout**: Direct `println!()` for debugging.
+
+### Why the background thread only applies to HTTP
+
+UDP, file, and stdout exports are inherently fast and bounded -- a UDP `sendto()` completes in microseconds, file writes go to the kernel page cache, and stdout is local. Only HTTP involves potentially unbounded network latency (DNS, TCP handshake, slow receivers), which is why it gets its own dedicated thread.
+
+### Graceful shutdown
+
+When the `TelemetryManager` is dropped (scheduler exit), it drops the channel sender. The background thread's `rx.recv()` returns `Err`, breaking the loop. The `Drop` implementation then calls `handle.join()` to drain any queued snapshots before the process exits, ensuring no data is lost on clean shutdown.
+
+---
+
+## Endpoint Types
+
+The `.telemetry(endpoint)` method accepts a string that determines the export backend:
+
+| String Format | Endpoint | Behavior |
+|--------------|----------|----------|
+| `"http://host:port/path"` | HTTP POST | Non-blocking — background thread handles network I/O |
+| `"https://host:port/path"` | HTTPS POST | Same as HTTP with TLS |
+| `"udp://host:port"` | UDP datagram | Compact JSON, single packet per snapshot |
+| `"file:///path/to/metrics.json"` | Local file | Pretty-printed JSON, overwritten each export |
+| `"/path/to/metrics.json"` | Local file | Same as `file://` prefix |
+| `"stdout"` or `"local"` | Stdout | Pretty-printed to terminal (debugging) |
+| `"disabled"` or `""` | Disabled | No export (default) |
+
+### HTTP Endpoint (Recommended for Production)
+
+```rust
+// simplified
+let mut scheduler = Scheduler::new()
+    .telemetry("http://localhost:9090/metrics");
+```
+
+HTTP export is **fully non-blocking** for the scheduler:
+1. Scheduler calls `export()` on its cycle — posts a snapshot to a bounded channel (capacity 4)
+2. A dedicated background thread reads from the channel and performs the HTTP POST
+3. If the channel is full (receiver slow), the snapshot is silently dropped — the scheduler never blocks
+
+### UDP Endpoint (Low Overhead)
+
+```rust
+// simplified
+let mut scheduler = Scheduler::new()
+    .telemetry("udp://192.168.1.100:9999");
+```
+
+Sends compact single-line JSON per snapshot. Good for LAN monitoring where packet loss is acceptable.
+
+### File Endpoint (Debugging & Logging)
+
+```rust
+// simplified
+let mut scheduler = Scheduler::new()
+    .telemetry("/tmp/horus-metrics.json");
+```
+
+Overwrites the file on each export cycle. Useful for debugging or feeding into log aggregation pipelines.
+
+---
+
+## JSON Payload Format
+
+Every export produces a `TelemetrySnapshot`:
+
+```json
+{
+  "timestamp_secs": 1710547200,
+  "scheduler_name": "motor_control",
+  "uptime_secs": 42.5,
+  "metrics": [
+    {
+      "name": "node.tick_duration_us",
+      "value": { "Gauge": 145.2 },
+      "labels": { "node": "MotorCtrl" },
+      "timestamp_secs": 1710547200
+    },
+    {
+      "name": "node.total_ticks",
+      "value": { "Counter": 4250 },
+      "labels": { "node": "MotorCtrl" },
+      "timestamp_secs": 1710547200
+    },
+    {
+      "name": "scheduler.deadline_misses",
+      "value": { "Counter": 0 },
+      "labels": {},
+      "timestamp_secs": 1710547200
+    }
+  ]
+}
+```
+
+### Metric Value Types
+
+| Type | JSON | Description |
+|------|------|-------------|
+| Counter | `{ "Counter": 42 }` | Monotonically increasing (total ticks, messages sent) |
+| Gauge | `{ "Gauge": 3.14 }` | Current value (tick duration, CPU usage) |
+| Histogram | `{ "Histogram": [0.1, 0.2, 0.15] }` | Distribution of values |
+| Text | `{ "Text": "Healthy" }` | String status |
+
+---
+
+## Auto-Collected Metrics
+
+When telemetry is enabled, the scheduler automatically exports:
+
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `node.total_ticks` | Counter | `node` | Total ticks executed |
+| `node.tick_duration_us` | Gauge | `node` | Last tick duration in microseconds |
+| `node.errors` | Counter | `node` | Total tick errors |
+| `scheduler.deadline_misses` | Counter | — | Total deadline misses across all nodes |
+| `scheduler.uptime_secs` | Gauge | — | Scheduler uptime |
+
+---
+
+## Feature Flag
+
+Telemetry requires the `telemetry` feature on `horus_core` — **enabled by default**.
+
+To disable at compile time (saves binary size):
+
+```toml
+[dependencies]
+horus = { version = "0.1", default-features = false, features = ["macros", "blackbox"] }
+```
+
+---
+
+## Integration with External Tools
+
+### Grafana + Custom Receiver
+
+Write a small HTTP server that receives the JSON POST and forwards metrics to Prometheus/InfluxDB:
+
+```python
+# receiver.py — minimal Flask example
+from flask import Flask, request
+app = Flask(__name__)
+
+@app.route("/metrics", methods=["POST"])
+def metrics():
+    snapshot = request.json
+    for m in snapshot["metrics"]:
+        print(f"{m['name']} = {m['value']}")
+    return "ok", 200
+
+app.run(port=9090)
+```
+
+### horus monitor (Alternative)
+
+For local debugging, `horus monitor` provides a built-in TUI dashboard — no external setup needed. See [Monitor](/development/monitor) for details.
+
+### Prometheus Integration
+
+Prometheus scrapes metrics over HTTP in its own exposition format, not JSON. HORUS exports JSON, so you need a small bridge that converts the JSON payload into Prometheus-compatible text. There are two approaches.
+
+**Approach A: Python bridge (recommended for quick setup)**
+
+This script receives HORUS JSON POSTs and serves a `/metrics` endpoint that Prometheus scrapes:
+
+```python
+# prometheus_bridge.py
+from flask import Flask, request
+from prometheus_client import Gauge, Counter, generate_latest, REGISTRY
+
+app = Flask(__name__)
+
+# Dynamic metric storage
+gauges = {}
+counters = {}
+
+def get_or_create_gauge(name, labels):
+    key = name
+    if key not in gauges:
+        label_keys = list(labels.keys()) if labels else []
+        gauges[key] = Gauge(
+            name.replace(".", "_"),
+            f"HORUS metric: {name}",
+            label_keys,
+        )
+    return gauges[key]
+
+def get_or_create_counter(name, labels):
+    key = name
+    if key not in counters:
+        label_keys = list(labels.keys()) if labels else []
+        counters[key] = Counter(
+            name.replace(".", "_"),
+            f"HORUS metric: {name}",
+            label_keys,
+        )
+    return counters[key]
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    """Receives HORUS telemetry JSON and updates Prometheus metrics."""
+    snapshot = request.json
+    for m in snapshot["metrics"]:
+        labels = m.get("labels", {})
+        value_dict = m["value"]
+
+        if "Gauge" in value_dict:
+            g = get_or_create_gauge(m["name"], labels)
+            if labels:
+                g.labels(**labels).set(value_dict["Gauge"])
+            else:
+                g.set(value_dict["Gauge"])
+        elif "Counter" in value_dict:
+            c = get_or_create_counter(m["name"], labels)
+            # Prometheus counters only increment; set to the HORUS total
+            current = c._value.get() if not labels else 0
+            delta = value_dict["Counter"] - current
+            if delta > 0:
+                if labels:
+                    c.labels(**labels).inc(delta)
+                else:
+                    c.inc(delta)
+    return "ok", 200
+
+@app.route("/metrics")
+def metrics():
+    """Prometheus scrape endpoint."""
+    return generate_latest(REGISTRY), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=9090)
+```
+
+Configure HORUS to push to the bridge:
+
+```rust
+// simplified
+let mut scheduler = Scheduler::new()
+    .tick_rate(100_u64.hz())
+    .telemetry("http://localhost:9090/ingest");  // POST to the bridge
+```
+
+Add the bridge to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: "horus"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
+**Approach B: File-based with `node_exporter` textfile collector**
+
+For environments where you cannot run an extra HTTP service, write telemetry to a file that Prometheus `node_exporter` picks up:
+
+```rust
+// simplified
+let mut scheduler = Scheduler::new()
+    .tick_rate(100_u64.hz())
+    .telemetry("/var/lib/node_exporter/textfile/horus.json");
+```
+
+Then use a cron job or sidecar script to convert the JSON file to Prometheus exposition format:
+
+```python
+#!/usr/bin/env python3
+# json_to_prom.py — convert HORUS JSON to Prometheus textfile format
+import json, sys
+
+with open(sys.argv[1]) as f:
+    snapshot = json.load(f)
+
+output = sys.argv[2] if len(sys.argv) > 2 else "/var/lib/node_exporter/textfile/horus.prom"
+
+lines = []
+for m in snapshot["metrics"]:
+    name = m["name"].replace(".", "_")
+    labels = m.get("labels", {})
+    label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+    label_part = "{" + label_str + "}" if label_str else ""
+
+    value_dict = m["value"]
+    for vtype in ("Gauge", "Counter"):
+        if vtype in value_dict:
+            lines.append(f"horus_{name}{label_part} {value_dict[vtype]}")
+
+with open(output, "w") as f:
+    f.write("\n".join(lines) + "\n")
+```
+
+Run it periodically: `watch -n 1 python3 json_to_prom.py /var/lib/node_exporter/textfile/horus.json`
+
+---
+
+## Performance Overhead
+
+All telemetry export happens **outside the scheduler's critical timing path**. The overhead per export cycle depends on the endpoint:
+
+| Endpoint | Overhead per export | Thread | Notes |
+|----------|-------------------|--------|-------|
+| HTTP | ~50us on the scheduler thread | Background thread does the actual POST | Scheduler only pays for `build_snapshot()` + `try_send()` into the bounded channel. Network I/O is fully off the RT thread. |
+| UDP | ~5us | Scheduler thread (single syscall) | `sendto()` is fire-and-forget. Socket is pre-bound at startup. No connection overhead per export. |
+| File | ~10us | Scheduler thread (buffered write) | `File::create()` + `write_all()`. Goes to kernel page cache, not disk. Actual disk flush is asynchronous. |
+| Stdout | Negligible | Scheduler thread | `println!()` to terminal. Only useful for debugging; not recommended in production. |
+| Disabled | Zero | N/A | No-op. `should_export()` returns `false` immediately. |
+
+### What "overhead" means in practice
+
+At a 100 Hz tick rate, the scheduler has a 10 ms budget per tick. A 50us telemetry export (the worst case for HTTP) consumes 0.5% of that budget, and it only runs once per second (every 100th tick), not every tick. The amortized per-tick cost is effectively 0.005%.
+
+For UDP and file endpoints, the overhead is even smaller. The `should_export()` check (a single `Instant::elapsed()` comparison) runs every tick and costs &lt;1us.
+
+### Memory overhead
+
+`TelemetryManager` maintains a `HashMap<String, Metric>` that grows with the number of unique metric names. For a typical system with 10 nodes, this is approximately 2-4 KB. The bounded channel for HTTP holds at most 4 snapshots, each roughly 1-2 KB serialized.
+
+---
+
+## Complete Example
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    struct SensorNode {
+        pub_topic: Topic<Imu>,
+    }
+
+    impl SensorNode {
+        fn new() -> Result<Self> {
+            Ok(Self { pub_topic: Topic::new("imu.raw")? })
+        }
+    }
+
+    impl Node for SensorNode {
+        fn name(&self) -> &str { "Sensor" }
+        fn tick(&mut self) {
+            self.pub_topic.send(Imu {
+                orientation: [1.0, 0.0, 0.0, 0.0],
+                angular_velocity: [0.0, 0.0, 0.0],
+                linear_acceleration: [0.0, 0.0, 9.81],
+            });
+        }
+    }
+
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new()
+            .tick_rate(100_u64.hz())
+            .telemetry("http://localhost:9090/metrics");  // export every 1s
+
+        scheduler.add(SensorNode::new()?)
+            .order(0)
+            .rate(100_u64.hz())
+            .build()?;
+
+        scheduler.run()
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, Imu, run
+
+    def sensor_tick(node):
+        node.send("imu.raw", Imu(
+            orientation=[1.0, 0.0, 0.0, 0.0],
+            angular_velocity=[0.0, 0.0, 0.0],
+            linear_acceleration=[0.0, 0.0, 9.81],
+        ))
+
+    sensor = Node(
+        name="Sensor",
+        tick=sensor_tick,
+        rate=100,
+        order=0,
+        pubs=[Imu],
+    )
+
+    run(sensor, telemetry="http://localhost:9090/metrics")
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No metrics exported | Telemetry endpoint not configured | Add `.telemetry("http://localhost:9090/metrics")` to `Scheduler::new()` builder |
+| HTTP metrics silently dropped | Receiver is slow or unreachable, bounded channel full (capacity 4) | Check receiver is running, increase receiver throughput — the scheduler never blocks |
+| Compile error: telemetry method not found | `telemetry` feature disabled | Ensure `horus` dependency has `telemetry` feature (enabled by default) |
+| File endpoint not updating | File overwritten each cycle but viewer caches | Re-read the file or use `watch cat /tmp/horus-metrics.json` |
+| UDP metrics lost | Network packet loss on LAN | Expected behavior for UDP; use HTTP for reliable delivery |
+
+---
+
+## Design Decisions
+
+Understanding **why** telemetry works this way helps you make the right integration choices for your system.
+
+### Why non-blocking (RT safety)
+
+HORUS is a real-time robotics framework. The scheduler tick loop has hard timing budgets -- a motor control node running at 1 kHz has exactly 1 ms per tick. If the telemetry export blocked on a slow HTTP server or a full TCP buffer, it would cause deadline misses and potentially unsafe behavior. The non-blocking design ensures that **telemetry is always best-effort and never degrades control loop timing**.
+
+The bounded channel with `try_send()` is the key mechanism. On the scheduler thread, `export()` either succeeds instantly (channel has space) or drops the snapshot instantly (channel full). Both paths complete in nanoseconds. The actual network I/O happens on a separate thread that the scheduler never waits on.
+
+### Why bounded channel with drop (not backpressure)
+
+Backpressure means "slow the producer when the consumer is slow." In telemetry for a real-time system, this is exactly wrong -- you never want your 1 kHz motor controller to slow down because Grafana's ingest endpoint is overloaded.
+
+The bounded channel (capacity 4) provides a small buffer for transient slowness (e.g., a brief network hiccup) while hard-capping memory usage. When the buffer is full, the oldest-unsent snapshot becomes stale anyway -- dropping it is the correct behavior because a newer snapshot with fresher data will arrive within a second.
+
+The capacity of 4 is deliberate: at the default 1-second export interval, it absorbs up to 4 seconds of receiver downtime before dropping begins. This handles common transient issues (GC pauses, brief network congestion) without unbounded memory growth.
+
+### Why JSON (not Protocol Buffers or MessagePack)
+
+Three reasons:
+
+1. **Debuggability** -- You can pipe HORUS telemetry to `jq`, read it in a browser, or `cat` the file endpoint directly. Binary formats require dedicated tools to inspect.
+
+2. **No build dependency** -- Protocol Buffers require `protoc` and `.proto` files. MessagePack requires additional codec libraries. JSON serialization via `serde_json` is already a transitive dependency of HORUS and adds zero extra build complexity.
+
+3. **Adequate performance** -- Serializing a typical telemetry snapshot (~10 metrics) to JSON takes &lt;10us. For a 1 Hz export, this is negligible. If HORUS ever needs sub-millisecond export rates (unlikely for telemetry), a binary format would be reconsidered.
+
+### Why feature-gated
+
+The `telemetry` feature on `horus_core` is enabled by default, but it can be disabled for two reasons:
+
+- **Binary size** -- Disabling `telemetry` removes `serde_json`, the `TelemetryManager`, and the HTTP background thread infrastructure. For deeply embedded targets with tight flash constraints, this matters.
+- **Attack surface** -- In locked-down production deployments, some teams prefer to compile out all network-facing code paths. Disabling the feature guarantees at the type level that no telemetry endpoint is reachable.
+
+When disabled, all telemetry builder methods are either absent (compile error if used) or no-op, depending on the feature gate configuration. There is no runtime overhead.
+
+---
+
+## Trade-offs
+
+| Decision | Benefit | Cost |
+|----------|---------|------|
+| Non-blocking `try_send()` for HTTP | Scheduler never stalls on network I/O | Snapshots may be silently dropped if receiver is slow |
+| Bounded channel (capacity 4) | Predictable memory usage, absorbs transient slowness | Only 4 seconds of buffering before drops begin |
+| Silent drop (no error log on full channel) | No log spam when receiver is down for extended periods | Harder to notice when telemetry delivery is degraded (check receiver-side metrics) |
+| JSON serialization | Human-readable, no build dependencies, easy debugging | ~5x larger payload than protobuf; ~3x slower serialization (still &lt;10us per snapshot) |
+| Single background thread (HTTP only) | Minimal resource usage, simple shutdown semantics | HTTP throughput limited to one in-flight POST at a time; pipelining not supported |
+| File endpoint overwrites (not appends) | Simple, bounded disk usage, always shows latest state | No history; use HTTP + a time-series database for historical data |
+| UDP fire-and-forget | Lowest overhead (~5us), good for LAN monitoring | No delivery guarantees; packet loss on congested networks |
+| 1-second default interval | Low overhead, sufficient for most dashboards | Not suitable for sub-second alerting (use `horus monitor` for real-time views) |
+| Feature-gated (compile-time opt-out) | Zero overhead when disabled, smaller binary | Must recompile to enable/disable; no runtime toggle |
+| Per-metric `HashMap` accumulation | Deduplicates metrics by name, latest value always wins | Small allocation per unique metric name; not lock-free (acceptable since only the scheduler thread writes) |
+
+---
+
+## See Also
+
+- [Monitor](/development/monitor) — Built-in web and TUI dashboards (no external setup needed)
+- [Logging](/development/logging) — Structured text logging with `hlog!` macros
+- [Scheduler API](/rust/api/scheduler) — Scheduler builder methods including `.telemetry()`
+- [Debugging Workflows](/development/debugging) — Using telemetry data to diagnose performance issues
+- [Operations](/operations) — Production monitoring and deployment patterns

@@ -1,0 +1,637 @@
+---
+title: "Actions API"
+description: "Long-running tasks with feedback, cancellation, and priority-based preemption"
+weight: 26
+---
+
+# Actions API
+
+HORUS actions model long-running tasks with real-time feedback and cancellation. Define an action with the `action!` macro, build a server with `ActionServerBuilder`, and send goals with `ActionClientNode` or `SyncActionClient`.
+
+> **Python**: Actions are Rust-only. Python bindings are not yet available.
+
+**When to use Actions**
+
+- Long-running tasks that take seconds to minutes (navigation, arm motion, calibration)
+- Tasks that need progress feedback (distance remaining, percentage complete)
+- Tasks that need cancellation or preemption by higher-priority goals
+
+**When NOT to use Actions**
+
+- Quick lookups that complete in milliseconds — use [Services](/rust/api/services) instead
+- Continuous data streams — use [Topics](/rust/api/topic) instead
+- Fire-and-forget commands — use Topics instead
+
+## Defining an Action
+
+```rust
+// simplified
+use horus::prelude::*;
+
+action! {
+    /// Navigate to a target pose.
+    NavigateToPose {
+        goal {
+            x: f64,
+            y: f64,
+            theta: f64,
+        }
+        feedback {
+            distance_remaining: f64,
+            estimated_time_sec: f64,
+        }
+        result {
+            success: bool,
+            final_x: f64,
+            final_y: f64,
+        }
+    }
+}
+```
+
+This generates four types:
+- `NavigateToPoseGoal` — goal struct
+- `NavigateToPoseFeedback` — feedback struct
+- `NavigateToPoseResult` — result struct
+- `NavigateToPose` — zero-sized marker implementing the `Action` trait
+
+---
+
+## Action Trait
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `name()` | `&'static str` | Action name (used as topic prefix) |
+| `goal_topic()` | `String` | `"{name}.goal"` |
+| `cancel_topic()` | `String` | `"{name}.cancel"` |
+| `result_topic()` | `String` | `"{name}.result"` |
+| `feedback_topic()` | `String` | `"{name}.feedback"` |
+| `status_topic()` | `String` | `"{name}.status"` |
+
+---
+
+## GoalStatus
+
+Lifecycle of a goal:
+
+| Variant | Terminal? | Description |
+|---------|-----------|-------------|
+| `Pending` | No | Received but not yet processed |
+| `Active` | No | Currently executing |
+| `Succeeded` | Yes | Completed successfully |
+| `Aborted` | Yes | Failed due to server error |
+| `Canceled` | Yes | Canceled by client request |
+| `Preempted` | Yes | Preempted by higher-priority goal |
+| `Rejected` | Yes | Validation failed at acceptance |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `is_active()` | `bool` | `Pending` or `Active` |
+| `is_terminal()` | `bool` | Reached a final state |
+| `is_success()` | `bool` | `Succeeded` |
+| `is_failure()` | `bool` | `Aborted`, `Canceled`, `Preempted`, or `Rejected` |
+
+---
+
+## GoalPriority
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `HIGHEST` | 0 | Critical goals |
+| `HIGH` | 64 | Above normal |
+| `NORMAL` | 128 | Default priority |
+| `LOW` | 192 | Below normal |
+| `LOWEST` | 255 | Background tasks |
+
+Lower value = higher priority. `is_higher_than(other)` compares priorities.
+
+---
+
+## PreemptionPolicy
+
+Controls what happens when a new goal arrives while one is active:
+
+| Variant | Description |
+|---------|-------------|
+| `RejectNew` | New goals rejected while one is active |
+| `PreemptOld` | New goals cancel active goals **(default)** |
+| `Priority` | Higher priority preempts lower priority |
+| `Queue { max_size }` | Queue goals up to `max_size` |
+
+---
+
+## GoalResponse / CancelResponse
+
+Server returns these from goal acceptance and cancel callbacks:
+
+| Type | Variants | Methods |
+|------|----------|---------|
+| `GoalResponse` | `Accept`, `Reject(String)` | `is_accepted()`, `is_rejected()`, `rejection_reason()` |
+| `CancelResponse` | `Accept`, `Reject(String)` | `is_accepted()`, `is_rejected()`, `rejection_reason()` |
+
+---
+
+## ActionServerConfig
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_concurrent_goals` | `Option<usize>` | `Some(1)` | Max simultaneous goals (`None` = unlimited) |
+| `feedback_rate_hz` | `f64` | `10.0` | Rate limit for feedback publishing |
+| `goal_timeout` | `Option<Duration>` | `None` | Auto-abort after timeout |
+| `preemption_policy` | `PreemptionPolicy` | `PreemptOld` | How to handle competing goals |
+| `result_history_size` | `usize` | `100` | How many results to keep in history |
+
+Builder methods: `new()`, `unlimited_goals()`, `max_goals(n)`, `feedback_rate(hz)`, `timeout(dur)`, `preemption(policy)`, `history_size(n)`.
+
+---
+
+## ActionError
+
+| Variant | Description |
+|---------|-------------|
+| `GoalRejected(String)` | Server rejected the goal |
+| `GoalCanceled` | Goal was canceled |
+| `GoalPreempted` | Goal was preempted by higher priority |
+| `GoalTimeout` | Goal timed out |
+| `ServerUnavailable` | No action server running |
+| `CommunicationError(String)` | Topic I/O failure |
+| `ExecutionError(String)` | Server execution error |
+| `InvalidGoal(String)` | Goal validation failed |
+| `GoalNotFound(GoalId)` | Goal ID not recognized |
+
+---
+
+## ActionServerBuilder
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ActionServerBuilder::<A>::new()` | `Self` | Create a new builder |
+| `on_goal(callback)` | `Self` | Goal acceptance callback (`Fn(&Goal) -> GoalResponse`) |
+| `on_cancel(callback)` | `Self` | Cancel request callback (`Fn(GoalId) -> CancelResponse`) |
+| `on_execute(callback)` | `Self` | Execution callback (`Fn(ServerGoalHandle) -> GoalOutcome`) |
+| `with_config(config)` | `Self` | Apply full `ActionServerConfig` |
+| `max_concurrent_goals(max)` | `Self` | Shorthand for max concurrent goals |
+| `feedback_rate(rate_hz)` | `Self` | Shorthand for feedback rate |
+| `goal_timeout(timeout)` | `Self` | Shorthand for goal timeout |
+| `preemption_policy(policy)` | `Self` | Shorthand for preemption policy |
+| `build()` | `ActionServerNode<A>` | Build the server node |
+
+### ActionServerNode
+
+Implements `Node` — add it to a `Scheduler` to process goals.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `builder()` | `ActionServerBuilder<A>` | Create a new builder |
+| `metrics()` | `ActionServerMetrics` | Get server metrics snapshot |
+
+### ActionServerMetrics
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `goals_received` | `u64` | Total goals received |
+| `goals_accepted` | `u64` | Goals that passed acceptance |
+| `goals_rejected` | `u64` | Goals rejected by `on_goal` |
+| `goals_succeeded` | `u64` | Successfully completed |
+| `goals_aborted` | `u64` | Aborted by server |
+| `goals_canceled` | `u64` | Canceled by client |
+| `goals_preempted` | `u64` | Preempted by higher priority |
+| `active_goals` | `usize` | Currently executing |
+| `queued_goals` | `usize` | Waiting in queue |
+
+---
+
+## ServerGoalHandle
+
+Handle passed to the `on_execute` callback. Use it to publish feedback and finalize the goal.
+
+### Query Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `goal_id()` | `GoalId` | Unique goal identifier |
+| `goal()` | `&A::Goal` | The goal data |
+| `priority()` | `GoalPriority` | Goal priority level |
+| `status()` | `GoalStatus` | Current status |
+| `elapsed()` | `Duration` | Time since execution started |
+| `is_cancel_requested()` | `bool` | Client requested cancellation |
+| `is_preempt_requested()` | `bool` | Higher-priority goal wants to preempt |
+| `should_abort()` | `bool` | `true` if canceled or preempted — check this in loops |
+
+### Action Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `publish_feedback(feedback)` | `()` | Send feedback to client (rate-limited) |
+| `succeed(result)` | `GoalOutcome<A>` | Complete successfully |
+| `abort(result)` | `GoalOutcome<A>` | Abort with error |
+| `canceled(result)` | `GoalOutcome<A>` | Acknowledge cancellation |
+| `preempted(result)` | `GoalOutcome<A>` | Acknowledge preemption |
+
+#### publish_feedback
+
+```rust
+// simplified
+pub fn publish_feedback(&self, feedback: A::Feedback)
+```
+
+Send progress feedback to the client. Rate-limited by `ActionServerConfig::feedback_rate_hz` (default: 10Hz). Extra calls within the rate window are silently dropped.
+
+**Example:**
+```rust
+// simplified
+handle.publish_feedback(NavFeedback {
+    distance_remaining: 3.2,
+    progress: 0.65,
+});
+```
+
+#### succeed
+
+```rust
+// simplified
+pub fn succeed(self, result: A::Result) -> GoalOutcome<A>
+```
+
+Complete the goal successfully. Consumes the handle — no further operations possible.
+
+**Example:**
+```rust
+// simplified
+return handle.succeed(MoveArmResult { final_position: current_pos });
+```
+
+#### should_abort
+
+```rust
+// simplified
+pub fn should_abort(&self) -> bool
+```
+
+Returns `true` if the client has requested cancellation or a higher-priority goal wants to preempt. **Check this in your execute loop:**
+
+**Example:**
+```rust
+// simplified
+loop {
+    if handle.should_abort() {
+        return handle.canceled(partial_result);
+    }
+    // ... do work ...
+    handle.publish_feedback(progress);
+}
+```
+
+### GoalOutcome
+
+| Variant | Description |
+|---------|-------------|
+| `Succeeded(A::Result)` | Goal completed successfully |
+| `Aborted(A::Result)` | Server aborted execution |
+| `Canceled(A::Result)` | Client canceled |
+| `Preempted(A::Result)` | Preempted by higher priority |
+
+Methods: `status()` returns `GoalStatus`, `into_result()` extracts the result.
+
+---
+
+## Server Example
+
+```rust
+// simplified
+use horus::prelude::*;
+
+action! {
+    MoveArm {
+        goal { target_x: f64, target_y: f64, target_z: f64 }
+        feedback { progress: f64, current_x: f64, current_y: f64, current_z: f64 }
+        result { success: bool, final_x: f64, final_y: f64, final_z: f64 }
+    }
+}
+
+let server = ActionServerNode::<MoveArm>::builder()
+    .on_goal(|goal| {
+        // Validate the goal
+        if goal.target_z < 0.0 {
+            GoalResponse::Reject("Z must be non-negative".into())
+        } else {
+            GoalResponse::Accept
+        }
+    })
+    .on_cancel(|_goal_id| CancelResponse::Accept)
+    .on_execute(|handle| {
+        let goal = handle.goal();
+        let mut progress = 0.0;
+
+        while progress < 1.0 {
+            // Check for cancellation
+            if handle.should_abort() {
+                return handle.canceled(MoveArmResult {
+                    success: false,
+                    final_x: 0.0, final_y: 0.0, final_z: 0.0,
+                });
+            }
+
+            progress += 0.01;
+            handle.publish_feedback(MoveArmFeedback {
+                progress,
+                current_x: goal.target_x * progress,
+                current_y: goal.target_y * progress,
+                current_z: goal.target_z * progress,
+            });
+
+            std::thread::sleep(10_u64.ms());
+        }
+
+        handle.succeed(MoveArmResult {
+            success: true,
+            final_x: goal.target_x,
+            final_y: goal.target_y,
+            final_z: goal.target_z,
+        })
+    })
+    .preemption_policy(PreemptionPolicy::Priority)
+    .goal_timeout(30_u64.secs())
+    .build();
+
+let mut scheduler = Scheduler::new();
+scheduler.add(server).order(0).build();
+```
+
+---
+
+## ActionClientBuilder
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ActionClientBuilder::<A>::new()` | `Self` | Create a new builder |
+| `on_feedback(callback)` | `Self` | Feedback callback (`Fn(GoalId, &Feedback)`) |
+| `on_result(callback)` | `Self` | Result callback (`Fn(GoalId, GoalStatus, &Result)`) |
+| `on_status(callback)` | `Self` | Status change callback (`Fn(GoalId, GoalStatus)`) |
+| `build()` | `ActionClientNode<A>` | Build the client node |
+
+### ActionClientNode
+
+Implements `Node` — add it to a `Scheduler` alongside the server.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `builder()` | `ActionClientBuilder<A>` | Create a new builder |
+| `send_goal(goal)` | `Result<ClientGoalHandle, ActionError>` | Send with `NORMAL` priority |
+| `send_goal_with_priority(goal, priority)` | `Result<ClientGoalHandle, ActionError>` | Send with specific priority |
+| `cancel_goal(goal_id)` | `()` | Request cancellation |
+
+#### send_goal
+
+Sends a goal to the action server with default (`NORMAL`) priority.
+
+**Signature**
+
+```rust
+// simplified
+pub fn send_goal(&self, goal: A::Goal) -> Result<ClientGoalHandle<A>, ActionError>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `goal` | `A::Goal` | yes | The goal data. Type defined by `action!` macro's `goal {}` block. |
+
+**Returns**
+
+`Result<ClientGoalHandle<A>, ActionError>` — a handle to monitor progress, get results, or cancel.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `ActionError::ServerUnavailable` | No action server registered |
+| `ActionError::GoalRejected` | Server's `on_goal` callback rejected the goal |
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let handle = client.send_goal(NavigateToPoseGoal { x: 1.0, y: 2.0, theta: 0.0 })?;
+// Monitor with handle.status(), handle.result(), handle.last_feedback()
+```
+
+#### send_goal_with_priority
+
+Sends a goal with explicit priority. Higher priority goals can preempt lower ones.
+
+**Signature**
+
+```rust
+// simplified
+pub fn send_goal_with_priority(&self, goal: A::Goal, priority: GoalPriority) -> Result<ClientGoalHandle<A>, ActionError>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `goal` | `A::Goal` | yes | The goal data. |
+| `priority` | `GoalPriority` | yes | `GoalPriority::LOW`, `NORMAL`, `HIGH`, or `HIGHEST`. |
+
+**Behavior**
+
+If the server's `PreemptionPolicy` allows it, a higher-priority goal will preempt the current executing goal. The preempted goal's `is_preempt_requested()` returns `true`.
+| `goal_status(goal_id)` | `Option<GoalStatus>` | Query goal status |
+| `active_goals()` | `Vec<GoalId>` | All active goal IDs |
+| `active_goal_count()` | `usize` | Number of active goals |
+| `metrics()` | `ActionClientMetrics` | Get client metrics |
+
+### ActionClientMetrics
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `goals_sent` | `u64` | Total goals sent |
+| `goals_succeeded` | `u64` | Successfully completed |
+| `goals_failed` | `u64` | Aborted, canceled, preempted, or rejected |
+| `cancels_sent` | `u64` | Cancel requests sent |
+| `active_goals` | `usize` | Currently active |
+
+---
+
+## ClientGoalHandle
+
+Handle returned by `send_goal()`. Use it to monitor progress and get results.
+
+### Query Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `goal_id()` | `GoalId` | Unique goal identifier |
+| `priority()` | `GoalPriority` | Goal priority level |
+| `status()` | `GoalStatus` | Current status |
+| `is_active()` | `bool` | Still executing |
+| `is_done()` | `bool` | Reached terminal state |
+| `is_success()` | `bool` | Completed successfully |
+| `elapsed()` | `Duration` | Time since goal was sent |
+| `time_since_update()` | `Duration` | Time since last status change |
+| `result()` | `Option<A::Result>` | Get result if completed |
+| `last_feedback()` | `Option<A::Feedback>` | Most recent feedback |
+
+### Blocking Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `await_result(timeout)` | `Option<A::Result>` | Block until result or timeout |
+| `await_result_with_feedback(timeout, callback)` | `Result<A::Result, ActionError>` | Block with feedback callback |
+| `cancel()` | `()` | Send cancel request to server |
+
+---
+
+## SyncActionClient (Blocking)
+
+Standalone blocking client — does not need a `Scheduler`.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `SyncActionClient::<A>::new()` | `Result<Self>` | Create and initialize |
+| `send_goal_and_wait(goal, timeout)` | `Result<A::Result, ActionError>` | Send goal, block until result |
+| `send_goal_and_wait_with_feedback(goal, timeout, callback)` | `Result<A::Result, ActionError>` | Block with feedback |
+| `cancel_goal(goal_id)` | `()` | Request cancellation |
+
+Type alias: `ActionClient<A> = SyncActionClient<A>`
+
+#### send_goal_and_wait
+
+```rust
+// simplified
+pub fn send_goal_and_wait(&self, goal: A::Goal, timeout: Duration) -> Result<A::Result, ActionError>
+```
+
+Send a goal and block until the server completes it or timeout elapses. The simplest way to execute an action.
+
+**Parameters:**
+- `goal: A::Goal` — The goal to send
+- `timeout: Duration` — Maximum wait time
+
+**Returns:** `Ok(result)` on success, `Err(ActionError::GoalTimeout)` on timeout, `Err(ActionError::GoalRejected)` if server rejects.
+
+**Example:**
+```rust
+// simplified
+let result = client.send_goal_and_wait(
+    MoveArmGoal { target: [0.5, 0.3, 0.1], speed: 0.5 },
+    10_u64.secs(),
+)?;
+println!("Arm reached: {:?}", result.final_position);
+```
+
+#### send_goal_and_wait_with_feedback
+
+```rust
+// simplified
+pub fn send_goal_and_wait_with_feedback(
+    &self, goal: A::Goal, timeout: Duration,
+    feedback_cb: impl Fn(GoalId, &A::Feedback),
+) -> Result<A::Result, ActionError>
+```
+
+Like `send_goal_and_wait`, but calls `feedback_cb` whenever the server publishes feedback.
+
+**Example:**
+```rust
+// simplified
+let result = client.send_goal_and_wait_with_feedback(
+    nav_goal,
+    30_u64.secs(),
+    |_id, feedback| {
+        println!("Progress: {:.0}%, distance: {:.1}m",
+            feedback.progress * 100.0, feedback.distance_remaining);
+    },
+)?;
+```
+
+### Example
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Simple blocking usage (no scheduler needed)
+let client = SyncActionClient::<MoveArm>::new()?;
+
+let result = client.send_goal_and_wait_with_feedback(
+    MoveArmGoal { target_x: 1.0, target_y: 2.0, target_z: 0.5 },
+    30_u64.secs(),
+    |feedback| {
+        println!("Progress: {:.0}%", feedback.progress * 100.0);
+    },
+)?;
+
+if result.success {
+    println!("Arm reached ({:.1}, {:.1}, {:.1})",
+        result.final_x, result.final_y, result.final_z);
+}
+```
+
+---
+
+## GoalId
+
+Unique identifier for each goal (`Uuid`-backed).
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `GoalId::new()` | `Self` | Generate a new unique ID |
+| `GoalId::from_uuid(uuid)` | `Self` | Create from existing UUID |
+| `as_uuid()` | `&Uuid` | Get underlying UUID |
+
+---
+
+## Wire Types
+
+> **Advanced:** These types carry action data through topics internally. Most users interact with `ServerGoalHandle` and `ClientGoalHandle` instead.
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `GoalRequest<G>` | `goal_id`, `goal`, `priority`, `timestamp` | Sent from client to server when a goal is submitted |
+| `CancelRequest` | `goal_id`, `timestamp` | Sent from client to server to cancel a goal |
+| `ActionResult<R>` | `goal_id`, `status`, `result`, `timestamp` | Sent from server to client with the final result |
+| `ActionFeedback<F>` | `goal_id`, `feedback`, `timestamp` | Sent from server to client during execution |
+| `GoalStatusUpdate` | `goal_id`, `status`, `timestamp` | Status change notification |
+
+`ActionResult<R>` (the struct) has convenience constructors:
+
+```rust
+// simplified
+ActionResult::succeeded(goal_id, result)
+ActionResult::aborted(goal_id, result)
+ActionResult::canceled(goal_id, result)
+ActionResult::preempted(goal_id, result)
+```
+
+## Callback Types
+
+Type aliases for the callback signatures used by builders:
+
+```rust
+// simplified
+// Server callbacks (passed to ActionServerBuilder)
+type GoalCallback<A>    = Box<dyn Fn(&<A as Action>::Goal) -> GoalResponse + Send + Sync>;
+type CancelCallback     = Box<dyn Fn(GoalId) -> CancelResponse + Send + Sync>;
+type ExecuteCallback<A> = Box<dyn Fn(ServerGoalHandle<A>) -> GoalOutcome<A> + Send + Sync>;
+
+// Client callbacks (passed to ActionClientBuilder)
+type FeedbackCallback<A> = Box<dyn Fn(GoalId, &<A as Action>::Feedback) + Send + Sync>;
+type ResultCallback<A>   = Box<dyn Fn(GoalId, GoalStatus, &<A as Action>::Result) + Send + Sync>;
+type StatusCallback      = Box<dyn Fn(GoalId, GoalStatus) + Send + Sync>;
+```
+
+You never construct these directly — they're inferred from the closures you pass to `.on_goal()`, `.on_execute()`, `.on_feedback()`, etc.
+
+---
+
+## See Also
+
+- [Actions Concepts](/concepts/actions) — Architecture and lifecycle design
+- [Services API](/rust/api/services) — Synchronous request/response RPC
+- [Topic API](/rust/api/topic) — Streaming pub/sub communication
+- [Scheduler API](/rust/api/scheduler) — Node execution orchestrator

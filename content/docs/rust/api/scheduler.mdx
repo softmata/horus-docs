@@ -1,0 +1,1470 @@
+---
+title: "Scheduler API"
+description: "Complete API reference for the HORUS Scheduler — node orchestration, real-time scheduling, and runtime management"
+weight: 5
+---
+
+# Scheduler API
+
+The Scheduler is the runtime that manages node execution in HORUS. It orchestrates tick loops, allocates real-time threads, enforces deadlines, and handles graceful shutdown. Every HORUS application creates exactly one Scheduler, adds nodes to it, and calls `.run()`.
+
+> **Python**: Available via `horus.Scheduler(tick_rate, rt, watchdog_ms)`. See [Python Bindings](/python/api/python-bindings).
+
+```rust
+// simplified
+use horus::prelude::*;
+```
+
+---
+
+## Quick Reference — Scheduler Builder
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `.name(name)` | `"Scheduler"` | Sets the scheduler name for logging and diagnostics |
+| `.tick_rate(freq)` | 100 Hz | Sets the global tick loop frequency |
+| `.prefer_rt()` | — | Enables RT features with graceful degradation |
+| `.require_rt()` | — | Enables RT features, panics if unavailable |
+| `.deterministic(bool)` | `false` | Enables deterministic mode (SimClock, no parallelism) |
+| `.watchdog(duration)` | disabled | Enables frozen node detection with graduated degradation |
+| `.blackbox(size_mb)` | disabled | Enables flight recorder for crash forensics |
+| `.max_deadline_misses(n)` | 100 | Sets consecutive miss threshold before node isolation |
+| `.cores(cpu_ids)` | all cores | Pins scheduler threads to specific CPU cores |
+| `.verbose(bool)` | `true` | Enables or disables non-emergency logging |
+| `.with_recording()` | disabled | Enables session record/replay |
+
+## Quick Reference — Node Builder
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `.order(n)` | 100 | Sets execution priority (lower = runs first) |
+| `.rate(freq)` | global | Sets per-node tick rate, auto-enables RT |
+| `.budget(duration)` | 80% of period | Sets maximum tick execution time |
+| `.deadline(duration)` | 95% of period | Sets hard deadline per tick |
+| `.on_miss(policy)` | `Warn` | Sets deadline miss policy |
+| `.compute()` | — | Runs on parallel thread pool |
+| `.on(topic)` | — | Triggers only when topic receives data |
+| `.async_io()` | — | Runs on tokio async runtime |
+| `.priority(n)` | — | Sets OS SCHED_FIFO priority (1-99) |
+| `.core(cpu_id)` | — | Pins node thread to a CPU core (also locks governor + moves IRQs) |
+| `.deadline_scheduler()` | — | Opt-in to SCHED_DEADLINE (kernel EDF). Falls back to SCHED_FIFO |
+| `.no_alloc()` | — | Panic if `tick()` allocates heap memory (requires `RtAwareAllocator`) |
+| `.failure_policy(p)` | — | Sets error recovery policy |
+| `.build()` | — | Validates and registers the node |
+
+## Quick Reference — Execution
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.run()` | `Result<()>` | Starts the tick loop, blocks until Ctrl+C |
+| `.run_for(duration)` | `Result<()>` | Runs for a specific duration |
+| `.tick_once()` | `Result<()>` | Executes exactly one tick cycle |
+| `.stop()` | `()` | Signals graceful shutdown |
+
+---
+
+## Scheduler Builder Methods
+
+### `new()`
+
+Creates a new Scheduler with default configuration and auto-detected platform capabilities.
+
+**Signature**
+
+```rust
+// simplified
+pub fn new() -> Self
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`Scheduler` — with 100 Hz tick rate, no watchdog, no blackbox, no RT features enabled. No nodes registered.
+
+**Panics**
+
+Never.
+
+**Behavior**
+
+1. Detects RT capabilities: `SCHED_FIFO` support, `mlockall` permission, CPU topology (~30-100us)
+2. Cleans up stale SHM namespaces from previously crashed processes (&lt;1ms)
+3. Does NOT enable any RT features — use `.prefer_rt()` or `.require_rt()` to opt in
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new();
+// Scheduler is ready — add nodes and call .run()
+```
+
+---
+
+### `tick_rate(freq)`
+
+Sets the global scheduler loop frequency. Individual nodes can override with `.rate()`.
+
+**Signature**
+
+```rust
+// simplified
+pub fn tick_rate(self, freq: Frequency) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `freq` | `Frequency` | yes | Target tick rate. Create with `.hz()`: `100_u64.hz()`, `1000_u64.hz()`. |
+
+**Returns**
+
+`Self` — chainable.
+
+**Panics**
+
+Indirectly — `Frequency` validates at construction:
+- `0_u64.hz()` panics (zero frequency)
+- NaN, infinite, or negative values panic
+
+**Behavior**
+
+- Nodes without their own `.rate()` tick at this frequency
+- Nodes WITH `.rate()` tick at their own frequency, independent of the global rate
+- Higher rates = lower latency but more CPU usage
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// 100 Hz default control loop
+let s = Scheduler::new().tick_rate(100_u64.hz());
+
+// 1 kHz high-frequency servo control
+let s = Scheduler::new().tick_rate(1000_u64.hz());
+```
+
+**When to use**
+
+- Set to the fastest rate any BestEffort node needs
+- RT nodes (`.rate()`) are independent — the global rate doesn't limit them
+
+---
+
+### `prefer_rt()`
+
+Enables OS-level real-time features with graceful degradation.
+
+**Signature**
+
+```rust
+// simplified
+pub fn prefer_rt(self) -> Self
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`Self` — chainable.
+
+**Panics**
+
+Never. Degrades gracefully.
+
+**Behavior**
+
+- Attempts to enable: `mlockall` (prevent page faults) + `SCHED_FIFO` (real-time scheduling)
+- If the system lacks RT capabilities, logs a warning and continues without them
+- Use `.degradations()` after construction to check which features were skipped
+
+> **Note**: `degradations()` is `#[doc(hidden)]`. It works but may change in future versions.
+
+**When to use**
+
+- Production robots where RT is desired but the deployment environment may vary
+- Development machines without RT kernels
+
+**When NOT to use**
+
+- Safety-critical systems where RT is mandatory — use `.require_rt()` instead
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let s = Scheduler::new().prefer_rt();
+// On RT kernel: mlockall + SCHED_FIFO enabled
+// On non-RT kernel: warning logged, runs normally
+```
+
+---
+
+### `require_rt()`
+
+Enables OS-level real-time features. Panics if unavailable.
+
+**Signature**
+
+```rust
+// simplified
+pub fn require_rt(self) -> Self
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`Self` — chainable.
+
+**Panics**
+
+If the system has neither `SCHED_FIFO` nor `mlockall` support. Message: "RT capabilities required but not available".
+
+**When to use**
+
+- Safety-critical deployments where running without RT guarantees is unacceptable
+- Forces developers to fix the deployment environment rather than silently degrading
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let s = Scheduler::new().require_rt();
+// On non-RT kernel: PANICS
+```
+
+---
+
+### `deterministic(enabled)`
+
+Enables deterministic execution mode for reproducible runs.
+
+**Signature**
+
+```rust
+// simplified
+pub fn deterministic(self, enabled: bool) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `enabled` | `bool` | yes | `true` to enable deterministic mode. `false` to disable (default). |
+
+**Returns**
+
+`Self` — chainable.
+
+**Behavior**
+
+When `true`:
+- Clock switches from `WallClock` to `SimClock` (virtual time, advances by exact `1/rate` per tick)
+- Execution is sequential — no parallelism, no thread pools
+- RNG is seeded deterministically
+- Two runs with identical inputs produce identical outputs regardless of CPU speed
+
+When `false`:
+- Normal wall-clock time, parallel execution, non-deterministic RNG
+
+**When to use**
+
+- Simulation and replay
+- Reproducible testing and CI pipelines
+- Debugging timing-dependent bugs
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let s = Scheduler::new()
+    .tick_rate(100_u64.hz())
+    .deterministic(true);
+// Time advances exactly 10ms per tick, regardless of actual CPU time
+```
+
+---
+
+### `watchdog(timeout)`
+
+Enables frozen node detection with graduated degradation.
+
+**Signature**
+
+```rust
+// simplified
+pub fn watchdog(self, timeout: Duration) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `timeout` | `Duration` | yes | Maximum allowed tick duration before degradation triggers. Create with `.ms()`: `500_u64.ms()`. |
+
+**Returns**
+
+`Self` — chainable.
+
+**Behavior**
+
+- Creates an internal safety monitor that checks every node's tick duration
+- Graduated response: Warning → reduce rate → isolate → enter safe state
+- Interacts with `.max_deadline_misses()` for the isolation threshold
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let s = Scheduler::new().watchdog(500_u64.ms());
+```
+
+---
+
+### `blackbox(size_mb)`
+
+Enables the flight recorder for post-crash analysis.
+
+**Signature**
+
+```rust
+// simplified
+pub fn blackbox(self, size_mb: usize) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `size_mb` | `usize` | yes | Circular buffer size in megabytes. Typical: 32-128. |
+
+**Returns**
+
+`Self` — chainable.
+
+**Behavior**
+
+- Records node ticks, timing data, and events in a circular buffer
+- On crash, the buffer survives for post-mortem analysis via `horus blackbox`
+- Overwrites oldest data when full — like an airplane's black box
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let s = Scheduler::new().blackbox(64); // 64MB flight recorder
+```
+
+---
+
+### `max_deadline_misses(n)`
+
+Sets the threshold for consecutive deadline misses before a node is isolated.
+
+**Signature**
+
+```rust
+// simplified
+pub fn max_deadline_misses(self, n: u64) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `n` | `u64` | yes | Number of consecutive misses. Default: 100. |
+
+**Returns**
+
+`Self` — chainable.
+
+**Behavior**
+
+- Requires `.watchdog()` to be enabled — without it, misses aren't tracked
+- After `n` consecutive misses, the node is isolated (stopped from ticking)
+- Lower values = more aggressive isolation, higher values = more tolerance
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let s = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .max_deadline_misses(5); // isolate after 5 consecutive misses
+```
+
+---
+
+### `cores(cpu_ids)`
+
+Pins scheduler threads to specific CPU cores.
+
+**Signature**
+
+```rust
+// simplified
+pub fn cores(self, cpu_ids: &[usize]) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `cpu_ids` | `&[usize]` | yes | CPU core indices. E.g., `&[2, 3]` for cores 2 and 3. |
+
+**Returns**
+
+`Self` — chainable.
+
+**When to use**
+
+- Production RT systems where you've isolated CPU cores for the robot
+- Prevents OS from migrating scheduler threads between cores
+
+---
+
+### `verbose(enabled)`
+
+Enables or disables non-emergency logging.
+
+**Signature**
+
+```rust
+// simplified
+pub fn verbose(self, enabled: bool) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `enabled` | `bool` | yes | `true` for full logging (default). `false` for emergency-only. |
+
+**Returns**
+
+`Self` — chainable.
+
+---
+
+### `name(name)`
+
+Sets the scheduler name for logging and diagnostics.
+
+**Signature**
+
+```rust
+// simplified
+pub fn name(self, name: &str) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | `&str` | yes | Scheduler name. Default: `"Scheduler"`. |
+
+**Returns**
+
+`Self` — chainable.
+
+---
+
+### `with_recording()`
+
+Enables session recording for replay and debugging.
+
+**Signature**
+
+```rust
+// simplified
+pub fn with_recording(self) -> Self
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`Self` — chainable.
+
+**Behavior**
+
+- Records all topic messages and timing data during the session
+- Use `horus record replay <session>` to replay
+
+---
+
+## Node Builder Methods
+
+Returned by `scheduler.add(node)`. Chain configuration methods, then call `.build()` to register.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(my_node)
+    .order(10)
+    .rate(500_u64.hz())
+    .on_miss(Miss::Skip)
+    .build()?;
+```
+
+### `order(n)`
+
+Sets execution priority. Lower values run first within each tick cycle.
+
+**Signature**
+
+```rust
+// simplified
+pub fn order(self, order: u32) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `order` | `u32` | yes | Execution priority. Default: 100. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Behavior**
+
+- Within a single tick, all nodes execute in order from lowest to highest
+- Applies to ALL execution classes — even Event and Compute nodes use order when multiple fire simultaneously
+
+**Guidelines**
+
+| Range | Use |
+|-------|-----|
+| 0-9 | Safety-critical (emergency stop, safety monitor) |
+| 10-49 | High priority (sensors, fast control loops) |
+| 50-99 | Normal (processing, planning) |
+| 100-199 | Low (logging, diagnostics) |
+| 200+ | Background (telemetry, analytics) |
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(safety_node).order(0).build()?;    // runs first
+scheduler.add(motor_ctrl).order(10).build()?;    // runs second
+scheduler.add(logger).order(200).build()?;       // runs last
+```
+
+---
+
+### `rate(freq)`
+
+Sets a per-node tick rate. Automatically promotes BestEffort nodes to RT execution class.
+
+**Signature**
+
+```rust
+// simplified
+pub fn rate(self, freq: Frequency) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `freq` | `Frequency` | yes | Node-specific tick rate. Create with `.hz()`: `1000_u64.hz()`. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Panics**
+
+Indirectly — `Frequency` validates at construction (zero, NaN, infinite panic).
+
+**Behavior**
+
+- If the node's execution class is still `BestEffort` (default), auto-promotes to `Rt` with:
+  - `budget = period * 0.80` (e.g., 500 Hz → 2ms period → 1.6ms budget)
+  - `deadline = period * 0.95` (e.g., 500 Hz → 2ms period → 1.9ms deadline)
+- If the node already has an execution class (`.compute()`, `.on()`, `.async_io()`), rate is informational — no RT promotion, no budget/deadline enforcement
+- Method call order doesn't matter — auto-derivation is deferred to `.build()` time
+
+**Constraints**
+
+| Combines with | Result |
+|--------------|--------|
+| `.budget()` | Explicit budget overrides the auto-derived 80% value |
+| `.deadline()` | Explicit deadline overrides the auto-derived 95% value |
+| `.compute()` | Stays Compute — rate limits frequency but no RT enforcement |
+| `.on(topic)` | Stays Event — rate is ignored |
+| `.async_io()` | Stays AsyncIo — rate limits frequency but no RT enforcement |
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Auto-derived RT: budget=1.6ms, deadline=1.9ms
+scheduler.add(sensor).order(0).rate(500_u64.hz()).build()?;
+
+// Override budget: budget=0.5ms instead of auto-derived 0.8ms
+scheduler.add(motor)
+    .order(1)
+    .rate(1000_u64.hz())
+    .budget(500_u64.us())
+    .build()?;
+
+// Compute node with rate-limiting (no RT)
+scheduler.add(planner).order(50).compute().rate(10_u64.hz()).build()?;
+```
+
+---
+
+### `budget(duration)`
+
+Sets the maximum CPU time allowed per tick. Auto-enables RT scheduling.
+
+**Signature**
+
+```rust
+// simplified
+pub fn budget(self, budget: Duration) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `budget` | `Duration` | yes | Maximum tick execution time. Create with `.us()` or `.ms()`: `300_u64.us()`. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Errors**
+
+`.build()` rejects if:
+- Budget is zero
+- Budget exceeds deadline
+- Budget set on a non-RT execution class (no `.rate()` and class is Compute/Event/AsyncIo)
+
+**Behavior**
+
+- Overrides the auto-derived budget from `.rate()` (which defaults to 80% of period)
+- If called without `.rate()`, implicitly enables RT scheduling
+- When exceeded, the safety monitor counts it as a budget violation
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(motor)
+    .order(0)
+    .rate(1000_u64.hz())
+    .budget(300_u64.us())   // override auto-derived 800us
+    .deadline(900_u64.us()) // override auto-derived 950us
+    .on_miss(Miss::Skip)
+    .build()?;
+```
+
+---
+
+### `deadline(duration)`
+
+Sets the hard deadline per tick. When exceeded, the `Miss` policy fires.
+
+**Signature**
+
+```rust
+// simplified
+pub fn deadline(self, deadline: Duration) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `deadline` | `Duration` | yes | Hard deadline. Create with `.us()` or `.ms()`: `900_u64.us()`. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Errors**
+
+`.build()` rejects if:
+- Deadline is zero
+- Deadline is less than budget
+- Deadline set on a non-RT execution class
+
+**Behavior**
+
+- Overrides the auto-derived deadline from `.rate()` (which defaults to 95% of period)
+- If called without `.rate()`, implicitly enables RT scheduling
+- When exceeded, the `Miss` policy fires (`.on_miss()`)
+
+---
+
+### `on_miss(policy)`
+
+Sets the policy for when a node exceeds its deadline.
+
+**Signature**
+
+```rust
+// simplified
+pub fn on_miss(self, policy: Miss) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `policy` | `Miss` | yes | One of `Miss::Warn`, `Miss::Skip`, `Miss::SafeMode`, `Miss::Stop`. Default: `Miss::Warn`. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Errors**
+
+`.build()` warns (but allows) if `.on_miss()` is set on a node without a deadline.
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(motor)
+    .order(0)
+    .rate(1000_u64.hz())
+    .on_miss(Miss::SafeMode)  // calls enter_safe_state() on deadline miss
+    .build()?;
+```
+
+---
+
+### `compute()`
+
+Marks the node as CPU-bound. Runs on a parallel worker thread pool.
+
+**Signature**
+
+```rust
+// simplified
+pub fn compute(self) -> Self
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`NodeBuilder` — chainable. Sets execution class to `Compute`.
+
+**Behavior**
+
+- The node runs in a thread pool, isolated from the main tick loop and RT threads
+- If `.rate()` was already set, the node is rate-limited but does NOT get RT guarantees
+- If another execution class was already set (`.on()`, `.async_io()`), this overrides it with a warning
+
+**Constraints**
+
+| Combines with | Result |
+|--------------|--------|
+| `.rate()` | Rate-limited Compute (no RT budget/deadline enforcement) |
+| `.on(topic)` | Conflict — `.compute()` overrides Event. Last setter wins. Warning logged. |
+| `.async_io()` | Conflict — `.compute()` overrides AsyncIo. Last setter wins. Warning logged. |
+| `.budget()` / `.deadline()` | Rejected by `.build()` — Compute nodes don't have timing guarantees |
+| `.order()` | Works — determines priority when multiple Compute nodes finish simultaneously |
+
+**When to use**
+
+- Path planning, SLAM, image processing, ML inference, inverse kinematics
+- Any CPU-heavy work that would block the main tick loop
+
+**When NOT to use**
+
+- Real-time control loops — use `.rate()` instead (needs guaranteed timing)
+- Network/file I/O — use `.async_io()` instead (blocking I/O wastes thread pool slots)
+- Event-driven processing — use `.on(topic)` instead (no need to poll)
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(PathPlanner::new())
+    .order(50)
+    .compute()
+    .rate(10_u64.hz())  // rate-limited to 10 Hz, no RT enforcement
+    .build()?;
+```
+
+---
+
+### `on(topic)`
+
+Makes the node event-driven. Ticks only when the named topic receives a new message.
+
+**Signature**
+
+```rust
+// simplified
+pub fn on(self, topic: &str) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `topic` | `&str` | yes | Topic name to listen on. Must match a `Topic::new(name)` call exactly (case-sensitive). Use `/`-delimited hierarchical names: `"sensors/emergency_stop"`. |
+
+**Returns**
+
+`NodeBuilder` — chainable. Sets execution class to `Event`.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `.build()` returns `Err` | `topic` is an empty string `""` |
+| `.build()` warns | `.budget()` or `.on_miss()` also set (no deadline to miss on Event nodes) |
+
+**Panics**
+
+Never. Invalid configuration is caught by `.build()`.
+
+**Behavior**
+
+- The node does NOT tick on the scheduler's global clock — it has its own wake mechanism
+- When a message is published to the named topic (by any node, any process), this node wakes and `tick()` is called
+- If multiple messages arrive between ticks, the node ticks once — call `recv()` in a loop to drain all pending messages
+- `.order()` still applies: if two event-driven nodes wake on the same tick, lower order runs first
+
+**Constraints**
+
+| Combines with | Result |
+|--------------|--------|
+| `.rate()` | Conflict — `.on()` overrides. Last setter wins. Warning logged. |
+| `.compute()` | Conflict — last setter wins. Warning logged. |
+| `.async_io()` | Conflict — last setter wins. Warning logged. |
+| `.budget()` / `.deadline()` | Rejected by `.build()` — Event nodes have no timing guarantees |
+| `.order()` | Works — priority when multiple events fire simultaneously |
+| `.on_miss()` | Warned — no deadline to miss on Event nodes |
+
+**When to use**
+
+- Emergency stop handlers — react to safety events immediately
+- Command processors — act on commands as they arrive, not on a clock
+- Event-driven pipelines — process images only when a new frame arrives
+
+**When NOT to use**
+
+- Continuous control loops — use `.rate()` instead (motor control needs guaranteed frequency)
+- Periodic polling — use default BestEffort (ticks every scheduler cycle)
+- CPU-heavy work triggered by events — use `.on()` to detect, then dispatch to a `.compute()` node via a topic
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// E-stop handler — ticks only when someone publishes to "emergency_stop"
+scheduler.add(EmergencyHandler::new())
+    .order(0)
+    .on("emergency_stop")
+    .build()?;
+
+// In the handler node:
+impl Node for EmergencyHandler {
+    fn tick(&mut self) {
+        // IMPORTANT: drain all pending messages — multiple stops may have fired
+        while let Some(stop_cmd) = self.estop_topic.recv() {
+            self.execute_stop(stop_cmd);
+        }
+    }
+}
+```
+
+---
+
+### `async_io()`
+
+Runs the node on the tokio async runtime. For blocking I/O operations.
+
+**Signature**
+
+```rust
+// simplified
+pub fn async_io(self) -> Self
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`NodeBuilder` — chainable. Sets execution class to `AsyncIo`.
+
+**Behavior**
+
+- Runs `tick()` via `tokio::task::spawn_blocking()` on a separate runtime
+- Blocking I/O in this node never affects RT jitter or Compute throughput
+- If `.rate()` was set, the node is rate-limited but without RT enforcement
+
+**Constraints**
+
+| Combines with | Result |
+|--------------|--------|
+| `.rate()` | Rate-limited AsyncIo (no RT enforcement) |
+| `.compute()` | Conflict — `.async_io()` overrides. Last setter wins. Warning logged. |
+| `.on(topic)` | Conflict — `.async_io()` overrides. Last setter wins. Warning logged. |
+| `.budget()` / `.deadline()` | Rejected by `.build()` — AsyncIo nodes have no timing guarantees |
+
+**When to use**
+
+- Network calls (HTTP APIs, cloud upload, telemetry export)
+- File I/O (logging to disk, configuration reloading)
+- Database queries
+
+**When NOT to use**
+
+- CPU-bound work — use `.compute()` instead
+- Real-time control — use `.rate()` instead
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(TelemetryUploader::new())
+    .order(200)
+    .async_io()
+    .rate(1_u64.hz())  // upload once per second
+    .build()?;
+```
+
+---
+
+### `priority(prio)`
+
+Sets OS-level thread priority for SCHED_FIFO real-time scheduling.
+
+**Signature**
+
+```rust
+// simplified
+pub fn priority(self, prio: i32) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `prio` | `i32` | yes | SCHED_FIFO priority, 1-99. Higher = more priority. Requires `CAP_SYS_NICE`. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Errors**
+
+`.build()` warns if set on a non-RT node (`.priority()` only meaningful with `.rate()`).
+
+---
+
+### `core(cpu_id)`
+
+Pins this node's thread to a specific CPU core.
+
+**Signature**
+
+```rust
+// simplified
+pub fn core(self, cpu_id: usize) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `cpu_id` | `usize` | yes | CPU core index. E.g., `2` for core 2. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+**Errors**
+
+`.build()` warns if set on a non-RT node.
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.add(motor)
+    .order(0)
+    .rate(1000_u64.hz())
+    .core(2)  // pin to isolated CPU core
+    .build()?;
+```
+
+---
+
+### `deadline_scheduler()`
+
+Opt in to Linux's SCHED_DEADLINE (Earliest Deadline First) scheduling instead of SCHED_FIFO.
+
+The kernel guarantees this node's thread gets `.budget()` of CPU time within every `.rate()` period. Unlike SCHED_FIFO (priority-based, can starve), EDF is bandwidth-fair with admission control — the kernel rejects tasks that would overcommit CPU.
+
+**Signature**
+
+```rust
+pub fn deadline_scheduler(self) -> Self
+```
+
+**Requires:** `.rate()` and `.budget()` must be set (they provide the kernel parameters). Requires `CAP_SYS_NICE` or root. Falls back to SCHED_FIFO silently if unavailable.
+
+**Example**
+
+```rust
+scheduler.add(motor_ctrl)
+    .rate(1000_u64.hz())
+    .budget(500_u64.us())
+    .deadline_scheduler()    // kernel-guaranteed EDF
+    .build()?;
+```
+
+---
+
+### `no_alloc()`
+
+Enforce zero heap allocations during `tick()`. Any `Vec::push()`, `String::from()`, `format!()`, or `Box::new()` inside the tick function will panic with a clear message naming the offending node.
+
+**Signature**
+
+```rust
+pub fn no_alloc(self) -> Self
+```
+
+**Requires:** The binary must set `RtAwareAllocator` as global allocator:
+
+```rust
+#[global_allocator]
+static ALLOC: horus_core::memory::rt_allocator::RtAwareAllocator
+    = horus_core::memory::rt_allocator::RtAwareAllocator;
+```
+
+Without this line, `.no_alloc()` is a no-op — safe for prototyping.
+
+**Example**
+
+```rust
+scheduler.add(motor_ctrl)
+    .rate(1000_u64.hz())
+    .no_alloc()              // panic if tick() allocates
+    .build()?;
+```
+
+---
+
+### `failure_policy(policy)`
+
+Sets the error recovery policy for this node.
+
+**Signature**
+
+```rust
+// simplified
+pub fn failure_policy(self, policy: FailurePolicy) -> Self
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `policy` | `FailurePolicy` | yes | One of `Fatal`, `Restart { max_retries, backoff }`, `Skip { max_skips, cooldown }`, `Ignore`. |
+
+**Returns**
+
+`NodeBuilder` — chainable.
+
+---
+
+### `build()`
+
+Validates the node configuration and registers it with the scheduler.
+
+**Signature**
+
+```rust
+// simplified
+pub fn build(self) -> Result<&mut Scheduler>
+```
+
+**Parameters**
+
+None.
+
+**Returns**
+
+`Result<&mut Scheduler>` — the scheduler for chaining further `.add()` calls.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `ValidationError` | Budget or deadline set on non-RT execution class |
+| `ValidationError` | Budget is zero |
+| `ValidationError` | Deadline is zero |
+| `ValidationError` | Budget exceeds deadline |
+| `ValidationError` | Empty topic name in `.on("")` |
+
+**Behavior**
+
+1. Runs `finalize()` — if `.rate()` was set on a BestEffort node, promotes to RT with auto-derived budget (80%) and deadline (95%)
+2. Validates all constraints (see Errors above)
+3. Logs warnings for non-fatal misconfigurations (`.priority()` on non-RT, `.on_miss()` without deadline)
+4. Registers the node with the scheduler
+
+**Panics**
+
+Never. Returns `Err` on invalid configuration.
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// This succeeds:
+scheduler.add(my_node).rate(100_u64.hz()).build()?;
+
+// This fails (budget > deadline):
+scheduler.add(my_node)
+    .budget(10_u64.ms())
+    .deadline(5_u64.ms())
+    .build()?;  // Err: budget exceeds deadline
+```
+
+---
+
+## Execution Methods
+
+### `run()`
+
+Starts the main scheduler loop. Blocks until `Ctrl+C` or `.stop()` is called.
+
+**Signature**
+
+```rust
+// simplified
+pub fn run(&mut self) -> Result<()>
+```
+
+**Returns**
+
+`Result<()>` — `Ok` on graceful shutdown, `Err` on fatal error.
+
+**Behavior**
+
+1. Installs `SIGINT`/`SIGTERM` signal handler
+2. Calls `init()` on all nodes (lazy init on first run)
+3. Loops: tick all nodes in order → sleep until next period → repeat
+4. On shutdown: calls `shutdown()` on all nodes in reverse order, prints timing report
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.run()?; // blocks until Ctrl+C
+```
+
+---
+
+### `run_for(duration)`
+
+Runs the scheduler for a specific duration, then shuts down.
+
+**Signature**
+
+```rust
+// simplified
+pub fn run_for(&mut self, duration: Duration) -> Result<()>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `duration` | `Duration` | yes | How long to run. Create with `.secs()`: `30_u64.secs()`. |
+
+**Returns**
+
+`Result<()>` — `Ok` after the duration elapses.
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+scheduler.run_for(30_u64.secs())?; // run 30 seconds then stop
+```
+
+---
+
+### `tick_once()`
+
+Executes exactly one tick cycle, then returns. No loop, no sleep.
+
+**Signature**
+
+```rust
+// simplified
+pub fn tick_once(&mut self) -> Result<()>
+```
+
+**Returns**
+
+`Result<()>`
+
+**Behavior**
+
+- Calls `init()` on all nodes if not yet initialized (lazy init)
+- Ticks every registered node once in order
+- Returns immediately after all nodes have ticked
+
+**When to use**
+
+- Unit testing — tick, assert, tick, assert
+- Simulation stepping — manual time control
+- Integration tests
+
+**Example**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new();
+scheduler.add(my_node).build()?;
+
+// Step through 100 ticks manually
+for _ in 0..100 {
+    scheduler.tick_once()?;
+}
+```
+
+---
+
+### `stop()`
+
+Signals graceful shutdown.
+
+**Signature**
+
+```rust
+// simplified
+pub fn stop(&self)
+```
+
+**Behavior**
+
+- The current tick completes
+- `shutdown()` is called on all nodes in reverse order
+- Timing report is printed
+
+---
+
+## Types
+
+### `Miss` Enum
+
+Deadline miss policy, set via `.on_miss()`.
+
+| Variant | Behavior | Use case |
+|---------|----------|----------|
+| `Miss::Warn` | Logs a warning, continues ticking | Soft real-time — logging, UI, telemetry |
+| `Miss::Skip` | Skips this tick entirely | Firm real-time — video encoding, non-critical sensors |
+| `Miss::SafeMode` | Calls `enter_safe_state()` on the node | Motor controllers, safety nodes — must go to safe output |
+| `Miss::Stop` | Stops the entire scheduler | Hard real-time safety-critical — unacceptable to continue |
+
+Default: `Miss::Warn`.
+
+### `NodeMetrics`
+
+Per-node performance data, returned by `scheduler.metrics()`.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.name()` | `&str` | Node name |
+| `.order()` | `u32` | Execution order |
+| `.total_ticks()` | `u64` | Total tick count |
+| `.successful_ticks()` | `u64` | Ticks without errors |
+| `.avg_tick_duration_ms()` | `f64` | Mean tick duration |
+| `.max_tick_duration_ms()` | `f64` | Worst-case tick duration |
+| `.min_tick_duration_ms()` | `f64` | Best-case tick duration |
+| `.last_tick_duration_ms()` | `f64` | Most recent tick duration |
+| `.messages_sent()` | `u64` | Total messages published |
+| `.messages_received()` | `u64` | Total messages consumed |
+| `.errors_count()` | `u64` | Error count |
+| `.warnings_count()` | `u64` | Warning count |
+| `.uptime_seconds()` | `f64` | Node uptime |
+
+### `RtStats`
+
+Real-time execution statistics for nodes with `.rate()` set.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.deadline_misses()` | `u64` | Total deadline misses |
+| `.budget_violations()` | `u64` | Total budget violations |
+| `.worst_execution()` | `Duration` | Worst-case tick duration |
+| `.last_execution()` | `Duration` | Most recent tick duration |
+| `.jitter_us()` | `f64` | Execution jitter in microseconds |
+| `.avg_execution_us()` | `f64` | Average tick duration in microseconds |
+| `.sampled_ticks()` | `u64` | Number of ticks sampled |
+| `.summary()` | `String` | Formatted timing summary |
+
+---
+
+## Monitoring Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `metrics()` | `Vec<NodeMetrics>` | Per-node performance metrics |
+| `rt_stats(name)` | `Option<&RtStats>` | RT timing stats for a specific node |
+| `safety_stats()` | `Option<SafetyStats>` | Aggregate safety stats (budget overruns, watchdog expirations) |
+| `node_list()` | `Vec<String>` | Names of all registered nodes |
+| `status()` | `String` | Formatted status report |
+
+> **Advanced/Unstable**: `rt_stats()`, `safety_stats()`, and `node_list()` are `#[doc(hidden)]` in the Rust source and may change without notice.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Check RT performance after a test run
+if let Some(stats) = scheduler.rt_stats("motor_ctrl") {
+    println!("Deadline misses: {}", stats.deadline_misses());
+    println!("Worst execution: {:?}", stats.worst_execution());
+    println!("Jitter: {:.1} us", stats.jitter_us());
+}
+```
+
+---
+
+## Production Patterns
+
+### Warehouse AGV
+
+Mobile robot with safety monitor, lidar SLAM, path planner, and motor control:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut sched = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(100_u64.hz());
+
+// Safety runs first every tick — never skip
+sched.add(EmergencyStopMonitor::new()?).order(0).rate(100_u64.hz()).on_miss(Miss::Stop).build()?;
+
+// Sensors at 50Hz
+sched.add(LidarDriver::new()?).order(10).rate(50_u64.hz()).build()?;
+sched.add(WheelOdometry::new()?).order(11).rate(100_u64.hz()).build()?;
+
+// SLAM is CPU-heavy — runs on thread pool
+sched.add(SlamNode::new()?).order(20).compute().build()?;
+
+// Planner at 10Hz — doesn't need to be fast
+sched.add(PathPlanner::new()?).order(30).rate(10_u64.hz()).build()?;
+
+// Motor control at 100Hz with strict deadline
+sched.add(MotorController::new()?).order(40).rate(100_u64.hz()).budget(5_u64.ms()).on_miss(Miss::Skip).build()?;
+
+// Logger at 1Hz — background priority
+sched.add(TelemetryLogger::new()?).order(200).rate(1_u64.hz()).build()?;
+
+sched.run()?;
+```
+
+### Drone Flight Controller
+
+High-frequency IMU processing with tight deadlines:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut sched = Scheduler::new()
+    .require_rt()
+    .watchdog(100_u64.ms())
+    .tick_rate(1000_u64.hz());
+
+sched.add(ImuReader::new()?).order(0).rate(1000_u64.hz()).budget(200_u64.us()).build()?;
+sched.add(AttitudeController::new()?).order(1).rate(1000_u64.hz()).budget(300_u64.us()).on_miss(Miss::SafeMode).build()?;
+sched.add(PositionController::new()?).order(2).rate(200_u64.hz()).budget(1_u64.ms()).build()?;
+sched.add(MotorMixer::new()?).order(3).rate(1000_u64.hz()).budget(100_u64.us()).build()?;
+
+sched.run()?;
+```
+
+---
+
+## See Also
+
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) — Conceptual overview and architecture
+- [Execution Classes](/concepts/execution-classes) — The 5 execution classes and when to use each
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Advanced tuning and deployment patterns
+- [Safety Monitor](/advanced/safety-monitor) — Budget enforcement and graduated degradation
+- [BlackBox](/advanced/blackbox) — Flight recorder for post-mortem analysis
+- [Node API](/concepts/core-concepts-nodes) — The Node trait and lifecycle
+- [DurationExt](/rust/api/duration-ext) — `.hz()`, `.ms()`, `.us()` ergonomic helpers
+- [Python Bindings](/python/api/python-bindings) — Python Scheduler API
+- [Driver API](/rust/api/drivers) — Load hardware from config

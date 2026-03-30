@@ -1,0 +1,435 @@
+---
+title: "Differential Drive"
+description: "Convert CmdVel velocity commands to left/right motor outputs with kinematics, odometry, and safety shutdown"
+order: 2
+---
+
+# Differential Drive
+
+Differential drive is the workhorse of mobile robotics. From TurtleBots in research labs to warehouse AGVs moving pallets at Amazon, from sidewalk delivery robots to hospital logistics carts — two independently driven wheels with a caster is the simplest platform that can both drive forward and turn in place. If you are building a ground robot, there is a good chance it is differential drive.
+
+The pattern is straightforward: take a velocity command (how fast, which direction) and split it into two wheel speeds. But production code needs more than kinematics — it needs RPM clamping so a bad upstream command cannot burn out a motor, odometry integration so the robot knows where it is, and a safe shutdown that zeros both wheels before the process exits. This recipe covers all three.
+
+## When To Use This
+
+- Any 2-wheel differential drive robot (TurtleBot, warehouse AGV, hobby bots)
+- Converting `CmdVel` from a path planner or teleoperation to motor outputs
+- When you need velocity clamping and safe shutdown
+
+**Use [Servo Controller](/recipes/servo-controller) instead** for directly commanding servo positions. **Use [DifferentialDriveCommand](/rust/api/control-messages) instead** if your motor driver accepts left/right wheel speeds directly.
+
+## Prerequisites
+
+- [Quick Start](/getting-started/quick-start) completed
+- Familiarity with [CmdVel](/stdlib/messages/cmd-vel) and the [Node trait](/concepts/core-concepts-nodes)
+
+## Kinematics
+
+A differential drive robot has two wheels separated by a distance **L** (the wheel base), each with radius **r**. A `CmdVel` command provides two values: linear velocity **v** (m/s, forward/backward) and angular velocity **omega** (rad/s, turning). The job is to convert `(v, omega)` into individual wheel angular velocities.
+
+```text
+        ┌───────── L ─────────┐
+        │                     │
+   ┌────┤                     ├────┐
+   │ L  │        Robot        │ R  │
+   │    │       Center        │    │
+   │    │         ●───► v     │    │
+   │    │         │           │    │
+   └────┤         ▼ ω         ├────┘
+        │                     │
+        └─────────────────────┘
+
+   L = wheel base (center-to-center distance)
+   v = linear velocity (m/s, forward)
+   ω = angular velocity (rad/s, counter-clockwise positive)
+```
+
+The conversion follows from the fact that the left wheel traces the inner arc and the right wheel traces the outer arc during a turn:
+
+```text
+v_left  = v - ω * L / 2
+v_right = v + ω * L / 2
+```
+
+Where `v_left` and `v_right` are the linear velocities at each wheel (m/s). To get angular velocity of each wheel in rad/s, divide by the wheel radius **r**:
+
+```text
+ω_left  = (v - ω * L / 2) / r
+ω_right = (v + ω * L / 2) / r
+```
+
+**Intuition**: When `omega = 0` (driving straight), both wheels spin at the same speed `v / r`. When `v = 0` and `omega > 0` (turning in place), the left wheel spins backward and the right wheel spins forward at equal magnitude `omega * L / (2 * r)`.
+
+## Solution
+
+### horus.toml
+
+```toml
+[package]
+name = "differential-drive"
+version = "0.1.0"
+description = "2-wheel differential drive with safe shutdown"
+```
+
+### src/main.rs (or src/main.py)
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    /// Robot physical parameters
+    const WHEEL_BASE: f32 = 0.3;    // meters between wheels
+    const WHEEL_RADIUS: f32 = 0.05; // meters
+    const MAX_RPM: f32 = 200.0;     // safety limit
+
+    /// Motor output for left and right wheels
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+    #[repr(C)]
+    struct WheelCmd {
+        left_rpm: f32,
+        right_rpm: f32,
+    }
+
+    struct DriveNode {
+        cmd_sub: Topic<CmdVel>,
+        wheel_pub: Topic<WheelCmd>,
+        last_cmd: CmdVel,
+    }
+
+    impl DriveNode {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                cmd_sub: Topic::new("cmd_vel")?,
+                wheel_pub: Topic::new("wheel.cmd")?,
+                last_cmd: CmdVel::default(),
+            })
+        }
+    }
+
+    impl Node for DriveNode {
+        fn name(&self) -> &str { "Drive" }
+
+        fn tick(&mut self) {
+            if let Some(cmd) = self.cmd_sub.recv() {
+                self.last_cmd = cmd;
+            }
+
+            // Differential drive kinematics: (linear, angular) → (left, right)
+            let v = self.last_cmd.linear;
+            let w = self.last_cmd.angular;
+            let left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+            let right = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+
+            // Convert rad/s to RPM and clamp to safety limit
+            let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
+            let left_rpm = (left * to_rpm).clamp(-MAX_RPM, MAX_RPM);
+            let right_rpm = (right * to_rpm).clamp(-MAX_RPM, MAX_RPM);
+
+            self.wheel_pub.send(WheelCmd { left_rpm, right_rpm });
+        }
+
+        // SAFETY: zero both motors before exiting — prevents runaway
+        fn shutdown(&mut self) -> Result<()> {
+            self.wheel_pub.send(WheelCmd { left_rpm: 0.0, right_rpm: 0.0 });
+            Ok(())
+        }
+    }
+
+    fn main() -> Result<()> {
+        let mut scheduler = Scheduler::new();
+
+        scheduler.add(DriveNode::new()?)
+            .order(0)
+            .rate(50_u64.hz())     // 50 Hz control loop — auto-enables RT
+            .on_miss(Miss::Warn)
+            .build()?;
+
+        scheduler.run()
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    from horus import Node, CmdVel, run, us
+    import math
+
+    WHEEL_BASE = 0.3      # meters between wheels
+    WHEEL_RADIUS = 0.05   # meters
+    MAX_RPM = 200.0        # safety limit
+
+    def drive_tick(node):
+        cmd = node.recv("cmd_vel")
+        if cmd is not None:
+            node.state["last_cmd"] = cmd
+
+        last = node.state.get("last_cmd")
+        if last is None:
+            return
+
+        v = last.linear
+        w = last.angular
+
+        # Differential drive kinematics
+        left_rad = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
+        right_rad = (v + w * WHEEL_BASE / 2.0) / WHEEL_RADIUS
+
+        # Convert rad/s to RPM and clamp
+        to_rpm = 60.0 / (2.0 * math.pi)
+        left_rpm = max(-MAX_RPM, min(MAX_RPM, left_rad * to_rpm))
+        right_rpm = max(-MAX_RPM, min(MAX_RPM, right_rad * to_rpm))
+
+        node.send("wheel.cmd", {"left_rpm": left_rpm, "right_rpm": right_rpm})
+
+    def drive_shutdown(node):
+        # SAFETY: zero both motors before exiting
+        node.send("wheel.cmd", {"left_rpm": 0.0, "right_rpm": 0.0})
+
+    drive = Node(
+        name="Drive",
+        tick=drive_tick,
+        shutdown=drive_shutdown,
+        rate=50,
+        order=0,
+        subs=["cmd_vel"],
+        pubs=["wheel.cmd"],
+    )
+
+    run(drive, rt=True)
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## Odometry: Closing the Loop
+
+Driving blind is fine for teleoperation, but any autonomous behavior needs position feedback. Odometry integrates wheel encoder ticks into a `(x, y, theta)` estimate. This is dead reckoning — it drifts over time, but it is the foundation that every higher-level system (SLAM, path planning, localization) builds on.
+
+The math mirrors the kinematics in reverse. Instead of splitting a velocity command into wheel speeds, we combine wheel displacements back into a robot displacement:
+
+```text
+Δs = (Δleft + Δright) / 2          distance traveled by robot center
+Δθ = (Δright - Δleft) / L          change in heading
+x += Δs * cos(θ + Δθ / 2)          update x position
+y += Δs * sin(θ + Δθ / 2)          update y position
+θ += Δθ                             update heading
+```
+
+Where `Δleft` and `Δright` are the linear distances each wheel traveled since the last tick, computed from encoder ticks:
+
+```text
+Δleft  = (left_ticks  - prev_left_ticks)  * meters_per_tick
+Δright = (right_ticks - prev_right_ticks) * meters_per_tick
+```
+
+The `cos(theta + d_theta / 2)` term (rather than just `cos(theta)`) is the second-order Runge-Kutta integration. It assumes the robot followed a circular arc during the tick, not a straight line. This reduces drift when turning.
+
+### Odometry Node
+
+```rust
+// simplified
+use horus::prelude::*;
+
+const WHEEL_BASE: f32 = 0.3;
+const TICKS_PER_REV: f32 = 1440.0;      // encoder resolution
+const WHEEL_CIRCUMFERENCE: f32 = 0.314;  // 2 * π * 0.05m radius
+const METERS_PER_TICK: f32 = WHEEL_CIRCUMFERENCE / TICKS_PER_REV;
+
+/// Raw encoder readings from motor driver
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
+#[repr(C)]
+struct WheelEncoder {
+    left_ticks: i64,
+    right_ticks: i64,
+}
+
+struct OdometryNode {
+    encoder_sub: Topic<WheelEncoder>,
+    odom_pub: Topic<Odometry>,
+    prev_left: i64,
+    prev_right: i64,
+    x: f64,
+    y: f64,
+    theta: f64,
+    initialized: bool,
+}
+
+impl OdometryNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            encoder_sub: Topic::new("wheel.encoder")?,
+            odom_pub: Topic::new("odom")?,
+            prev_left: 0,
+            prev_right: 0,
+            x: 0.0,
+            y: 0.0,
+            theta: 0.0,
+            initialized: false,
+        })
+    }
+}
+
+impl Node for OdometryNode {
+    fn name(&self) -> &str { "Odometry" }
+
+    fn tick(&mut self) {
+        let enc = match self.encoder_sub.recv() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // First reading — just record baseline, no integration
+        if !self.initialized {
+            self.prev_left = enc.left_ticks;
+            self.prev_right = enc.right_ticks;
+            self.initialized = true;
+            return;
+        }
+
+        // Convert encoder deltas to linear distance
+        let d_left = (enc.left_ticks - self.prev_left) as f64 * METERS_PER_TICK as f64;
+        let d_right = (enc.right_ticks - self.prev_right) as f64 * METERS_PER_TICK as f64;
+        self.prev_left = enc.left_ticks;
+        self.prev_right = enc.right_ticks;
+
+        // Dead reckoning integration (second-order Runge-Kutta)
+        let ds = (d_left + d_right) / 2.0;
+        let d_theta = (d_right - d_left) / WHEEL_BASE as f64;
+        let mid_theta = self.theta + d_theta / 2.0;
+        self.x += ds * mid_theta.cos();
+        self.y += ds * mid_theta.sin();
+        self.theta += d_theta;
+
+        let mut odom = Odometry::default();
+        odom.pose = Pose2D {
+            x: self.x,
+            y: self.y,
+            theta: self.theta,
+            ..Default::default()
+        };
+        self.odom_pub.send(odom);
+    }
+}
+```
+
+### Running Both Nodes Together
+
+```rust
+// simplified
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+
+    // Order matters: odometry reads encoders first, drive writes commands second
+    scheduler.add(OdometryNode::new()?)
+        .order(0)
+        .rate(50_u64.hz())
+        .build()?;
+
+    scheduler.add(DriveNode::new()?)
+        .order(1)
+        .rate(50_u64.hz())
+        .on_miss(Miss::Warn)
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+## Understanding the Code
+
+- **Kinematics**: `v - w*L/2` and `v + w*L/2` is the standard unicycle-to-differential conversion, where `v` is linear velocity, `w` is angular velocity, and `L` is the wheel base
+- **`#[repr(C)]` + `Copy`** on `WheelCmd` enables zero-copy shared memory transport
+- **`.rate(50_u64.hz())`** auto-enables RT with 80% budget (16 ms) and 95% deadline (19 ms)
+- **`shutdown()`** sends zero RPM — prevents wheels spinning if the program crashes mid-tick
+- **`clamp()`** enforces motor safety limits even if upstream sends dangerous velocities
+
+## Design Decisions
+
+### Why shutdown zeros velocity
+
+If the drive node crashes or the user hits Ctrl+C mid-tick, the last `WheelCmd` published to shared memory persists. Any downstream motor driver reading that topic will keep spinning the wheels at whatever speed was last commanded. The `shutdown()` method is the only guaranteed opportunity to publish a safe value before the process exits. This is not optional — it is the difference between a robot that stops and a robot that drives into a wall.
+
+### Why RPM clamping
+
+A path planner bug, a corrupted message, or a numerical overflow can produce arbitrarily large velocity commands. Without clamping, those commands pass straight through to the motor driver. At best, the driver rejects them and the robot does nothing. At worst, the driver accepts them and the motor stalls, overheats, or strips gears. The `MAX_RPM` constant acts as a last line of defense that is independent of upstream correctness.
+
+### Why fixed constants instead of parameter tuning
+
+`WHEEL_BASE`, `WHEEL_RADIUS`, and `MAX_RPM` are compile-time constants in this recipe for clarity. In production, load them from a config file or `horus.toml` parameters so you can calibrate per-robot without recompiling. The trade-off: constants are faster (no lookup), parameters are flexible (no rebuild). For a fleet of identical robots, constants are fine. For heterogeneous hardware, use parameters.
+
+### Why f64 for odometry
+
+The drive node uses `f32` because motor commands do not accumulate error — each tick produces an independent output. Odometry is different: `x`, `y`, and `theta` are running sums that grow over thousands of ticks. With `f32` (about 7 decimal digits), a robot at `x = 100.0` meters loses sub-millimeter resolution. `f64` (about 15 decimal digits) keeps sub-micrometer precision out to kilometers. The final `Odometry` message is still `f32` because downstream consumers (visualization, path planner) do not need `f64` precision.
+
+## Trade-offs
+
+| Decision | Upside | Downside |
+|----------|--------|----------|
+| 50 Hz control loop | Smooth enough for most ground robots, low CPU cost | Too slow for high-speed or high-inertia platforms (use 200+ Hz) |
+| RPM clamping | Prevents motor damage from bad upstream commands | Silent saturation — path planner does not know it was clamped |
+| Dead reckoning odometry | No extra sensors needed, always available | Drift accumulates — unusable alone over long distances |
+| Second-order integration | Reduces drift during turns vs first-order | Marginally more computation per tick (one extra trig call) |
+| `WheelCmd` as RPM | Matches most hobby motor drivers directly | Industrial drives may expect rad/s, m/s, or duty cycle |
+| Fixed constants | No config loading, zero runtime overhead | Must recompile to change robot dimensions |
+| Separate drive + odom nodes | Independent rates, independent failure | Two nodes sharing `WHEEL_BASE` must stay in sync |
+
+## Variations
+
+<Details title="Holonomic (Mecanum) Drive">
+
+For a 4-wheel mecanum drive, extend `WheelCmd` to 4 wheels and use the mecanum kinematic model:
+
+```rust
+// simplified
+let fl = (v - w * L / 2.0 - vy) / WHEEL_RADIUS;
+let fr = (v + w * L / 2.0 + vy) / WHEEL_RADIUS;
+let rl = (v - w * L / 2.0 + vy) / WHEEL_RADIUS;
+let rr = (v + w * L / 2.0 - vy) / WHEEL_RADIUS;
+```
+
+This requires a 3-DOF velocity command — use `Twist` instead of `CmdVel`.
+
+</Details>
+
+<Details title="Acceleration Limiting">
+
+Add a ramp rate to prevent wheel slip on sudden velocity changes:
+
+```rust
+// simplified
+let max_accel = 2.0; // rad/s² per tick
+let target_left = (v - w * WHEEL_BASE / 2.0) / WHEEL_RADIUS;
+let limited_left = self.prev_left + (target_left - self.prev_left).clamp(-max_accel * dt, max_accel * dt);
+self.prev_left = limited_left;
+```
+
+</Details>
+
+<Details title="Odometry Feedback">
+
+Add wheel encoder integration to publish `Odometry` alongside wheel commands. See [Multi-Sensor Fusion](/recipes/multi-sensor-fusion) for combining with IMU.
+
+</Details>
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot drives in circles | Wheel base constant wrong | Measure center-to-center distance between wheels |
+| Motors overshoot on startup | No acceleration limiting | Add a ramp rate (see Variations above) |
+| Robot drifts when commanded straight | Wheel radii unequal | Calibrate `WHEEL_RADIUS` per wheel |
+| Wheels spin after Ctrl+C | Missing `shutdown()` | Always send zero in `shutdown()` |
+| Motor driver rejects commands | RPM exceeds driver limit | Reduce `MAX_RPM` to match your hardware |
+| Odometry drifts in a curve | Wheel base measured wrong | Spin robot 360 degrees, compare actual vs reported angle |
+| Odometry jumps on first tick | Missing initialization guard | Skip integration on first encoder reading (see `initialized` flag) |
+| Position loses precision far from origin | Using f32 for odometry state | Use f64 for running sums, cast to f32 only in the output message |
+
+## See Also
+
+- [CmdVel](/stdlib/messages/cmd-vel) — Velocity command type
+- [Odometry](/stdlib/messages/odometry) — Position feedback from wheel encoders
+- [Motor Controller Tutorial](/tutorials/02-motor-controller) — Step-by-step motor control
+- [Emergency Stop Recipe](/recipes/emergency-stop) — Override cmd_vel on safety trigger
+- [PID Controller Recipe](/recipes/pid-controller) — Closed-loop control for velocity tracking
+- [Multi-Sensor Fusion](/recipes/multi-sensor-fusion) — Combine wheel odometry with IMU

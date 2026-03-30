@@ -1,0 +1,309 @@
+---
+title: "Deterministic Mode"
+description: "Run-to-run reproducible execution with SimClock, dependency ordering, and deterministic RNG for simulation, testing, and replay"
+weight: 35
+---
+
+# Deterministic Mode
+
+You need reproducible, bit-identical execution across runs for simulation, testing, or replay. Here is how to enable deterministic mode and what it changes about scheduler behavior.
+
+## When To Use This
+
+- You are running physics simulation and need virtual time (SimClock) instead of wall clock
+- You want CI tests that never flake due to timing nondeterminism
+- You are replaying recorded sessions for regression testing
+- You need to compare two runs and verify identical outputs
+
+**Do not use for real hardware.** Deterministic mode uses virtual time -- a motor controller receiving `horus::dt()` gets a fixed value regardless of how fast ticks actually execute. Use normal mode for real actuators.
+
+## Prerequisites
+
+- Familiarity with [Scheduler](/concepts/core-concepts-scheduler) and [Scheduler Configuration](/advanced/scheduler-configuration)
+- Understanding of [Nodes](/concepts/core-concepts-nodes) (especially `publishers()` and `subscribers()` for dependency ordering)
+
+## Enabling Deterministic Mode
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    let mut scheduler = Scheduler::new()
+        .deterministic(true)       // SimClock + dependency ordering
+        .tick_rate(100_u64.hz());
+
+    scheduler.add(Controller::new())
+        .order(0)
+        .rate(100_u64.hz())
+        .build()?;
+
+    // Each tick_once() produces identical results every run
+    for _ in 0..1000 {
+        scheduler.tick_once()?;
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    scheduler = horus.Scheduler(tick_rate=100, deterministic=True)
+    scheduler.add(horus.Node(tick=controller_fn, rate=100, order=0))
+
+    # Each tick_once() produces identical results every run
+    for _ in range(1000):
+        scheduler.tick_once()
+    ```
+  </LangTab>
+</LanguageTabs>
+
+## What Changes in Deterministic Mode
+
+| Aspect | Normal Mode | Deterministic Mode |
+|--------|-------------|-------------------|
+| Clock | Wall clock (real time) | Virtual SimClock (fixed dt per tick) |
+| RNG | System entropy | Tick-seeded (reproducible) |
+| Execution order | Parallel by execution class | Dependency-ordered steps |
+| Independent nodes | Parallel | Still parallel |
+| Dependent nodes | Parallel (races possible) | Sequenced (producer before consumer) |
+| Execution classes | All active | All active |
+| Failure policies | Active | Active |
+| Watchdog | Active | Active |
+
+**What does NOT change**: execution classes (RT, Compute, AsyncIo, Event, BestEffort), failure policies, watchdog, budget/deadline monitoring. Deterministic mode does not degrade the scheduling system — it adds ordering guarantees.
+
+## Framework Time API
+
+Use `horus::now()`, `horus::dt()`, and `horus::rng()` instead of `Instant::now()` and `rand::random()`. These are the standard framework API — same pattern as `hlog!()` for logging.
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    use horus::prelude::*;
+
+    struct Controller {
+        position: f64,
+        velocity: f64,
+    }
+
+    impl Node for Controller {
+        fn tick(&mut self) {
+            // horus::dt() returns fixed 1/rate in deterministic mode,
+            // real elapsed in normal mode
+            let dt = horus::dt();
+            self.position += self.velocity * dt.as_secs_f64();
+
+            // horus::rng() is tick-seeded in deterministic mode,
+            // system entropy in normal mode
+            let noise: f64 = horus::rng(|r| {
+                use rand::Rng;
+                r.gen_range(-0.01..0.01)
+            });
+            self.velocity += noise;
+
+            hlog!(debug, "pos={:.3} at t={:?}", self.position, horus::elapsed());
+        }
+    }
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+    import random
+
+    position = 0.0
+    velocity = 0.0
+
+    def controller_tick(node):
+        global position, velocity
+        # horus.dt() returns fixed 1/rate in deterministic mode
+        dt = horus.dt()
+        position += velocity * dt
+
+        # Use seeded RNG for deterministic noise
+        noise = random.uniform(-0.01, 0.01)
+        velocity += noise
+
+        node.log_debug(f"pos={position:.3f} at t={horus.elapsed()}")
+    ```
+  </LangTab>
+</LanguageTabs>
+
+See the [Time API reference](/rust/time-api) for the full API.
+
+## Dependency Ordering
+
+The scheduler builds a dependency graph from nodes' `publishers()` and `subscribers()` metadata. Dependent nodes are sequenced (producer before consumer). Independent nodes run in parallel.
+
+```rust
+// simplified
+struct SensorDriver {
+    scan_topic: Topic<LaserScan>,
+}
+
+impl Node for SensorDriver {
+    fn name(&self) -> &str { "sensor" }
+
+    fn publishers(&self) -> Vec<TopicMetadata> {
+        vec![TopicMetadata {
+            topic_name: "scan".into(),
+            type_name: "LaserScan".into(),
+        }]
+    }
+
+    fn tick(&mut self) {
+        self.scan_topic.send(self.read_hardware());
+    }
+}
+
+struct Controller {
+    scan_topic: Topic<LaserScan>,
+    cmd_topic: Topic<CmdVel>,
+}
+
+impl Node for Controller {
+    fn name(&self) -> &str { "controller" }
+
+    fn subscribers(&self) -> Vec<TopicMetadata> {
+        vec![TopicMetadata {
+            topic_name: "scan".into(),
+            type_name: "LaserScan".into(),
+        }]
+    }
+
+    fn publishers(&self) -> Vec<TopicMetadata> {
+        vec![TopicMetadata {
+            topic_name: "cmd".into(),
+            type_name: "CmdVel".into(),
+        }]
+    }
+
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_topic.try_recv() {
+            let cmd = self.compute_velocity(&scan);
+            self.cmd_topic.send(cmd);
+        }
+    }
+}
+```
+
+The scheduler automatically ensures `sensor` ticks before `controller` because `controller` subscribes to a topic that `sensor` publishes.
+
+### Fallback Without Metadata
+
+If nodes don't implement `publishers()` / `subscribers()`, the scheduler uses `.order()` values as a proxy: lower order runs first, same order = independent (parallel).
+
+## Normal vs Deterministic: When to Use Which
+
+| Purpose | Mode | Why |
+|---------|------|-----|
+| Real robot deployment | Normal | Wall clock matches hardware reality |
+| Simulation (physics engine) | Deterministic | Virtual clock matches physics time |
+| Unit / integration tests | Deterministic | Reproducible, no flakes |
+| CI pipeline | Deterministic | Same result every run |
+| Record/replay debugging | Replay (`replay_from()`) | Recorded clock reproduces exact scenario |
+| Recording a session on real robot | Normal + `.with_recording()` | Wall clock for hardware, recording for later |
+
+**Deterministic mode uses virtual time** — it cannot drive real hardware. A motor controller receiving `horus::dt()` in deterministic mode gets a fixed value (e.g., exactly 1ms for 1kHz), regardless of how fast ticks actually execute. This is correct for simulation but wrong for real actuators.
+
+## Record and Replay
+
+<LanguageTabs>
+  <LangTab language="Rust">
+    ```rust
+// simplified
+    // Record a session
+    let mut scheduler = Scheduler::new()
+        .deterministic(true)
+        .with_recording()
+        .tick_rate(100_u64.hz());
+
+    scheduler.add(Sensor::new()).order(0).build()?;
+    scheduler.add(Controller::new()).order(1).build()?;
+    scheduler.run_for(10_u64.secs())?;
+
+    // Replay — bit-identical output
+    let mut replay = Scheduler::replay_from(
+        "~/.horus/recordings/session_001/scheduler@abc123.horus".into()
+    )?;
+    replay.run()?;
+
+    // Mixed replay — recorded sensors, new controller
+    let mut replay = Scheduler::replay_from(path)?;
+    replay.add(ControllerV2::new()).order(1).rate(100_u64.hz()).build()?;
+    replay.run()?;
+    ```
+  </LangTab>
+  <LangTab language="Python">
+    ```python
+    import horus
+
+    # Record a session
+    scheduler = horus.Scheduler(tick_rate=100, deterministic=True, recording=True)
+    scheduler.add(horus.Node(tick=sensor_fn, order=0))
+    scheduler.add(horus.Node(tick=controller_fn, order=1))
+    scheduler.run_for(10.0)  # 10 seconds
+
+    # Replay via CLI
+    # horus record replay my_session
+    # horus record replay my_session --speed 0.5
+    ```
+  </LangTab>
+</LanguageTabs>
+
+During replay, recorded topic data is injected into shared memory so live subscriber nodes see the replayed data.
+
+## Determinism Guarantees
+
+**What HORUS guarantees**: same binary + same hardware produces bit-identical outputs, tick for tick, across unlimited runs.
+
+**What is NOT deterministic** (hardware/compiler, not HORUS):
+- **Cross-platform float**: IEEE 754 differs across CPUs (FMA, extended precision). Same binary + same hardware = deterministic.
+- **Direct `Instant::now()`**: Bypasses the framework clock. Use `horus::now()` instead.
+- **`HashMap` iteration**: Rust randomizes per process. Use `BTreeMap` in deterministic nodes.
+
+## Design Decisions
+
+**Why virtual time instead of slowed-down wall clock?**
+
+A slowed wall clock still introduces nondeterminism from OS scheduling jitter. Virtual time (SimClock) advances by exactly `1/rate` per tick, making output bit-identical across runs. This is the same approach used by Gazebo, Drake, and Isaac Sim.
+
+**Why tick-seeded RNG instead of a global seed?**
+
+A global seed produces different sequences if nodes are added or removed. Tick-seeded RNG produces the same value at tick N regardless of how many nodes are in the system, making results stable across configuration changes.
+
+**Why dependency ordering instead of always-sequential?**
+
+Sequential execution is deterministic but slow. Dependency ordering gives the same guarantees (producer before consumer) while allowing independent nodes to run in parallel. This matches real-world robotics where sensor nodes have no dependencies on each other.
+
+## Trade-offs
+
+| Gain | Cost |
+|------|------|
+| Bit-identical runs for testing and replay | Cannot drive real hardware (virtual time) |
+| Dependency ordering eliminates data races | Requires `publishers()` and `subscribers()` metadata for automatic ordering |
+| Tick-seeded RNG is stable across config changes | Must use `horus::rng()` instead of `rand::random()` |
+| Independent nodes still run in parallel | Dependent nodes are serialized (slower than normal mode) |
+
+## Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Different results across runs | Using `Instant::now()` or `rand::random()` directly | Use `horus::now()`, `horus::dt()`, and `horus::rng()` instead |
+| Different results across platforms | IEEE 754 float differences (FMA, extended precision) | Expected. Same binary + same hardware = deterministic |
+| Nodes execute in unexpected order | Missing `publishers()` / `subscribers()` metadata | Implement metadata on nodes, or use `.order()` as fallback |
+| `HashMap` iteration order varies | Rust randomizes HashMap per process | Use `BTreeMap` in deterministic nodes |
+| Motor overshoots in deterministic mode | Virtual time does not match real actuator timing | Do not use deterministic mode with real hardware |
+| Replay produces different output | Code changed between recording and replay | Replay requires the same binary version |
+
+---
+
+## See Also
+
+- [Record & Replay](/advanced/record-replay) — Session recording and mixed replay
+- [Scheduler Configuration](/advanced/scheduler-configuration) — Builder methods including `.deterministic(true)`
+- [Time API](/rust/time-api) — SimClock, `horus::now()`, `horus::dt()`, `horus::rng()`
+- [Scheduler Concepts](/concepts/core-concepts-scheduler) — How the scheduler manages node execution

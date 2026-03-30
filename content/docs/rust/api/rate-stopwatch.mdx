@@ -1,0 +1,170 @@
+---
+title: "Rate & Stopwatch"
+description: "Fixed-frequency rate limiting and elapsed time measurement for background threads and performance profiling"
+weight: 28
+---
+
+# Rate & Stopwatch
+
+Two timing utilities exported from `horus::prelude::*` for use outside the scheduler's tick loop.
+
+```rust
+// simplified
+use horus::prelude::*;
+```
+
+## Rate — Fixed-Frequency Loop
+
+`Rate` is the HORUS equivalent of ROS2's `rclcpp::Rate`. Use it for standalone threads that need to run at a target frequency without a scheduler.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Hardware polling thread at 100 Hz
+std::thread::spawn(|| {
+    let mut rate = Rate::new(100.0);
+    loop {
+        let reading = read_sensor();
+        process(reading);
+        rate.sleep(); // Sleeps the remaining fraction of 10ms
+    }
+});
+```
+
+### How It Works
+
+`rate.sleep()` calculates how much time remains in the current period and sleeps for that duration. If work took longer than the period, sleep is skipped and the next cycle catches up — no drift accumulation.
+
+### API
+
+| Method | Returns | Description |
+|---|---|---|
+| `Rate::new(hz)` | `Rate` | Create a rate limiter at `hz` Hz. Panics if `hz <= 0` |
+| `.sleep()` | `()` | Sleep for the remainder of the current period |
+| `.actual_hz()` | `f64` | Exponentially smoothed actual frequency |
+| `.target_hz()` | `f64` | The target frequency in Hz |
+| `.period()` | `Duration` | The target period (1/hz) |
+| `.reset()` | `()` | Reset cycle start to now (use after a long pause) |
+| `.is_late()` | `bool` | Whether the current cycle exceeded the target period |
+
+### Example: Hardware Driver Thread
+
+```rust
+// simplified
+use horus::prelude::*;
+
+struct CanBusReader {
+    topic: Topic<MotorCommand>,
+}
+
+impl CanBusReader {
+    fn run(&mut self) {
+        let mut rate = Rate::new(500.0); // 500 Hz CAN bus polling
+        loop {
+            if let Some(frame) = self.read_can_frame() {
+                let cmd = MotorCommand::from_can(frame);
+                self.topic.send(cmd);
+            }
+
+            if rate.is_late() {
+                hlog!(warn, "CAN polling late — actual {:.0} Hz", rate.actual_hz());
+            }
+
+            rate.sleep();
+        }
+    }
+}
+```
+
+### When to Use Rate vs Scheduler
+
+| Scenario | Use |
+|---|---|
+| Node with `tick()` in a scheduler | Scheduler handles timing — don't use Rate |
+| Background thread polling hardware | `Rate` |
+| Standalone process (no scheduler) | `Rate` |
+| One-off timed loop in a test | `Rate` |
+
+## Stopwatch — Elapsed Time
+
+`Stopwatch` measures elapsed time with lap support. Useful for profiling operations inside nodes.
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut sw = Stopwatch::start();
+expensive_computation();
+hlog!(debug, "computation took {:.2} ms", sw.elapsed_ms());
+```
+
+### API
+
+| Method | Returns | Description |
+|---|---|---|
+| `Stopwatch::start()` | `Stopwatch` | Create and start immediately |
+| `.elapsed()` | `Duration` | Time since start (or last reset) |
+| `.elapsed_us()` | `u64` | Elapsed microseconds |
+| `.elapsed_ms()` | `f64` | Elapsed milliseconds (fractional) |
+| `.lap()` | `Duration` | Return elapsed and reset (for split timing) |
+| `.reset()` | `()` | Reset start time to now |
+
+### Example: Profiling a Node
+
+```rust
+// simplified
+use horus::prelude::*;
+
+struct PlannnerNode {
+    scan_sub: Topic<LaserScan>,
+    path_pub: Topic<NavPath>,
+}
+
+impl Node for PlannnerNode {
+    fn name(&self) -> &str { "Planner" }
+
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_sub.recv() {
+            let mut sw = Stopwatch::start();
+
+            let path = self.compute_path(&scan);
+            let plan_time = sw.lap();
+
+            self.path_pub.send(path);
+            let total_time = sw.elapsed();
+
+            hlog!(debug, "plan={:.1}ms total={:.1}ms",
+                plan_time.as_secs_f64() * 1000.0,
+                (plan_time + total_time).as_secs_f64() * 1000.0);
+        }
+    }
+}
+```
+
+### Example: Multi-Lap Benchmarking
+
+```rust
+// simplified
+let mut sw = Stopwatch::start();
+
+let data = load_model();
+let load_time = sw.lap();
+
+let result = run_inference(&data);
+let infer_time = sw.lap();
+
+save_result(&result);
+let save_time = sw.lap();
+
+hlog!(info, "load={:.1}ms infer={:.1}ms save={:.1}ms",
+    load_time.as_secs_f64() * 1000.0,
+    infer_time.as_secs_f64() * 1000.0,
+    save_time.as_secs_f64() * 1000.0);
+```
+
+## See Also
+
+- **[Time API](/rust/time-api)** — `horus::now()`, `horus::dt()`, `horus::elapsed()` for scheduler-aware time
+- **[DurationExt](/rust/api/duration-ext)** — `100_u64.hz()`, `200_u64.us()` ergonomic helpers
+- **[Scheduler](/rust/api/scheduler)** — built-in rate control via `.rate()` and `.tick_rate()`

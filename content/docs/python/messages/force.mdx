@@ -1,0 +1,363 @@
+---
+title: "Force & Haptics Messages"
+description: "Force sensing, impedance control, haptic feedback, and tactile types for Python robotics — every method explained"
+order: 6
+---
+
+# Force & Haptics Messages
+
+Force messages handle the physical interaction between your robot and the world — measuring contact forces, commanding force-controlled actuators, adjusting compliance, and providing haptic feedback to operators. This is the most physics-intensive message category.
+
+```python
+# simplified
+from horus import (
+    WrenchStamped, ForceCommand, ImpedanceParameters,
+    HapticFeedback, ContactInfo, TactileArray, Vector3,
+)
+```
+
+---
+
+## WrenchStamped
+
+A 6-DOF force/torque measurement from a force/torque sensor. "Wrench" is the physics term for combined force + torque.
+
+### Constructor
+
+```python
+# simplified
+wrench = WrenchStamped(fx=10.0, fy=0.0, fz=-9.81, tx=0.0, ty=0.5, tz=0.0)
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `fx`, `fy`, `fz` | `float` | Force components in Newtons (N) |
+| `tx`, `ty`, `tz` | `float` | Torque components in Newton-meters (Nm) |
+| `timestamp_ns` | `int` | Measurement timestamp in nanoseconds |
+
+### `.force_only(vector)` — Force Without Torque
+
+```python
+# simplified
+from horus import Vector3
+w = WrenchStamped.force_only(Vector3(x=0.0, y=0.0, z=-20.0))
+# torque is zero
+```
+
+Creates a wrench with only force components. Use when modeling pure forces (gravity, push/pull) without any rotational component.
+
+### `.torque_only(vector)` — Torque Without Force
+
+```python
+# simplified
+w = WrenchStamped.torque_only(Vector3(x=0.0, y=0.5, z=0.0))
+# force is zero
+```
+
+### `.force_magnitude()` — Total Force Strength
+
+```python
+# simplified
+print(f"Force: {wrench.force_magnitude():.1f} N")
+```
+
+Euclidean magnitude of the force vector: `sqrt(fx² + fy² + fz²)`. This is the total force regardless of direction — use it for safety checks ("is the force too high?") and monitoring.
+
+Typical ranges by robot type:
+- **Small arm (UR3)**: 0-30N normal, >50N = concerning
+- **Large arm (UR10)**: 0-100N normal, >150N = concerning
+- **Gripper**: 0-50N grasp force
+
+### `.torque_magnitude()` — Total Torque Strength
+
+```python
+# simplified
+print(f"Torque: {wrench.torque_magnitude():.2f} Nm")
+```
+
+### `.exceeds_limits(max_force, max_torque)` — Safety Check
+
+```python
+# simplified
+if wrench.exceeds_limits(max_force=50.0, max_torque=5.0):
+    estop_topic.send(EmergencyStop.engage("Force limit exceeded"), node)
+    cmd_topic.send(CmdVel.zero(), node)
+```
+
+Returns `True` if either `force_magnitude() > max_force` OR `torque_magnitude() > max_torque`. **This is a safety-critical method** — call it every tick when the robot is in contact with the environment or near humans.
+
+> **Common mistake:** Not calling this frequently enough. Force spikes happen in milliseconds — checking at 10Hz might miss a dangerous impact. Check at your control rate (typically 100-1000Hz).
+
+### `.filter(prev_wrench, alpha)` — Noise Smoothing
+
+```python
+# simplified
+prev = wrench  # Save previous reading
+new_reading = WrenchStamped(fx=10.5, fy=0.1, fz=-9.8, tx=0.0, ty=0.5, tz=0.0)
+new_reading.filter(prev, alpha=0.8)
+# Result: 80% new reading + 20% previous reading
+```
+
+Applies exponential moving average (EMA) filter in-place. `alpha` controls responsiveness:
+- **0.9-1.0**: Very responsive but noisy — use for collision detection
+- **0.5-0.8**: Balanced — use for force control
+- **0.1-0.3**: Very smooth but laggy — use for slow-changing measurements
+
+> **Common mistake:** Not filtering force/torque sensor data. Raw readings are noisy, and noise causes false safety triggers and jittery force control. Always filter.
+
+---
+
+## ForceCommand
+
+Commands for force-controlled actuators.
+
+### `.force_only(target)` — Pure Force Command
+
+```python
+# simplified
+cmd = ForceCommand.force_only(Vector3(x=0.0, y=0.0, z=-10.0))
+# Push down with 10N
+```
+
+Commands the actuator to apply the specified force. The controller maintains the target force using feedback from a force/torque sensor.
+
+### `.surface_contact(normal_force, normal)` — Follow a Surface
+
+```python
+# simplified
+cmd = ForceCommand.surface_contact(
+    normal_force=5.0,
+    normal=Vector3(x=0.0, y=0.0, z=1.0),  # Surface normal points up
+)
+```
+
+Creates a compliant contact command — the robot pushes against a surface with constant force along the surface normal while allowing free motion in the tangential plane. Essential for surface polishing, assembly insertion, and inspection tasks.
+
+### `.with_timeout(seconds)` — Safety Timeout
+
+```python
+# simplified
+cmd = ForceCommand.force_only(Vector3(x=0.0, y=0.0, z=-10.0)) \
+    .with_timeout(5.0)
+```
+
+**Always set a timeout on force commands.** Without one, the robot pushes indefinitely — if the target surface moves away, the robot lunges forward into free space at full force.
+
+---
+
+## ImpedanceParameters
+
+Spring-damper model for compliant robot behavior. Think of it as a virtual spring between the robot and its target position.
+
+### `.compliant()` — Soft Spring (Safe for Contact)
+
+```python
+# simplified
+params = ImpedanceParameters.compliant()
+```
+
+Low stiffness, high damping. The robot yields easily on contact — like pushing against a foam pad. **Use this when the robot is near humans or during the approach phase of contact tasks.**
+
+### `.stiff()` — Rigid Spring (Precise Positioning)
+
+```python
+# simplified
+params = ImpedanceParameters.stiff()
+```
+
+High stiffness, low damping. The robot holds position rigidly — small forces won't displace it. **Use this for precise positioning in free space** (not during contact — rigid + contact = high forces).
+
+### `.enable()` / `.disable()` — Toggle Impedance Mode
+
+```python
+# simplified
+params = ImpedanceParameters.compliant()
+params.enable()   # Activate compliance
+# ... do contact task ...
+params.disable()  # Back to position control
+```
+
+> **Common mistake:** Using `stiff()` during contact approach. If the robot touches something while stiff, the contact force spikes immediately. Always approach in `compliant()` mode, then switch to `stiff()` after stable contact is established.
+
+---
+
+## HapticFeedback
+
+Haptic patterns for teleoperation — the operator *feels* what the robot feels.
+
+### `.vibration(intensity, frequency, duration)` — Continuous Vibration
+
+```python
+# simplified
+vib = HapticFeedback.vibration(intensity=0.8, frequency=200.0, duration=0.5)
+```
+
+- `intensity`: 0.0 (off) to 1.0 (max). Clamped.
+- `frequency`: Hz. 100-300Hz is most perceptible on most haptic devices.
+- `duration`: seconds.
+
+Use for collision warnings, proximity alerts, motor stall notification.
+
+### `.force(force_vec, duration)` — Force Feedback
+
+```python
+# simplified
+ff = HapticFeedback.force(force=Vector3(x=0.0, y=0.0, z=-2.0), duration=1.0)
+```
+
+Pushes back on the operator's hand. Use to convey the robot's contact force — the operator feels resistance proportional to what the robot feels.
+
+### `.pulse(intensity, frequency, duration)` — Single Pulse
+
+```python
+# simplified
+pulse = HapticFeedback.pulse(intensity=1.0, frequency=50.0, duration=0.1)
+```
+
+A brief, sharp pulse. Use for event notification — button click confirmation, waypoint reached, object grasped.
+
+---
+
+## ContactInfo
+
+Contact detection and classification from force/torque sensors or contact sensors.
+
+### Constructor
+
+```python
+# simplified
+contact = ContactInfo(state=1, force=5.0)
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `int` | Contact state (0=NoContact, 1=Contact, 2=Sliding, 3=Stuck) |
+| `force` | `float` | Contact force magnitude (Newtons) |
+| `timestamp_ns` | `int` | Timestamp of contact event |
+
+### `.is_in_contact()` — Is the Robot Touching Something?
+
+```python
+# simplified
+if contact.is_in_contact():
+    print("Contact detected!")
+```
+
+Returns `True` when the contact state indicates active contact (not `NoContact`).
+
+### `.contact_duration_seconds()` — How Long Has Contact Lasted?
+
+```python
+# simplified
+duration = contact.contact_duration_seconds()
+if duration > 2.0:
+    print("Stable contact for 2+ seconds — safe to increase force")
+```
+
+Returns seconds since initial contact. Use to distinguish brief collisions (&lt; 0.1s) from stable grasps (&gt; 1s).
+
+**Example — Grasp Verification:**
+
+```python
+# simplified
+from horus import ContactInfo, Topic
+
+contact_topic = Topic(ContactInfo)
+
+def verify_grasp(node):
+    contact = contact_topic.recv(node)
+    if contact is None:
+        return
+    if contact.is_in_contact() and contact.contact_duration_seconds() > 1.0:
+        if contact.force > 2.0:
+            print("Stable grasp confirmed")
+        else:
+            print("Weak grasp — increase gripper force")
+    elif not contact.is_in_contact():
+        print("No contact — object dropped?")
+```
+
+---
+
+## TactileArray
+
+Grid of force readings from a tactile sensor pad — common on robotic gripper fingertips.
+
+### Constructor
+
+```python
+# simplified
+tactile = TactileArray(rows=4, cols=4)  # 4x4 taxel grid
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `rows` | `int` | Number of taxel rows |
+| `cols` | `int` | Number of taxel columns |
+| `physical_size` | `(float, float)` | Sensor pad dimensions in meters (width, height) |
+
+### `.set_force(row, col, force)` / `.get_force(row, col)` — Access Taxels
+
+```python
+# simplified
+tactile.set_force(1, 2, 3.5)           # Set taxel at row 1, col 2 to 3.5 N
+force = tactile.get_force(1, 2)         # 3.5
+force = tactile.get_force(10, 10)       # None (out of bounds)
+```
+
+Row-major grid. Each taxel is a force reading in Newtons. `physical_size` gives the sensor pad dimensions in meters, `center_of_pressure` gives the weighted average contact point.
+
+**Example — Detect Grip Slip:**
+
+```python
+# simplified
+from horus import TactileArray, Topic
+
+tactile_topic = Topic(TactileArray)
+prev_total = 0.0
+
+def detect_slip(node):
+    global prev_total
+    tactile = tactile_topic.recv(node)
+    if tactile is None:
+        return
+    total_force = 0.0
+    for r in range(tactile.rows):
+        for c in range(tactile.cols):
+            f = tactile.get_force(r, c)
+            if f is not None:
+                total_force += f
+    if prev_total > 0 and total_force < prev_total * 0.7:
+        print("WARNING: Rapid force drop — possible slip!")
+    prev_total = total_force
+```
+
+---
+
+## Design Decisions
+
+**Why "WrenchStamped" instead of "ForceTorque"?** "Wrench" is the standard physics term for a combined force-torque vector (6-DOF). Using the correct physics terminology aligns with academic literature and other robotics frameworks. "Stamped" indicates the message includes a timestamp and frame ID, distinguishing it from a raw wrench without metadata.
+
+**Why does `exceeds_limits()` check force and torque independently?** A robot arm can exert dangerous force without dangerous torque (pushing straight), or dangerous torque without dangerous force (twisting a stuck bolt). Checking both independently catches both failure modes. If you only need one, compare `force_magnitude()` or `torque_magnitude()` directly.
+
+**Why does `ImpedanceParameters` have presets instead of requiring manual tuning?** Impedance tuning requires knowledge of the robot's mass, inertia, and task requirements. Getting it wrong causes instability (oscillation) or poor performance (too stiff or too soft). The `compliant()` and `stiff()` presets provide safe starting points for the two most common modes. Users can adjust from there.
+
+**Why does `ForceCommand` require an explicit timeout?** Force control without a timeout is a safety hazard. If the contact surface moves away, the robot accelerates into free space at the commanded force. A timeout limits the maximum duration, giving the safety system time to intervene. The `with_timeout()` method is chained rather than required in the constructor to keep simple examples readable, but production code should always set one.
+
+**Why `HapticFeedback` patterns instead of raw motor commands?** Haptic devices vary widely (vibration motors, voice coils, force-feedback joysticks). Patterns (`vibration()`, `pulse()`, `force()`) describe intent, not implementation. The haptic driver maps patterns to device-specific commands. This decouples your teleoperation code from the specific haptic hardware.
+
+---
+
+## See Also
+
+- [Diagnostics Messages](/python/messages/diagnostics) — EmergencyStop for force safety
+- [Control Messages](/python/messages/control) — MotorCommand, JointCommand for actuators
+- [Geometry Messages](/python/messages/geometry) — Vector3 for force/torque directions
+- [Sensor Messages](/python/messages/sensor) — JointState for reading joint efforts
+- [Python Message Library](/python/library/python-message-library) — All 55+ message types overview

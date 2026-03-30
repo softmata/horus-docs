@@ -1,0 +1,445 @@
+---
+title: Common Mistakes
+description: Avoid these common beginner pitfalls when using HORUS
+order: 6
+---
+
+# Common Mistakes
+
+New to HORUS? Here are the most common mistakes beginners make and how to fix them.
+
+## Prerequisites
+
+- HORUS installed ([Installation Guide](/getting-started/installation))
+- [Quick Start](/getting-started/quick-start) completed
+
+---
+
+## 1. Using Slashes in Topic Names
+
+**The Problem:**
+```rust
+// simplified
+// Works on Linux only — fails on macOS!
+let topic: Topic<f32> = Topic::new("sensors/lidar")?;
+```
+
+**Why:** On Linux, slashes create subdirectories in the shared memory filesystem which works fine. On macOS, `shm_open()` does not support slashes in names, so this will fail.
+
+**The Fix:**
+```rust
+// simplified
+// CORRECT — Use dots for cross-platform compatibility
+let topic: Topic<f32> = Topic::new("sensors.lidar")?;
+```
+
+Use dot-separated names (`"sensors.lidar"`, `"camera.rgb"`) for portable topic names that work on all platforms.
+
+---
+
+## 2. Forgetting to Call recv() Every Tick
+
+**The Problem:**
+```rust
+// simplified
+fn tick(&mut self) {
+    // Only check for messages sometimes
+    if self.counter % 10 == 0 {
+        if let Some(data) = self.sensor_sub.recv() {
+            self.process(data);
+        }
+    }
+    self.counter += 1;
+}
+```
+
+**Why:** Messages can be missed if you don't check every tick. Topic uses a ring buffer (16-1024 slots by default), and old messages are overwritten when the buffer fills up.
+
+**The Fix:**
+```rust
+// simplified
+fn tick(&mut self) {
+    // ALWAYS check for new messages
+    if let Some(data) = self.sensor_sub.recv() {
+        self.last_data = Some(data);
+    }
+
+    // Use cached data for processing
+    if self.counter % 10 == 0 {
+        if let Some(ref data) = self.last_data {
+            self.process(data);
+        }
+    }
+    self.counter += 1;
+}
+```
+
+---
+
+## 3. Blocking in tick()
+
+**The Problem:**
+```rust
+// simplified
+fn tick(&mut self) {
+    // WRONG - This blocks the entire scheduler!
+    let data = std::fs::read_to_string("large_file.txt").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+}
+```
+
+**Why:** All nodes run in a single tick cycle. Blocking one node blocks them all.
+
+**The Fix:**
+```rust
+// simplified
+fn init(&mut self) -> Result<()> {
+    // Do slow initialization in init(), not tick()
+    self.data = std::fs::read_to_string("large_file.txt")?;
+    Ok(())
+}
+
+fn tick(&mut self) {
+    // Keep tick() fast - ideally under 1ms
+    self.process(&self.data);
+}
+```
+
+---
+
+## 4. Wrong Priority Order
+
+**The Problem:**
+```rust
+// simplified
+// WRONG - Logger runs before sensor!
+scheduler.add(logger).order(0).build()?;       // Order 0 (runs first)
+scheduler.add(sensor).order(10).build()?;      // Order 10
+scheduler.add(controller).order(5).build()?;   // Order 5
+```
+
+**Why:** Lower order number = runs first. Safety-critical code should be order 0.
+
+**The Fix:**
+```rust
+// simplified
+// CORRECT - Proper ordering
+scheduler.add(safety_monitor).order(0).build()?;   // Safety first!
+scheduler.add(sensor).order(5).build()?;           // Then sensors
+scheduler.add(controller).order(10).build()?;      // Then control
+scheduler.add(logger).order(100).build()?;         // Logging last
+```
+
+---
+
+## 5. Not Implementing shutdown() for Motors
+
+**The Problem:**
+```rust
+// simplified
+impl Node for MotorController {
+    fn name(&self) -> &str { "motor" }
+
+    fn tick(&mut self) {
+        self.motor.set_velocity(self.velocity);
+    }
+
+    // No shutdown() implemented!
+}
+```
+
+**Why:** When you press Ctrl+C, the motor keeps running at its last velocity!
+
+**The Fix:**
+```rust
+// simplified
+impl Node for MotorController {
+    fn name(&self) -> &str { "motor" }
+
+    fn tick(&mut self) {
+        self.motor.set_velocity(self.velocity);
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // CRITICAL: Stop motor on shutdown!
+        hlog!(info, "Stopping motor for safe shutdown");
+        self.motor.set_velocity(0.0);
+        Ok(())
+    }
+}
+```
+
+---
+
+## 6. Not Deriving Required Traits for Custom Messages
+
+**The Problem:**
+```rust
+// simplified
+struct MyMessage {
+    x: f32,
+    y: f32,
+}
+
+// Error: the trait bound `MyMessage: Clone` is not satisfied
+let topic: Topic<MyMessage> = Topic::new("data")?;
+```
+
+**Why:** Topic requires types to implement `Clone + Send + Sync + Serialize + Deserialize`. Most Rust types are `Send + Sync` automatically, so you usually only need to derive the other three.
+
+**The Fix:**
+```rust
+// simplified
+use serde::{Serialize, Deserialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct MyMessage {
+    x: f32,
+    y: f32,
+    name: String,  // Strings work fine!
+    data: Vec<f32>,  // Vecs work too!
+}
+
+let topic: Topic<MyMessage> = Topic::new("data")?;
+```
+
+Or use the standard message types which already have the required traits:
+```rust
+// simplified
+use horus::prelude::*;
+
+let topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+let topic: Topic<Odometry> = Topic::new("odom")?;
+```
+
+---
+
+## 7. Thinking send() Returns a Result
+
+**The Problem:**
+```rust
+// simplified
+fn tick(&mut self) {
+    // WRONG - send() is infallible, this won't compile
+    if let Err(e) = self.pub_topic.send(data) {
+        hlog!(warn, "Failed to publish: {:?}", e);
+    }
+}
+```
+
+**Why:** `send()` returns `()`, not `Result`. It uses ring buffer "keep last" semantics — when the buffer is full, the oldest message is overwritten. This means `send()` always succeeds.
+
+**The Fix:**
+```rust
+// simplified
+fn tick(&mut self) {
+    // CORRECT - send() is infallible, just call it
+    self.pub_topic.send(data);
+}
+```
+
+---
+
+## 8. Creating Topic Inside tick()
+
+**The Problem:**
+```rust
+// simplified
+fn tick(&mut self) {
+    // WRONG - Creates new Topic every tick!
+    let topic: Topic<f32> = Topic::new("data").unwrap();
+    topic.send(42.0);
+}
+```
+
+**Why:** Creating a Topic is expensive (opens shared memory). Doing it every tick wastes resources.
+
+**The Fix:**
+```rust
+// simplified
+struct MyNode {
+    topic: Topic<f32>,  // Store Topic in struct
+}
+
+impl MyNode {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            topic: Topic::new("data")?,  // Create once
+        })
+    }
+}
+
+fn tick(&mut self) {
+    self.topic.send(42.0);  // Reuse existing Topic
+}
+```
+
+---
+
+## 9. Mismatched Topic Types
+
+**The Problem:**
+```rust
+// simplified
+// Publisher sends f32
+let pub_topic: Topic<f32> = Topic::new("data")?;
+pub_topic.send(42.0);
+
+// Subscriber expects i32
+let sub_topic: Topic<i32> = Topic::new("data")?;  // WRONG TYPE!
+let value = sub_topic.recv();  // Will get garbage data
+```
+
+**Why:** HORUS doesn't check types at runtime. Mismatched types cause data corruption.
+
+**The Fix:**
+```rust
+// simplified
+// Use the SAME type for publisher and subscriber
+let pub_topic: Topic<f32> = Topic::new("data")?;
+let sub_topic: Topic<f32> = Topic::new("data")?;  // Same type!
+```
+
+**Pro tip:** Use named message types to avoid confusion:
+```rust
+// simplified
+type SensorReading = f32;
+let pub_topic: Topic<SensorReading> = Topic::new("sensor")?;
+let sub_topic: Topic<SensorReading> = Topic::new("sensor")?;
+```
+
+---
+
+## 10. Using Raw Node Trait When node! Macro Would Be Simpler
+
+**The Problem:**
+```rust
+// simplified
+// Manual implementation - lots of boilerplate
+struct MySensor {
+    pub_topic: Topic<f32>,
+}
+
+impl MySensor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            pub_topic: Topic::new("sensor.data")?,
+        })
+    }
+}
+
+impl Node for MySensor {
+    fn name(&self) -> &str { "MySensor" }
+
+    fn tick(&mut self) {
+        let data = 42.0;  // Read sensor
+        self.pub_topic.send(data);
+    }
+}
+```
+
+**The Fix:**
+```rust
+// simplified
+// Use node! macro - 75% less code!
+node! {
+    MySensor {
+        pub { sensor_data: f32 -> "sensor.data" }
+
+        tick {
+            let data = 42.0;  // Read sensor
+            self.sensor_data.send(data);
+        }
+    }
+}
+```
+
+See [node! Macro](/concepts/node-macro) for more examples.
+
+---
+
+## 11. Not Enabling Watchdog for Safety-Critical Nodes
+
+**The Problem:**
+```rust
+// simplified
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(MotorController::new()?).order(0).rate(100_u64.hz()).build()?;
+    scheduler.run()
+}
+```
+
+**Why:** Without a watchdog, if the motor controller node hangs (deadlock, hardware stall, infinite loop), nothing detects it. The robot keeps running on its last commanded velocity.
+
+**The Fix:**
+```rust
+// simplified
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .watchdog(500_u64.ms());     // global watchdog for all nodes
+
+    scheduler.add(MotorController::new()?)
+        .order(0)
+        .rate(100_u64.hz())
+        .watchdog(50_u64.ms())       // tighter timeout for motor control
+        .on_miss(Miss::SafeMode)     // enter safe state if tick overruns
+        .build()?;
+
+    scheduler.run()
+}
+```
+
+Also implement `enter_safe_state()` on any node that controls actuators:
+
+```rust
+// simplified
+impl Node for MotorController {
+    fn name(&self) -> &str { "motor" }
+    fn tick(&mut self) { self.motor.set_velocity(self.velocity); }
+
+    fn enter_safe_state(&mut self) {
+        self.motor.set_velocity(0.0);
+        self.motor.engage_brake();
+    }
+}
+```
+
+**Rule of thumb:** Set the watchdog to 5x–10x the tick period (e.g., 100 Hz node → 50–100 ms watchdog). See [Safety Monitor](/advanced/safety-monitor) for graduated degradation details.
+
+---
+
+## Quick Reference
+
+| Mistake | Fix |
+|---------|-----|
+| Slashes in topic names | Use dots: `sensors.lidar` |
+| Not checking recv() every tick | Always call recv(), cache last value |
+| Blocking in tick() | Keep tick() under 1ms, do I/O in init() |
+| Wrong priority order | Lower number = higher priority |
+| No shutdown() for motors | Always stop actuators in shutdown() |
+| Missing derives on messages | Add Clone, Serialize, Deserialize |
+| Treating send() as fallible | `send()` is infallible — just call it directly |
+| Creating Topic in tick() | Create Topic once in new() |
+| Mismatched topic types | Use same type for pub and sub |
+| Too much boilerplate | Use the `node!` macro |
+| No watchdog on safety-critical nodes | Enable `.watchdog()` + `.on_miss()` + `enter_safe_state()` |
+
+---
+
+## Still Having Issues?
+
+- Check [Troubleshooting](/getting-started/troubleshooting) for error messages
+- See [Examples](/rust/examples/basic-examples) for working code
+- Run `horus monitor` to see what your nodes are doing
+
+---
+
+## See Also
+
+- [Troubleshooting](/getting-started/troubleshooting) — Detailed error resolution
+- [Testing](/development/testing) — Catch mistakes early
+- [Debugging](/development/debugging) — Diagnose runtime issues
+- [Safety Monitor](/advanced/safety-monitor) — Full watchdog and deadline enforcement reference
+- [Choosing Your Configuration](/concepts/choosing-configuration) — Progressive complexity guide (Level 0→4)
+- [Execution Classes](/concepts/execution-classes) — When to use `.compute()`, `.on()`, `.async_io()`

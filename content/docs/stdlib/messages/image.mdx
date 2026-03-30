@@ -1,0 +1,226 @@
+---
+title: "Image"
+description: "Zero-copy camera images backed by shared memory with ML framework interop"
+order: 3
+---
+
+# Image
+
+A camera image backed by shared memory for zero-copy inter-process communication. Only a small descriptor (metadata) travels through the ring buffer; the actual pixel data stays in a shared memory pool. This enables real-time image pipelines at full camera frame rates without serialization overhead.
+
+## When to Use
+
+Use `Image` when your robot has a camera and you need to share frames between nodes -- for example, between a camera driver node, a computer vision node, and a display node. The zero-copy design means a 1080p RGB image transfers in microseconds, not milliseconds.
+
+## ROS2 Equivalent
+
+`sensor_msgs/Image` -- same concept (width, height, encoding, pixel data), but HORUS uses shared memory pools instead of serialized byte buffers.
+
+## Zero-Copy Architecture
+
+```
+Camera driver         Vision node           Display node
+     |                     |                     |
+     |-- descriptor -->    |                     |
+     |   (64 bytes)        |-- descriptor -->    |
+     |                     |   (64 bytes)        |
+     +-----+               +-----+               +-----+
+           |                     |                     |
+           v                     v                     v
+     [ Shared Memory Pool -- pixel data lives here ]
+```
+
+The descriptor contains pool ID, slot index, dimensions, and encoding. Each recipient maps the same physical memory -- no copies at any stage.
+
+## Encoding Types
+
+| Encoding | Channels | Bytes/Pixel | Description |
+|----------|----------|-------------|-------------|
+| `Mono8` | 1 | 1 | 8-bit grayscale |
+| `Mono16` | 1 | 2 | 16-bit grayscale |
+| `Rgb8` | 3 | 3 | 8-bit RGB (default) |
+| `Bgr8` | 3 | 3 | 8-bit BGR (OpenCV format) |
+| `Rgba8` | 4 | 4 | 8-bit RGBA |
+| `Bgra8` | 4 | 4 | 8-bit BGRA |
+| `Yuv422` | 2 | 2 | YUV 4:2:2 |
+| `Mono32F` | 1 | 4 | 32-bit float grayscale |
+| `Rgb32F` | 3 | 12 | 32-bit float RGB |
+| `BayerRggb8` | 1 | 1 | Bayer pattern (raw sensor) |
+| `Depth16` | 1 | 2 | 16-bit depth in millimeters |
+
+## Constructor
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Image::new(width, height, encoding) -> Result<Image>
+let img = Image::new(640, 480, ImageEncoding::Rgb8)?;
+```
+
+**Parameters:**
+- `width: u32` — Image width in pixels
+- `height: u32` — Image height in pixels
+- `encoding: ImageEncoding` — Pixel format (see Encoding Types above)
+
+**Returns:** `Result<Image>` — Fails with `MemoryError::PoolExhausted` if the shared memory pool is full.
+
+### Python
+
+```python
+from horus import Image
+
+# Image(height, width, encoding) — note: height first in Python
+img = Image(480, 640, "rgb8")
+
+# From NumPy array (copies data into shared memory pool)
+img = Image.from_numpy(np_array)              # encoding auto-detected from shape
+img = Image.from_numpy(np_array, "bgr8")      # explicit encoding
+
+# From ML frameworks (copies data into shared memory pool)
+img = Image.from_torch(tensor, "rgb8")
+```
+
+**Parameters (constructor):**
+- `height: int` — Image height in pixels
+- `width: int` — Image width in pixels
+- `encoding: str` — Pixel format string: `"rgb8"`, `"bgr8"`, `"mono8"`, `"depth16"`, etc.
+
+**Parameters (from_numpy):**
+- `array: np.ndarray` — NumPy array with shape `(H, W)` for grayscale or `(H, W, C)` for color
+- `encoding: str` (optional) — Override auto-detected encoding
+
+<Callout type="warning">
+**Python takes `(height, width)`, Rust takes `(width, height)`.** This matches each language's convention — NumPy/OpenCV use row-major `(H, W)`, while graphics APIs use `(W, H)`.
+</Callout>
+
+## Rust Example
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Create a 640x480 RGB image (shared memory backed)
+let mut img = Image::new(640, 480, ImageEncoding::Rgb8)?;
+img.fill(&[0, 0, 255]);                // Fill blue
+img.set_pixel(100, 200, &[255, 0, 0]); // Red dot at (100, 200)
+
+// Send via topic (zero-copy -- only the descriptor travels)
+let topic: Topic<Image> = Topic::new("camera.rgb")?;
+topic.send(&img);
+
+// Receive in another node
+if let Some(received) = topic.recv() {
+    let px = received.pixel(100, 200);    // Zero-copy read
+    let roi = received.roi(0, 0, 320, 240); // Extract region
+}
+```
+
+## Python Example
+
+```python
+from horus import Image, Topic
+
+# Create a 640x480 RGB image
+img = Image(480, 640, "rgb8")  # Note: Python takes (height, width, encoding)
+
+# Create from numpy array (zero-copy into shared memory)
+import numpy as np
+frame = np.zeros((480, 640, 3), dtype=np.uint8)
+img = Image.from_numpy(frame)
+
+# Convert to ML frameworks (zero-copy)
+arr = img.to_numpy()   # numpy array
+t = img.to_torch()     # PyTorch tensor
+j = img.to_jax()       # JAX array
+
+# Pixel access
+px = img.pixel(100, 200)
+img.set_pixel(100, 200, [255, 0, 0])
+
+# Send via topic
+topic = Topic(Image)
+topic.send(img)
+```
+
+## Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `width` | `u32` | px | Image width |
+| `height` | `u32` | px | Image height |
+| `channels` | `u32` | -- | Number of color channels |
+| `encoding` | `ImageEncoding` | -- | Pixel format (see table above) |
+| `step` | `u32` | bytes | Bytes per row (width * bytes_per_pixel) |
+| `frame_id` | `str` | -- | Coordinate frame (e.g., `"camera_front"`) |
+| `timestamp_ns` | `u64` | ns | Timestamp in nanoseconds since epoch |
+
+## Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new(w, h, enc)` | `(u32, u32, ImageEncoding) -> Image` | Create zero-initialized image |
+| `pixel(x, y)` | `(u32, u32) -> Option<&[u8]>` | Read pixel bytes at (x, y) |
+| `set_pixel(x, y, val)` | `(u32, u32, &[u8]) -> &mut Self` | Write pixel, chainable |
+| `fill(val)` | `(&[u8]) -> &mut Self` | Fill entire image with color |
+| `roi(x, y, w, h)` | `(u32, u32, u32, u32) -> Option<Vec<u8>>` | Extract region of interest |
+| `data()` | `-> &[u8]` | Raw pixel data slice |
+| `data_mut()` | `-> &mut [u8]` | Mutable pixel data slice |
+| `from_numpy(arr)` | Python: array -> Image | Create from numpy (copies in) |
+| `to_numpy()` | Python: -> ndarray | Zero-copy to numpy |
+| `to_torch()` | Python: -> Tensor | Zero-copy to PyTorch via DLPack |
+| `to_jax()` | Python: -> Array | Zero-copy to JAX via DLPack |
+
+## Common Patterns
+
+**Camera-to-ML pipeline:**
+
+<MermaidDiagram
+  chart={`flowchart LR
+    A["Camera driver"] --> B["Image (SHM)"]
+    B --> C["to_torch()"]
+    C --> D["YOLO model"]
+    D --> E["Detection"]
+    D --> F["to_numpy()"]
+    F --> G["OpenCV overlay"]
+`}
+  caption="Camera-to-ML pipeline"
+/>
+
+**Multi-encoding workflow:**
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Camera outputs BGR (OpenCV convention)
+let bgr = Image::new(640, 480, ImageEncoding::Bgr8)?;
+
+// Depth camera outputs 16-bit depth in millimeters
+let depth = Image::new(640, 480, ImageEncoding::Depth16)?;
+
+// ML model expects float grayscale
+let gray = Image::new(640, 480, ImageEncoding::Mono32F)?;
+```
+
+## Design Decisions
+
+**Why pool-backed shared memory instead of serialized byte buffers?** Serializing a 1080p RGB image (6 MB) takes ~2ms and doubles memory usage (sender buffer + receiver buffer). With pool-backed shared memory, only the 64-byte descriptor is copied; the pixel data stays in one place and every subscriber maps the same physical memory. This keeps latency under 10us regardless of resolution.
+
+**Why fixed encoding enums instead of arbitrary format strings?** Fixed enums enable compile-time size calculations (`step = width * bytes_per_pixel`) and prevent encoding mismatches between publisher and subscriber. The enum covers all common camera output formats; for exotic encodings, use `GenericMessage` with manual layout.
+
+**Why `from_numpy()` copies data in but `to_numpy()` is zero-copy?** Writing into the shared memory pool requires placing data at a specific pool slot, so `from_numpy()` must copy once. Reading (`to_numpy()`) returns a view into the existing pool memory -- no copy needed. This asymmetry is intentional: one copy on publish, zero copies on subscribe.
+
+**Image vs DepthImage:** Use `Image` with `Depth16` encoding for raw depth sensor output (16-bit millimeters). Use `DepthImage` when you need float-meter depth values with statistics and min/max queries. They serve different pipeline stages: `Image` is for transport, `DepthImage` is for processing.
+
+---
+
+## See Also
+
+- [Image API (Rust)](/rust/api/image) — Full Rust Image API with pool-backed allocation
+- [Python Image](/python/api/image) — NumPy/PyTorch zero-copy
+- [Python CV Node Recipe](/recipes/python-cv-node) — Computer vision with Python
+- [DepthImage](/rust/api/depth-image) — Depth maps for stereo/structured light
+- [PointCloud](/rust/api/perception-messages) — 3D point cloud data

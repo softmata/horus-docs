@@ -1,0 +1,342 @@
+---
+title: "DepthImage"
+description: "Zero-copy shared memory depth image for RGB-D cameras and depth sensors"
+weight: 62
+---
+
+# DepthImage
+
+Pool-backed depth image with zero-copy shared memory transport. Use it for obstacle detection, 3D reconstruction, or navigation costmap updates from RGB-D cameras.
+
+**Quick example** — detect obstacles closer than 1 meter:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let depth_topic: Topic<DepthImage> = Topic::new("camera.depth")?;
+
+if let Some(depth) = depth_topic.recv() {
+    // Check center pixel for close obstacles
+    if let Some(center_distance) = depth.get_depth(320, 240) {
+        if center_distance > 0.0 && center_distance < 1.0 {
+            hlog!(warn, "Obstacle at {:.2}m!", center_distance);
+        }
+    }
+
+    // Find closest point in the frame
+    if let Some((min, _max, _mean)) = depth.depth_statistics() {
+        hlog!(info, "Closest point: {:.2}m", min);
+    }
+}
+```
+
+DepthImage supports two formats: F32 (meters) and U16 (millimeters). All depth access methods work in meters regardless of format — U16 values are automatically converted.
+
+## Creating a DepthImage
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// F32 depth image -- values stored in meters (default choice)
+let mut depth = DepthImage::meters(640, 480)?;
+
+// U16 depth image -- values stored in millimeters (common for Intel RealSense, Azure Kinect)
+let mut depth_mm = DepthImage::millimeters(640, 480)?;
+```
+
+## Reading and Writing Depth
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut depth = DepthImage::meters(640, 480)?;
+
+// Set depth at pixel (x, y) in meters -- returns &mut Self for chaining
+depth.set_depth(320, 240, 1.5)?;
+depth.set_depth(100, 100, 2.3)?;
+
+// Get depth at pixel -- always returns meters (auto-converts U16 mm to f32 m)
+if let Some(d) = depth.get_depth(320, 240) {
+    println!("Depth at center: {:.3}m", d);
+}
+
+// For U16 images, get raw millimeter value
+let depth_u16 = DepthImage::millimeters(640, 480)?;
+if let Some(mm) = depth_u16.get_depth_u16(320, 240) {
+    println!("Raw depth: {}mm", mm);
+}
+
+// Compute min, max, mean over valid (non-zero) depth values
+if let Some((min, max, mean)) = depth.depth_statistics() {
+    println!("Range: {:.2}-{:.2}m, mean: {:.2}m", min, max, mean);
+}
+```
+
+## Metadata and Transport
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut depth = DepthImage::meters(640, 480)?;
+
+// Set metadata (method chaining)
+depth
+    .set_frame_id("depth_camera")
+    .set_timestamp_ns(1234567890);
+
+// Check format
+println!("{}x{}", depth.width(), depth.height());
+println!("Meters: {}, Scale: {}", depth.is_meters(), depth.depth_scale());
+
+// Zero-copy raw data access
+let raw: &[u8] = depth.data();
+println!("{} bytes", depth.nbytes());
+```
+
+## RGB-D Pipeline
+
+```rust
+// simplified
+use horus::prelude::*;
+
+struct RgbdNode {
+    rgb_sub: Topic<Image>,
+    depth_sub: Topic<DepthImage>,
+    cloud_pub: Topic<PointCloud>,
+    fx: f32, fy: f32, cx: f32, cy: f32,
+}
+
+impl Node for RgbdNode {
+    fn name(&self) -> &str { "RgbdNode" }
+
+    fn tick(&mut self) {
+        let depth = match self.depth_sub.recv() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let w = depth.width();
+        let h = depth.height();
+
+        if let Ok(mut cloud) = PointCloud::from_xyz(&xyz_points) {
+            // Depth-to-pointcloud using camera intrinsics
+            for y in 0..h {
+                for x in 0..w {
+                    if let Some(z) = depth.get_depth(x, y) {
+                        if z > 0.0 {
+                            let px = (x as f32 - self.cx) * z / self.fx;
+                            let py = (y as f32 - self.cy) * z / self.fy;
+                            // Write (px, py, z) into cloud data...
+                        }
+                    }
+                }
+            }
+            cloud.set_frame_id(depth.frame_id());
+            self.cloud_pub.send(cloud);
+        }
+    }
+}
+```
+
+## Method Reference
+
+### meters
+
+Creates an F32 depth image storing values in meters.
+
+**Signature**
+
+```rust
+// simplified
+pub fn meters(width: u32, height: u32) -> HorusResult<Self>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `width` | `u32` | yes | Image width in pixels |
+| `height` | `u32` | yes | Image height in pixels |
+
+**Returns**
+
+`HorusResult<DepthImage>` — F32 depth image. Each pixel stores depth in meters as `f32`.
+
+**When to use**: Processed depth data, simulation output, SLAM maps.
+
+**When NOT to use**: Raw sensor data from RealSense/Kinect — use `millimeters()` instead (matches sensor output format).
+
+**Example:**
+```rust
+// simplified
+let depth = DepthImage::meters(640, 480)?;
+assert!(depth.is_meters());
+```
+
+### millimeters
+
+Creates a U16 depth image storing values in millimeters.
+
+**Signature**
+
+```rust
+// simplified
+pub fn millimeters(width: u32, height: u32) -> HorusResult<Self>
+```
+
+**Parameters**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `width` | `u32` | yes | Image width in pixels |
+| `height` | `u32` | yes | Image height in pixels |
+
+**Returns**
+
+`HorusResult<DepthImage>` — U16 depth image. Each pixel stores depth in millimeters as `u16`. Range: 0-65535mm (0-65.535m).
+
+**When to use**: Raw sensor data from Intel RealSense, Azure Kinect, stereo cameras — matches their native output format. Half the memory of F32.
+
+**Example:**
+```rust
+// simplified
+let depth = DepthImage::millimeters(640, 480)?;
+assert!(depth.is_millimeters());
+```
+
+### get_depth
+
+```rust
+// simplified
+pub fn get_depth(&self, x: u32, y: u32) -> Option<f32>
+```
+
+Get depth in **meters** at pixel (x, y). Automatically converts U16 millimeters to F32 meters.
+
+**Returns:** `None` if out of bounds. Returns `0.0` for invalid/no-return pixels.
+
+### set_depth
+
+```rust
+// simplified
+pub fn set_depth(&mut self, x: u32, y: u32, value: f32) -> HorusResult<&mut Self>
+```
+
+Set depth in meters. For U16 images, validates range (0-65.535m). Chainable.
+
+**Errors:** `ValidationError::OutOfRange` if value exceeds U16 range for millimeter images.
+
+### depth_statistics
+
+```rust
+// simplified
+pub fn depth_statistics(&self) -> Option<(f32, f32, f32)>
+```
+
+Compute (min, max, mean) over valid (non-zero) depth values, in meters. Returns `None` if no valid pixels.
+
+**Example:**
+```rust
+// simplified
+if let Some((min, max, mean)) = depth.depth_statistics() {
+    println!("Range: {:.2}-{:.2}m, avg: {:.2}m", min, max, mean);
+}
+```
+
+## API Quick Reference
+
+DepthImage is an RAII type -- fields are private, accessed through methods. Mutation methods return `&mut Self` for chaining.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(width, height, dtype)` | `Result<Self>` | Create depth image (F32 or U16) from global pool |
+| `get_depth(x, y)` | `Option<f32>` | Depth in meters at pixel (auto-converts U16) |
+| `set_depth(x, y, value)` | `Result<&mut Self>` | Set depth in meters at pixel |
+| `get_depth_u16(x, y)` | `Option<u16>` | Raw U16 millimeters (U16 dtype only) |
+| `depth_statistics()` | `Option<(f32, f32, f32)>` | (min, max, mean) in meters over valid depths |
+| `width()` | `u32` | Image width in pixels |
+| `height()` | `u32` | Image height in pixels |
+| `is_meters()` | `bool` | True if dtype is F32 |
+| `is_millimeters()` | `bool` | True if dtype is U16 |
+| `depth_scale()` | `f32` | Depth unit scale factor |
+| `data()` | `&[u8]` | Zero-copy access to raw depth data |
+| `data_mut()` | `&mut [u8]` | Mutable access to raw depth data |
+| `copy_from(src)` | `&mut Self` | Copy raw bytes into the image |
+| `dtype()` | `TensorDtype` | Data type (F32 or U16) |
+| `nbytes()` | `u64` | Total size in bytes |
+| `is_cpu()` | `bool` | Whether data is on CPU |
+| `set_frame_id(id)` | `&mut Self` | Set sensor frame identifier |
+| `frame_id()` | `&str` | Get sensor frame identifier |
+| `set_timestamp_ns(ts)` | `&mut Self` | Set timestamp in nanoseconds |
+| `timestamp_ns()` | `u64` | Get timestamp in nanoseconds |
+
+**Depth format summary:**
+
+| Dtype | Unit | `is_meters()` | `depth_scale()` | Typical sensor |
+|-------|------|---------------|-----------------|----------------|
+| `TensorDtype::F32` | meters | `true` | `1.0` | Processed / simulated |
+| `TensorDtype::U16` | millimeters | `false` | `0.001` | RealSense, Kinect, stereo |
+
+## Python API (PyDepthImage)
+
+```python
+import horus
+import numpy as np
+
+# Create from dtype string
+depth = horus.DepthImage(480, 640, dtype="float32")   # meters
+depth = horus.DepthImage(480, 640, dtype="uint16")    # millimeters
+depth = horus.DepthImage(480, 640, dtype="mm")         # alias for uint16
+
+# Create from numpy array
+arr = np.zeros((480, 640), dtype=np.float32)
+depth = horus.DepthImage.from_numpy(arr)
+
+# Create from torch tensor
+import torch
+t = torch.zeros(480, 640, dtype=torch.float32)
+depth = horus.DepthImage.from_torch(t)
+
+# Read/write depth (meters)
+depth.set_depth(320, 240, 1.5)
+d = depth.get_depth(320, 240)  # -> float
+
+# Statistics
+stats = depth.depth_statistics()  # -> (min, max, mean) or None
+
+# Convert to numpy/torch/jax
+arr = depth.to_numpy()
+t = depth.to_torch()
+j = depth.to_jax()
+
+# Properties
+depth.height       # 480
+depth.width        # 640
+depth.dtype        # "float32"
+depth.nbytes       # total bytes
+depth.depth_scale  # 1.0 for F32, 0.001 for U16
+
+# Metadata
+depth.set_frame_id("depth_cam")
+depth.set_timestamp_ns(123456)
+depth.is_meters()       # True
+depth.is_millimeters()  # False
+```
+
+**Valid dtype strings:**
+
+| String | Format |
+|--------|--------|
+| `"float32"`, `"meters"` | F32, meters |
+| `"uint16"`, `"millimeters"`, `"mm"` | U16, millimeters |
+
+## See Also
+
+- [Perception Messages](/rust/api/perception-messages) -- PointCloud, Landmark, TrackedObject
+- [Vision Messages](/rust/api/vision-messages) -- Image, CameraInfo, Detection
+- [Tensor API](/rust/api/tensor) -- Underlying pool management
+- [Python DepthImage](/python/api/depth-image) — Python DepthImage API

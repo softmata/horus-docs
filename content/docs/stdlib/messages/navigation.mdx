@@ -1,0 +1,157 @@
+---
+title: "Navigation Messages"
+description: "NavGoal, NavPath, PathPlan, and CostMap — the navigation stack interface"
+order: 12
+---
+
+# Navigation Messages
+
+Messages for goal-based navigation: send a target pose, receive a planned path, and follow waypoints. These form the interface between high-level commands ("go to the kitchen") and low-level control ([CmdVel](/stdlib/messages/cmd-vel)).
+
+## NavGoal — Where to Go
+
+A navigation target with position, orientation, and tolerances.
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let goal = NavGoal {
+    target_pose: Pose2D { x: 5.0, y: 3.0, theta: 0.0 },
+    tolerance_position: 0.1,    // 10cm position tolerance
+    tolerance_angle: 0.05,      // ~3° heading tolerance
+    timeout_seconds: 30.0,      // 30s to reach goal (0 = no limit)
+    timestamp_ns: 0,
+};
+
+let topic: Topic<NavGoal> = Topic::new("nav.goal")?;
+topic.send(goal);
+```
+
+### Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `target_pose` | `Pose2D` | m, rad | Target position and heading |
+| `tolerance_position` | `f64` | m | Acceptable position error |
+| `tolerance_angle` | `f64` | rad | Acceptable heading error |
+| `timeout_seconds` | `f64` | s | Max time to reach goal (0 = unlimited) |
+| `timestamp_ns` | `u64` | ns | Timestamp |
+
+---
+
+## NavPath — Planned Waypoints
+
+A sequence of waypoints computed by a path planner. Each waypoint has position, heading, and speed.
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Subscribe to planned paths from the planner node
+let path_sub: Topic<NavPath> = Topic::new("nav.path")?;
+
+if let Some(path) = path_sub.recv() {
+    for i in 0..path.waypoint_count as usize {
+        let wp = &path.waypoints[i];
+        // Follow waypoint: wp.x, wp.y, wp.theta, wp.velocity
+    }
+}
+```
+
+### Key Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `waypoints` | `[Waypoint; 256]` | Array of waypoints (max 256) |
+| `waypoint_count` | `u16` | Number of valid waypoints |
+| `total_length` | `f64` | Total path length in meters |
+| `estimated_time` | `f64` | Estimated completion time in seconds |
+
+---
+
+## PathPlan — Compact Path Representation
+
+A flat-array path format optimized for zero-copy IPC. Stores waypoints as packed `[x, y, theta]` triples.
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let plan_sub: Topic<PathPlan> = Topic::new("nav.plan")?;
+
+if let Some(plan) = plan_sub.recv() {
+    let n = plan.waypoint_count as usize;
+    for i in 0..n {
+        let x = plan.waypoint_data[i * 3];
+        let y = plan.waypoint_data[i * 3 + 1];
+        let theta = plan.waypoint_data[i * 3 + 2];
+    }
+}
+```
+
+### Key Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `waypoint_data` | `[f32; 768]` | Packed `[x, y, theta]` × 256 waypoints |
+| `goal_pose` | `[f32; 3]` | Target `[x, y, theta]` |
+| `waypoint_count` | `u16` | Number of valid waypoints |
+
+---
+
+## CostMap — Navigation Cost Grid
+
+An inflated cost grid built on top of an [OccupancyGrid](/stdlib/messages/occupancy-grid). Used by planners to avoid obstacles with safety margins.
+
+### Key Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `occupancy_grid` | `OccupancyGrid` | Base grid data |
+| `costs` | `Vec<u8>` | Cell costs (0=free, 253=lethal, 255=unknown) |
+| `inflation_radius` | `f32` | Obstacle inflation radius in meters |
+| `cost_scaling_factor` | `f32` | Exponential cost decay factor |
+
+---
+
+## Navigation Pipeline
+
+```text
+User/Planner → NavGoal → Path Planner → NavPath/PathPlan → Path Follower → CmdVel → Drive
+                              ↑
+                          CostMap (from OccupancyGrid + LiDAR)
+```
+
+## Related Types
+
+- [CmdVel](/stdlib/messages/cmd-vel) — Velocity commands (output of path follower)
+- [Odometry](/stdlib/messages/odometry) — Robot position feedback
+- [OccupancyGrid](/stdlib/messages/occupancy-grid) — 2D grid map
+- [Pose2D](/stdlib/messages/pose) — Position representation
+
+## Design Decisions
+
+**Why both NavPath and PathPlan?** `NavPath` carries rich waypoints (position, heading, speed, curvature) for sophisticated path followers. `PathPlan` uses a flat `[f32; 768]` array for maximum zero-copy efficiency when you only need `(x, y, theta)` triples. Use `NavPath` for full-featured navigation; use `PathPlan` for high-frequency replanning where minimal overhead matters.
+
+**Why 256 max waypoints?** Fixed-size arrays enable zero-copy shared memory transport. 256 waypoints at 5cm spacing covers 12.8m of path -- enough for most local planning horizons. Global planners that need longer paths can publish successive segments or use NavGoal for high-level goals.
+
+**Why tolerances on NavGoal instead of exact target matching?** Real robots can't reach exact positions due to sensor noise, wheel slip, and control loop granularity. Position and angle tolerances let the path follower declare "goal reached" when the robot is close enough, preventing endless oscillation around the target.
+
+**Why timeout on NavGoal?** A stuck robot should not attempt a goal forever. The timeout provides a safety bound -- if the robot can't reach the goal within the specified time, the navigation stack can abort and report failure via `GoalResult`, letting higher-level logic decide what to do next (retry, pick a different goal, or request human help).
+
+---
+
+## See Also
+
+- [Navigation Messages (Rust)](/rust/api/navigation-messages) — Full Rust API
+- [Navigation Messages (Python)](/python/messages/navigation) — Python API
+- [OccupancyGrid](/stdlib/messages/occupancy-grid) — Map representation
+- [CmdVel](/stdlib/messages/cmd-vel) — Velocity commands from path follower
+- [Odometry](/stdlib/messages/odometry) — Robot position feedback for navigation

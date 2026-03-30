@@ -1,0 +1,326 @@
+---
+title: "Hardware API"
+description: "Configure hardware nodes in horus.toml, load them at runtime, register custom node factories"
+weight: 6
+---
+
+# Hardware API
+
+Load hardware node configurations from `horus.toml` and add them to your scheduler.
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware;
+```
+
+## Overview
+
+A driver is a node. The hardware API provides:
+
+- **Config-driven hardware declarations** in `horus.toml [hardware]`
+- **Typed parameter access** via `NodeParams` (port, baudrate, servo IDs, etc.)
+- **Node factory registration** via `register_driver!` — your own `Node` implementations loaded from config
+- **Simulation swap** — `sim = true` per device, replaced by stub when `horus run --sim`
+
+## Loading Hardware
+
+### `hardware::load()`
+
+Reads the `[hardware]` section from `horus.toml` (searches current directory and up to 10 parents). Returns a list of `(name, node)` pairs ready for the scheduler.
+
+```rust
+// simplified
+let nodes = hardware::load()?;
+for (name, node) in nodes {
+    sched.add(node).build()?;
+}
+```
+
+Each entry in `[hardware]` must have a `use` field naming a registered node type. The factory is called with a `NodeParams` containing all non-reserved config keys.
+
+### `hardware::load_from(path)`
+
+Load from a specific config file. Useful for testing or multi-robot setups.
+
+```rust
+// simplified
+let nodes = hardware::load_from("tests/test_hardware.toml")?;
+```
+
+---
+
+## Registering Node Types
+
+Use `register_driver!` to register a factory so `[hardware]` config can instantiate your node.
+
+### Step 1: Define your node
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware::NodeParams;
+
+struct ConveyorDriver {
+    port: String,
+    speed: f64,
+    publisher: Topic<CmdVel>,
+}
+
+impl ConveyorDriver {
+    fn from_params(params: &NodeParams) -> Result<Self> {
+        let port: String = params.get("port")?;
+        let speed: f64 = params.get_or("speed", 1.0);
+
+        Ok(Self {
+            port,
+            speed,
+            publisher: Topic::new("conveyor.velocity")?,
+        })
+    }
+}
+
+impl Node for ConveyorDriver {
+    fn name(&self) -> &str { "ConveyorDriver" }
+
+    fn tick(&mut self) {
+        self.publisher.send(CmdVel::new(self.speed as f32, 0.0));
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.publisher.send(CmdVel::new(0.0, 0.0));
+    }
+}
+
+// Register so [hardware.conveyor] use = "ConveyorDriver" works
+register_driver!(ConveyorDriver, ConveyorDriver::from_params);
+```
+
+### Step 2: Configure in horus.toml
+
+```toml
+[hardware.conveyor]
+use = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+### Step 3: Load and schedule
+
+```rust
+// simplified
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(50_u64.hz());
+
+    // Load all [hardware] entries — creates nodes from registered factories
+    let nodes = hardware::load()?;
+    for (_name, node) in nodes {
+        sched.add(node).rate(50_u64.hz()).build()?;
+    }
+
+    sched.run()
+}
+```
+
+`hardware::load()` looks up `"ConveyorDriver"` in the registry and calls `from_params()` with the config values. It returns `Box<dyn Node>` ready for the scheduler.
+
+---
+
+## `NodeParams`
+
+Typed access to config values from a `[hardware.NAME]` table.
+
+| Method | Description |
+|--------|-------------|
+| `params.get::<T>("key")?` | Required param — errors if missing or wrong type |
+| `params.get_or("key", default)` | Optional param — returns default if missing or wrong type |
+| `params.has("key")` | Whether a key exists |
+| `params.keys()` | Iterator over param names |
+| `params.len()` | Number of params |
+| `params.is_empty()` | Whether there are no params |
+| `params.raw("key")` | Raw `toml::Value` for a key |
+
+### Supported Types
+
+`get::<T>()` supports: `String`, `bool`, `i32`, `i64`, `u32`, `u64`, `u8`, `f32`, `f64`, `Vec<T>` (for any supported `T`).
+
+**Type coercion:** TOML integers convert to floats (`1000` becomes `1000.0`). No other cross-type coercion — a string `"42"` will NOT parse as an integer. Use the correct TOML type in your config.
+
+### Reserved Keys
+
+These keys are consumed by the loader and NOT passed to `NodeParams`:
+
+`use`, `sim`, `args`, `terra`, `package`, `node`, `crate`, `source`, `pip`, `exec`, `simulated`
+
+---
+
+## Simulation Override
+
+Mark hardware entries with `sim = true` to swap them for stubs when running in simulation mode:
+
+```toml
+[hardware.lidar]
+use = "rplidar"
+port = "/dev/ttyUSB0"
+sim = true
+
+[hardware.imu]
+use = "bno055"
+bus = "/dev/i2c-1"
+sim = true
+```
+
+```bash
+horus run          # real hardware — creates rplidar and bno055 nodes
+horus run --sim    # sim mode — creates stub nodes, simulator publishes to same topics
+```
+
+Your application code doesn't change. The simulator (sim3d, mujoco) publishes to the same topic names.
+
+---
+
+## External Process Drivers
+
+Use the `exec:` prefix to wrap any binary as a node:
+
+```toml
+[hardware.camera]
+use = "exec:./realsense_bridge"
+args = ["--width", "640", "--height", "480"]
+```
+
+The binary runs as a subprocess. It should publish to horus SHM topics. The `ExecDriver` monitors health and restarts on crash.
+
+---
+
+## `register_driver!`
+
+Register a node factory so `hardware::load()` can instantiate it from config.
+
+```rust
+// simplified
+register_driver!(MyDriver, MyDriver::from_params);
+```
+
+The factory function signature: `fn(&NodeParams) -> Result<Self>`.
+
+The macro uses `.init_array` for compile-time registration — no manual setup needed.
+
+---
+
+## Complete Example
+
+```toml
+# horus.toml
+[package]
+name = "my-robot"
+version = "0.1.0"
+
+[hardware.arm]
+use = "ArmDriver"
+port = "/dev/ttyUSB0"
+baudrate = 1000000
+servo_ids = [1, 2, 3, 4, 5, 6]
+sim = true
+
+[hardware.conveyor]
+use = "ConveyorDriver"
+port = "/dev/ttyACM0"
+speed = 0.5
+```
+
+```rust
+// simplified
+use horus::prelude::*;
+use horus::hardware;
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz());
+
+    // Load all hardware nodes from config
+    let nodes = hardware::load()?;
+    for (name, node) in nodes {
+        hlog!(info, "Loaded hardware node: {}", name);
+        sched.add(node).build()?;
+    }
+
+    sched.run()
+}
+```
+
+---
+
+## Testing with Mock Config
+
+Use `hardware::load_from()` to load from a test config file:
+
+```rust
+// simplified
+#[test]
+fn conveyor_from_config() {
+    std::fs::write("test_hw.toml", r#"
+        [hardware.conveyor]
+        use = "ConveyorDriver"
+        port = "/dev/null"
+        speed = 0.0
+    "#).unwrap();
+
+    let nodes = hardware::load_from("test_hw.toml").unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].0, "conveyor");
+
+    std::fs::remove_file("test_hw.toml").ok();
+}
+```
+
+---
+
+## Error Handling
+
+All hardware methods return `Result<T>`. Common error conditions:
+
+| Operation | Error | When |
+|-----------|-------|------|
+| `hardware::load()` | `ConfigError` | No `horus.toml` found (searches up to 10 levels) |
+| `hardware::load()` | `ConfigError` | Unknown node type in `use` field — error lists registered types |
+| `params.get::<T>("key")` | `ConfigError` | Key missing or type mismatch |
+
+```rust
+// simplified
+let nodes = match hardware::load() {
+    Ok(n) => n,
+    Err(e) => {
+        hlog!(error, "No hardware config: {}", e);
+        hlog!(info, "Running without hardware");
+        vec![]
+    }
+};
+```
+
+---
+
+## Legacy Support
+
+The `[drivers]` section name and legacy source keys (`terra`, `package`, `node`, `crate`, `pip`, `exec`) are still parsed for backward compatibility. Migrate to `[hardware]` with the `use` field:
+
+```toml
+# Old format
+[drivers.arm]
+terra = "dynamixel"
+port = "/dev/ttyUSB0"
+
+# New format
+[hardware.arm]
+use = "dynamixel"
+port = "/dev/ttyUSB0"
+sim = true
+```
+
+---
+
+## See Also
+
+- [Hardware Drivers Tutorial](/tutorials/05-hardware-drivers) — Step-by-step hardware integration
+- [Scheduler API](/rust/api/scheduler) — Running nodes
+- [Configuration Reference](/package-management/configuration) — `[hardware]` section in horus.toml

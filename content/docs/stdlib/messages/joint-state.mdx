@@ -1,0 +1,158 @@
+---
+title: "JointState / JointCommand"
+description: "Multi-joint feedback and control for robot arms, grippers, and articulated mechanisms"
+order: 13
+---
+
+# JointState / JointCommand
+
+Messages for multi-joint robots: manipulator arms, grippers, legged robots, and any system with named revolute or prismatic joints. `JointState` reports current positions/velocities/efforts; `JointCommand` sends target positions/velocities.
+
+## When to Use
+
+Use `JointState` to publish feedback from joint encoders (position, velocity, effort). Use `JointCommand` to send target positions or velocities to a servo controller. Supports up to 16 joints per message.
+
+## ROS2 Equivalent
+
+`sensor_msgs/JointState` and `trajectory_msgs/JointTrajectoryPoint` — similar structure.
+
+## JointState — Feedback
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut state = JointState::default();
+state.joint_count = 6;  // 6-DOF arm
+
+// Set joint names (null-terminated, max 31 chars)
+state.names[0][..8].copy_from_slice(b"shoulder");
+state.names[1][..5].copy_from_slice(b"elbow");
+state.names[2][..5].copy_from_slice(b"wrist");
+
+// Set current positions (radians)
+state.positions[0] = 0.5;   // shoulder at 0.5 rad
+state.positions[1] = -1.2;  // elbow at -1.2 rad
+state.positions[2] = 0.0;   // wrist at home
+
+let topic: Topic<JointState> = Topic::new("joint.state")?;
+topic.send(state);
+```
+
+### Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `names` | `[[u8; 32]; 16]` | -- | Joint names (null-terminated strings) |
+| `joint_count` | `u8` | -- | Number of active joints (max 16) |
+| `positions` | `[f64; 16]` | rad / m | Position: radians (revolute) or meters (prismatic) |
+| `velocities` | `[f64; 16]` | rad/s / m/s | Velocity |
+| `efforts` | `[f64; 16]` | Nm / N | Torque (revolute) or force (prismatic) |
+| `timestamp_ns` | `u64` | ns | Timestamp |
+
+---
+
+## JointCommand — Control
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let mut cmd = JointCommand::default();
+cmd.joint_count = 3;
+
+// Target positions
+cmd.positions[0] = 1.0;   // shoulder to 1.0 rad
+cmd.positions[1] = -0.5;  // elbow to -0.5 rad
+cmd.positions[2] = 0.3;   // wrist to 0.3 rad
+
+// Velocity limits
+cmd.velocities[0] = 0.5;  // max 0.5 rad/s
+cmd.velocities[1] = 0.5;
+cmd.velocities[2] = 1.0;
+
+let topic: Topic<JointCommand> = Topic::new("joint.command")?;
+topic.send(cmd);
+```
+
+### Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `joint_names` | `[[u8; 32]; 16]` | -- | Joint names (null-terminated strings) |
+| `joint_count` | `u8` | -- | Number of active joints (max 16) |
+| `positions` | `[f64; 16]` | rad / m | Target positions |
+| `velocities` | `[f64; 16]` | rad/s / m/s | Velocity limits or targets |
+| `efforts` | `[f64; 16]` | Nm / N | Torque/force limits or targets |
+| `timestamp_ns` | `u64` | ns | Timestamp |
+
+---
+
+## Common Patterns
+
+### Arm Controller Node
+
+```rust
+// simplified
+fn tick(&mut self) {
+    // IMPORTANT: always recv() every tick
+    if let Some(cmd) = self.cmd_sub.recv() {
+        for i in 0..cmd.joint_count as usize {
+            // SAFETY: clamp to joint limits
+            let pos = cmd.positions[i].clamp(self.min_limits[i], self.max_limits[i]);
+            self.write_servo(i, pos);
+        }
+    }
+
+    // Read encoder feedback
+    let mut state = JointState::default();
+    state.joint_count = self.num_joints;
+    for i in 0..self.num_joints as usize {
+        state.positions[i] = self.read_encoder(i);
+    }
+    self.state_pub.send(state);
+}
+
+fn shutdown(&mut self) -> Result<()> {
+    // SAFETY: move all joints to home position
+    for i in 0..self.num_joints as usize {
+        self.write_servo(i, 0.0);
+    }
+    Ok(())
+}
+```
+
+## Quick Reference
+
+| Type | Direction | Key Fields | Use Case |
+|------|-----------|------------|----------|
+| `JointState` | Feedback (sensor to controller) | `positions`, `velocities`, `efforts` | Report current joint values from encoders |
+| `JointCommand` | Control (controller to actuator) | `positions`, `velocities`, `efforts` | Send target positions/velocities to servos |
+
+## Design Decisions
+
+**Why fixed-size arrays of 16 joints instead of variable-length?** Fixed-size arrays enable zero-copy shared memory transport with no heap allocation. 16 joints cover common configurations: 6-DOF arms (6), humanoid arms (7), dual-arm setups (14), hexapod legs (3 x 6 = 18, split across two messages). For robots with more than 16 joints, publish separate messages per limb/chain.
+
+**Why `[u8; 32]` for joint names instead of strings?** Same rationale as Detection -- fixed-size Pod layout for zero-copy. 31 characters is enough for descriptive names like `"left_shoulder_pitch"` or `"gripper_finger_left"`.
+
+**Why positions/velocities/efforts as parallel arrays instead of per-joint structs?** Parallel arrays match how servo drivers and motor controllers work: you read all positions at once from a bus scan, write all targets in one command. This layout also maps directly to NumPy arrays for Python ML pipelines.
+
+**Why both position and velocity in JointCommand?** Different control modes need different fields. Position control uses `positions` (servo moves to target). Velocity control uses `velocities` (motor spins at target speed). Impedance/force control uses `efforts`. Publishing all three lets the receiving controller pick the appropriate mode without separate message types.
+
+## Related Types
+
+- [ServoCommand](/rust/api/control-messages) — Single servo control
+- [TrajectoryPoint](/rust/api/control-messages) — Timed trajectory waypoint
+- [Servo Controller](/recipes/servo-controller) — Complete servo bus recipe
+
+---
+
+## See Also
+
+- [Sensor Messages (Rust)](/rust/api/sensor-messages) — Full Rust API
+- [Servo Controller Recipe](/recipes/servo-controller) — Multi-servo control
+- [BatteryState](/stdlib/messages/battery-state) — Power monitoring for actuated systems

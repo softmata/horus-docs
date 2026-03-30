@@ -1,0 +1,354 @@
+---
+title: "Tensor"
+description: "Zero-copy tensor descriptor with DLPack interop for ML pipelines"
+weight: 63
+---
+
+# Tensor
+
+A lightweight tensor descriptor for zero-copy ML data sharing across nodes and processes.
+
+```rust
+// simplified
+use horus::prelude::*;
+```
+
+<Callout type="info">
+**Most users do not need Tensor directly.** For camera images use [Image](/rust/api/tensor-messages), for 3D points use [PointCloud](/rust/api/tensor-messages), for depth data use [DepthImage](/rust/api/tensor-messages). Tensor is for advanced ML pipelines where you need direct control over shape, dtype, and layout — for example, feeding preprocessed batches into a model or reading raw model outputs.
+</Callout>
+
+## Overview
+
+`Tensor` is a lightweight descriptor that references data in shared memory. Only the descriptor is transmitted through topics — the actual tensor data stays in-place, enabling zero-copy transport for large ML payloads.
+
+## Methods
+
+| Method | Return Type | Description |
+|--------|-------------|-------------|
+| `shape()` | `&[u64]` | Tensor dimensions (e.g., `[1080, 1920, 3]`) |
+| `strides()` | `&[u64]` | Byte strides per dimension |
+| `numel()` | `u64` | Total number of elements |
+| `nbytes()` | `u64` | Total size in bytes (`numel * dtype.element_size()`) |
+| `dtype()` | `TensorDtype` | Element data type |
+| `device()` | `Device` | Device location (CPU or CUDA) |
+| `is_cpu()` | `bool` | True if data resides on CPU / shared memory |
+| `is_cuda()` | `bool` | True if device descriptor is set to CUDA |
+| `is_contiguous()` | `bool` | True if memory layout is C-contiguous |
+| `view(new_shape)` | `Option` | Reshape without copying (fails if not contiguous or element count changes) |
+| `slice_first_dim(start, end)` | `Option` | Slice along the first dimension, adjusting strides |
+
+### Reshape and Slice
+
+```rust
+// simplified
+let topic: Topic<Tensor> = Topic::new("model.input")?;
+
+if let Some(tensor) = topic.recv() {
+    // Reshape a flat 1D tensor into a batch of images
+    if let Some(reshaped) = tensor.view(&[4, 3, 224, 224]) {
+        println!("Batch shape: {:?}", reshaped.shape()); // [4, 3, 224, 224]
+    }
+
+    // Take the first 2 items from a batch
+    if let Some(sliced) = tensor.slice_first_dim(0, 2) {
+        println!("Sliced shape: {:?}", sliced.shape()); // [2, 3, 224, 224]
+    }
+}
+```
+
+## TensorDtype
+
+Supported element types with sizes and common use cases:
+
+| Dtype | Size | Use Case |
+|-------|------|----------|
+| `F32` | 4 bytes | ML training and inference |
+| `F64` | 8 bytes | High-precision computation |
+| `F16` | 2 bytes | Memory-efficient inference |
+| `BF16` | 2 bytes | Training on modern GPUs |
+| `I8` | 1 byte | Quantized inference |
+| `I16` | 2 bytes | Audio, sensor data |
+| `I32` | 4 bytes | General integer |
+| `I64` | 8 bytes | Large signed values |
+| `U8` | 1 byte | Images |
+| `U16` | 2 bytes | Depth sensors (mm) |
+| `U32` | 4 bytes | Large indices |
+| `U64` | 8 bytes | Counters, timestamps |
+| `Bool` | 1 byte | Masks |
+
+### TensorDtype Methods
+
+```rust
+// simplified
+let dtype = TensorDtype::F32;
+
+// Size in bytes
+assert_eq!(dtype.element_size(), 4);
+
+// Display (lowercase string representation)
+println!("{}", dtype); // "float32"
+
+// Parse from string — accepts common aliases
+let parsed = TensorDtype::parse("float32").unwrap(); // F32
+let parsed = TensorDtype::parse("f16").unwrap();     // F16
+let parsed = TensorDtype::parse("uint8").unwrap();   // U8
+let parsed = TensorDtype::parse("bool").unwrap();     // Bool
+```
+
+## Device
+
+Fixed-size device descriptor supporting CPU and CUDA device tags. `Device::cuda(N)` targets CUDA GPU index N. The optimal GPU memory backend is auto-detected at runtime: unified memory on Jetson, managed memory on discrete GPUs.
+
+```rust
+// simplified
+// Constructors
+let cpu = Device::cpu();
+let gpu0 = Device::cuda(0);  // CUDA device 0
+
+// Check device type
+assert!(cpu.is_cpu());
+assert!(gpu0.is_cuda());
+
+// Display
+println!("{}", gpu0); // "cuda:0"
+
+// Parse from string
+let dev = Device::parse("cpu").unwrap();
+let dev = Device::parse("cuda:0").unwrap();
+
+// GPU detection
+if horus::cuda_available() {
+    println!("{} GPU(s) found", horus::cuda_device_count());
+}
+
+// GPU-backed Image
+let gpu_img = Image::new(640, 480, ImageEncoding::Rgb8)?.to_gpu(Device::cuda(0))?;
+assert!(gpu_img.is_cuda());
+
+// Transfer between devices
+let cpu_img = gpu_img.to_cpu()?;
+let back_on_gpu = cpu_img.to_gpu(Device::cuda(0))?;
+```
+
+## ML Pipeline Example
+
+A camera node captures frames using `Image`, while a preprocessing node converts them into batched `Tensor` data for model inference:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Producer: camera capture node — uses Image, not raw Tensor
+node! {
+    CameraNode {
+        pub { frames: Image -> "camera.rgb" }
+        data { frame_count: u64 = 0 }
+
+        tick {
+            let image = Image::new(640, 480, ImageEncoding::Rgb8);
+            // ... fill pixel data from camera driver ...
+            self.frames.send(&image);
+            self.frame_count += 1;
+        }
+    }
+}
+
+// Preprocessor: converts Image frames into batched Tensor for ML
+node! {
+    PreprocessNode {
+        sub { frames: Image -> "camera.rgb" }
+        pub { batch: Tensor -> "model.input" }
+        data { buffer: Vec<Image> = Vec::new() }
+
+        tick {
+            if let Some(img) = self.frames.recv() {
+                self.buffer.push(img);
+
+                if self.buffer.len() >= 4 {
+                    // Build a [4, 3, 224, 224] F32 batch tensor for the model
+                    let tensor = Tensor::from_shape(
+                        &[4, 3, 224, 224],
+                        TensorDtype::F32,
+                        Device::cpu(),
+                    );
+                    // ... resize, normalize, and copy frames into tensor ...
+                    self.batch.send(&tensor);
+                    self.buffer.clear();
+                }
+            }
+        }
+    }
+}
+
+// Consumer: inference node — works with raw Tensor input/output
+node! {
+    InferenceNode {
+        sub { input: Tensor -> "model.input" }
+        pub { detections: GenericMessage -> "model.detections" }
+
+        tick {
+            if let Some(tensor) = self.input.recv() {
+                hlog!(debug, "Input: {:?}, {} bytes", tensor.shape(), tensor.nbytes());
+                // Run inference on the batch tensor, publish results ...
+            }
+        }
+    }
+}
+```
+
+## Python Usage
+
+In Python, use `Image`, `PointCloud`, or `DepthImage` for zero-copy tensor data — they wrap the pool-backed tensor system automatically and provide `.to_numpy()`, `.to_torch()`, `.to_jax()` conversions:
+
+```python
+import horus
+import numpy as np
+
+# Image → NumPy (zero-copy)
+img = horus.Image(480, 640, "rgb8")
+arr = img.to_numpy()  # shape: (480, 640, 3), dtype: uint8
+
+# PointCloud → PyTorch (zero-copy via DLPack)
+cloud = horus.PointCloud.from_numpy(np.random.randn(1000, 3).astype(np.float32))
+tensor = cloud.to_torch()
+
+# DepthImage → JAX
+depth = horus.DepthImage(480, 640, "float32")
+jax_arr = depth.to_jax()
+```
+
+See [Python Image](/python/api/image), [Python PointCloud](/python/api/pointcloud), and [Python DepthImage](/python/api/depth-image) for the full APIs.
+
+---
+
+## TensorDtype
+
+Enumerates all supported tensor element types. Matches common ML framework dtypes for seamless interop with PyTorch, NumPy, JAX, and DLPack.
+
+| Variant | Value | Size | NumPy | Use Case |
+|---------|-------|------|-------|----------|
+| `F32` | 0 | 4 bytes | `<f4` | Default for most ML models |
+| `F64` | 1 | 8 bytes | `<f8` | High-precision computation |
+| `F16` | 2 | 2 bytes | `<f2` | GPU inference, mixed precision |
+| `BF16` | 3 | 2 bytes | `<V2` | Training, transformer models |
+| `I8` | 4 | 1 byte | `\|i1` | Quantized models |
+| `I16` | 5 | 2 bytes | `<i2` | Audio, depth sensors |
+| `I32` | 6 | 4 bytes | `<i4` | Labels, indices |
+| `I64` | 7 | 8 bytes | `<i8` | Timestamps, large indices |
+| `U8` | 8 | 1 byte | `\|u1` | Images (RGB pixels) |
+| `U16` | 9 | 2 bytes | `<u2` | Depth images (mm) |
+| `U32` | 10 | 4 bytes | `<u4` | Point cloud indices |
+| `U64` | 11 | 8 bytes | `<u8` | Large counters |
+| `Bool` | 12 | 1 byte | `\|b1` | Masks, flags |
+
+### Methods
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let dtype = TensorDtype::F32;
+
+// Element size in bytes
+assert_eq!(dtype.element_size(), 4);
+
+// NumPy type string (for __array_interface__)
+assert_eq!(dtype.numpy_typestr(), "<f4");
+
+// DLPack interop (code, bits, lanes)
+let (code, bits, lanes) = dtype.to_dlpack();
+assert_eq!((code, bits, lanes), (2, 32, 1)); // FLOAT, 32-bit, 1 lane
+
+// Round-trip from DLPack
+let recovered = TensorDtype::from_dlpack(code, bits, lanes);
+assert_eq!(recovered, Some(TensorDtype::F32));
+
+// Parse from string
+let parsed = TensorDtype::parse("f16");
+assert_eq!(parsed, Some(TensorDtype::F16));
+
+// Safe construction from raw u8 (for SHM/network data)
+let safe = TensorDtype::from_raw(255); // invalid → defaults to F32
+assert_eq!(safe, TensorDtype::F32);
+```
+
+---
+
+## Device
+
+Specifies where tensor data resides: CPU or CUDA GPU. Supports unlimited GPU indices.
+
+### Layout
+
+```text
+device_type (1 byte): 0=CPU, 1=CUDA
+_pad        (3 bytes): alignment
+device_id   (4 bytes): GPU index (0 for CPU)
+Total: 8 bytes
+```
+
+### Methods
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// CPU (default)
+let cpu = Device::cpu();
+assert!(cpu.is_cpu());
+
+// CUDA GPU 0
+let gpu0 = Device::cuda(0);
+assert!(gpu0.is_cuda());
+
+// CUDA GPU 3 (multi-GPU)
+let gpu3 = Device::cuda(3);
+
+// Parse from string
+let dev = Device::parse("cuda:1").unwrap();
+assert!(dev.is_cuda());
+assert_eq!(dev.device_id, 1);
+
+// Also supports "gpu" alias
+let dev = Device::parse("gpu:0").unwrap();
+assert!(dev.is_cuda());
+
+// Constants
+let _ = Device::CPU;   // CPU constant
+let _ = Device::CUDA0; // CUDA device 0 constant
+```
+
+### DLPack Interop
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let device = Device::cuda(2);
+
+// Convert to DLPack format
+let dl_type = device.to_dlpack_device_type(); // 2 = kDLCUDA
+let dl_id = device.to_dlpack_device_id();     // 2
+
+// Create from DLPack
+let recovered = Device::from_dlpack(2, 2); // kDLCUDA, device 2
+assert_eq!(recovered, Some(Device::cuda(2)));
+```
+
+### String Parsing
+
+| Input | Result |
+|-------|--------|
+| `"cpu"` | `Device::cpu()` |
+| `"cuda"` or `"gpu"` | `Device::cuda(0)` |
+| `"cuda:0"` or `"gpu:0"` | `Device::cuda(0)` |
+| `"cuda:3"` | `Device::cuda(3)` |
+| `"tpu"` | `None` (unsupported) |
+
+---
+
+## See Also
+
+- [Data Types & Encoding](/rust/api/tensor-messages) — Image, PointCloud, DepthImage for common robotics data
+- [Message Types](/concepts/message-types) — All HORUS message types
+- [Python Image](/python/api/image), [Python PointCloud](/python/api/pointcloud), [Python DepthImage](/python/api/depth-image)

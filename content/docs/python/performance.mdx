@@ -1,0 +1,568 @@
+---
+title: "Performance Guide (Python)"
+description: "Optimization techniques for Python HORUS nodes — topic types, GIL management, zero-copy patterns, GPU interop, and profiling"
+order: 14
+---
+
+# Performance Guide (Python)
+
+Your Python node works. Now you want it faster. This page covers every optimization available to Python HORUS nodes — from topic type selection to GPU interop — with concrete latency numbers so you can decide what matters for your application.
+
+**Golden rule:** Optimize only after your system works correctly. A fast controller that computes the wrong output is worse than a slow one that gets it right.
+
+---
+
+## Quick Reference: Operation Latencies
+
+| Operation | Typical Latency | Notes |
+|-----------|----------------|-------|
+| Typed topic send/recv (`horus.CmdVel`) | ~1.5-1.7 us | Zero-copy Pod, binary-compatible with Rust |
+| Dict topic send (small, 3-5 keys) | ~6-12 us | MessagePack serialization |
+| Dict topic send (large, 50+ keys) | ~50-110 us | Proportional to dict size |
+| `Image.to_numpy()` | ~3 us | Zero-copy view into SHM pool |
+| `Image.to_torch()` | ~3 us | Zero-copy via DLPack |
+| `Image.from_numpy()` | ~50-200 us | One copy into SHM pool (size-dependent) |
+| `torch.from_dlpack(tensor)` | ~1 us | Zero-copy tensor exchange |
+| `tensor.cuda()` (CPU to GPU) | ~50 us | Unavoidable PCIe transfer |
+| GIL acquire per tick | ~3 us | Fixed overhead per Python tick |
+| Runtime custom message | ~20-40 us | `struct` serialization |
+| Compiled custom message | ~3-5 us | Generated PyO3 bindings |
+| `node.recv()` (no message) | ~0.1 us | Lock-free ring buffer check |
+
+---
+
+## Dict Topics vs Typed Topics
+
+String topics (`pubs=["data"]`) use `GenericMessage` with MessagePack serialization. Typed topics (`pubs=[horus.CmdVel]`) use zero-copy Pod transport. The performance gap is significant.
+
+### Benchmarks
+
+```
+Dict topic (3 keys):     ~6-12 μs per send/recv
+Dict topic (50+ keys):   ~50-110 μs per send/recv
+Typed topic (CmdVel):    ~1.5-1.7 μs per send/recv
+```
+
+A 4x-30x difference. For a control loop at 100Hz (10ms budget), dict overhead is negligible. For 1kHz loops (1ms budget), it consumes 5-10% of your budget.
+
+### When to Upgrade
+
+**Stay with dicts** when:
+- Prototyping and schema is changing frequently
+- Rate is &lt;50Hz and message is small (&lt;10 keys)
+- Communication is Python-to-Python only
+- You value iteration speed over latency
+
+**Switch to typed** when:
+- Rate is &gt;100Hz or budget is &lt;1ms
+- Messages cross to Rust nodes (dicts cannot cross the language boundary)
+- You need deterministic, predictable latency
+- Message schema is stable
+
+### Upgrading
+
+```python
+# simplified
+# Before: dict topic (~8 μs)
+node = horus.Node(
+    name="controller",
+    pubs=["cmd_vel"],
+    tick=my_tick,
+    rate=100,
+)
+def my_tick(node):
+    node.send("cmd_vel", {"linear": 0.5, "angular": 0.1})
+
+# After: typed topic (~1.5 μs)
+node = horus.Node(
+    name="controller",
+    pubs=[horus.CmdVel],
+    tick=my_tick,
+    rate=100,
+)
+def my_tick(node):
+    node.send("cmd_vel", horus.CmdVel(linear=0.5, angular=0.1))
+```
+
+The node API is identical — only the `pubs`/`subs` spec and the data you pass to `send()` change.
+
+---
+
+## GIL Impact on Tick Latency
+
+Every Python tick acquires the GIL. This costs ~3 us per tick — fixed, unavoidable overhead. The GIL is released during `run()` and re-acquired only when the scheduler calls your `tick`, `init`, or `shutdown` callback.
+
+### What This Means in Practice
+
+| Tick Rate | GIL Overhead per Second | Budget Consumed |
+|-----------|------------------------|-----------------|
+| 10 Hz | 30 us | Negligible |
+| 100 Hz | 300 us | Negligible |
+| 1 kHz | 3 ms | 0.3% of wall time |
+
+For most Python nodes, GIL overhead is irrelevant. It becomes a concern only at very high tick rates (>500Hz) where the 3 us per tick adds up.
+
+### GC Pauses
+
+Python's garbage collector can introduce unpredictable pauses:
+
+- **Generation 0 collection:** ~0.1-0.5 ms (frequent, small)
+- **Generation 1 collection:** ~1-5 ms (less frequent)
+- **Generation 2 collection:** ~5-50 ms (rare, large heap)
+
+For latency-sensitive nodes, minimize allocations inside `tick()`:
+
+```python
+# simplified
+import gc
+
+# Pre-allocate outside tick
+cmd = horus.CmdVel(linear=0.0, angular=0.0)
+
+def controller_tick(node):
+    scan = node.recv("scan")
+    if scan:
+        # Reuse pre-allocated message — no allocation in tick
+        cmd.linear = 0.5 if min(scan.ranges) > 0.3 else 0.0
+        cmd.angular = 0.0
+        node.send("cmd_vel", cmd)
+
+# For tight budgets, disable GC during critical phases
+def init(node):
+    gc.disable()  # Manual GC control
+
+def shutdown(node):
+    gc.enable()
+```
+
+**Warning:** Disabling GC risks memory growth. Only do this for short-duration, allocation-light nodes.
+
+---
+
+## Zero-Copy Patterns
+
+Pool-backed types (`Image`, `PointCloud`, `DepthImage`, `Tensor`) use shared memory. The zero-copy path avoids serialization entirely.
+
+### The Zero-Copy Pipeline
+
+```
+Camera Node (Rust, 30Hz)
+    │
+    │  Image descriptor (64 bytes) via ring buffer
+    │  Pixel data stays in SHM pool
+    ▼
+Python Node
+    │
+    ├── img.to_numpy()       ~3 μs  (NumPy view into SHM, no copy)
+    ├── img.to_torch()       ~3 μs  (DLPack, no copy)
+    ├── img.to_jax()         ~3 μs  (DLPack, no copy)
+    │
+    │  Processing happens on SHM data directly
+    │
+    ├── Image.from_numpy()   ~50-200 μs  (one copy into SHM pool)
+    └── node.send()          ~1.5 μs     (descriptor only)
+```
+
+**Key insight:** `to_*()` methods are zero-copy. `from_*()` methods copy once into the pool. Design your pipeline to minimize `from_*()` calls.
+
+### What Copies and What Does Not
+
+| Operation | Copy? | Latency | Why |
+|-----------|-------|---------|-----|
+| `img.to_numpy()` | No | ~3 us | Returns view into existing SHM |
+| `img.to_torch()` | No | ~3 us | DLPack wraps SHM pointer |
+| `img.to_jax()` | No | ~3 us | DLPack wraps SHM pointer |
+| `img.as_tensor()` | No | ~3 us | Tensor shares same SHM slot |
+| `Image.from_numpy(arr)` | Yes (1x) | ~50-200 us | Must place data in pool slot |
+| `Image.from_torch(t)` | Yes (1x) | ~50-200 us | Must place data in pool slot |
+| `node.send("topic", dict)` | Yes | ~6-50 us | MessagePack serialization |
+| `node.send("topic", typed)` | No | ~1.5 us | Pod copied into ring buffer slot |
+
+### Anti-Pattern: Unnecessary Copies
+
+```python
+# simplified
+# BAD: Two copies — to_numpy creates a view, but np.array() copies it
+def tick(node):
+    img = node.recv("camera.rgb")
+    arr = np.array(img.to_numpy())  # Unnecessary copy!
+    process(arr)
+
+# GOOD: One view, zero copies
+def tick(node):
+    img = node.recv("camera.rgb")
+    arr = img.to_numpy()  # Zero-copy view
+    process(arr)
+```
+
+---
+
+## NumPy Interop
+
+HORUS pool-backed types implement the array protocol. NumPy operations work directly on shared memory.
+
+### Direct Array Operations
+
+```python
+# simplified
+import numpy as np
+
+def vision_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+
+    pixels = img.to_numpy()  # (H, W, C) view, zero-copy
+
+    # NumPy operations on SHM data — no copies
+    gray = np.mean(pixels, axis=2, dtype=np.float32)
+    edges = np.abs(np.diff(gray, axis=1))
+    obstacle_count = np.sum(edges > 128)
+
+    node.send("obstacles", {"count": int(obstacle_count)})
+```
+
+### Avoiding Copies with NumPy
+
+```python
+# simplified
+# BAD: .copy() forces allocation
+cropped = pixels[100:300, 200:400].copy()
+
+# GOOD: Slice is a view (no copy until you write to it)
+cropped = pixels[100:300, 200:400]
+
+# BAD: astype() always copies
+float_pixels = pixels.astype(np.float32)
+
+# GOOD: Use view if memory layout allows
+float_pixels = pixels.view(np.float32)  # Only works for same-size dtypes
+```
+
+### PointCloud with NumPy
+
+```python
+# simplified
+cloud = node.recv("lidar.points")
+if cloud:
+    points = cloud.to_numpy()  # (N, 3) float32, zero-copy
+
+    # Filter ground plane — operates on SHM data
+    above_ground = points[points[:, 2] > 0.1]
+
+    # Compute centroid
+    centroid = np.mean(above_ground, axis=0)
+```
+
+---
+
+## GPU Interop
+
+HORUS supports zero-copy tensor exchange with PyTorch, JAX, and CuPy via DLPack.
+
+### DLPack with PyTorch
+
+```python
+# simplified
+import torch
+
+def ml_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+
+    # Zero-copy: SHM → PyTorch CPU tensor
+    cpu_tensor = img.to_torch()  # ~3 μs, no copy
+
+    # CPU → GPU (unavoidable PCIe transfer, ~50 μs)
+    gpu_tensor = cpu_tensor.cuda().float() / 255.0
+    gpu_tensor = gpu_tensor.permute(2, 0, 1).unsqueeze(0)
+
+    # Inference
+    with torch.no_grad():
+        output = model(gpu_tensor)
+
+    # GPU → CPU
+    results = output.cpu().numpy()
+    node.send("detections", parse_results(results))
+```
+
+### DLPack with JAX
+
+```python
+# simplified
+import jax
+
+def jax_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+
+    # Zero-copy: SHM → JAX array
+    jax_array = img.to_jax()  # ~3 μs
+
+    # JAX processing
+    processed = jax.numpy.mean(jax_array, axis=2)
+    node.send("processed", {"mean_brightness": float(processed.mean())})
+```
+
+### Tensor Bridge for Custom Data
+
+Use `.as_tensor()` to get a general-purpose Tensor from any pool-backed type, then pass it to any framework via DLPack:
+
+```python
+# simplified
+import torch
+
+img = node.recv("camera.rgb")
+t = img.as_tensor()                    # shape=[480, 640, 3], zero-copy
+pt = torch.from_dlpack(t)             # zero-copy to PyTorch
+# Process with PyTorch...
+```
+
+### GPU Pipeline Performance
+
+```
+img.to_torch()           ~3 μs     (SHM → CPU tensor, zero-copy)
+tensor.cuda()            ~50 μs    (CPU → GPU, PCIe transfer)
+model(tensor)            ~5-30 ms  (GPU inference)
+output.cpu()             ~20 μs    (GPU → CPU)
+node.send(results)       ~6-12 μs  (dict) or ~1.5 μs (typed)
+───────────────────────────────────
+Total pipeline:          ~5-30 ms  (dominated by inference)
+```
+
+The IPC overhead (3 us + 6 us) is negligible compared to GPU inference time. Optimize the model, not the transport.
+
+---
+
+## Profiling
+
+### budget_remaining()
+
+Check how much time is left in your tick budget:
+
+```python
+# simplified
+import horus
+
+def adaptive_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+
+    frame = img.to_numpy()
+
+    # Always run fast detection
+    fast_result = fast_detect(frame)
+    node.send("detections", fast_result)
+
+    # Run expensive refinement only if budget allows
+    remaining = horus.budget_remaining()
+    if remaining > 5 * horus.ms:
+        refined = expensive_refinement(frame, fast_result)
+        node.send("detections.refined", refined)
+
+node = horus.Node(
+    name="adaptive_detector",
+    subs=[horus.Image],
+    pubs=["detections", "detections.refined"],
+    tick=adaptive_tick,
+    rate=30,
+    budget=30 * horus.ms,
+    on_miss="skip",
+)
+```
+
+### Node Metrics
+
+Query tick duration and error stats at runtime:
+
+```python
+# simplified
+sched = horus.Scheduler(tick_rate=100)
+sched.add(detector)
+sched.add(planner)
+
+# After running for a while...
+for name in sched.get_node_names():
+    stats = sched.get_node_stats(name)
+    avg_ms = stats.get("avg_tick_duration_ms", 0)
+    total = stats.get("total_ticks", 0)
+    errors = stats.get("error_count", 0)
+    print(f"{name}: avg={avg_ms:.2f}ms, ticks={total}, errors={errors}")
+```
+
+### cProfile for Tick Functions
+
+Profile individual tick functions to find bottlenecks:
+
+```python
+# simplified
+import cProfile
+import pstats
+
+profiler = cProfile.Profile()
+tick_count = 0
+
+def profiled_tick(node):
+    global tick_count
+    profiler.enable()
+    actual_tick(node)  # Your real tick logic
+    profiler.disable()
+    tick_count += 1
+
+def shutdown(node):
+    stats = pstats.Stats(profiler)
+    stats.sort_stats("cumulative")
+    stats.print_stats(20)  # Top 20 hotspots
+    print(f"Profiled {tick_count} ticks")
+
+node = horus.Node(
+    name="profiled_node",
+    tick=profiled_tick,
+    shutdown=shutdown,
+    rate=30,
+)
+horus.run(node, duration=10.0)
+```
+
+### CLI Profiling
+
+Use the HORUS CLI to monitor node performance without modifying code:
+
+```bash
+# Watch tick rates and latencies for all nodes
+horus monitor
+
+# Check topic message rates
+horus topic hz camera.rgb
+
+# View topic data in real time
+horus topic echo detections
+```
+
+---
+
+## When to Move Work to Rust
+
+Python is the right choice for most ML, prototyping, and I/O-heavy work. Move to Rust when Python becomes the bottleneck — not before.
+
+### Concrete Guidelines
+
+| Situation | Recommendation |
+|-----------|---------------|
+| Tick rate &gt;1 kHz | Move to Rust (GIL overhead dominates) |
+| Budget &lt;100 us | Move to Rust (Python tick overhead alone is ~3 us) |
+| Safety-critical node | Move to Rust (`is_safe_state` / `enter_safe_state` unavailable in Python) |
+| Tight control loop | Move to Rust (GC pauses are unpredictable) |
+| ML inference at 30Hz | Stay in Python (inference dominates, not tick overhead) |
+| I/O-heavy (HTTP, DB) | Stay in Python (async support is natural) |
+| Prototyping any rate | Stay in Python (iterate faster, optimize later) |
+| Data visualization | Stay in Python (matplotlib, plotly ecosystem) |
+
+### The Hybrid Pattern
+
+The most common production architecture: Rust for high-frequency control, Python for ML and I/O.
+
+```
+Python ML Node (30Hz)              Rust Control Node (1kHz)
+  ├── Receives camera images         ├── Receives detections
+  ├── Runs YOLO inference            ├── Runs path planning
+  ├── Publishes detections           ├── Publishes motor commands
+  │                                  │
+  └── budget=30ms, compute=True      └── budget=200μs, deadline=500μs
+```
+
+Both share the same topics via zero-copy SHM. The Python node uses `compute=True` to run on the thread pool. The Rust node uses budget/deadline for hard timing guarantees.
+
+---
+
+## Memory: Pool-Backed vs Heap-Allocated
+
+### Pool-Backed Types
+
+`Image`, `PointCloud`, `DepthImage`, and `Tensor` are backed by a shared memory pool. The pool pre-allocates slots, so creating and sending these types avoids per-tick heap allocation.
+
+```python
+# simplified
+def camera_tick(node):
+    # Image.from_numpy() places data in a pre-allocated pool slot
+    # Only the 64-byte descriptor is sent through the ring buffer
+    frame = capture_camera()
+    img = horus.Image.from_numpy(frame)
+    node.send("camera.rgb", img)  # ~1.5 μs (descriptor only)
+```
+
+**Performance:** Pool allocation is O(1) — a single atomic compare-and-swap to claim a slot. No malloc, no GC pressure.
+
+### Heap-Allocated (Dict Topics)
+
+Dict topics allocate a new MessagePack buffer on every `send()`. This creates GC pressure:
+
+```python
+# simplified
+def telemetry_tick(node):
+    # Every send() allocates a new MessagePack buffer
+    node.send("telemetry", {
+        "cpu": get_cpu(),
+        "mem": get_mem(),
+        "temp": get_temp(),
+    })
+```
+
+At low rates (&lt;100Hz), this is fine. At high rates, the repeated allocations can trigger GC pauses.
+
+### Reducing Allocation Pressure
+
+```python
+# simplified
+# Pre-allocate typed message (reuse across ticks)
+cmd = horus.CmdVel(linear=0.0, angular=0.0)
+
+def fast_tick(node):
+    scan = node.recv("scan")
+    if scan:
+        cmd.linear = compute_speed(scan)
+        cmd.angular = compute_turn(scan)
+        node.send("cmd_vel", cmd)  # No allocation — reuses existing Pod
+```
+
+For pool-backed types, the pool handles reuse automatically. For typed Pod messages, you can reuse the same object across ticks.
+
+---
+
+## Design Decisions
+
+**Why does Python have a ~3 us GIL overhead per tick?** The HORUS scheduler is Rust code. It releases the GIL during the main tick loop so other Python threads (Flask servers, background tasks) can run concurrently. The GIL is re-acquired only when calling your Python callback. This design prioritizes scheduler determinism: the Rust tick loop runs without Python interference, and Python code gets a clean, bounded window.
+
+**Why is `GenericMessage` slower than typed topics?** Dict topics serialize Python objects to MessagePack binary format, which requires traversing the dict, type-checking each value, and writing variable-length output. Typed topics (`horus.CmdVel`) are fixed-size Plain Old Data — a single `memcpy` of known size. The serialization cost is the price of Python's dynamic typing.
+
+**Why does `from_numpy()` copy but `to_numpy()` does not?** The shared memory pool controls memory layout and lifetime. `from_numpy()` must copy data into a specific pool slot for cross-process sharing. `to_numpy()` returns a view into that already-shared slot. This is one copy on publish, zero copies on subscribe — the optimal tradeoff for pub/sub patterns where one publisher serves many subscribers.
+
+**Why not auto-detect when to use typed vs dict topics?** Explicit is better than implicit. Dict topics and typed topics have different semantics (cross-language support, size limits, error behavior). Forcing the choice at `Node()` construction time makes the performance characteristics visible in the code, not hidden behind heuristics.
+
+---
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| GIL release during `run()` | Other Python threads run freely | ~3 us re-acquire per tick |
+| Dict topics for flexibility | Any Python object works | ~5-50 us vs ~1.5 us for typed |
+| Pool-backed large data | Zero-copy IPC for images/clouds | One copy on `from_numpy()` |
+| DLPack for GPU interop | Works with PyTorch, JAX, CuPy | Requires framework-specific import |
+| Pre-allocation for speed | No GC pressure in tick | More setup code, less flexibility |
+| `budget_remaining()` for adaptive work | Maximizes budget usage | Adds branching complexity |
+| Disabling GC | Eliminates GC pauses | Risks memory growth |
+
+---
+
+## See Also
+
+- [Python API](/python/api) -- Node, Scheduler, Topic, Clock API reference
+- [Image API](/python/api/image) -- Zero-copy camera frames with NumPy/PyTorch
+- [Memory Types](/python/api/memory-types) -- Pool-backed Image, PointCloud, DepthImage, Tensor
+- [ML Developer's Guide](/python/library/ml-guide) -- PyTorch, ONNX, and OpenCV integration
+- [Advanced Patterns](/python/advanced-patterns) -- Compute nodes, async I/O, deterministic mode
+- [Benchmarks](/performance/benchmarks) -- Full IPC and scheduler benchmark data

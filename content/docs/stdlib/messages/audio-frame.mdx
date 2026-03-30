@@ -1,0 +1,199 @@
+---
+title: "AudioFrame"
+description: "Audio data from microphones for speech recognition, anomaly detection, and human-robot interaction"
+order: 14
+---
+
+# AudioFrame
+
+Audio data from a microphone or audio source. Fixed-size Pod type for zero-copy shared memory transport. Supports mono, stereo, and multi-channel microphone arrays.
+
+## When to Use
+
+Use `AudioFrame` when your robot has microphones and needs to share audio between nodes -- for example, between a microphone driver node, a speech recognition node, and an anomaly detection node.
+
+Common use cases:
+- **Voice commands** -- speech-to-text for human-robot interaction
+- **Anomaly detection** -- motor fault detection by sound
+- **Acoustic SLAM** -- using sound for localization
+- **Teleoperation** -- two-way audio between operator and robot
+
+## ROS2 Equivalent
+
+`audio_common_msgs/AudioData` -- similar concept, but HORUS uses a fixed-size Pod buffer for zero-copy SHM instead of variable-length serialized bytes.
+
+## Quick Start
+
+### Rust
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Publish audio from a microphone
+let topic: Topic<AudioFrame> = Topic::new("mic")?;
+let samples: Vec<f32> = capture_audio(); // your mic driver
+let frame = AudioFrame::mono(16000, &samples);
+topic.send(frame);
+
+// Receive and process
+let frame = topic.recv().unwrap();
+println!("Got {} samples at {}Hz, {:.1}ms",
+    frame.num_samples, frame.sample_rate, frame.duration_ms());
+```
+
+### Python
+
+```python
+import horus
+
+def process_audio(node):
+    frame = node.recv("mic")
+    if frame:
+        samples = frame.samples        # list of floats
+        rate = frame.sample_rate        # e.g. 16000
+        duration = frame.duration_ms    # e.g. 10.0
+
+        # Feed to speech recognition
+        text = whisper.transcribe(samples, sr=rate)
+
+node = horus.Node("speech", subs=["mic"], tick=process_audio, rate=100)
+horus.run(node)
+```
+
+## Constructors
+
+### Rust
+
+| Constructor | Description |
+|-------------|-------------|
+| `AudioFrame::mono(sample_rate, &samples)` | Single-channel audio |
+| `AudioFrame::stereo(sample_rate, &samples)` | Interleaved stereo (L R L R...) |
+| `AudioFrame::multi_channel(sample_rate, channels, &samples)` | Microphone arrays (4, 8, 16 mics) |
+
+### Python
+
+```python
+# Mono microphone at 16kHz
+frame = horus.AudioFrame(sample_rate=16000, samples=[0.1, -0.2, 0.3])
+
+# Stereo at 48kHz
+frame = horus.AudioFrame(sample_rate=48000, channels=2, samples=interleaved)
+
+# 4-channel mic array
+frame = horus.AudioFrame(sample_rate=16000, channels=4, samples=array_data)
+
+# With metadata
+frame = horus.AudioFrame(
+    sample_rate=16000,
+    samples=data,
+    frame_id="mic_left",
+    timestamp_ns=horus.timestamp_ns()
+)
+```
+
+## Fields
+
+| Field | Type | Unit | Description |
+|-------|------|------|-------------|
+| `samples` | `[f32; 4800]` | -- | Audio sample buffer (Rust), `list[float]` (Python -- only valid samples). Range: [-1.0, 1.0] (F32) |
+| `num_samples` | `u32` | -- | Number of valid samples in buffer |
+| `sample_rate` | `u32` | Hz | Sample rate (8000, 16000, 44100, 48000) |
+| `channels` | `u8` | -- | Channel count (1=mono, 2=stereo, N=mic array) |
+| `encoding` | `u8` | -- | Audio encoding (0=F32, 1=I16) |
+| `timestamp_ns` | `u64` | ns | Capture timestamp in nanoseconds |
+| `frame_id` | `[u8; 32]` | -- | Source identifier (e.g. "mic_left") |
+
+## Computed Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `duration_ms()` | `f64` | Duration of this audio chunk in milliseconds |
+| `frame_count()` | `u32` | Number of audio frames (samples per channel) |
+| `valid_samples()` | `&[f32]` | Slice of only the valid samples (Rust) |
+
+## Buffer Size
+
+`MAX_AUDIO_SAMPLES = 4800` -- enough for 48kHz at 100ms chunks. For common configurations:
+
+| Sample Rate | Chunk Duration | Samples Needed | Fits? |
+|-------------|---------------|----------------|-------|
+| 8kHz | 100ms | 800 | Yes |
+| 16kHz | 20ms | 320 | Yes |
+| 16kHz | 100ms | 1600 | Yes |
+| 44.1kHz | 20ms | 882 | Yes |
+| 48kHz | 100ms | 4800 | Yes (max) |
+| 48kHz stereo | 50ms | 4800 | Yes (max) |
+
+For longer chunks, send multiple frames.
+
+## Multi-Channel Audio
+
+For microphone arrays, samples are **interleaved**: channel 0 sample 0, channel 1 sample 0, channel 0 sample 1, channel 1 sample 1, etc.
+
+```rust
+// simplified
+// 4-channel mic array, 16kHz, 10ms chunk = 640 samples
+let samples = capture_4ch_audio(); // [ch0_s0, ch1_s0, ch2_s0, ch3_s0, ch0_s1, ...]
+let frame = AudioFrame::multi_channel(16000, 4, &samples);
+assert_eq!(frame.frame_count(), 160); // 640 / 4 channels
+```
+
+## AudioEncoding
+
+The encoding format for audio samples in the buffer.
+
+| Variant | Value | Description |
+|---------|-------|-------------|
+| `F32` | 0 | 32-bit float, range [-1.0, 1.0] (normalized) |
+| `I16` | 1 | 16-bit signed integer, range [-32768, 32767] (PCM) |
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Float encoding (default, best for processing)
+let frame = AudioFrame::mono(16000, &float_samples);
+assert_eq!(frame.encoding, AudioEncoding::F32 as u8);
+
+// Integer encoding (common for hardware capture)
+let mut frame = AudioFrame::default();
+frame.encoding = AudioEncoding::I16 as u8;
+```
+
+## Wire Format
+
+`AudioFrame` is a fixed-size Pod type (~19.2 KB). It uses the same zero-copy SHM transport as all other Pod messages -- no serialization overhead.
+
+```
+[f32 x 4800] samples    = 19200 bytes
+[u32] num_samples        =     4 bytes
+[u32] sample_rate        =     4 bytes
+[u8]  channels           =     1 byte
+[u8]  encoding           =     1 byte
+[u8 x 2] padding         =     2 bytes
+[u64] timestamp_ns       =     8 bytes
+[u8 x 32] frame_id      =    32 bytes
+Total                    = 19252 bytes
+```
+
+## Design Decisions
+
+**Why fixed-size `[f32; 4800]` instead of variable-length?** Fixed-size enables zero-copy Pod transport with no heap allocation. 4800 samples fits the largest common configuration (48kHz mono at 100ms) and smaller configurations use only a portion of the buffer, with `num_samples` tracking the valid range. The ~19KB overhead per message is acceptable given the transport speed advantage.
+
+**Why F32 as the default encoding instead of I16 PCM?** Float-normalized audio ([-1.0, 1.0]) is the standard input format for speech recognition models (Whisper, Wav2Vec2), anomaly detection, and audio ML in general. This avoids a normalization step in every consumer node. For hardware that captures I16 PCM, convert once at the driver level.
+
+**Why interleaved multi-channel instead of planar?** Interleaved layout (`[ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]`) matches how audio hardware and ALSA/PulseAudio deliver data. This avoids a deinterleave step in the driver node. ML models that need planar audio can reshape via NumPy: `arr.reshape(-1, channels).T`.
+
+**Why 100ms max chunk duration?** Audio processing in robotics needs low latency for reactive behavior (voice commands, anomaly detection). 100ms chunks balance processing efficiency (enough samples for FFT) with responsiveness. For streaming speech recognition, 20ms chunks at 16kHz (320 samples) are typical.
+
+**AudioFrame vs Image for spectrograms:** Use `AudioFrame` for raw time-domain audio. If your pipeline computes spectrograms or mel-frequency features, publish the result as an `Image` (Mono32F encoding) -- this lets downstream ML nodes use the standard Image zero-copy path.
+
+---
+
+## See Also
+
+- [Sensor Messages (Rust)](/rust/api/sensor-messages) — Full Rust API
+- [Input Messages (Python)](/python/messages/input) — Python audio/input API
+- [Image](/stdlib/messages/image) — For spectrogram/mel-feature transport
+- [Async Nodes (Python)](/python/api/async-nodes) — Non-blocking audio streaming

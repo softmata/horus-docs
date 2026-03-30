@@ -1,0 +1,327 @@
+---
+title: "Error Types"
+description: "Structured error handling — HorusError variants, pattern matching, severity, and retry utilities"
+weight: 30
+---
+
+# Error Types
+
+Every error in HORUS is structured and pattern-matchable. Import the short aliases from the prelude:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+// Result<T> = std::result::Result<T, HorusError>
+// Error = HorusError
+fn my_function() -> Result<()> {
+    let topic: Topic<f32> = Topic::new("sensor")?;
+    Ok(())
+}
+```
+
+## Quick Reference
+
+| Prelude Name | Full Name | What it is |
+|---|---|---|
+| `Result<T>` | `HorusResult<T>` | `std::result::Result<T, HorusError>` |
+| `Error` | `HorusError` | The umbrella error enum |
+
+**Always use `Result<T>` and `Error`** — never write `HorusResult` or `HorusError` directly.
+
+## HorusError Variants
+
+`HorusError` is a `#[non_exhaustive]` enum with 13 variants. Each wraps a domain-specific sub-error:
+
+| Variant | Sub-error Type | Domain | Common Source |
+|---|---|---|---|
+| `Io(…)` | `std::io::Error` | File/system I/O | `std::fs::read()` |
+| `Config(…)` | `ConfigError` | Configuration | `horus.toml` parsing |
+| `Communication(…)` | `CommunicationError` | IPC, topics | `Topic::new()` |
+| `Node(…)` | `NodeError` | Node lifecycle | `init()`, `tick()` panics |
+| `Memory(…)` | `MemoryError` | SHM, tensors | `Image::new()`, pool exhaustion |
+| `Serialization(…)` | `SerializationError` | JSON, YAML, TOML | Config/message parsing |
+| `NotFound(…)` | `NotFoundError` | Missing resources | Frame/topic/node lookup |
+| `Resource(…)` | `ResourceError` | Resource lifecycle | Duplicate names, permissions |
+| `InvalidInput(…)` | `ValidationError` | Input validation | Parameter bounds, format |
+| `Parse(…)` | `ParseError` | Type parsing | Integer, float, bool from strings |
+| `InvalidDescriptor(…)` | `String` | Tensor integrity | Cross-process tensor validation |
+| `Transform(…)` | `TransformError` | Coordinate frames | Extrapolation, stale data |
+| `Timeout(…)` | `TimeoutError` | Timeouts | Service calls, resource waits |
+
+## Pattern Matching
+
+Match on specific error variants to handle them differently:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+fn handle_topic_error(err: Error) {
+    match err {
+        HorusError::Communication(CommunicationError::TopicFull { topic }) => {
+            // Back-pressure: subscriber is slower than publisher
+            hlog!(warn, "Topic '{}' full, dropping message", topic);
+        }
+        HorusError::Communication(CommunicationError::TopicNotFound { topic }) => {
+            // Topic doesn't exist yet
+            hlog!(error, "Topic '{}' not found — is the publisher running?", topic);
+        }
+        HorusError::Memory(MemoryError::PoolExhausted { reason }) => {
+            // Image/PointCloud pool has no free slots
+            hlog!(warn, "Pool exhausted: {} — waiting for consumers", reason);
+        }
+        HorusError::Transform(TransformError::Stale { frame, age, threshold }) => {
+            // Transform data is too old
+            hlog!(warn, "Frame '{}' stale: {:?} > {:?}", frame, age, threshold);
+        }
+        other => {
+            hlog!(error, "Unexpected error: {}", other);
+            // Check for actionable hints
+            if let Some(hint) = other.help() {
+                hlog!(info, "  hint: {}", hint);
+            }
+        }
+    }
+}
+```
+
+## Error Hints
+
+Every `HorusError` has a `.help()` method that returns an actionable remediation hint:
+
+```rust
+// simplified
+if let Err(e) = Topic::<f32>::new("sensor") {
+    eprintln!("error: {}", e);
+    if let Some(hint) = e.help() {
+        eprintln!("  hint: {}", hint);
+    }
+}
+```
+
+Example output:
+```
+error: Failed to create topic 'sensor': permission denied
+  hint: Check shared memory permissions and available space. Run: horus clean --shm
+```
+
+## Severity
+
+Every error has a `Severity` classification used by the scheduler for automatic recovery:
+
+| Severity | Meaning | Scheduler Action |
+|---|---|---|
+| `Transient` | May resolve on retry (back-pressure, timeout) | Retry |
+| `Permanent` | Won't succeed but system can continue | Skip, log warning |
+| `Fatal` | Data integrity compromised, unrecoverable | Stop node or scheduler |
+
+```rust
+// simplified
+match err.severity() {
+    Severity::Transient => { /* retry */ }
+    Severity::Permanent => { hlog!(warn, "{}", err); }
+    Severity::Fatal     => { /* emergency stop */ }
+}
+```
+
+## Adding Context
+
+Use the `HorusContext` trait to wrap foreign errors with descriptive context:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+fn load_sensor_config(path: &str) -> Result<String> {
+    // .horus_context() wraps std::io::Error with a message
+    let data = std::fs::read_to_string(path)
+        .horus_context(format!("reading sensor config '{}'", path))?;
+    Ok(data)
+}
+
+fn load_calibration(path: &str) -> Result<String> {
+    // .horus_context_with() is lazy — closure only called on Err
+    std::fs::read_to_string(path)
+        .horus_context_with(|| format!("reading calibration '{}'", path))
+}
+```
+
+The context is preserved in the error chain and displayed as:
+```
+reading sensor config 'sensors.yaml'
+  Caused by: No such file or directory (os error 2)
+```
+
+## Retry Utility
+
+`retry_transient` automatically retries operations that return transient errors:
+
+```rust
+// simplified
+use horus::prelude::*;
+
+let config = RetryConfig {
+    max_retries: 3,
+    base_delay: 100_u64.ms(),
+    ..Default::default()
+};
+
+let result = retry_transient(&config, || {
+    connect_to_sensor()
+});
+```
+
+## Common Error Scenarios
+
+| You're doing | Error you'll see | What to do |
+|---|---|---|
+| `Topic::new("name")` | `CommunicationError::TopicCreationFailed` | Check SHM permissions, disk space |
+| `scheduler.run()` | `NodeError::InitPanic` | Fix the node's `init()` method |
+| `Image::new(w, h, enc)` | `MemoryError::PoolExhausted` | Consumers aren't dropping images fast enough |
+| `tf.tf("a", "b")` | `TransformError::Extrapolation` | Increase history buffer or check timestamp |
+| `client.call(req, timeout)` | `TimeoutError` | Server not running or overloaded |
+| `params.set("key", val)` | `ValidationError::OutOfRange` | Value outside configured min/max |
+
+## Sub-Error Details
+
+### CommunicationError
+
+```rust
+// simplified
+TopicFull { topic }              // Ring buffer full
+TopicNotFound { topic }          // No such topic
+TopicCreationFailed { topic, reason }  // SHM setup failed
+NetworkFault { peer, reason }    // Peer unreachable
+ActionFailed { reason }          // Action system error
+```
+
+### NotFoundError
+
+```rust
+// simplified
+Frame { name }     // TransformFrame lookup
+Topic { name }     // Topic lookup
+Node { name }      // Node lookup
+Service { name }   // Service lookup
+Action { name }    // Action lookup
+Parameter { name } // RuntimeParams lookup
+```
+
+### ValidationError
+
+```rust
+// simplified
+OutOfRange { field, min, max, actual }  // Value outside bounds
+InvalidFormat { field, expected_format, actual }  // Wrong format
+InvalidEnum { field, valid_options, actual }  // Not an allowed value
+MissingRequired { field }  // Required field absent
+ConstraintViolation { field, constraint }  // Custom constraint
+Conflict { field_a, field_b, reason }  // Two fields conflict
+```
+
+### ConfigError
+
+```rust
+// simplified
+ParseFailed { format, reason, source }       // Failed to parse config file
+MissingField { field, context }              // Required field missing
+ValidationFailed { field, expected, actual } // Value doesn't match constraint
+InvalidValue { key, reason }                 // Invalid configuration value
+Other(String)                                // General config error
+```
+
+### SerializationError
+
+```rust
+// simplified
+Json { source: serde_json::Error }     // JSON parse/emit failure
+Yaml { source: serde_yaml::Error }     // YAML parse/emit failure
+Toml { source: toml::ser::Error }      // TOML parse/emit failure
+Other { format, reason }               // Other format error
+```
+
+### MemoryError
+
+```rust
+// simplified
+PoolExhausted { reason }        // Tensor pool out of slots
+AllocationFailed { reason }     // Memory allocation failed
+ShmCreateFailed { path, reason } // Shared memory region creation failed
+MmapFailed { reason }           // Memory mapping failed
+DLPackImportFailed { reason }   // DLPack tensor import failed
+OffsetOverflow                  // Tensor offset exceeds region
+```
+
+### NodeError
+
+```rust
+// simplified
+InitPanic { node }              // Node panicked during init()
+ReInitPanic { node }            // Node panicked during re-init
+ShutdownPanic { node }          // Node panicked during shutdown()
+InitFailed { node, reason }     // init() returned Err
+TickFailed { node, reason }     // Tick error
+Other { node, message }         // General node error
+```
+
+### ResourceError
+
+```rust
+// simplified
+AlreadyExists { resource_type, name }         // Resource already registered
+PermissionDenied { resource, required_permission } // Insufficient permissions
+Unsupported { feature, reason }               // Feature not available on this platform
+```
+
+### ParseError
+
+```rust
+// simplified
+Int { input, source: ParseIntError }     // Integer parsing failed
+Float { input, source: ParseFloatError } // Float parsing failed
+Bool { input, source: ParseBoolError }   // Boolean parsing failed
+Custom { type_name, input, reason }      // Custom type parse failed
+```
+
+### TransformError
+
+```rust
+// simplified
+Extrapolation { frame, requested_ns, oldest_ns, newest_ns }  // Out of buffer range
+Stale { frame, age, threshold }  // Transform too old
+```
+
+### TimeoutError
+
+```rust
+// simplified
+TimeoutError { resource, elapsed, deadline }  // Operation timed out
+```
+
+### Internal & Contextual Variants
+
+Two special variants for framework-internal errors:
+
+```rust
+// simplified
+// Internal error with source location (use horus_internal!() macro)
+Internal { message: String, file: &'static str, line: u32 }
+
+// Error with preserved source chain (use .horus_context() on Results)
+Contextual { message: String, source: Box<dyn Error + Send + Sync> }
+```
+
+```rust
+// simplified
+// Adding context to errors
+let device = Device::open("/dev/ttyUSB0")
+    .horus_context("opening motor controller serial port")?;
+```
+
+## See Also
+
+- **[Error Handling Guide](/development/error-handling)** — high-level patterns and best practices
+- **[Node Trait](/concepts/core-concepts-nodes)** — lifecycle methods that return `Result`
+- **[Services](/rust/api/services)** — `ServiceError` for RPC failures
+- **[Actions](/rust/api/actions)** — `ActionError` for long-running task failures
