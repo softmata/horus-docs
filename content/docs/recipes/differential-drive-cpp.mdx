@@ -7,73 +7,222 @@ order: 6
 
 ## Differential Drive (C++)
 
-Control a two-wheeled robot: convert CmdVel (linear + angular) into left/right wheel velocities, with odometry feedback.
+Convert velocity commands into left/right wheel speeds for a two-wheeled mobile robot, with dead-reckoning odometry and safe shutdown.
 
-### Code
+### Problem
+
+You have a robot with two independently driven wheels and a caster. A path planner or teleoperation system publishes `CmdVel` (linear velocity + angular velocity). You need to split that into individual wheel speeds, track the robot's position via odometry, and guarantee the wheels stop if the node exits or enters a safety state.
+
+### How It Works
+
+A differential drive robot steers by varying the speed difference between its two wheels. When both spin at the same speed, the robot drives straight. When one spins faster, the robot curves. When they spin at equal speed in opposite directions, the robot rotates in place.
+
+**Inverse kinematics** converts a `(v, omega)` command into wheel angular velocities:
+
+```text
+v_left  = (v - omega * L / 2) / r
+v_right = (v + omega * L / 2) / r
+```
+
+Where `L` is the wheel base (center-to-center distance) and `r` is the wheel radius.
+
+**Forward kinematics** (odometry) reverses the process. Given how far each wheel moved, compute how the robot's position changed:
+
+```text
+x     += v * cos(theta) * dt
+y     += v * sin(theta) * dt
+theta += omega * dt
+```
+
+This is first-order Euler integration. It drifts over time but provides the baseline position estimate that SLAM and localization systems build upon.
+
+### When To Use
+
+- Any 2-wheel differential drive robot (TurtleBot, warehouse AGV, hobby bots)
+- Converting `CmdVel` from a planner or teleop to motor outputs
+- When you need velocity clamping and safe shutdown on a ground platform
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <cmath>
+#include <cstdio>
+#include <algorithm>
 using namespace horus::literals;
 
 class DiffDrive : public horus::Node {
 public:
-    DiffDrive(double wheel_base, double wheel_radius)
-        : Node("diff_drive"), wheel_base_(wheel_base), wheel_radius_(wheel_radius)
+    DiffDrive(double wheel_base, double wheel_radius, double max_wheel_speed)
+        : Node("diff_drive"),
+          wheel_base_(wheel_base),
+          wheel_radius_(wheel_radius),
+          max_wheel_speed_(max_wheel_speed)
     {
+        // Subscribe to velocity commands from planner/teleop
         cmd_sub_   = subscribe<horus::msg::CmdVel>("cmd_vel");
+        // Publish odometry for localization / SLAM
         odom_pub_  = advertise<horus::msg::Odometry>("odom");
+        // Publish individual wheel velocities for the motor driver
         motor_pub_ = advertise<horus::msg::CmdVel>("motor.wheels");
     }
 
     void tick() override {
-        auto cmd = cmd_sub_->recv();
-        if (!cmd) return;
+        // Always drain the subscriber buffer to avoid stale commands
+        if (auto cmd = cmd_sub_->recv()) {
+            last_v_ = cmd->get()->linear;
+            last_w_ = cmd->get()->angular;
+        }
 
-        double v = cmd->get()->linear;
-        double w = cmd->get()->angular;
+        // ── Inverse kinematics: CmdVel -> wheel angular velocities ──
+        // Left wheel traces the inner arc, right wheel the outer arc
+        double v_left  = (last_v_ - last_w_ * wheel_base_ / 2.0) / wheel_radius_;
+        double v_right = (last_v_ + last_w_ * wheel_base_ / 2.0) / wheel_radius_;
 
-        // Inverse kinematics: CmdVel -> wheel velocities
-        double v_left  = (v - w * wheel_base_ / 2.0) / wheel_radius_;
-        double v_right = (v + w * wheel_base_ / 2.0) / wheel_radius_;
+        // Clamp to motor limits — prevents burning out motors on bad commands
+        v_left  = std::clamp(v_left,  -max_wheel_speed_, max_wheel_speed_);
+        v_right = std::clamp(v_right, -max_wheel_speed_, max_wheel_speed_);
 
+        // Pack into CmdVel (linear=left, angular=right) for the motor driver
         horus::msg::CmdVel wheels{};
         wheels.linear  = static_cast<float>(v_left);
         wheels.angular = static_cast<float>(v_right);
         motor_pub_->send(wheels);
 
-        // Forward kinematics: update odometry
-        double dt = 0.01;  // 100Hz
-        x_     += v * std::cos(theta_) * dt;
-        y_     += v * std::sin(theta_) * dt;
-        theta_ += w * dt;
+        // ── Forward kinematics: update dead-reckoning odometry ──────
+        double dt = 1.0 / 50.0;  // matches 50 Hz tick rate
+        x_     += last_v_ * std::cos(theta_) * dt;
+        y_     += last_v_ * std::sin(theta_) * dt;
+        theta_ += last_w_ * dt;
+
+        // Normalize theta to [-pi, pi] to prevent float drift
+        if (theta_ > M_PI)  theta_ -= 2.0 * M_PI;
+        if (theta_ < -M_PI) theta_ += 2.0 * M_PI;
 
         horus::msg::Odometry odom{};
-        odom.pose.x = x_;
-        odom.pose.y = y_;
+        odom.pose.x     = x_;
+        odom.pose.y     = y_;
         odom.pose.theta = theta_;
         odom_pub_->send(odom);
+
+        // Log at 1 Hz (every 50th tick at 50 Hz)
+        if (++tick_count_ % 50 == 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "pos=(%.2f, %.2f) theta=%.1f deg  wheels=(%.1f, %.1f) rad/s",
+                x_, y_, theta_ * 180.0 / M_PI, v_left, v_right);
+            horus::log::info("diff_drive", buf);
+        }
     }
 
     void enter_safe_state() override {
+        // Zero both motors immediately on safety event
         horus::msg::CmdVel stop{};
         motor_pub_->send(stop);
+        last_v_ = 0;
+        last_w_ = 0;
+        horus::blackbox::record("diff_drive", "Entered safe state, motors zeroed");
     }
 
 private:
-    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
-    horus::Publisher<horus::msg::Odometry>* odom_pub_;
-    horus::Publisher<horus::msg::CmdVel>*  motor_pub_;
-    double wheel_base_, wheel_radius_;
+    horus::Subscriber<horus::msg::CmdVel>*  cmd_sub_;
+    horus::Publisher<horus::msg::Odometry>*  odom_pub_;
+    horus::Publisher<horus::msg::CmdVel>*   motor_pub_;
+
+    // Physical parameters
+    double wheel_base_;
+    double wheel_radius_;
+    double max_wheel_speed_;  // rad/s limit per wheel
+
+    // Command state (persists between ticks for hold-last-value behavior)
+    double last_v_ = 0;
+    double last_w_ = 0;
+
+    // Odometry state (double precision — running sums accumulate error with f32)
     double x_ = 0, y_ = 0, theta_ = 0;
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(100_hz);
+    sched.tick_rate(50_hz).name("diff_drive_demo");
 
-    DiffDrive drive(0.3, 0.05);  // 30cm wheelbase, 5cm wheel radius
-    sched.add(drive).order(10).build();
+    // TurtleBot3 Burger: 16cm wheelbase, 3.3cm wheel radius, ~60 rad/s max
+    DiffDrive drive(0.16, 0.033, 61.5);
+    sched.add(drive)
+        .order(10)
+        .budget(5_ms)
+        .on_miss(horus::Miss::Warn)  // warn on overrun — not safety-critical alone
+        .build();
+
     sched.spin();
 }
 ```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot drives in circles when commanded straight | `wheel_base_` constant wrong | Measure center-to-center distance between wheels precisely |
+| Wheels spin after Ctrl+C | Missing `enter_safe_state()` | Always zero motors in safe state and shutdown |
+| Odometry drifts even driving straight | Wheel radii unequal in hardware | Calibrate `wheel_radius_` per wheel or average measured values |
+| Motor driver rejects commands | Wheel speed exceeds driver limit | Reduce `max_wheel_speed_` to match your motor's spec |
+| Odometry theta wraps unexpectedly | No angle normalization | Keep theta in [-pi, pi] with modular wrapping |
+| Position precision degrades far from origin | Using float for odometry state | Use double for x/y/theta running sums, cast to float only in output |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| `horus::Node` subclass | Odometry state (x, y, theta) must persist across ticks cleanly |
+| Hold-last-value for `cmd_sub_` | If no new command arrives, keep the last velocity rather than stopping — lets sparse planners work |
+| `double` for odometry, `float` for output | Running sums lose precision with float; downstream consumers do not need double |
+| `enter_safe_state()` zeros motors | Prevents runaway wheels on any scheduler safety event |
+| `Miss::Warn` policy | Drive node alone is not safety-critical — pair with Emergency Stop for `Miss::SafeMode` |
+| 50 Hz tick rate | Fast enough for ground robots, slow enough for affordable compute |
+| Wheel speed clamping | Prevents motor damage from upstream bugs or corrupted messages |
+
+### Variations
+
+**Acceleration limiting** — prevent wheel slip on sudden commands:
+```cpp
+double target_left = (last_v_ - last_w_ * wheel_base_ / 2.0) / wheel_radius_;
+double max_accel = 5.0;  // rad/s^2
+double dt = 1.0 / 50.0;
+v_left = prev_left_ + std::clamp(target_left - prev_left_, -max_accel * dt, max_accel * dt);
+prev_left_ = v_left;
+```
+
+**Encoder-based odometry** — use actual wheel encoder ticks instead of integrating commands:
+```cpp
+// More accurate than command integration: measures what the wheels actually did
+double d_left  = (encoder_left  - prev_enc_left_)  * meters_per_tick_;
+double d_right = (encoder_right - prev_enc_right_) * meters_per_tick_;
+double ds = (d_left + d_right) / 2.0;
+double d_theta = (d_right - d_left) / wheel_base_;
+x_ += ds * std::cos(theta_ + d_theta / 2.0);  // second-order Runge-Kutta
+y_ += ds * std::sin(theta_ + d_theta / 2.0);
+theta_ += d_theta;
+```
+
+**Mecanum (holonomic) drive** — 4-wheel omnidirectional:
+```cpp
+// Requires lateral velocity (vy) in addition to v and omega
+double fl = (v - omega * L / 2.0 - vy) / radius;
+double fr = (v + omega * L / 2.0 + vy) / radius;
+double rl = (v - omega * L / 2.0 + vy) / radius;
+double rr = (v + omega * L / 2.0 - vy) / radius;
+```
+
+### Key Takeaways
+
+- Always clamp wheel speeds to motor limits — upstream bugs produce unbounded velocities
+- Use `double` for odometry running sums — `float` loses sub-millimeter precision past 100m
+- `enter_safe_state()` must zero motor outputs, not just stop computing
+- Hold-last-value on `cmd_sub_` lets sparse planners work without the robot stopping between commands
+- Normalize theta to [-pi, pi] to prevent floating-point drift over long runs
