@@ -1,0 +1,88 @@
+---
+title: "Recipe: Emergency Stop (C++)"
+description: "Safety system that monitors sensors and triggers emergency stop"
+sidebar_section: "C++"
+order: 9
+---
+
+## Emergency Stop (C++)
+
+A safety node that monitors sensor data, triggers emergency stop on danger, and stops all motors.
+
+### Code
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class SafetyMonitor : public horus::Node {
+public:
+    SafetyMonitor() : Node("safety_monitor") {
+        scan_sub_  = subscribe<horus::msg::LaserScan>("lidar.scan");
+        estop_pub_ = advertise<horus::msg::EmergencyStop>("emergency.stop");
+        cmd_pub_   = advertise<horus::msg::CmdVel>("cmd_vel");
+    }
+
+    void tick() override {
+        auto scan = scan_sub_->recv();
+        if (!scan) return;
+
+        // Check if any range is dangerously close
+        bool danger = false;
+        for (int i = 0; i < 360; i++) {
+            if (scan->get()->ranges[i] > 0.01f && scan->get()->ranges[i] < 0.15f) {
+                danger = true;
+                break;
+            }
+        }
+
+        if (danger && !estop_active_) {
+            estop_active_ = true;
+            horus::msg::EmergencyStop estop{};
+            estop.engaged = 1;
+            estop_pub_->send(estop);
+            horus::log::error("safety", "EMERGENCY STOP — obstacle < 15cm");
+            horus::blackbox::record("safety", "E-stop triggered: obstacle < 15cm");
+
+            // Zero all motor commands
+            horus::msg::CmdVel stop{};
+            cmd_pub_->send(stop);
+        }
+
+        if (!danger && estop_active_) {
+            estop_active_ = false;
+            horus::msg::EmergencyStop clear{};
+            clear.engaged = 0;
+            estop_pub_->send(clear);
+            horus::log::info("safety", "E-stop cleared");
+        }
+    }
+
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        cmd_pub_->send(stop);
+        estop_active_ = true;
+    }
+
+private:
+    horus::Subscriber<horus::msg::LaserScan>*   scan_sub_;
+    horus::Publisher<horus::msg::EmergencyStop>* estop_pub_;
+    horus::Publisher<horus::msg::CmdVel>*        cmd_pub_;
+    bool estop_active_ = false;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(50_hz);
+    SafetyMonitor safety;
+    sched.add(safety).order(0).budget(2_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.spin();
+}
+```
+
+### Key Takeaways
+
+- Safety node has highest priority (`order(0)`) and strictest budget
+- Uses `horus::blackbox::record()` for post-mortem analysis
+- `enter_safe_state()` is called by the scheduler's safety monitor
+- EmergencyStop is a typed Pod message — other nodes subscribe and react

@@ -1,6 +1,7 @@
 ---
 title: "Getting Started with C++"
 description: "Build robotics applications in C++ with HORUS — zero-copy IPC, real-time scheduling, and 70+ message types"
+sidebar_section: "C++"
 order: 1
 ---
 
@@ -67,21 +68,63 @@ auto sched = horus::Scheduler()
     .watchdog(5_s);         // 5 second watchdog
 ```
 
-### Nodes
+### Nodes — Three Ways
 
-Nodes are added with a builder chain. The tick callback is a captured lambda:
+**1. Lambda (quick scripts):**
 
 ```cpp
 sched.add("motor_ctrl")
-    .rate(1000_hz)          // 1 kHz control loop
-    .budget(800_us)         // max 800us per tick
-    .deadline(950_us)       // must finish by 950us
-    .on_miss(horus::Miss::Skip)  // skip if overrun
-    .order(0)               // highest priority
-    .tick([&] {
-        // Your control logic here
-    })
+    .rate(1000_hz)
+    .budget(800_us)
+    .on_miss(horus::Miss::Skip)
+    .order(0)
+    .tick([&] { /* control logic */ })
     .build();
+```
+
+**2. Struct-based (stateful, lifecycle hooks — like Rust `impl Node`):**
+
+```cpp
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_ = subscribe<msg::CmdVel>("lidar.scan");
+        cmd_  = advertise<msg::CmdVel>("motor.cmd");
+    }
+
+    void tick() override {
+        auto scan = scan_->recv();
+        if (!scan) return;
+        msg::CmdVel cmd{};
+        cmd.linear = scan->get()->linear > 0.5f ? 0.3f : 0.0f;
+        cmd_->send(cmd);
+    }
+
+    void init() override { /* called once */ }
+    void enter_safe_state() override { /* stop motors */ }
+
+private:
+    Subscriber<msg::CmdVel>* scan_;
+    Publisher<msg::CmdVel>*  cmd_;
+};
+
+Controller ctrl;
+sched.add(ctrl).rate(100_hz).order(10).build();
+```
+
+**3. LambdaNode (declarative — like Python `horus.Node()`):**
+
+```cpp
+auto node = horus::LambdaNode("controller")
+    .sub<msg::CmdVel>("lidar.scan")
+    .pub<msg::CmdVel>("motor.cmd")
+    .on_tick([](horus::LambdaNode& self) {
+        auto scan = self.recv<msg::CmdVel>("lidar.scan");
+        if (!scan) return;
+        self.send<msg::CmdVel>("motor.cmd", msg::CmdVel{0, 0.3f, 0.0f});
+    });
+
+sched.add(node).order(10).build();
 ```
 
 ### Zero-Copy Publishing (Loan Pattern)
@@ -89,9 +132,8 @@ sched.add("motor_ctrl")
 The loan pattern gives you a direct pointer to shared memory — no copies:
 
 ```cpp
-auto pub = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+horus::Publisher<horus::msg::CmdVel> pub("cmd_vel");
 
-// In tick callback:
 auto sample = pub.loan();       // ~3ns — get SHM buffer
 sample->linear = 0.5f;          // 0ns — direct write
 sample->angular = 0.1f;         // 0ns — direct write
@@ -102,12 +144,11 @@ pub.publish(std::move(sample));  // ~3ns — make visible
 ### Subscribing
 
 ```cpp
-auto sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+horus::Subscriber<horus::msg::CmdVel> sub("lidar.scan");
 
-// In tick callback:
 auto scan = sub.recv();          // returns std::optional
 if (!scan) return;               // no message yet
-float min_range = scan->ranges[0];  // direct read from SHM
+float range = scan->get()->linear;  // read from SHM
 ```
 
 ### Duration Literals

@@ -1,0 +1,92 @@
+---
+title: "Recipe: Multi-Rate Pipeline (C++)"
+description: "Run sensors at different rates in a single scheduler"
+sidebar_section: "C++"
+order: 14
+---
+
+## Multi-Rate Pipeline (C++)
+
+Run a camera at 30 Hz, IMU at 200 Hz, controller at 100 Hz, and logger at 1 Hz — all in one scheduler with deterministic ordering.
+
+### Code
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(200_hz);  // Scheduler runs at fastest node rate
+    sched.name("multi_rate");
+
+    auto imu_pub = sched.advertise<horus::msg::Imu>("imu.data");
+    auto cmd_pub = sched.advertise<horus::msg::CmdVel>("camera.detections");
+    auto vel_pub = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+
+    auto imu_sub = sched.subscribe<horus::msg::Imu>("imu.data");
+    auto cam_sub = sched.subscribe<horus::msg::CmdVel>("camera.detections");
+    auto vel_sub = sched.subscribe<horus::msg::CmdVel>("cmd_vel");
+
+    // IMU: 200 Hz (every tick)
+    sched.add("imu_driver")
+        .order(0)
+        .tick([&] {
+            horus::msg::Imu data{};
+            data.linear_acceleration[2] = 9.81;
+            imu_pub.send(data);
+        })
+        .build();
+
+    // Camera: 30 Hz (every ~7th tick)
+    static int cam_div = 0;
+    sched.add("camera_driver")
+        .order(1)
+        .tick([&] {
+            if (++cam_div % 7 != 0) return;
+            horus::msg::CmdVel det{};
+            det.linear = 1.0f;  // detection score
+            cmd_pub.send(det);
+        })
+        .build();
+
+    // Controller: 100 Hz (every 2nd tick)
+    static int ctrl_div = 0;
+    sched.add("controller")
+        .order(10)
+        .budget(3_ms)
+        .on_miss(horus::Miss::Skip)
+        .tick([&] {
+            if (++ctrl_div % 2 != 0) return;
+            auto imu = imu_sub.recv();
+            auto det = cam_sub.recv();
+            horus::msg::CmdVel cmd{};
+            cmd.linear = det ? 0.3f : 0.1f;
+            vel_pub.send(cmd);
+        })
+        .build();
+
+    // Logger: 1 Hz (every 200th tick)
+    static int log_div = 0;
+    sched.add("logger")
+        .order(100)
+        .tick([&] {
+            if (++log_div % 200 != 0) return;
+            auto vel = vel_sub.recv();
+            if (vel) {
+                std::printf("[1Hz] cmd_vel.linear = %.2f\n", vel->get()->linear);
+            }
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+### Key Takeaways
+
+- One scheduler tick rate = fastest node (200 Hz)
+- Slower nodes use tick dividers: `if (++count % N != 0) return;`
+- Ordering guarantees: IMU (0) -> Camera (1) -> Controller (10) -> Logger (100)
+- Controller has budget enforcement for real-time safety

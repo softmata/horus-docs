@@ -1,0 +1,88 @@
+---
+title: "Recipe: PID Controller (C++)"
+description: "PID control loop with anti-windup using horus::Node"
+sidebar_section: "C++"
+order: 5
+---
+
+## PID Controller (C++)
+
+A PID controller node that reads sensor feedback, computes control output, and publishes motor commands. Uses `horus::Node` for clean state management.
+
+### Code
+
+```cpp
+#include <horus/horus.hpp>
+#include <algorithm>
+#include <cmath>
+using namespace horus::literals;
+
+class PidController : public horus::Node {
+public:
+    PidController(double kp, double ki, double kd, double setpoint)
+        : Node("pid_controller"), kp_(kp), ki_(ki), kd_(kd), setpoint_(setpoint)
+    {
+        sensor_ = subscribe<horus::msg::CmdVel>("sensor.feedback");
+        motor_  = advertise<horus::msg::CmdVel>("motor.cmd");
+    }
+
+    void tick() override {
+        auto reading = sensor_->recv();
+        if (!reading) return;
+
+        double measured = reading->get()->linear;
+        double error = setpoint_ - measured;
+
+        // Proportional
+        double p = kp_ * error;
+
+        // Integral with anti-windup
+        integral_ += error * dt_;
+        integral_ = std::clamp(integral_, -integral_max_, integral_max_);
+        double i = ki_ * integral_;
+
+        // Derivative with filtering
+        double raw_d = (error - prev_error_) / dt_;
+        filtered_d_ = 0.8 * filtered_d_ + 0.2 * raw_d;
+        double d = kd_ * filtered_d_;
+        prev_error_ = error;
+
+        // Output
+        double output = std::clamp(p + i + d, -1.0, 1.0);
+
+        horus::msg::CmdVel cmd{};
+        cmd.linear = static_cast<float>(output);
+        motor_->send(cmd);
+    }
+
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        motor_->send(stop);
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* sensor_;
+    horus::Publisher<horus::msg::CmdVel>*  motor_;
+    double kp_, ki_, kd_, setpoint_;
+    double integral_ = 0, prev_error_ = 0, filtered_d_ = 0;
+    double dt_ = 0.01;  // 100Hz
+    double integral_max_ = 10.0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz);
+
+    PidController pid(1.0, 0.1, 0.05, 1.0);  // Kp=1, Ki=0.1, Kd=0.05, setpoint=1.0
+    sched.add(pid).order(10).budget(5_ms).on_miss(horus::Miss::Skip).build();
+
+    sched.spin();
+}
+```
+
+### Key Takeaways
+
+- State (integral, prev_error) lives in the Node class, not captured lambdas
+- `enter_safe_state()` sends zero command on safety events
+- Anti-windup clamps integral to prevent saturation
+- Budget enforcement ensures PID runs within deadline

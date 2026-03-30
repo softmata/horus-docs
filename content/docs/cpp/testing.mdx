@@ -1,0 +1,116 @@
+---
+title: "C++ Testing Guide"
+description: "Unit testing, ASAN, stress testing, and cross-process verification"
+order: 3
+---
+
+# C++ Testing Guide
+
+## Building Test Binaries
+
+```bash
+# Build the shared library
+cargo build --no-default-features -p horus_cpp
+
+# Compile a C++ test
+g++ -std=c++17 -fext-numeric-literals \
+    -I horus_cpp/include \
+    -o my_test tests/my_test.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
+
+# Run
+LD_LIBRARY_PATH=target/debug ./my_test
+```
+
+## Writing C++ Tests
+
+Use a simple CHECK macro pattern:
+
+```cpp
+#include <horus/horus.hpp>
+
+static int pass = 0, fail = 0;
+#define CHECK(cond, name) do { \
+    if (cond) { printf("[PASS] %s\n", name); pass++; } \
+    else { printf("[FAIL] %s\n", name); fail++; } \
+} while(0)
+
+void test_pubsub() {
+    horus::Publisher<horus::msg::CmdVel>  pub("test.cmd");
+    horus::Subscriber<horus::msg::CmdVel> sub("test.cmd");
+
+    horus::msg::CmdVel msg{}; msg.linear = 1.5f;
+    pub.send(msg);
+
+    auto recv = sub.recv();
+    CHECK(recv.has_value(), "message received");
+    CHECK(recv->get()->linear == 1.5f, "field preserved");
+}
+
+int main() {
+    test_pubsub();
+    printf("Results: %d passed, %d failed\n", pass, fail);
+    return fail > 0 ? 1 : 0;
+}
+```
+
+## AddressSanitizer
+
+Compile with ASAN to detect memory errors:
+
+```bash
+g++ -std=c++17 -fsanitize=address -fno-omit-frame-pointer \
+    -I horus_cpp/include \
+    -o my_test_asan tests/my_test.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
+
+LD_LIBRARY_PATH=target/debug ASAN_OPTIONS=detect_leaks=0 ./my_test_asan
+```
+
+## Stress Testing
+
+Test stability under load:
+
+```cpp
+// 1000 scheduler create/destroy cycles
+for (int i = 0; i < 1000; i++) {
+    horus::Scheduler sched;
+    sched.add("node").tick([]{ }).build();
+    sched.tick_once();
+}
+
+// 50 nodes with 100 ticks each
+{
+    horus::Scheduler sched;
+    for (int i = 0; i < 50; i++) {
+        sched.add(("node_" + std::to_string(i)).c_str())
+            .tick([]{ }).build();
+    }
+    for (int i = 0; i < 100; i++) sched.tick_once();
+}
+```
+
+## Cross-Process Testing
+
+Test IPC between separate processes:
+
+```bash
+# Terminal 1: subscriber (start first)
+LD_LIBRARY_PATH=target/debug ./cross_process_sub "test.topic"
+
+# Terminal 2: publisher
+LD_LIBRARY_PATH=target/debug ./cross_process_pub "test.topic"
+```
+
+The subscriber must start first — it creates the SHM ring buffer that both processes share.
+
+## CI Integration
+
+The `.github/workflows/cpp-bindings.yml` pipeline runs:
+
+1. **Rust FFI tests** (139 tests)
+2. **C++ compilation** (15 binaries)
+3. **C++ unit tests** (e2e, ergonomic, full API, user API, stress)
+4. **Cross-process IPC** (CmdVel, JSON, Service, Action)
+5. **ASAN** (stress + full API under AddressSanitizer)
+6. **Benchmarks** (release-mode performance)
