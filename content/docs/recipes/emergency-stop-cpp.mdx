@@ -7,17 +7,51 @@ order: 9
 
 ## Emergency Stop (C++)
 
-A safety node that monitors sensor data, triggers emergency stop on danger, and stops all motors.
+A safety-critical node that monitors sensor data for imminent collision, triggers an emergency stop to halt all motion, and requires deliberate confirmation before resuming. Uses `Miss::SafeMode` for the strictest deadline enforcement.
 
-### Code
+### Problem
+
+Your robot has actuators that can injure people or damage property. You need a last line of defense that overrides all motion commands when a hazard is detected, logs the event for post-mortem analysis, and does not resume until the hazard has definitively cleared. A single spurious "all clear" must not release the stop.
+
+### How It Works
+
+The E-stop monitor runs at the **highest priority** (`order(0)`) with the **tightest budget** and the **strictest miss policy** (`Miss::SafeMode`). Every tick it:
+
+1. Reads the latest LiDAR scan
+2. Checks if any beam reports an obstacle within the critical distance (15cm)
+3. If danger detected: activates E-stop, publishes `EmergencyStop{engaged=1}`, zeros `cmd_vel`, and records the event to the blackbox
+4. If danger clears: increments a debounce counter. Only after N consecutive clear readings does it release the E-stop
+
+**Why debounce on clear but not on trigger?** Triggering must be instant — any delay means the robot travels further into the hazard. But releasing can afford 0.5 seconds of delay. Debounce prevents a flickering signal (e.g., a person walking past the sensor) from rapidly cycling the robot between motion and stop, which stresses motors and gearboxes.
+
+**Why fail-safe default?** If the LiDAR node crashes and stops publishing, `scan_sub_->recv()` returns null. The monitor treats this as a sensor failure and keeps the E-stop active. Silence is never interpreted as "safe."
+
+### When To Use
+
+- Any robot with actuators (motors, servos, grippers)
+- When safety regulations require guaranteed shutdown
+- As a secondary software safety layer alongside hardware E-stop relays
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+- Understanding of [Miss policies](/docs/concepts/core-concepts-scheduling)
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
+#include <cstdio>
 using namespace horus::literals;
 
 class SafetyMonitor : public horus::Node {
 public:
-    SafetyMonitor() : Node("safety_monitor") {
+    SafetyMonitor(float critical_dist = 0.15f, int clear_threshold = 25)
+        : Node("safety_monitor"),
+          critical_dist_(critical_dist),
+          clear_threshold_(clear_threshold)
+    {
         scan_sub_  = subscribe<horus::msg::LaserScan>("lidar.scan");
         estop_pub_ = advertise<horus::msg::EmergencyStop>("emergency.stop");
         cmd_pub_   = advertise<horus::msg::CmdVel>("cmd_vel");
@@ -25,64 +59,206 @@ public:
 
     void tick() override {
         auto scan = scan_sub_->recv();
-        if (!scan) return;
 
-        // Check if any range is dangerously close
+        // ── Fail-safe: no scan data = sensor failure ────────────────
+        // If the LiDAR node crashed, we have no sensor coverage.
+        // Treat silence as danger, not safety.
+        if (!scan) {
+            ticks_without_scan_++;
+            if (ticks_without_scan_ > 10 && !estop_active_) {
+                estop_active_ = true;
+                consecutive_clears_ = 0;
+                horus::log::error("safety",
+                    "No LiDAR data for 10 ticks — activating E-stop");
+                horus::blackbox::record("safety",
+                    "E-stop triggered: LiDAR timeout (sensor failure)");
+            }
+            // Always zero cmd_vel while E-stop is active
+            if (estop_active_) {
+                horus::msg::CmdVel stop{};
+                cmd_pub_->send(stop);
+                horus::msg::EmergencyStop estop{};
+                estop.engaged = 1;
+                estop_pub_->send(estop);
+            }
+            return;
+        }
+        ticks_without_scan_ = 0;
+
+        // ── Check all beams for critical proximity ──────────────────
         bool danger = false;
         for (int i = 0; i < 360; i++) {
-            if (scan->get()->ranges[i] > 0.01f && scan->get()->ranges[i] < 0.15f) {
+            float r = scan->get()->ranges[i];
+            // Valid reading below critical distance = imminent collision
+            if (r > 0.02f && r < critical_dist_) {
                 danger = true;
                 break;
             }
         }
 
+        // ── E-stop state machine ────────────────────────────────────
         if (danger && !estop_active_) {
+            // TRIGGER: immediate activation, no debounce
             estop_active_ = true;
+            consecutive_clears_ = 0;
+
             horus::msg::EmergencyStop estop{};
             estop.engaged = 1;
             estop_pub_->send(estop);
-            horus::log::error("safety", "EMERGENCY STOP — obstacle < 15cm");
-            horus::blackbox::record("safety", "E-stop triggered: obstacle < 15cm");
 
-            // Zero all motor commands
+            horus::log::error("safety",
+                "EMERGENCY STOP — obstacle within 15cm");
+            horus::blackbox::record("safety",
+                "E-stop triggered: obstacle within critical distance");
+
+            // Zero all motor commands immediately
             horus::msg::CmdVel stop{};
             cmd_pub_->send(stop);
         }
+        else if (danger && estop_active_) {
+            // Still in danger — reset clear counter, keep sending stop
+            consecutive_clears_ = 0;
+            horus::msg::CmdVel stop{};
+            cmd_pub_->send(stop);
+        }
+        else if (!danger && estop_active_) {
+            // Danger cleared — debounce before releasing
+            consecutive_clears_++;
+            if (consecutive_clears_ >= clear_threshold_) {
+                estop_active_ = false;
+                horus::msg::EmergencyStop clear{};
+                clear.engaged = 0;
+                estop_pub_->send(clear);
+                horus::log::info("safety", "E-stop cleared after debounce");
+                horus::blackbox::record("safety",
+                    "E-stop released after clear threshold met");
+            } else {
+                // Still debouncing — keep motors stopped
+                horus::msg::CmdVel stop{};
+                cmd_pub_->send(stop);
+            }
+        }
 
-        if (!danger && estop_active_) {
-            estop_active_ = false;
-            horus::msg::EmergencyStop clear{};
-            clear.engaged = 0;
-            estop_pub_->send(clear);
-            horus::log::info("safety", "E-stop cleared");
+        // Log at 1 Hz (every 50th tick at 50 Hz)
+        if (++tick_count_ % 50 == 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "estop=%s  clears=%d/%d",
+                estop_active_ ? "ACTIVE" : "clear",
+                consecutive_clears_, clear_threshold_);
+            horus::log::info("safety", buf);
         }
     }
 
     void enter_safe_state() override {
+        // Called by scheduler on deadline miss — force E-stop
         horus::msg::CmdVel stop{};
         cmd_pub_->send(stop);
         estop_active_ = true;
+        consecutive_clears_ = 0;
+        horus::blackbox::record("safety",
+            "Scheduler forced safe state (deadline miss or watchdog)");
     }
 
 private:
     horus::Subscriber<horus::msg::LaserScan>*   scan_sub_;
     horus::Publisher<horus::msg::EmergencyStop>* estop_pub_;
     horus::Publisher<horus::msg::CmdVel>*        cmd_pub_;
+
+    // Configuration
+    float critical_dist_;    // meters — trigger threshold
+    int clear_threshold_;    // consecutive clear ticks before release
+
+    // State
     bool estop_active_ = false;
+    int consecutive_clears_ = 0;
+    int ticks_without_scan_ = 0;
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(50_hz);
-    SafetyMonitor safety;
-    sched.add(safety).order(0).budget(2_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.tick_rate(50_hz).name("safety_demo");
+
+    // 15cm critical distance, 25 clear readings (0.5s at 50 Hz) to release
+    SafetyMonitor safety(0.15f, 25);
+    sched.add(safety)
+        .order(0)                        // highest priority — runs first
+        .budget(2_ms)                    // tight budget for safety-critical code
+        .on_miss(horus::Miss::SafeMode)  // strictest policy — force safe state on any overrun
+        .build();
+
     sched.spin();
+}
+```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| E-stop never triggers | `critical_dist_` too small or LiDAR beams miss the obstacle | Increase distance or verify LiDAR field of view |
+| E-stop flickers on/off rapidly | No debounce on clear, or `clear_threshold_` too low | Increase `clear_threshold_` (25-50 at 50 Hz) |
+| Motors keep running after E-stop | E-stop node runs after motor node in execution order | Set E-stop to `order(0)` (highest priority) |
+| E-stop activates on startup | No LiDAR data yet, fail-safe triggers | Allow a startup grace period before fail-safe kicks in |
+| System enters safe mode unexpectedly | Budget too tight for scan processing | Increase budget from 2ms to 3ms, or reduce scan resolution |
+| E-stop never releases | Sensor has spurious short-range noise | Filter readings below sensor's minimum range (typically 0.02-0.05m) |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| `order(0)` — highest priority | Safety must run before any other node can publish motion commands |
+| `Miss::SafeMode` policy | Any deadline miss in the safety node is itself a safety failure — force full stop |
+| Instant trigger, debounced clear | Triggering must be immediate; releasing can afford 0.5s delay to prevent flicker |
+| Fail-safe on missing data | Silence from LiDAR means no sensor coverage — assume danger |
+| `horus::blackbox::record()` | All E-stop events logged for post-mortem analysis and incident reporting |
+| `enter_safe_state()` forces E-stop | Scheduler can force safety independently of sensor data |
+| 50 Hz tick rate | Fast enough for &lt;20ms response time, reasonable CPU cost |
+
+### Variations
+
+**Multi-sensor E-stop** — monitor LiDAR, bumpers, and IMU simultaneously:
+```cpp
+void tick() override {
+    auto scan = scan_sub_->recv();
+    auto bump = bumper_sub_->recv();
+    auto imu  = imu_sub_->recv();
+
+    bool danger = false;
+    if (scan) danger |= check_proximity(scan);
+    if (bump) danger |= (bump->get()->pressed != 0);
+    if (imu)  danger |= check_tilt(imu);  // tip-over detection
+
+    // Same state machine as single-sensor version
+    // ...
+}
+```
+
+**Zone-based E-stop** — different thresholds for front, sides, and rear:
+```cpp
+// Front (330-30 deg): 30cm critical, 80cm warning
+// Sides (30-150, 210-330): 15cm critical
+// Rear (150-210): 10cm critical (backing up is slower)
+for (int i = 0; i < 360; i++) {
+    float threshold = get_zone_threshold(i);
+    if (r > 0.02f && r < threshold) { danger = true; break; }
+}
+```
+
+**Hardware GPIO E-stop integration** — read a physical E-stop button:
+```cpp
+// Subscribe to a GPIO publisher that reads the hardware button
+auto hw_estop = hw_estop_sub_->recv();
+if (hw_estop && hw_estop->get()->engaged) {
+    estop_active_ = true;  // hardware override takes priority
+    horus::blackbox::record("safety", "Hardware E-stop pressed");
 }
 ```
 
 ### Key Takeaways
 
-- Safety node has highest priority (`order(0)`) and strictest budget
-- Uses `horus::blackbox::record()` for post-mortem analysis
-- `enter_safe_state()` is called by the scheduler's safety monitor
-- EmergencyStop is a typed Pod message — other nodes subscribe and react
+- Safety nodes run at `order(0)` with `Miss::SafeMode` — no exceptions
+- `horus::blackbox::record()` is mandatory for every E-stop event — you will need it for incident investigation
+- Debounce on clear, never on trigger — instant activation, deliberate release
+- Fail-safe means silence = danger — if the sensor stops publishing, assume the worst
+- `enter_safe_state()` gives the scheduler an independent path to force a stop, separate from sensor data

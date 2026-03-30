@@ -1,7 +1,7 @@
 # HORUS Documentation (Full)
 
-Generated: 2026-03-30T21:06:27.030Z
-Pages: 267
+Generated: 2026-03-30T21:28:42.188Z
+Pages: 273
 Source: https://docs.horusrobotics.dev
 Condensed overview: https://docs.horusrobotics.dev/llms.txt
 
@@ -13,7 +13,7 @@ AI agents can use this to understand the full framework.
 - Getting Started (17 pages)
 - Learn (4 pages)
 - Core Concepts (25 pages)
-- Tutorials (20 pages)
+- Tutorials (26 pages)
 - Rust (37 pages)
 - Python (66 pages)
 - Development (14 pages)
@@ -19008,6 +19008,176 @@ You should see all 4 nodes with their tick rates, all topics with message counts
 - [Safety Monitor](/advanced/safety-monitor) — Add watchdog and graceful degradation
 
 ---
+## Tutorial 4: Custom Messages (C++)
+Path: /tutorials/04-custom-messages-cpp
+Description: Define custom message types and use them with typed Publisher/Subscriber
+
+# Tutorial 4: Custom Messages (C++)
+
+HORUS provides 50+ built-in message types, but you'll often need your own. This tutorial shows how to define custom `#[repr(C)]` Pod messages usable across C++, Rust, and Python.
+
+## What You'll Learn
+
+- Defining `#[repr(C)]` structs that work as Pod messages
+- Using custom types with `Publisher` / `Subscriber`
+- Layout requirements for cross-language compatibility
+- When to use custom messages vs JsonWireMessage
+
+## The Two Approaches
+
+### Approach 1: Use JsonWireMessage (Quick, Flexible)
+
+For prototyping or when the message schema changes frequently, use JSON:
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstring>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+
+    // JSON wire message — sends arbitrary JSON through SHM
+    horus::Publisher<horus::msg::CmdVel> cmd_pub("cmd_vel");
+
+    // For custom data, use the JSON wire message type
+    auto json_pub = sched.advertise<HorusJsonWireMsg>("custom.data");
+
+    sched.add("sender")
+        .tick([&] {
+            // Pack custom data as JSON
+            HorusJsonWireMsg msg{};
+            const char* json = R"({"temperature": 25.3, "humidity": 60, "location": "lab"})";
+            std::memcpy(msg.data, json, strlen(json));
+            msg.data_len = strlen(json);
+            msg.msg_id = 1;
+            json_pub.send(msg);
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+**Pros:** No Rust changes needed, any JSON schema, works immediately.
+**Cons:** 4KB max, serialization overhead, no compile-time type checking.
+
+### Approach 2: Define a Pod Struct (Production, Zero-Copy)
+
+For production use, define a `#[repr(C)]` struct in Rust, add it to the FFI pipeline, and create a matching C++ struct. This gives you zero-copy SHM transfer.
+
+#### Step 1: Define in Rust (`horus_library/messages/`)
+
+```rust
+/// Custom sensor reading from a weather station
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct WeatherData {
+    pub temperature: f32,     // Celsius
+    pub humidity: f32,        // 0-100%
+    pub pressure: f32,        // hPa
+    pub wind_speed: f32,      // m/s
+    pub wind_direction: f32,  // degrees (0=N, 90=E)
+    pub timestamp_ns: u64,
+}
+```
+
+#### Step 2: Add to FFI pipeline
+
+In `horus_cpp/src/topic_ffi.rs`:
+```rust
+impl_topic_ffi!(weather_data, WeatherData, horus_library::WeatherData);
+```
+
+In `horus_cpp/src/c_api.rs`:
+```rust
+impl_pod_topic_c_api!(weather_data, horus_library::WeatherData);
+```
+
+#### Step 3: Define matching C++ struct
+
+```cpp
+// In your project or in horus_cpp/include/horus/msg/
+namespace horus { namespace msg {
+
+struct WeatherData {
+    float temperature;      // Celsius
+    float humidity;         // 0-100%
+    float pressure;         // hPa
+    float wind_speed;       // m/s
+    float wind_direction;   // degrees
+    uint64_t timestamp_ns;
+};
+
+}} // namespace horus::msg
+```
+
+#### Step 4: Add C++ template specialization
+
+In `horus_cpp/include/horus/impl/topic_impl.hpp`:
+```cpp
+HORUS_TOPIC_IMPL(msg::WeatherData, weather_data)
+```
+
+#### Step 5: Use it
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class WeatherStation : public horus::Node {
+public:
+    WeatherStation() : Node("weather_station") {
+        pub_ = advertise<horus::msg::WeatherData>("weather.data");
+    }
+
+    void tick() override {
+        horus::msg::WeatherData data{};
+        data.temperature = read_temperature();
+        data.humidity = read_humidity();
+        data.pressure = read_pressure();
+        data.timestamp_ns = 0;
+        pub_->send(data);
+    }
+
+private:
+    horus::Publisher<horus::msg::WeatherData>* pub_;
+    float read_temperature() { return 22.5f; }
+    float read_humidity() { return 55.0f; }
+    float read_pressure() { return 1013.25f; }
+};
+```
+
+## Layout Rules for Custom Types
+
+| Rule | Why |
+|------|-----|
+| `#[repr(C)]` in Rust | Ensures C-compatible memory layout |
+| Only primitive types + fixed arrays | `Vec`, `String`, `Box` can't cross SHM |
+| Same field order in C++ and Rust | Memory layout must match exactly |
+| Use `f32`/`f64`/`u8`/`u16`/`u32`/`u64`/`i32`/`i64` | Cross-language compatible primitives |
+| Fixed-size arrays `[T; N]` only | Variable-length data needs JsonWireMessage |
+| `timestamp_ns: u64` as last field | Convention for all HORUS messages |
+
+## When To Use Each Approach
+
+| Scenario | Approach |
+|----------|----------|
+| Prototyping, schema changing | JsonWireMessage |
+| Production, performance-critical | Custom Pod struct |
+| Cross-language (C++ + Python + Rust) | Custom Pod struct |
+| One-off configuration messages | JsonWireMessage |
+| High-frequency sensor data (>100 Hz) | Custom Pod struct (zero-copy) |
+
+## Key Takeaways
+
+- JsonWireMessage is the fastest path for custom data — no Rust changes, JSON payload, 4KB max
+- Custom Pod structs give zero-copy SHM but require adding to the FFI pipeline (5 steps)
+- Both approaches work cross-language (C++ ↔ Rust ↔ Python)
+- Always put `timestamp_ns: u64` as the last field (convention)
+- The `HORUS_TOPIC_IMPL` macro generates the entire Publisher/Subscriber specialization in one line
+
+---
 ## Tutorial: Real-Time Control
 Path: /tutorials/realtime-control
 Description: Build a multi-rate robot controller with real-time scheduling, deadline enforcement, and safety policies
@@ -19308,6 +19478,220 @@ You should see the system run. Press Ctrl+C to stop — the timing report shows 
 - [Execution Classes](/concepts/execution-classes) — How RT auto-detection works
 - [Real-Time Concepts](/concepts/real-time) — Why real-time matters for robotics
 - [Miss Enum](/rust/api/scheduler#miss-enum) — All deadline miss policies
+
+---
+## Tutorial 5: Hardware & Real-Time (C++)
+Path: /tutorials/05-hardware-rt-cpp
+Description: Connect real hardware with RT scheduling, CPU pinning, and watchdog protection
+
+# Tutorial 5: Hardware & Real-Time (C++)
+
+Connect real sensors and actuators to HORUS with proper real-time scheduling. This tutorial builds a motor controller that reads encoder feedback and drives a motor with SCHED_FIFO priority.
+
+## What You'll Learn
+
+- Opening serial ports from a Node
+- RT scheduling: `budget()`, `deadline()`, `pin_core()`, `priority()`
+- Watchdog for detecting frozen hardware
+- `enter_safe_state()` for actuator safety
+- CPU governor and kernel requirements
+
+## Prerequisites
+
+- Completed [Tutorial 2: Motor Controller](/docs/tutorials/02-motor-controller-cpp)
+- A Linux machine (RT features require Linux)
+- Optional: USB serial device for testing
+
+## The Hardware Pattern
+
+Every hardware driver follows the same pattern:
+
+```
+init():    open device, configure, verify connection
+tick():    read sensor OR write actuator (never both blocking)
+safe():    zero actuators, disable outputs
+shutdown(): close device, release resources
+```
+
+## Complete Code: RT Motor Driver
+
+```cpp
+#include <horus/horus.hpp>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <cstdio>
+#include <cstring>
+using namespace horus::literals;
+
+class MotorDriver : public horus::Node {
+public:
+    MotorDriver(const char* port, int baudrate)
+        : Node("motor_driver"), port_(port), baudrate_(baudrate)
+    {
+        cmd_sub_   = subscribe<horus::msg::CmdVel>("motor.cmd");
+        state_pub_ = advertise<horus::msg::CmdVel>("motor.state");
+    }
+
+    void init() override {
+        fd_ = open(port_, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd_ < 0) {
+            horus::log::error("motor", "Failed to open serial port");
+            horus::blackbox::record("motor", "Serial port open failed");
+            return;
+        }
+
+        // Configure serial port
+        struct termios tty{};
+        tcgetattr(fd_, &tty);
+        cfsetispeed(&tty, baudrate_);
+        cfsetospeed(&tty, baudrate_);
+        tty.c_cflag |= (CLOCAL | CREAD);
+        tty.c_cflag &= ~PARENB;
+        tty.c_cflag &= ~CSTOPB;
+        tty.c_cflag &= ~CSIZE;
+        tty.c_cflag |= CS8;
+        tcsetattr(fd_, TCSANOW, &tty);
+
+        horus::log::info("motor", "Serial port opened, motor ready");
+    }
+
+    void tick() override {
+        if (fd_ < 0) return;
+
+        // Read command
+        auto cmd = cmd_sub_->recv();
+        if (cmd) {
+            float duty = cmd->get()->linear;
+            last_cmd_ = duty;
+
+            // Send PWM command to motor controller
+            // Protocol: "M<duty>\n" where duty is -100 to 100
+            char buf[32];
+            int n = std::snprintf(buf, sizeof(buf), "M%.0f\n", duty * 100.0f);
+            write(fd_, buf, n);
+        }
+
+        // Read encoder feedback (non-blocking)
+        char rbuf[64];
+        int n = read(fd_, rbuf, sizeof(rbuf) - 1);
+        if (n > 0) {
+            rbuf[n] = '\0';
+            float rpm = 0;
+            if (std::sscanf(rbuf, "E%f", &rpm) == 1) {
+                horus::msg::CmdVel state{};
+                state.linear = rpm;
+                state.angular = last_cmd_;
+                state_pub_->send(state);
+                watchdog_fed_ = true;
+            }
+        }
+
+        // Watchdog: if no encoder response for 100 ticks (1s), alarm
+        if (watchdog_fed_) {
+            watchdog_counter_ = 0;
+            watchdog_fed_ = false;
+        } else {
+            watchdog_counter_++;
+            if (watchdog_counter_ > 100 && !watchdog_alarmed_) {
+                horus::log::error("motor", "Encoder watchdog timeout");
+                horus::blackbox::record("motor", "Encoder timeout > 1s");
+                watchdog_alarmed_ = true;
+                send_zero();
+            }
+        }
+    }
+
+    void enter_safe_state() override {
+        send_zero();
+        horus::blackbox::record("motor", "Safe state: motor zeroed");
+    }
+
+private:
+    void send_zero() {
+        if (fd_ >= 0) {
+            write(fd_, "M0\n", 3);
+        }
+        horus::msg::CmdVel stop{};
+        state_pub_->send(stop);
+    }
+
+    const char* port_;
+    int baudrate_;
+    int fd_ = -1;
+    float last_cmd_ = 0;
+    int watchdog_counter_ = 0;
+    bool watchdog_fed_ = false;
+    bool watchdog_alarmed_ = false;
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Publisher<horus::msg::CmdVel>*  state_pub_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz)
+         .name("rt_motor")
+         .prefer_rt();    // Use SCHED_FIFO if available
+
+    MotorDriver motor("/dev/ttyUSB0", B115200);
+    sched.add(motor)
+        .order(0)                    // highest priority
+        .budget(2_ms)                // must complete in 2ms
+        .deadline(5_ms)              // absolute deadline 5ms
+        .on_miss(horus::Miss::SafeMode)  // stop motor if overrun
+        .pin_core(2)                 // pin to CPU core 2
+        .priority(90)                // SCHED_FIFO priority 90
+        .watchdog(1_s)               // scheduler-level watchdog
+        .build();
+
+    sched.spin();
+}
+```
+
+## RT Configuration Explained
+
+```cpp
+sched.prefer_rt();         // Try SCHED_FIFO; degrade gracefully if unavailable
+// vs
+sched.require_rt();        // FAIL if SCHED_FIFO not available (production systems)
+```
+
+| Setting | Purpose | Typical Value |
+|---------|---------|---------------|
+| `budget(2_ms)` | Max time per tick | 50-80% of period |
+| `deadline(5_ms)` | Absolute tick deadline | 90-95% of period |
+| `pin_core(2)` | CPU affinity | Dedicated core, not core 0 |
+| `priority(90)` | SCHED_FIFO level | 80-99 for critical, 50-79 for normal |
+| `watchdog(1_s)` | Frozen node detection | 5-10x expected tick period |
+
+## RT Kernel Setup
+
+For full RT guarantees:
+
+```bash
+# Check current kernel
+uname -r  # Look for "-rt" suffix
+
+# Set CPU governor to performance
+sudo cpupower frequency-set -g performance
+
+# Grant RT privileges without root
+sudo setcap cap_sys_nice+ep ./my_robot
+
+# Or run with elevated privileges
+sudo nice -n -20 ./my_robot
+```
+
+Without an RT kernel, HORUS still works — `prefer_rt()` logs warnings but continues with best-effort scheduling.
+
+## Key Takeaways
+
+- `init()` opens hardware, `tick()` reads/writes, `enter_safe_state()` zeros actuators
+- Never block in `tick()` — use non-blocking I/O (`O_NONBLOCK`)
+- Watchdog detects frozen hardware (encoder cable disconnected, motor driver crash)
+- `pin_core()` prevents OS from migrating the thread — critical for latency
+- `budget()` + `SafeMode` = automatic motor shutdown on timing overrun
+- Test without RT kernel first, add RT for production deployment
 
 ---
 ## Tutorial: Real-Time Control (Python)
@@ -19858,6 +20242,322 @@ For motor control at 1 kHz+, use the [Rust Real-Time Control](/tutorials/realtim
 - [Python Bindings](/python/api/python-bindings) --- complete API surface
 
 ---
+## Tutorial 6: Services & Actions (C++)
+Path: /tutorials/06-services-actions-cpp
+Description: Request/response RPC and long-running tasks with progress feedback
+
+# Tutorial 6: Services & Actions (C++)
+
+Topics are fire-and-forget. Sometimes you need a **response** (services) or **progress updates** (actions). This tutorial covers both.
+
+## What You'll Learn
+
+- `horus::ServiceClient` / `horus::ServiceServer` for request/response
+- `horus::ActionClient` / `horus::ActionServer` for long-running tasks
+- JSON-based type erasure for flexible RPC
+- Cross-process service calls
+
+## Services: Request/Response
+
+A service is like a function call across processes. Client sends a request, server returns a response.
+
+### Example: Add Two Numbers
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+#include <cstring>
+using namespace horus::literals;
+
+int main() {
+    // ── Server: listens for requests, computes response ─────────
+    horus::ServiceServer server("add_two_ints");
+
+    // Handler receives raw bytes, writes response
+    server.set_handler([](const uint8_t* req, size_t req_len,
+                          uint8_t* res, size_t* res_len) -> bool {
+        // Parse request JSON
+        char json[4096] = {};
+        std::memcpy(json, req, req_len);
+        // Simple parsing (production: use a JSON library)
+        int a = 0, b = 0;
+        std::sscanf(json, R"({"a":%d,"b":%d})", &a, &b);
+
+        // Compute response
+        int sum = a + b;
+        *res_len = std::snprintf(reinterpret_cast<char*>(res), 4096,
+                                  R"({"sum":%d})", sum);
+        return true;
+    });
+
+    // ── Client: sends request, waits for response ───────────────
+    horus::ServiceClient client("add_two_ints");
+
+    auto response = client.call(R"({"a": 3, "b": 4})",
+                                std::chrono::milliseconds(1000));
+    if (response) {
+        std::printf("Response: %s\n", response->c_str());
+        // Output: Response: {"sum":7}
+    } else {
+        std::printf("Service call timed out\n");
+    }
+}
+```
+
+### How Services Work
+
+```
+Client                          Server
+  │                               │
+  │─── Request JSON ──────────→  │
+  │    (via SHM topic)           │ handler() called
+  │                               │ computes response
+  │  ←── Response JSON ──────── │
+  │    (via SHM topic)           │
+```
+
+Under the hood, services use `JsonWireMessage` Pod transport over two SHM topics:
+- `{service_name}.request` — client publishes, server subscribes
+- `{service_name}.response.{client_pid}` — server publishes, client subscribes
+
+## Actions: Long-Running Tasks with Progress
+
+Actions are for tasks that take time — navigating to a goal, calibrating a sensor, recording data.
+
+### Example: Navigate to Goal
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    // ── Client: send goal, monitor progress ─────────────────────
+    horus::ActionClient client("navigate");
+
+    auto goal = client.send_goal(R"({"target_x": 5.0, "target_y": 3.0})");
+    if (!goal) {
+        std::printf("Failed to send goal\n");
+        return 1;
+    }
+
+    std::printf("Goal sent (id=%lu), status: Pending\n", goal.id());
+
+    // Monitor status
+    while (goal.is_active()) {
+        // In a real system, poll feedback topic
+        std::printf("  Status: %s\n",
+            goal.status() == horus::GoalStatus::Pending ? "Pending" :
+            goal.status() == horus::GoalStatus::Active  ? "Active"  : "?");
+        break;  // demo — normally poll in tick loop
+    }
+
+    // Cancel if needed
+    // goal.cancel();
+
+    std::printf("Final status: %d\n", static_cast<int>(goal.status()));
+}
+```
+
+### Action Lifecycle
+
+```
+Client                          Server
+  │                               │
+  │── Goal JSON ──────────────→  │  accept_handler() → accept/reject
+  │                               │
+  │  ←── Feedback JSON ────────  │  (periodic progress updates)
+  │  ←── Feedback JSON ────────  │
+  │  ←── Feedback JSON ────────  │
+  │                               │
+  │  ←── Result JSON ──────────  │  (final result)
+  │                               │
+  │── Cancel ──────────────────→  │  (optional, client-initiated)
+```
+
+### Action Server
+
+```cpp
+horus::ActionServer server("navigate");
+
+// Accept handler: decide whether to accept the goal
+server.set_accept_handler([](const uint8_t* goal, size_t len) -> uint8_t {
+    // 0 = accept, 1 = reject
+    return 0;  // accept all goals
+});
+
+// Execute handler: called when goal is accepted
+server.set_execute_handler([](uint64_t goal_id, const uint8_t* goal, size_t len) {
+    // Start navigation...
+    // Publish feedback periodically
+    // Publish result when done
+});
+```
+
+## Cross-Process Services
+
+Services work across processes — client and server can be separate binaries:
+
+```bash
+# Terminal 1: server
+./my_service_server
+
+# Terminal 2: client
+./my_service_client
+```
+
+Both connect through SHM. The topic names must match.
+
+## When To Use What
+
+| Pattern | Use Case | Latency |
+|---------|----------|---------|
+| **Topic** | Continuous data (sensor readings, commands) | ~15 ns |
+| **Service** | One-shot query (get parameter, check status) | ~5 us (JSON round-trip) |
+| **Action** | Long task with progress (navigate, calibrate) | ~5 us + task duration |
+
+## Key Takeaways
+
+- Services = synchronous request/response (like function calls)
+- Actions = asynchronous goal/feedback/result (like background tasks)
+- Both use `JsonWireMessage` for type-erased communication
+- Both work same-process and cross-process via SHM
+- Client must specify timeout for services (network could delay)
+- Actions support cancellation via `goal.cancel()`
+
+---
+## Tutorial 7: Parameters Deep Dive (C++)
+Path: /tutorials/07-params-deep-dive-cpp
+Description: Runtime configuration with typed parameters, live tuning, and persistence
+
+# Tutorial 7: Parameters Deep Dive (C++)
+
+Parameters let you change robot behavior at runtime without recompiling. Tune PID gains, adjust speed limits, enable/disable features — all while the robot is running.
+
+## What You'll Learn
+
+- `horus::Params` for typed key-value storage
+- `get()` with defaults for safe access
+- Live tuning from `horus param` CLI
+- Organizing parameters by subsystem
+
+## Basic Usage
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class TunableController : public horus::Node {
+public:
+    TunableController(horus::Params& params)
+        : Node("tunable_ctrl"), params_(params)
+    {
+        cmd_sub_ = subscribe<horus::msg::CmdVel>("cmd_vel");
+        out_pub_ = advertise<horus::msg::CmdVel>("motor.cmd");
+    }
+
+    void tick() override {
+        // Read parameters every tick — picks up live changes
+        double max_speed = params_.get<double>("max_speed", 0.5);
+        double gain      = params_.get<double>("controller_gain", 0.8);
+        bool   enabled   = params_.get<bool>("motor_enabled", true);
+
+        if (!enabled) {
+            horus::msg::CmdVel stop{};
+            out_pub_->send(stop);
+            return;
+        }
+
+        auto cmd = cmd_sub_->recv();
+        if (!cmd) return;
+
+        double scaled = cmd->get()->linear * gain;
+        scaled = std::min(scaled, max_speed);
+
+        horus::msg::CmdVel out{};
+        out.linear = static_cast<float>(scaled);
+        out_pub_->send(out);
+    }
+
+private:
+    horus::Params& params_;
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Publisher<horus::msg::CmdVel>*  out_pub_;
+};
+
+int main() {
+    horus::Params params;
+
+    // Set defaults
+    params.set("max_speed", 0.5);
+    params.set("controller_gain", 0.8);
+    params.set("motor_enabled", true);
+    params.set("robot_name", "atlas");
+
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz);
+
+    TunableController ctrl(params);
+    sched.add(ctrl).order(10).build();
+
+    sched.spin();
+}
+```
+
+## Supported Types
+
+| Type | `set()` | `get()` | `get_*()` |
+|------|---------|------------|-----------|
+| `double` | `set("key", 1.5)` | `get<double>("key", 0.0)` | `get_f64("key")` → `optional<double>` |
+| `int64_t` | `set("key", int64_t(42))` | `get<int64_t>("key", 0)` | `get_i64("key")` → `optional<int64_t>` |
+| `bool` | `set("key", true)` | `get<bool>("key", false)` | `get_bool("key")` → `optional<bool>` |
+| `string` | `set("key", "value")` | `get<std::string>("key", "")` | `get_string("key")` → `optional<string>` |
+
+## Organizing Parameters
+
+Group by subsystem:
+
+```cpp
+// Locomotion
+params.set("loco.max_speed", 0.5);
+params.set("loco.max_angular", 1.0);
+params.set("loco.wheel_base", 0.3);
+
+// PID
+params.set("pid.kp", 2.0);
+params.set("pid.ki", 0.1);
+params.set("pid.kd", 0.05);
+
+// Safety
+params.set("safety.min_distance", 0.3);
+params.set("safety.estop_enabled", true);
+```
+
+## Pattern: Parameter Validation
+
+```cpp
+void init() override {
+    double kp = params_.get<double>("pid.kp", -1.0);
+    if (kp < 0) {
+        horus::log::error("pid", "pid.kp must be >= 0");
+        return;
+    }
+    double max_speed = params_.get<double>("loco.max_speed", 0.5);
+    if (max_speed > 2.0) {
+        horus::log::warn("pid", "max_speed > 2.0 m/s — are you sure?");
+    }
+}
+```
+
+## Key Takeaways
+
+- Read params every tick — captures live changes
+- Always provide defaults: `get<double>("key", 0.0)` never fails
+- Use dotted naming (`pid.kp`, `loco.max_speed`) to organize
+- Validate in `init()` — log warnings for dangerous values
+- `horus::Params` is thread-safe for concurrent read/write
+
+---
 ## Cross-Language Interop: C++ + Rust + Python
 Path: /tutorials/cross-language-interop
 Description: Run C++, Rust, and Python nodes in the same system, sharing topics over shared memory
@@ -20026,6 +20726,311 @@ Cross-process latency is dominated by SHM synchronization, not language boundari
 | Monitoring/logging | Python | Rapid development, visualization |
 | Safety systems | Rust | Compile-time guarantees, no undefined behavior |
 | Legacy integration | C++ | Existing codebase compatibility |
+
+---
+## Tutorial: Real-Time Control (C++)
+Path: /tutorials/realtime-control-cpp
+Description: Build a 1kHz motor control loop with SCHED_FIFO, jitter measurement, and failsafe
+
+# Tutorial: Real-Time Control (C++)
+
+Build a 1 kHz motor control loop — the kind that runs real industrial servos. Measure jitter, enforce deadlines, and prove your system meets timing requirements.
+
+## What You'll Build
+
+A control loop that:
+- Runs at exactly 1000 Hz
+- Reads encoder + computes PID + writes motor in < 500us
+- Measures tick-to-tick jitter
+- Fails safe (stops motor) if any tick exceeds 900us
+
+## Complete Code
+
+```cpp
+#include <horus/horus.hpp>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <algorithm>
+using namespace horus::literals;
+
+class RtMotorLoop : public horus::Node {
+public:
+    RtMotorLoop() : Node("rt_motor_1khz") {
+        cmd_sub_  = subscribe<horus::msg::CmdVel>("motor.target");
+        enc_sub_  = subscribe<horus::msg::CmdVel>("encoder.rpm");
+        pwm_pub_  = advertise<horus::msg::CmdVel>("motor.pwm");
+    }
+
+    void init() override {
+        last_tick_ = std::chrono::steady_clock::now();
+        horus::log::info("rt_motor", "1kHz RT loop initialized");
+    }
+
+    void tick() override {
+        auto now = std::chrono::steady_clock::now();
+        auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            now - last_tick_).count();
+        last_tick_ = now;
+
+        // Track jitter statistics
+        if (tick_count_ > 10) {  // skip first 10 ticks (startup)
+            if (dt_us > max_jitter_us_) max_jitter_us_ = dt_us;
+            if (dt_us < min_jitter_us_) min_jitter_us_ = dt_us;
+            jitter_sum_ += dt_us;
+        }
+        tick_count_++;
+
+        // Read target velocity
+        if (auto cmd = cmd_sub_->recv()) {
+            target_rpm_ = cmd->get()->linear;
+        }
+
+        // Read actual RPM
+        double actual_rpm = 0;
+        if (auto enc = enc_sub_->recv()) {
+            actual_rpm = enc->get()->linear;
+        }
+
+        // PID (tuned for motor dynamics)
+        double error = target_rpm_ - actual_rpm;
+        integral_ += error * 0.001;  // dt = 1ms
+        integral_ = std::clamp(integral_, -100.0, 100.0);
+        double derivative = (error - prev_error_) * 1000.0;
+        prev_error_ = error;
+
+        double output = 0.5 * error + 0.01 * integral_ + 0.001 * derivative;
+        output = std::clamp(output, -1.0, 1.0);
+
+        horus::msg::CmdVel pwm{};
+        pwm.linear = static_cast<float>(output);
+        pwm_pub_->send(pwm);
+
+        // Report jitter every 1000 ticks (1 Hz)
+        if (tick_count_ % 1000 == 0) {
+            double avg = static_cast<double>(jitter_sum_) / (tick_count_ - 10);
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "jitter: min=%ldus avg=%.0fus max=%ldus (target=1000us)",
+                min_jitter_us_, avg, max_jitter_us_);
+            horus::log::info("rt_motor", buf);
+        }
+    }
+
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        pwm_pub_->send(stop);
+        integral_ = 0;
+
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+            "SAFE STATE — max jitter was %ldus", max_jitter_us_);
+        horus::blackbox::record("rt_motor", buf);
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Subscriber<horus::msg::CmdVel>* enc_sub_;
+    horus::Publisher<horus::msg::CmdVel>*  pwm_pub_;
+
+    double target_rpm_ = 0;
+    double integral_ = 0, prev_error_ = 0;
+    int tick_count_ = 0;
+    long jitter_sum_ = 0;
+    long max_jitter_us_ = 0;
+    long min_jitter_us_ = 999999;
+    std::chrono::steady_clock::time_point last_tick_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(1000_hz)
+         .name("rt_control")
+         .prefer_rt();
+
+    RtMotorLoop motor;
+    sched.add(motor)
+        .order(0)
+        .budget(500_us)              // must finish in 500us (50% of 1ms period)
+        .deadline(900_us)            // absolute deadline 900us
+        .on_miss(horus::Miss::SafeMode)
+        .pin_core(3)                 // dedicated CPU core
+        .priority(95)                // near-max SCHED_FIFO priority
+        .watchdog(100_ms)            // if stuck for 100ms, trigger safety
+        .build();
+
+    std::printf("1kHz RT motor loop starting...\n");
+    std::printf("Monitor: horus log (see jitter stats)\n");
+    sched.spin();
+}
+```
+
+## Understanding the Timing Budget
+
+```
+|←────────── 1000 us (1 kHz period) ──────────→|
+|── budget ──|── slack ──|── deadline ──|
+|   500 us   |           |   900 us    |
+                                        ^ Miss::SafeMode triggers here
+```
+
+- **budget(500us)**: expected max computation time
+- **deadline(900us)**: absolute latest the tick can finish
+- **slack**: 400us buffer for OS scheduling jitter
+- If tick exceeds 900us → `enter_safe_state()` called → motor stops
+
+## Jitter Measurement
+
+The code measures tick-to-tick timing:
+- **Ideal**: every tick exactly 1000us apart
+- **Real (no RT kernel)**: 950-1200us typical, spikes to 5000us+
+- **Real (PREEMPT_RT)**: 995-1005us, max spike ~50us
+
+## Key Takeaways
+
+- 1 kHz control is achievable on commodity Linux with HORUS
+- `pin_core()` is critical — prevents OS migration mid-tick
+- `budget()` + `SafeMode` = automatic shutdown on timing failure
+- Measure jitter to prove your system meets requirements
+- `prefer_rt()` for development, `require_rt()` for production
+- BlackBox records the max jitter at safe-state for post-mortem analysis
+
+---
+## Tutorial 8: Multi-Process Systems (C++)
+Path: /tutorials/08-multi-process-cpp
+Description: Run multiple C++ processes sharing topics over shared memory
+
+# Tutorial 8: Multi-Process Systems (C++)
+
+Real robots run multiple processes — a sensor driver, a controller, a safety monitor, each as a separate binary. This tutorial shows how to build and run multi-process systems.
+
+## What You'll Learn
+
+- Separate binaries sharing SHM topics
+- Process startup ordering (subscriber before publisher)
+- Cross-process service calls
+- Using `horus launch` for multi-process orchestration
+
+## Architecture
+
+```
+Process 1: lidar_driver       Process 2: controller        Process 3: safety
+┌────────────────────┐       ┌────────────────────┐       ┌────────────┐
+│ Publisher           │──SHM─→│ Subscriber          │       │ Subscriber │
+│ "lidar.scan"        │       │ "lidar.scan"        │       │ "cmd_vel"  │
+└────────────────────┘       │ Publisher           │──SHM─→│            │
+                              │ "cmd_vel"           │       └────────────┘
+                              └────────────────────┘
+```
+
+All three processes open the **same SHM files** in `/dev/shm/horus_default/topics/`. No message broker, no serialization.
+
+## Process 1: Sensor Driver
+
+```cpp
+// sensor_driver.cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class LidarSensor : public horus::Node {
+public:
+    LidarSensor() : Node("lidar") {
+        pub_ = advertise<horus::msg::LaserScan>("lidar.scan");
+    }
+    void tick() override {
+        auto scan = pub_->loan();
+        for (int i = 0; i < 360; i++)
+            scan->ranges[i] = 2.0f + 0.5f * std::sin(i * 0.1f);
+        pub_->publish(std::move(scan));
+    }
+private:
+    horus::Publisher<horus::msg::LaserScan>* pub_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz).name("lidar_proc");
+    LidarSensor lidar;
+    sched.add(lidar).order(0).build();
+    sched.spin();
+}
+```
+
+## Process 2: Controller
+
+```cpp
+// controller.cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        cmd_pub_  = advertise<horus::msg::CmdVel>("cmd_vel");
+    }
+    void tick() override {
+        auto scan = scan_sub_->recv();
+        if (!scan) return;
+        float min_range = 999.0f;
+        for (int i = 0; i < 360; i++)
+            if (scan->get()->ranges[i] < min_range)
+                min_range = scan->get()->ranges[i];
+        horus::msg::CmdVel cmd{};
+        cmd.linear = min_range > 0.5f ? 0.3f : 0.0f;
+        cmd_pub_->send(cmd);
+    }
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        cmd_pub_->send(stop);
+    }
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
+    horus::Publisher<horus::msg::CmdVel>*     cmd_pub_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(50_hz).name("ctrl_proc");
+    Controller ctrl;
+    sched.add(ctrl).order(0).build();
+    sched.spin();
+}
+```
+
+## Running Multi-Process
+
+```bash
+# Build both
+g++ -std=c++17 -I horus_cpp/include -o sensor sensor_driver.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
+g++ -std=c++17 -I horus_cpp/include -o controller controller.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
+
+# Run (subscriber process first — creates SHM)
+LD_LIBRARY_PATH=target/debug ./controller &
+sleep 0.5
+LD_LIBRARY_PATH=target/debug ./sensor &
+
+# Monitor from any terminal
+horus topic list    # shows lidar.scan, cmd_vel
+horus node list     # shows lidar, controller (separate PIDs)
+```
+
+## Startup Order Rule
+
+**Subscriber must start before publisher** for the first message exchange. The first process to open a topic creates the SHM ring buffer. If the publisher creates it and exits, the data is gone before the subscriber connects.
+
+For production, use `horus launch` which manages startup ordering automatically.
+
+## Key Takeaways
+
+- Each process has its own `Scheduler` — they don't share a scheduler
+- Topics are shared via SHM files (`/dev/shm/horus_default/topics/`)
+- Subscriber should start first to create the ring buffer
+- `horus topic list` shows topics from ALL processes
+- No message broker — direct SHM ring buffer, ~170ns cross-process latency
+- Each process can have different tick rates (10 Hz sensor, 50 Hz controller)
 
 ---
 ## Tutorial 4: Custom Message Types
@@ -89399,6 +90404,15 @@ public:
         }
     }
 
+    void enter_safe_state() override {
+        // IMU reader has no actuators, but publish a zeroed orientation
+        // so downstream controllers see a neutral state and stop moving
+        horus::msg::Pose2D zero{};
+        pose_pub_->send(zero);
+        horus::blackbox::record("imu_reader",
+            "Entered safe state, published zero orientation");
+    }
+
 private:
     horus::Subscriber<horus::msg::Imu>*   imu_sub_;
     horus::Publisher<horus::msg::Pose2D>*  pose_pub_;
@@ -90472,20 +91486,55 @@ Description: Reactive obstacle avoidance using LaserScan data
 
 ## LiDAR Obstacle Avoidance (C++)
 
-Read 360-degree LiDAR scans, find closest obstacle, steer away or stop.
+Read 360-degree LiDAR scans, identify the closest obstacle, and generate reactive velocity commands to steer away from danger while maintaining forward progress.
 
-### Code
+### Problem
+
+Your robot has a planar LiDAR and needs to navigate without hitting things. A full path planner is overkill for simple environments. You need a lightweight reactive behavior: drive forward when the path is clear, slow down and steer away when obstacles appear.
+
+### How It Works
+
+The node processes a 360-degree `LaserScan` in three zones:
+
+1. **Front zone** (roughly -30 to +30 degrees): if an obstacle is here, the robot must stop or slow down
+2. **Left zone** (0-180 degrees): obstacles here pull the robot to the right
+3. **Right zone** (180-360 degrees): obstacles here pull the robot to the left
+
+The algorithm finds the closest point in the full scan, then decides:
+- If the closest obstacle is beyond the safe distance: drive at full speed
+- If it is within the safe distance but outside the critical zone: slow down and turn away
+- If it is within the critical distance: stop and rotate in place
+
+The turn direction is chosen to steer *away* from the closest obstacle. If the obstacle is on the left half of the scan (index 0-179), turn right (negative angular velocity). If on the right half (180-359), turn left (positive angular velocity).
+
+### When To Use
+
+- Simple hallway or warehouse navigation without a map
+- Backup safety behavior when the primary planner fails
+- Prototyping before implementing a full costmap-based planner
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 using namespace horus::literals;
 
 class LidarAvoidance : public horus::Node {
 public:
-    LidarAvoidance(float safe_dist = 0.5f, float max_speed = 0.3f)
-        : Node("lidar_avoidance"), safe_dist_(safe_dist), max_speed_(max_speed)
+    LidarAvoidance(float safe_dist, float critical_dist, float max_speed, float turn_rate)
+        : Node("lidar_avoidance"),
+          safe_dist_(safe_dist),
+          critical_dist_(critical_dist),
+          max_speed_(max_speed),
+          turn_rate_(turn_rate)
     {
         scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
         cmd_pub_  = advertise<horus::msg::CmdVel>("cmd_vel");
@@ -90497,49 +91546,171 @@ public:
 
         const auto* s = scan->get();
 
-        // Find minimum range and its angle
+        // ── Find minimum range and its bearing ──────────────────────
         float min_range = 999.0f;
         int min_idx = 0;
+        int valid_count = 0;
+
         for (int i = 0; i < 360; i++) {
-            if (s->ranges[i] > 0.01f && s->ranges[i] < min_range) {
-                min_range = s->ranges[i];
-                min_idx = i;
+            float r = s->ranges[i];
+            // Filter invalid readings: too close (sensor noise) or too far (max range)
+            if (r > 0.05f && r < 12.0f) {
+                valid_count++;
+                if (r < min_range) {
+                    min_range = r;
+                    min_idx = i;
+                }
             }
         }
 
+        // ── Detect sensor failure ───────────────────────────────────
+        // If fewer than 10% of beams are valid, sensor may be obscured or broken
+        if (valid_count < 36) {
+            horus::log::error("lidar_avoidance",
+                "Insufficient valid LiDAR readings — stopping for safety");
+            horus::msg::CmdVel stop{};
+            cmd_pub_->send(stop);
+            horus::blackbox::record("lidar_avoidance", "Sensor failure: <10% valid beams");
+            return;
+        }
+
+        // ── Decide action based on proximity ────────────────────────
         horus::msg::CmdVel cmd{};
-        if (min_range < safe_dist_) {
-            // Obstacle close — turn away
+
+        if (min_range < critical_dist_) {
+            // CRITICAL: obstacle very close — rotate in place
             cmd.linear = 0.0f;
-            cmd.angular = (min_idx < 180) ? -0.5f : 0.5f;
-            horus::log::warn("lidar_avoidance", "Obstacle detected, turning");
+            cmd.angular = (min_idx < 180) ? -turn_rate_ : turn_rate_;
+            horus::log::warn("lidar_avoidance", "Critical obstacle — rotating in place");
+        } else if (min_range < safe_dist_) {
+            // CAUTION: obstacle within safe zone — slow down and steer away
+            // Speed proportional to distance (closer = slower)
+            float speed_factor = (min_range - critical_dist_) / (safe_dist_ - critical_dist_);
+            cmd.linear = max_speed_ * speed_factor * 0.5f;
+            cmd.angular = (min_idx < 180) ? -turn_rate_ * 0.7f : turn_rate_ * 0.7f;
         } else {
-            // Clear — go forward
+            // CLEAR: no close obstacles — full speed ahead
             cmd.linear = max_speed_;
             cmd.angular = 0.0f;
         }
+
         cmd_pub_->send(cmd);
+
+        // Log at 1 Hz (every 10th tick at 10 Hz)
+        if (++tick_count_ % 10 == 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "min=%.2fm at %d deg  cmd=(%.2f m/s, %.2f rad/s)  valid=%d/360",
+                min_range, min_idx, cmd.linear, cmd.angular, valid_count);
+            horus::log::info("lidar_avoidance", buf);
+        }
     }
 
     void enter_safe_state() override {
+        // Stop all motion on safety event
         horus::msg::CmdVel stop{};
         cmd_pub_->send(stop);
+        horus::blackbox::record("lidar_avoidance", "Entered safe state, motion stopped");
     }
 
 private:
     horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
     horus::Publisher<horus::msg::CmdVel>*     cmd_pub_;
-    float safe_dist_, max_speed_;
+
+    // Tunable parameters
+    float safe_dist_;      // meters — start slowing down
+    float critical_dist_;  // meters — stop and rotate
+    float max_speed_;      // m/s forward speed
+    float turn_rate_;      // rad/s rotation speed
+
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(10_hz);
-    LidarAvoidance avoid(0.5f, 0.3f);
-    sched.add(avoid).order(10).build();
+    sched.tick_rate(10_hz).name("lidar_avoidance_demo");
+
+    // safe=0.8m, critical=0.3m, max=0.3 m/s, turn=0.8 rad/s
+    LidarAvoidance avoid(0.8f, 0.3f, 0.3f, 0.8f);
+    sched.add(avoid)
+        .order(10)
+        .budget(5_ms)
+        .on_miss(horus::Miss::Skip)  // skip if overrun — stale scan data is dangerous
+        .build();
+
     sched.spin();
 }
 ```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Robot oscillates left/right near walls | Turn rate too high or safe distance too large | Reduce `turn_rate_` or `safe_dist_` |
+| Robot drives into obstacles | `safe_dist_` too small for robot's stopping distance | Increase safe distance to account for braking at `max_speed_` |
+| Robot stops and never recovers | `critical_dist_` too large or turn direction blocked | Reduce critical distance or add a "wander" timeout |
+| Robot ignores nearby obstacles | LiDAR returns values &lt;0.05m that are filtered out | Adjust minimum range filter to match your sensor's spec |
+| Jerky motion near obstacles | 10 Hz too slow for smooth speed modulation | Increase tick rate to 20-30 Hz |
+| Robot stops with no obstacle | Sensor returns spurious short-range readings | Add median filter on `ranges[]` before processing |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| Three-tier response (clear/caution/critical) | Smoother behavior than binary go/stop — gradual slowdown feels natural |
+| Speed proportional to obstacle distance | Closer obstacles mean slower approach — natural deceleration curve |
+| Sensor failure detection | If the LiDAR is blocked or broken, stopping is safer than driving blind |
+| 10 Hz tick rate | Matches typical LiDAR publish rate (10-15 Hz); faster ticks waste CPU re-processing the same scan |
+| `Miss::Skip` policy | Processing a stale scan with old obstacle positions is dangerous |
+| `enter_safe_state()` stops robot | Any system-level safety event must halt motion |
+| Min range filter at 0.05m | Most LiDARs report noise below their minimum range |
+
+### Variations
+
+**Weighted gap-finding** — steer toward the largest open gap instead of away from the closest obstacle:
+```cpp
+// Find the widest contiguous gap of ranges > safe_dist_
+int best_start = 0, best_len = 0, cur_start = 0, cur_len = 0;
+for (int i = 0; i < 360; i++) {
+    if (s->ranges[i] > safe_dist_) {
+        if (cur_len == 0) cur_start = i;
+        cur_len++;
+    } else {
+        if (cur_len > best_len) { best_start = cur_start; best_len = cur_len; }
+        cur_len = 0;
+    }
+}
+int gap_center = best_start + best_len / 2;
+cmd.angular = (gap_center - 180) * 0.01f;  // steer toward gap
+```
+
+**Vector field histogram (VFH)** — build a polar histogram of obstacle density:
+```cpp
+// Bin ranges into sectors, compute steering from obstacle-free sectors
+float histogram[36] = {};  // 10-degree bins
+for (int i = 0; i < 360; i++) {
+    int bin = i / 10;
+    if (s->ranges[i] < safe_dist_) histogram[bin] += 1.0f;
+}
+// Steer toward the bin with lowest obstacle density
+```
+
+**Follow-the-wall** — maintain a constant distance from a wall for corridor navigation:
+```cpp
+// Use readings at 90 and 270 degrees for left/right wall distance
+float left_dist  = s->ranges[90];
+float right_dist = s->ranges[270];
+float wall_error = left_dist - desired_wall_dist_;
+cmd.angular = kp_wall_ * wall_error;  // P-controller on wall distance
+```
+
+### Key Takeaways
+
+- Always validate sensor data — filter out-of-range readings and detect sensor failure
+- Three-tier response (clear/caution/critical) is smoother and safer than binary go/stop
+- Match tick rate to sensor publish rate — faster ticks just reprocess the same data
+- `Miss::Skip` is essential for reactive avoidance — stale obstacle data is dangerous
+- Speed proportional to obstacle distance gives a natural deceleration profile
 
 ---
 ## Recipe: Emergency Stop (C++)
@@ -90548,17 +91719,51 @@ Description: Safety system that monitors sensors and triggers emergency stop
 
 ## Emergency Stop (C++)
 
-A safety node that monitors sensor data, triggers emergency stop on danger, and stops all motors.
+A safety-critical node that monitors sensor data for imminent collision, triggers an emergency stop to halt all motion, and requires deliberate confirmation before resuming. Uses `Miss::SafeMode` for the strictest deadline enforcement.
 
-### Code
+### Problem
+
+Your robot has actuators that can injure people or damage property. You need a last line of defense that overrides all motion commands when a hazard is detected, logs the event for post-mortem analysis, and does not resume until the hazard has definitively cleared. A single spurious "all clear" must not release the stop.
+
+### How It Works
+
+The E-stop monitor runs at the **highest priority** (`order(0)`) with the **tightest budget** and the **strictest miss policy** (`Miss::SafeMode`). Every tick it:
+
+1. Reads the latest LiDAR scan
+2. Checks if any beam reports an obstacle within the critical distance (15cm)
+3. If danger detected: activates E-stop, publishes `EmergencyStop{engaged=1}`, zeros `cmd_vel`, and records the event to the blackbox
+4. If danger clears: increments a debounce counter. Only after N consecutive clear readings does it release the E-stop
+
+**Why debounce on clear but not on trigger?** Triggering must be instant — any delay means the robot travels further into the hazard. But releasing can afford 0.5 seconds of delay. Debounce prevents a flickering signal (e.g., a person walking past the sensor) from rapidly cycling the robot between motion and stop, which stresses motors and gearboxes.
+
+**Why fail-safe default?** If the LiDAR node crashes and stops publishing, `scan_sub_->recv()` returns null. The monitor treats this as a sensor failure and keeps the E-stop active. Silence is never interpreted as "safe."
+
+### When To Use
+
+- Any robot with actuators (motors, servos, grippers)
+- When safety regulations require guaranteed shutdown
+- As a secondary software safety layer alongside hardware E-stop relays
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+- Understanding of [Miss policies](/docs/concepts/core-concepts-scheduling)
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
+#include <cstdio>
 using namespace horus::literals;
 
 class SafetyMonitor : public horus::Node {
 public:
-    SafetyMonitor() : Node("safety_monitor") {
+    SafetyMonitor(float critical_dist = 0.15f, int clear_threshold = 25)
+        : Node("safety_monitor"),
+          critical_dist_(critical_dist),
+          clear_threshold_(clear_threshold)
+    {
         scan_sub_  = subscribe<horus::msg::LaserScan>("lidar.scan");
         estop_pub_ = advertise<horus::msg::EmergencyStop>("emergency.stop");
         cmd_pub_   = advertise<horus::msg::CmdVel>("cmd_vel");
@@ -90566,67 +91771,209 @@ public:
 
     void tick() override {
         auto scan = scan_sub_->recv();
-        if (!scan) return;
 
-        // Check if any range is dangerously close
+        // ── Fail-safe: no scan data = sensor failure ────────────────
+        // If the LiDAR node crashed, we have no sensor coverage.
+        // Treat silence as danger, not safety.
+        if (!scan) {
+            ticks_without_scan_++;
+            if (ticks_without_scan_ > 10 && !estop_active_) {
+                estop_active_ = true;
+                consecutive_clears_ = 0;
+                horus::log::error("safety",
+                    "No LiDAR data for 10 ticks — activating E-stop");
+                horus::blackbox::record("safety",
+                    "E-stop triggered: LiDAR timeout (sensor failure)");
+            }
+            // Always zero cmd_vel while E-stop is active
+            if (estop_active_) {
+                horus::msg::CmdVel stop{};
+                cmd_pub_->send(stop);
+                horus::msg::EmergencyStop estop{};
+                estop.engaged = 1;
+                estop_pub_->send(estop);
+            }
+            return;
+        }
+        ticks_without_scan_ = 0;
+
+        // ── Check all beams for critical proximity ──────────────────
         bool danger = false;
         for (int i = 0; i < 360; i++) {
-            if (scan->get()->ranges[i] > 0.01f && scan->get()->ranges[i] < 0.15f) {
+            float r = scan->get()->ranges[i];
+            // Valid reading below critical distance = imminent collision
+            if (r > 0.02f && r < critical_dist_) {
                 danger = true;
                 break;
             }
         }
 
+        // ── E-stop state machine ────────────────────────────────────
         if (danger && !estop_active_) {
+            // TRIGGER: immediate activation, no debounce
             estop_active_ = true;
+            consecutive_clears_ = 0;
+
             horus::msg::EmergencyStop estop{};
             estop.engaged = 1;
             estop_pub_->send(estop);
-            horus::log::error("safety", "EMERGENCY STOP — obstacle < 15cm");
-            horus::blackbox::record("safety", "E-stop triggered: obstacle < 15cm");
 
-            // Zero all motor commands
+            horus::log::error("safety",
+                "EMERGENCY STOP — obstacle within 15cm");
+            horus::blackbox::record("safety",
+                "E-stop triggered: obstacle within critical distance");
+
+            // Zero all motor commands immediately
             horus::msg::CmdVel stop{};
             cmd_pub_->send(stop);
         }
+        else if (danger && estop_active_) {
+            // Still in danger — reset clear counter, keep sending stop
+            consecutive_clears_ = 0;
+            horus::msg::CmdVel stop{};
+            cmd_pub_->send(stop);
+        }
+        else if (!danger && estop_active_) {
+            // Danger cleared — debounce before releasing
+            consecutive_clears_++;
+            if (consecutive_clears_ >= clear_threshold_) {
+                estop_active_ = false;
+                horus::msg::EmergencyStop clear{};
+                clear.engaged = 0;
+                estop_pub_->send(clear);
+                horus::log::info("safety", "E-stop cleared after debounce");
+                horus::blackbox::record("safety",
+                    "E-stop released after clear threshold met");
+            } else {
+                // Still debouncing — keep motors stopped
+                horus::msg::CmdVel stop{};
+                cmd_pub_->send(stop);
+            }
+        }
 
-        if (!danger && estop_active_) {
-            estop_active_ = false;
-            horus::msg::EmergencyStop clear{};
-            clear.engaged = 0;
-            estop_pub_->send(clear);
-            horus::log::info("safety", "E-stop cleared");
+        // Log at 1 Hz (every 50th tick at 50 Hz)
+        if (++tick_count_ % 50 == 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "estop=%s  clears=%d/%d",
+                estop_active_ ? "ACTIVE" : "clear",
+                consecutive_clears_, clear_threshold_);
+            horus::log::info("safety", buf);
         }
     }
 
     void enter_safe_state() override {
+        // Called by scheduler on deadline miss — force E-stop
         horus::msg::CmdVel stop{};
         cmd_pub_->send(stop);
         estop_active_ = true;
+        consecutive_clears_ = 0;
+        horus::blackbox::record("safety",
+            "Scheduler forced safe state (deadline miss or watchdog)");
     }
 
 private:
     horus::Subscriber<horus::msg::LaserScan>*   scan_sub_;
     horus::Publisher<horus::msg::EmergencyStop>* estop_pub_;
     horus::Publisher<horus::msg::CmdVel>*        cmd_pub_;
+
+    // Configuration
+    float critical_dist_;    // meters — trigger threshold
+    int clear_threshold_;    // consecutive clear ticks before release
+
+    // State
     bool estop_active_ = false;
+    int consecutive_clears_ = 0;
+    int ticks_without_scan_ = 0;
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(50_hz);
-    SafetyMonitor safety;
-    sched.add(safety).order(0).budget(2_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.tick_rate(50_hz).name("safety_demo");
+
+    // 15cm critical distance, 25 clear readings (0.5s at 50 Hz) to release
+    SafetyMonitor safety(0.15f, 25);
+    sched.add(safety)
+        .order(0)                        // highest priority — runs first
+        .budget(2_ms)                    // tight budget for safety-critical code
+        .on_miss(horus::Miss::SafeMode)  // strictest policy — force safe state on any overrun
+        .build();
+
     sched.spin();
+}
+```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| E-stop never triggers | `critical_dist_` too small or LiDAR beams miss the obstacle | Increase distance or verify LiDAR field of view |
+| E-stop flickers on/off rapidly | No debounce on clear, or `clear_threshold_` too low | Increase `clear_threshold_` (25-50 at 50 Hz) |
+| Motors keep running after E-stop | E-stop node runs after motor node in execution order | Set E-stop to `order(0)` (highest priority) |
+| E-stop activates on startup | No LiDAR data yet, fail-safe triggers | Allow a startup grace period before fail-safe kicks in |
+| System enters safe mode unexpectedly | Budget too tight for scan processing | Increase budget from 2ms to 3ms, or reduce scan resolution |
+| E-stop never releases | Sensor has spurious short-range noise | Filter readings below sensor's minimum range (typically 0.02-0.05m) |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| `order(0)` — highest priority | Safety must run before any other node can publish motion commands |
+| `Miss::SafeMode` policy | Any deadline miss in the safety node is itself a safety failure — force full stop |
+| Instant trigger, debounced clear | Triggering must be immediate; releasing can afford 0.5s delay to prevent flicker |
+| Fail-safe on missing data | Silence from LiDAR means no sensor coverage — assume danger |
+| `horus::blackbox::record()` | All E-stop events logged for post-mortem analysis and incident reporting |
+| `enter_safe_state()` forces E-stop | Scheduler can force safety independently of sensor data |
+| 50 Hz tick rate | Fast enough for &lt;20ms response time, reasonable CPU cost |
+
+### Variations
+
+**Multi-sensor E-stop** — monitor LiDAR, bumpers, and IMU simultaneously:
+```cpp
+void tick() override {
+    auto scan = scan_sub_->recv();
+    auto bump = bumper_sub_->recv();
+    auto imu  = imu_sub_->recv();
+
+    bool danger = false;
+    if (scan) danger |= check_proximity(scan);
+    if (bump) danger |= (bump->get()->pressed != 0);
+    if (imu)  danger |= check_tilt(imu);  // tip-over detection
+
+    // Same state machine as single-sensor version
+    // ...
+}
+```
+
+**Zone-based E-stop** — different thresholds for front, sides, and rear:
+```cpp
+// Front (330-30 deg): 30cm critical, 80cm warning
+// Sides (30-150, 210-330): 15cm critical
+// Rear (150-210): 10cm critical (backing up is slower)
+for (int i = 0; i < 360; i++) {
+    float threshold = get_zone_threshold(i);
+    if (r > 0.02f && r < threshold) { danger = true; break; }
+}
+```
+
+**Hardware GPIO E-stop integration** — read a physical E-stop button:
+```cpp
+// Subscribe to a GPIO publisher that reads the hardware button
+auto hw_estop = hw_estop_sub_->recv();
+if (hw_estop && hw_estop->get()->engaged) {
+    estop_active_ = true;  // hardware override takes priority
+    horus::blackbox::record("safety", "Hardware E-stop pressed");
 }
 ```
 
 ### Key Takeaways
 
-- Safety node has highest priority (`order(0)`) and strictest budget
-- Uses `horus::blackbox::record()` for post-mortem analysis
-- `enter_safe_state()` is called by the scheduler's safety monitor
-- EmergencyStop is a typed Pod message — other nodes subscribe and react
+- Safety nodes run at `order(0)` with `Miss::SafeMode` — no exceptions
+- `horus::blackbox::record()` is mandatory for every E-stop event — you will need it for incident investigation
+- Debounce on clear, never on trigger — instant activation, deliberate release
+- Fail-safe means silence = danger — if the sensor stops publishing, assume the worst
+- `enter_safe_state()` gives the scheduler an independent path to force a stop, separate from sensor data
 
 ---
 ## Recipe: Telemetry Logger (Python)
@@ -90945,68 +92292,250 @@ Description: Fuse IMU + odometry for localization using a simple Kalman-style fi
 
 ## Multi-Sensor Fusion (C++)
 
-Fuse IMU orientation with wheel odometry for more accurate localization.
+Fuse IMU heading with wheel odometry position for more accurate localization than either sensor alone. Uses a complementary filter approach to blend the strengths of both sensors.
 
-### Code
+### Problem
+
+Wheel odometry gives position (x, y) and heading (theta), but heading drifts because of wheel slip, uneven terrain, and tire wear. The IMU gyroscope gives accurate short-term heading changes but drifts long-term due to bias. You need to combine both sensors so the robot's position estimate is better than either one alone.
+
+### How It Works
+
+This fusion node runs a **complementary filter on heading** while taking position directly from odometry:
+
+- **Position (x, y)**: comes from wheel odometry. The IMU accelerometer is too noisy for double-integration into position — it drifts by meters within seconds. Wheel odometry is the only practical source for position without GPS or SLAM.
+- **Heading (theta)**: blended between odometry heading and IMU gyro integration. The gyro is trusted for short-term changes (no wheel slip), while odometry heading provides a long-term reference (no gyro drift).
+
+The fusion formula for heading:
+
+```text
+theta = alpha * (theta + gyro_z * dt) + (1 - alpha) * odom_theta
+```
+
+Where `alpha` is the IMU trust factor (0.95 = 95% gyro, 5% odometry correction). High alpha gives smoother heading during turns (gyro-dominated). Low alpha corrects gyro drift faster (odometry-dominated).
+
+**Why not a full Kalman filter?** A Kalman filter is the theoretically optimal approach, but it requires a noise model (process and measurement covariances), matrix operations, and careful tuning. The complementary filter gives 90% of the benefit with 10% of the complexity. Start here, upgrade to Kalman only if you need covariance estimates or more than two sensors.
+
+### When To Use
+
+- Any ground robot with wheel encoders and an IMU
+- When odometry heading drifts due to wheel slip (carpet, gravel, wet floors)
+- When you need better localization than odometry alone but cannot run SLAM
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+- An odometry source (e.g., [Differential Drive recipe](/docs/recipes/differential-drive-cpp))
+- An IMU source (e.g., [IMU Reader recipe](/docs/recipes/imu-reader-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <cmath>
+#include <cstdio>
 using namespace horus::literals;
 
 class SensorFusion : public horus::Node {
 public:
-    SensorFusion() : Node("sensor_fusion") {
-        imu_sub_  = subscribe<horus::msg::Imu>("imu.data");
-        odom_sub_ = subscribe<horus::msg::Odometry>("odom");
+    SensorFusion(double alpha = 0.95)
+        : Node("sensor_fusion"), alpha_(alpha)
+    {
+        // Subscribe to both sensor sources
+        imu_sub_   = subscribe<horus::msg::Imu>("imu.data");
+        odom_sub_  = subscribe<horus::msg::Odometry>("odom");
+        // Publish the fused estimate
         fused_pub_ = advertise<horus::msg::Odometry>("fused.pose");
     }
 
     void tick() override {
-        // Read both sensors
+        // ── Always drain both subscribers to avoid stale data ────────
         auto imu  = imu_sub_->recv();
         auto odom = odom_sub_->recv();
 
-        // Update from odometry (predict)
+        double dt = 1.0 / 100.0;  // matches 100 Hz tick rate
+
+        // ── Predict from odometry (position + heading reference) ────
         if (odom) {
+            // Position comes directly from odometry — no IMU correction
+            // IMU accelerometer is too noisy for position estimation
             x_ = odom->get()->pose.x;
             y_ = odom->get()->pose.y;
-            // Blend odometry heading with current estimate
-            double odom_theta = odom->get()->pose.theta;
-            theta_ = alpha_ * theta_ + (1.0 - alpha_) * odom_theta;
+
+            // Odometry heading provides long-term reference (no gyro drift)
+            odom_theta_ = odom->get()->pose.theta;
+            has_odom_ = true;
         }
 
-        // Correct from IMU (gyro-based heading)
+        // ── Correct heading from IMU gyroscope ──────────────────────
         if (imu) {
-            double gz = imu->get()->angular_velocity[2];
-            double imu_theta = theta_ + gz * 0.01;  // integrate gyro
-            theta_ = alpha_ * imu_theta + (1.0 - alpha_) * theta_;
+            double gz = imu->get()->angular_velocity[2];  // yaw rate (rad/s)
+
+            if (has_odom_) {
+                // Complementary filter: gyro for short-term, odom for long-term
+                // alpha_ high (0.95) = trust gyro more = smooth during wheel slip
+                // alpha_ low (0.80) = trust odom more = corrects gyro drift faster
+                theta_ = alpha_ * (theta_ + gz * dt) + (1.0 - alpha_) * odom_theta_;
+            } else {
+                // No odometry yet — integrate gyro only (will drift)
+                theta_ += gz * dt;
+            }
+            has_imu_ = true;
+        } else if (has_odom_ && !has_imu_) {
+            // No IMU data — fall back to odometry heading
+            theta_ = odom_theta_;
         }
 
-        // Publish fused estimate
+        // Normalize theta to [-pi, pi]
+        if (theta_ > M_PI)  theta_ -= 2.0 * M_PI;
+        if (theta_ < -M_PI) theta_ += 2.0 * M_PI;
+
+        // ── Publish fused estimate ──────────────────────────────────
         horus::msg::Odometry fused{};
-        fused.pose.x = x_;
-        fused.pose.y = y_;
+        fused.pose.x     = x_;
+        fused.pose.y     = y_;
         fused.pose.theta = theta_;
         fused_pub_->send(fused);
+
+        // Log at 2 Hz (every 50th tick at 100 Hz)
+        if (++tick_count_ % 50 == 0) {
+            double heading_diff = theta_ - odom_theta_;
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "fused=(%.2f, %.2f, %.1f deg)  odom_drift=%.1f deg",
+                x_, y_, theta_ * 180.0 / M_PI,
+                heading_diff * 180.0 / M_PI);
+            horus::log::info("fusion", buf);
+
+            // Log large heading disagreement as a warning
+            if (std::abs(heading_diff) > 0.17) {  // ~10 degrees
+                horus::log::warn("fusion",
+                    "Large IMU/odom heading disagreement — possible wheel slip");
+            }
+        }
+    }
+
+    void enter_safe_state() override {
+        // Publish last known good pose with a flag indicating degraded mode.
+        // Downstream nodes (e.g., navigation) should check for stale data
+        // and switch to a conservative behavior.
+        horus::msg::Odometry last{};
+        last.pose.x     = x_;
+        last.pose.y     = y_;
+        last.pose.theta = theta_;
+        fused_pub_->send(last);
+        horus::blackbox::record("fusion",
+            "Entered safe state — publishing last known pose");
+        horus::log::warn("fusion",
+            "Safe state active — fused estimate may be stale");
     }
 
 private:
     horus::Subscriber<horus::msg::Imu>*      imu_sub_;
     horus::Subscriber<horus::msg::Odometry>* odom_sub_;
     horus::Publisher<horus::msg::Odometry>*  fused_pub_;
+
+    // Filter parameter
+    double alpha_;  // IMU trust factor (0.80-0.99 typical)
+
+    // Fused state (double for running-sum precision)
     double x_ = 0, y_ = 0, theta_ = 0;
-    double alpha_ = 0.95;  // IMU trust factor
+    double odom_theta_ = 0;
+
+    // Data availability flags
+    bool has_odom_ = false;
+    bool has_imu_  = false;
+
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(100_hz);
-    SensorFusion fusion;
-    sched.add(fusion).order(20).build();
+    sched.tick_rate(100_hz).name("fusion_demo");
+
+    // alpha=0.95: 95% gyro trust for heading, 5% odometry correction
+    SensorFusion fusion(0.95);
+    sched.add(fusion)
+        .order(20)           // after odometry (0-10) and IMU (5) nodes
+        .budget(2_ms)        // lightweight math
+        .on_miss(horus::Miss::Warn)  // warn but don't stop — downstream can tolerate a stale estimate
+        .build();
+
     sched.spin();
 }
 ```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Heading oscillates during turns | `alpha` too low — odometry heading disagrees with gyro | Increase alpha (0.95-0.99) to trust gyro more during turns |
+| Heading drifts when stationary | `alpha` too high — gyro drift not corrected | Decrease alpha toward 0.90 or calibrate gyro bias |
+| Position is completely wrong | Odometry node not running or publishing on wrong topic | Verify odom node publishes to "odom" topic |
+| Sudden heading jumps | Odometry theta wraps at pi/-pi differently than fused theta | Normalize both angles before blending |
+| No output on startup | Neither sensor has published yet | Check has_odom/has_imu flags; fusion waits for first data |
+| Heading matches odometry exactly | IMU not publishing or alpha = 0 | Verify IMU node runs and alpha is set correctly |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| Position from odometry only | IMU accelerometer double-integration drifts meters in seconds — unusable for position |
+| Complementary filter over Kalman | 90% of Kalman's benefit with 10% of the complexity; no covariance matrices |
+| `alpha = 0.95` default | Trusts gyro for smooth turns while slowly correcting drift from odometry |
+| Graceful degradation | Works with odometry-only, IMU-only, or both — does not crash on missing data |
+| `order(20)` | Runs after sensor nodes (IMU=5, odom=10) so both inputs are fresh |
+| `Miss::Warn` policy | A stale fused estimate is imperfect but not dangerous — downstream nodes tolerate it |
+| Heading disagreement warning | Large drift between IMU and odometry signals wheel slip or sensor failure |
+| `enter_safe_state()` publishes last pose | Downstream navigation nodes get a final estimate rather than silence during a safety event |
+
+### Variations
+
+**Extended Kalman Filter (EKF)** — for optimal fusion with uncertainty estimates:
+```cpp
+// State: [x, y, theta], Measurement: [odom_x, odom_y, odom_theta, gyro_z]
+// Requires process noise Q and measurement noise R matrices
+void predict(double v, double w, double dt) {
+    x_ += v * std::cos(theta_) * dt;
+    y_ += v * std::sin(theta_) * dt;
+    theta_ += w * dt;
+    // P = F * P * F^T + Q  (covariance propagation)
+}
+void correct_odom(double ox, double oy, double otheta) {
+    // K = P * H^T * (H * P * H^T + R)^-1  (Kalman gain)
+    // x = x + K * (z - H * x)               (state update)
+}
+```
+
+**GPS fusion** — add absolute position correction when available:
+```cpp
+if (auto gps = gps_sub_->recv()) {
+    // GPS provides absolute x/y but at low rate (1-10 Hz) and with noise (~2m)
+    double gps_alpha = 0.05;  // low trust — GPS is noisy
+    x_ = (1.0 - gps_alpha) * x_ + gps_alpha * gps->get()->x;
+    y_ = (1.0 - gps_alpha) * y_ + gps_alpha * gps->get()->y;
+}
+```
+
+**Multi-IMU fusion** — average multiple IMUs for redundancy and noise reduction:
+```cpp
+auto imu1 = imu1_sub_->recv();
+auto imu2 = imu2_sub_->recv();
+double gz = 0;
+int count = 0;
+if (imu1) { gz += imu1->get()->angular_velocity[2]; count++; }
+if (imu2) { gz += imu2->get()->angular_velocity[2]; count++; }
+if (count > 0) gz /= count;  // averaged yaw rate
+```
+
+### Key Takeaways
+
+- Never integrate IMU accelerometer for position — it drifts meters in seconds
+- The complementary filter is the right starting point: simple, tunable, and effective
+- Drain both subscribers every tick, even if only one has new data, to avoid stale buffers
+- Log the heading disagreement between sensors — it reveals wheel slip and sensor failures
+- `order(20)` ensures sensor nodes run first and fusion gets fresh data every tick
+- Use `enter_safe_state()` to publish a final known-good pose before the system shuts down
 
 ---
 ## Recipe: Python CV Node
@@ -91164,63 +92693,343 @@ Description: Control servos with position commands and runtime parameter tuning
 
 ## Servo Controller (C++)
 
-Control a servo motor with position commands. Use `horus::Params` for live gain tuning.
+Control a servo motor with position commands, including proportional control, effort clamping, and runtime gain tuning via `horus::Params`. Suitable for robotic arms, pan-tilt heads, and gripper fingers.
 
-### Code
+### Problem
+
+You have a servo or position-controlled actuator that accepts effort commands (torque or voltage). You need to drive it to target positions smoothly, clamp the maximum effort to prevent hardware damage, and adjust gains at runtime without restarting the system.
+
+### How It Works
+
+The controller implements a **proportional position loop with velocity feedforward**:
+
+```text
+error  = target_position - current_position
+effort = clamp(Kp * error + Kv * velocity_feedforward, -max_effort, max_effort)
+```
+
+The servo hardware moves in response to the effort command, and the controller reads the new position on the next tick. Two parameters dominate behavior:
+
+**Kp (Proportional gain) -- determines tracking aggression**
+
+- **Low Kp (0.5-1.0)**: slow, smooth motion with low overshoot. Good for camera gimbals where smooth video matters more than speed.
+- **Medium Kp (2.0-5.0)**: responsive tracking. Good for robotic arm joints that need to reach targets within a few hundred milliseconds.
+- **High Kp (10.0+)**: fast response but oscillation risk. Only use with derivative damping (see PID recipe).
+
+**max_effort -- protects hardware from self-destruction**
+
+Every servo has a torque or current limit beyond which gears strip, windings overheat, or mounting hardware deforms. The `max_effort` clamp is the last line of defense. Set it to 80% of the servo's rated maximum to leave margin for transient loads.
+
+**Runtime parameter tuning** via `horus::Params` lets you adjust `Kp`, `max_effort`, and `max_velocity` while the robot is running. This is critical for field calibration where you cannot afford to stop the system, recompile, and redeploy for every gain change. Parameters are read every tick so changes take effect within 10 ms at 100 Hz.
+
+**Feedback timeout** protects against encoder failures. If the position feedback topic goes silent for 2 seconds, the controller zeros effort rather than blindly driving the servo into a hard stop. This is a fail-safe: the servo coasts to a stop under its own friction rather than crashing at full torque.
+
+### When To Use
+
+- Position-controlled servos (hobby PWM servos, Dynamixel, industrial servo drives)
+- Pan-tilt camera heads with live tuning requirements
+- Gripper fingers that need adjustable grip force
+- Any single-DOF actuator needing smooth position tracking with hardware protection
+- Field-deployed robots where gains must be adjusted without restarting
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+- A servo or actuator that accepts effort (torque/voltage) commands and provides position feedback
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <cmath>
+#include <cstdio>
+#include <algorithm>
 using namespace horus::literals;
 
 class ServoController : public horus::Node {
 public:
     ServoController() : Node("servo_controller") {
-        target_sub_ = subscribe<horus::msg::CmdVel>("servo.target");
-        motor_pub_  = advertise<horus::msg::ServoCommand>("servo.cmd");
+        // Subscribe to position targets from upstream (planner, teleop, etc.)
+        target_sub_   = subscribe<horus::msg::CmdVel>("servo.target");
+        // Subscribe to actual position feedback from servo encoder
+        feedback_sub_ = subscribe<horus::msg::CmdVel>("servo.feedback");
+        // Publish effort commands to the servo driver
+        motor_pub_    = advertise<horus::msg::ServoCommand>("servo.cmd");
     }
 
     void tick() override {
-        auto target = target_sub_->recv();
-        if (!target) return;
+        // ── Read runtime parameters (can be changed without restart) ─
+        double kp         = params_.get<double>("servo_kp", 2.0);
+        double max_effort = params_.get<double>("servo_max_effort", 5.0);
+        double max_vel    = params_.get<double>("servo_max_velocity", 2.0);  // rad/s
+        double deadband   = params_.get<double>("servo_deadband", 0.005);    // rad
 
-        double kp = params_.get<double>("servo_kp", 2.0);
-        double target_pos = target->get()->linear;
-        double error = target_pos - current_pos_;
-        double effort = std::clamp(kp * error, -1.0, 1.0);
+        // ── Read latest target and feedback ─────────────────────────
+        // IMPORTANT: always recv() every tick to drain buffers even if
+        // you don't use the value this tick.
+        if (auto target = target_sub_->recv()) {
+            target_pos_ = target->get()->linear;
+        }
+        if (auto feedback = feedback_sub_->recv()) {
+            prev_pos_ = current_pos_;
+            current_pos_ = feedback->get()->linear;
+            has_feedback_ = true;
+            no_feedback_count_ = 0;
+        }
 
-        // Simulate servo motion
-        current_pos_ += effort * 0.01;
+        // ── Safety: do not command without position feedback ────────
+        if (!has_feedback_) {
+            if (++no_feedback_count_ % 200 == 0) {  // warn every 2s at 100 Hz
+                horus::log::warn("servo",
+                    "No feedback for 2s — holding zero effort for safety");
+            }
+            horus::msg::ServoCommand cmd{};
+            cmd.target_position = static_cast<float>(target_pos_);
+            cmd.target_velocity = 0.0f;
+            cmd.max_force = 0.0f;  // zero effort without feedback
+            motor_pub_->send(cmd);
+            return;
+        }
 
+        // ── Deadband: ignore errors smaller than encoder resolution ─
+        double error = target_pos_ - current_pos_;
+        if (std::abs(error) < deadband) {
+            // Close enough — hold position with zero effort to save power
+            horus::msg::ServoCommand cmd{};
+            cmd.target_position = static_cast<float>(current_pos_);
+            cmd.target_velocity = 0.0f;
+            cmd.max_force = static_cast<float>(max_effort);
+            motor_pub_->send(cmd);
+            return;
+        }
+
+        // ── Proportional control ────────────────────────────────────
+        double effort = std::clamp(kp * error,
+                                   -max_effort, max_effort);
+
+        // ── Velocity limiting ───────────────────────────────────────
+        // Estimate current velocity from position delta
+        double dt = 0.01;  // 100 Hz tick rate
+        double measured_vel = (current_pos_ - prev_pos_) / dt;
+
+        // Clamp effort to keep velocity under max_vel
+        // If already moving faster than max_vel, reduce effort
+        if (std::abs(measured_vel) > max_vel) {
+            double brake = std::copysign(max_effort * 0.5, -measured_vel);
+            effort = brake;  // actively brake if overspeeding
+        } else {
+            // Limit implied acceleration
+            double implied_vel = std::abs(effort) / kp;
+            if (implied_vel > max_vel) {
+                effort = std::copysign(max_vel * kp, effort);
+                effort = std::clamp(effort, -max_effort, max_effort);
+            }
+        }
+
+        // ── Publish servo command ───────────────────────────────────
         horus::msg::ServoCommand cmd{};
-        cmd.target_position = static_cast<float>(target_pos);
+        cmd.target_position = static_cast<float>(target_pos_);
         cmd.target_velocity = static_cast<float>(effort);
-        cmd.max_force = 5.0f;
+        cmd.max_force       = static_cast<float>(max_effort);
         motor_pub_->send(cmd);
+
+        // ── Diagnostics at 2 Hz (every 50th tick at 100 Hz) ────────
+        if (++tick_count_ % 50 == 0) {
+            char buf[196];
+            std::snprintf(buf, sizeof(buf),
+                "target=%.3f  actual=%.3f  error=%.4f  effort=%.2f  "
+                "vel=%.2f  kp=%.1f  max_eff=%.1f",
+                target_pos_, current_pos_, error, effort,
+                measured_vel, kp, max_effort);
+            horus::log::info("servo", buf);
+        }
+    }
+
+    void enter_safe_state() override {
+        // Zero effort on safety event — servo coasts to stop under friction.
+        // Holding position under power during an emergency is dangerous:
+        // a jammed servo draws maximum current and can overheat or break
+        // mechanical linkages.
+        horus::msg::ServoCommand stop{};
+        stop.target_position = static_cast<float>(current_pos_);
+        stop.target_velocity = 0.0f;
+        stop.max_force = 0.0f;
+        motor_pub_->send(stop);
+
+        horus::blackbox::record("servo",
+            "Entered safe state, effort zeroed, servo coasting");
     }
 
     void set_params(horus::Params& p) { params_ = std::move(p); }
 
 private:
     horus::Subscriber<horus::msg::CmdVel>*     target_sub_;
+    horus::Subscriber<horus::msg::CmdVel>*     feedback_sub_;
     horus::Publisher<horus::msg::ServoCommand>* motor_pub_;
     horus::Params params_;
+
+    // State
+    double target_pos_  = 0;
     double current_pos_ = 0;
+    double prev_pos_    = 0;
+    bool has_feedback_  = false;
+    int no_feedback_count_ = 0;
+    int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(100_hz);
+    sched.tick_rate(100_hz).name("servo_demo");
 
+    // Set initial parameters (adjustable at runtime via `horus param set`)
     horus::Params params;
-    params.set("servo_kp", 2.0);
+    params.set("servo_kp", 2.0);           // proportional gain
+    params.set("servo_max_effort", 5.0);   // Nm (set to 80% of servo rated max)
+    params.set("servo_max_velocity", 2.0); // rad/s
+    params.set("servo_deadband", 0.005);   // rad (~0.3 degrees)
 
     ServoController servo;
     servo.set_params(params);
-    sched.add(servo).order(10).build();
+
+    sched.add(servo)
+        .order(10)
+        .budget(2_ms)
+        .on_miss(horus::Miss::Skip)  // skip if overrun — stale effort is dangerous
+        .build();
+
     sched.spin();
 }
 ```
+
+### Gain Tuning Guide
+
+**Start with low Kp** (0.5). Command a small step (e.g., 0.1 rad) and watch the response:
+
+- **Slow, never reaches target**: increase Kp. Double it until the servo reaches the target within 0.5 seconds.
+- **Reaches target but slowly**: Kp is close. Increase by 20% increments.
+- **Overshoots then settles**: Kp is at the edge. Back off 30% or add derivative damping (see PID recipe).
+- **Oscillates continuously**: Kp is too high. Halve it.
+
+**Set max_effort conservatively**. Read the servo datasheet for stall torque. Set `servo_max_effort` to 60-80% of stall torque. A Dynamixel MX-64 has 6.0 Nm stall torque, so `max_effort = 4.0` is a safe starting point.
+
+**Set max_velocity for the application**:
+
+| Application | Typical max_vel |
+|-------------|-----------------|
+| Camera gimbal | 0.5-1.0 rad/s |
+| Robotic arm joint | 1.0-3.0 rad/s |
+| Gripper finger | 0.2-0.5 rad/s |
+| Pan-tilt turret | 1.5-4.0 rad/s |
+
+**Runtime tuning via CLI** (no restart needed):
+```bash
+horus param set servo_kp 3.5
+horus param set servo_max_effort 4.0
+horus param set servo_max_velocity 1.5
+```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Servo oscillates around target | Kp too high for the mechanical system | Reduce `servo_kp` by 50%; add derivative damping (see PID recipe) |
+| Servo moves slowly, never reaches target | Kp too low or max_effort too low | Increase `servo_kp` or `servo_max_effort`; check for mechanical binding |
+| Servo jerks on large target changes | Velocity limiting too permissive | Reduce `servo_max_velocity` to limit tracking speed |
+| Servo does nothing | No feedback data (has_feedback_ stays false) | Verify feedback publisher topic name matches `servo.feedback`; check encoder wiring |
+| Effort maxes out constantly | Target far from current position | Working correctly but servo needs more travel time; reduce target step size or increase max_effort |
+| Servo holds position but drifts slowly | Deadband too large | Reduce `servo_deadband` (default 0.005 rad is ~0.3 degrees) |
+| Servo chatters near target | Deadband too small relative to encoder noise | Increase `servo_deadband` to 2x the encoder's noise floor |
+| Servo runs away after encoder disconnect | Feedback timeout not triggering | The code handles this: zero effort after 200 ticks (2s) without feedback |
+| Log says "No feedback for 2s" at startup | Feedback publisher not started yet | Normal during system bringup; servo holds zero effort until feedback arrives |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| `horus::Params` for runtime tuning | Field calibration requires gain changes without restart; impossible to predict optimal gains for every installation |
+| Position feedback required before commanding | Open-loop servo control risks collisions and mechanical damage; the controller refuses to move without knowing where it is |
+| Feedback timeout (2s) | If the encoder dies mid-operation, zero effort prevents the servo from driving into a hard stop at maximum torque |
+| `enter_safe_state()` zeros effort | Holding position under power during an emergency risks overheating, stripped gears, or broken linkages if the servo is jammed |
+| `Miss::Skip` policy | A stale effort command computed from an old position reading drives the servo based on outdated state, which is worse than one missed tick |
+| Deadband around target | Eliminates chatter near the setpoint caused by encoder quantization noise; saves power when the servo is already at the target |
+| Velocity limiting via measured velocity | Prevents jerky motion on large target step changes and actively brakes if the servo is overspeeding |
+| 100 Hz tick rate | Standard for servo control: fast enough for smooth motion (10 ms latency), slow enough for most encoder hardware |
+| `order(10)` with 2 ms budget | Servo control runs early in the tick (before logging/diagnostics) with a tight budget to guarantee real-time behavior |
+
+### Variations
+
+**Multi-joint arm control** -- control N servos as a coordinated unit:
+```cpp
+class ArmController : public horus::Node {
+    static constexpr int NUM_JOINTS = 6;
+    horus::Subscriber<horus::msg::JointState>* target_sub_;
+    horus::Subscriber<horus::msg::JointState>* feedback_sub_;
+    horus::Publisher<horus::msg::JointState>*  cmd_pub_;
+    double positions_[NUM_JOINTS] = {};
+    double kp_[NUM_JOINTS] = {3.0, 2.5, 2.5, 4.0, 4.0, 5.0};  // per-joint gains
+    double max_effort_[NUM_JOINTS] = {6.0, 5.0, 5.0, 3.0, 3.0, 2.0};  // Nm per joint
+
+    void tick() override {
+        if (auto fb = feedback_sub_->recv()) {
+            for (int i = 0; i < NUM_JOINTS; i++)
+                positions_[i] = fb->get()->position[i];
+        }
+        if (auto target = target_sub_->recv()) {
+            horus::msg::JointState cmd{};
+            for (int i = 0; i < NUM_JOINTS; i++) {
+                double error = target->get()->position[i] - positions_[i];
+                cmd.effort[i] = std::clamp(kp_[i] * error,
+                    -max_effort_[i], max_effort_[i]);
+            }
+            cmd_pub_->send(cmd);
+        }
+    }
+};
+```
+
+**Trajectory following** -- interpolate between waypoints for smooth, jerk-free motion:
+```cpp
+void tick() override {
+    double t_elapsed = (tick_count_ - segment_start_) * 0.01;  // seconds
+    double t_norm = std::clamp(t_elapsed / segment_duration_, 0.0, 1.0);
+
+    // Cubic interpolation (zero velocity at endpoints)
+    double s = 3.0 * t_norm * t_norm - 2.0 * t_norm * t_norm * t_norm;
+    target_pos_ = start_pos_ + s * (end_pos_ - start_pos_);
+
+    // ... rest of proportional control as above
+}
+```
+
+**PID instead of P-only** -- for faster convergence and zero steady-state error under load:
+```cpp
+double error = target_pos_ - current_pos_;
+double dt = 0.01;
+integral_ += error * dt;
+integral_ = std::clamp(integral_, -0.5, 0.5);  // anti-windup
+double derivative = (error - prev_error_) / dt;
+double effort = kp * error + ki * integral_ + kd * derivative;
+prev_error_ = error;
+```
+
+**Gravity compensation** -- for vertical joints that fight gravity:
+```cpp
+// Add a constant feedforward term to counteract gravity torque.
+// Calibrate by measuring the effort needed to hold the joint still.
+double gravity_comp = 1.2;  // Nm, measured experimentally
+double effort = kp * error + gravity_comp * std::cos(current_pos_);
+```
+
+### Key Takeaways
+
+- Always require position feedback before commanding effort -- open-loop servo control is dangerous and risks mechanical damage
+- `horus::Params` enables runtime tuning without restarting -- essential for field calibration where stopping the system is not an option
+- Deadband eliminates chatter near the target and saves power by not fighting encoder noise
+- Velocity limiting prevents jerky motion on large target changes and actively brakes overspeeding servos
+- `enter_safe_state()` should zero effort, not hold position -- powering the motor during an emergency creates fire and mechanical failure risks
+- `Miss::Skip` is correct for servo control because a stale error computation drives the servo based on an outdated position reading
+- Set `max_effort` to 60-80% of the servo's rated stall torque -- leave margin for transient loads
 
 ---
 ## Recipe: Coordinate Transforms (Python)
@@ -91605,76 +93414,268 @@ Description: Coordinate frame tree for multi-sensor robots
 
 ## Transform Frames (C++)
 
-Build a TF tree for a robot with multiple sensors, update transforms dynamically, query spatial relationships.
+Build a coordinate frame tree for a robot with multiple sensors, set static transforms for sensor mounts, update dynamic transforms from localization, and query spatial relationships between frames.
 
-### Code
+### Problem
+
+Your robot has a LiDAR, a camera, and an IMU, each mounted at different positions and orientations on the chassis. A LiDAR point at `(1.5, 0.3)` in the LiDAR frame is useless until you know where that is in the robot's body frame or the world frame. You need a transform tree that tracks the spatial relationship between every sensor and the world, updated in real time as the robot moves.
+
+### How It Works
+
+A **transform tree** is a directed acyclic graph (usually a tree) where:
+
+- Each **node** is a coordinate frame (e.g., `world`, `base_link`, `lidar`, `camera`)
+- Each **edge** stores a transform: translation (x, y, z) and rotation (quaternion)
+- **Static transforms** (sensor mounts) are set once at startup and never change
+- **Dynamic transforms** (localization) are updated every tick
+
+To find the transform between any two frames, HORUS composes transforms along the path in the tree. For example, to get `lidar` in `world` coordinates:
+
+```text
+T_lidar_in_world = T_base_in_world * T_lidar_in_base
+```
+
+The `lookup(source, target)` function does this composition automatically, walking the tree from source to target and multiplying transforms along the way.
+
+**Quaternion convention**: HORUS uses `(x, y, z, w)` quaternion ordering. An identity rotation is `{0, 0, 0, 1}`. A 5-degree pitch is `{0, 0, sin(2.5deg), cos(2.5deg)} = {0, 0, 0.0436, 0.999}`.
+
+### When To Use
+
+- Any robot with multiple sensors mounted at different positions
+- When you need sensor fusion that requires aligning data into a common frame
+- When localization updates the robot's pose in the world frame
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
+#include <cmath>
+#include <cstdio>
 using namespace horus::literals;
+
+class LocalizationNode : public horus::Node {
+public:
+    LocalizationNode(horus::TransformFrame& tf)
+        : Node("localizer"), tf_(tf)
+    {
+        odom_sub_ = subscribe<horus::msg::Odometry>("odom");
+    }
+
+    void tick() override {
+        if (auto odom = odom_sub_->recv()) {
+            // Update base_link position in world frame from odometry
+            double x     = odom->get()->pose.x;
+            double y     = odom->get()->pose.y;
+            double theta = odom->get()->pose.theta;
+
+            // Convert heading to quaternion (rotation around Z axis)
+            double half_angle = theta / 2.0;
+            tf_.update("base_link",
+                {x, y, 0.0},                                       // translation
+                {0, 0, std::sin(half_angle), std::cos(half_angle)}, // quaternion (x,y,z,w)
+                horus::now_ns());                                   // timestamp
+        }
+    }
+
+    void enter_safe_state() override {
+        // Stop updating transforms — downstream nodes see stale data
+        // and should interpret it as "localization degraded"
+        horus::blackbox::record("localizer",
+            "Entered safe state, transform updates halted");
+    }
+
+private:
+    horus::TransformFrame& tf_;
+    horus::Subscriber<horus::msg::Odometry>* odom_sub_;
+};
+
+class SensorProcessorNode : public horus::Node {
+public:
+    SensorProcessorNode(horus::TransformFrame& tf)
+        : Node("sensor_processor"), tf_(tf)
+    {
+        scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+    }
+
+    void tick() override {
+        auto scan = scan_sub_->recv();
+        if (!scan) return;
+
+        // ── Transform a LiDAR point into world coordinates ──────────
+        // Example: closest obstacle point in LiDAR frame
+        float min_range = 999.0f;
+        int min_idx = 0;
+        for (int i = 0; i < 360; i++) {
+            if (scan->get()->ranges[i] > 0.05f &&
+                scan->get()->ranges[i] < min_range) {
+                min_range = scan->get()->ranges[i];
+                min_idx = i;
+            }
+        }
+
+        // Point in LiDAR frame: (range * cos(angle), range * sin(angle), 0)
+        double angle_rad = min_idx * M_PI / 180.0;
+        double lx = min_range * std::cos(angle_rad);
+        double ly = min_range * std::sin(angle_rad);
+
+        // Look up the transform from lidar to world
+        if (auto t = tf_.lookup("lidar", "world")) {
+            // t->translation gives lidar origin in world frame
+            // Full point transform: world_point = R * lidar_point + t
+            // For 2D (z=0): approximate with translation only
+            double wx = t->translation[0] + lx;
+            double wy = t->translation[1] + ly;
+
+            if (++tick_count_ % 50 == 0) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "Closest obstacle: lidar=(%.2f, %.2f)  world=(%.2f, %.2f)",
+                    lx, ly, wx, wy);
+                horus::log::info("tf_demo", buf);
+            }
+        }
+
+        // ── Check sensor alignment ──────────────────────────────────
+        if (tf_.can_transform("camera", "lidar")) {
+            // Camera-to-lidar transform exists — can align detections
+            // Use for matching camera bounding boxes with LiDAR point clouds
+        }
+    }
+
+private:
+    horus::TransformFrame& tf_;
+    horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
+    int tick_count_ = 0;
+};
 
 int main() {
     horus::TransformFrame tf;
 
-    // Build frame tree
+    // ── Build frame tree ────────────────────────────────────────────
     //   world
-    //   └── base_link
-    //       ├── lidar (front, 20cm forward, 30cm up)
-    //       ├── camera (front, 10cm forward, 25cm up, 5° tilt)
-    //       └── imu (center, 15cm up)
+    //   +-- base_link  (dynamic — updated by localization)
+    //       +-- lidar   (static — front of robot, 20cm forward, 30cm up)
+    //       +-- camera  (static — front, 10cm forward, 25cm up, 5 deg pitch down)
+    //       +-- imu     (static — center, 15cm up)
     tf.register_frame("world");
     tf.register_frame("base_link", "world");
     tf.register_frame("lidar", "base_link");
     tf.register_frame("camera", "base_link");
     tf.register_frame("imu", "base_link");
 
-    // Static transforms (sensor mounts — set once)
+    // Static transforms: sensor mounts (set once, timestamp 0 = static)
+    // These must match the physical mounting on your robot
     tf.update("lidar",  {0.20, 0.0, 0.30}, {0, 0, 0, 1}, 0);
-    tf.update("camera", {0.10, 0.0, 0.25}, {0, 0, 0.0436, 0.999}, 0);  // ~5° pitch
+    tf.update("camera", {0.10, 0.0, 0.25}, {0, 0, 0.0436, 0.999}, 0);  // ~5 deg pitch
     tf.update("imu",    {0.0,  0.0, 0.15}, {0, 0, 0, 1}, 0);
 
+    horus::log::info("tf_demo", "Frame tree built: world -> base_link -> {lidar, camera, imu}");
+
+    // ── Build scheduler ─────────────────────────────────────────────
     horus::Scheduler sched;
-    sched.tick_rate(50_hz);
+    sched.tick_rate(50_hz).name("tf_demo");
 
-    // Localization node updates base_link in world frame
-    sched.add("localizer")
-        .order(0)
-        .tick([&] {
-            static double x = 0;
-            x += 0.01;
-            tf.update("base_link", {x, 0.0, 0.0}, {0, 0, 0, 1}, 0);
-        })
+    // Localization updates base_link in world frame
+    LocalizationNode localizer(tf);
+    sched.add(localizer)
+        .order(0)         // run first — other nodes need fresh transforms
+        .budget(2_ms)
+        .on_miss(horus::Miss::Warn)  // warn on overrun — stale transforms degrade accuracy
         .build();
 
-    // Processing node queries transforms
-    sched.add("processor")
-        .order(10)
-        .tick([&] {
-            // Where is the lidar in world coordinates?
-            if (auto t = tf.lookup("lidar", "world")) {
-                // t->translation[0] = base_x + 0.20
-            }
-
-            // Can we transform between camera and lidar?
-            if (tf.can_transform("camera", "lidar")) {
-                auto cam_to_lidar = tf.lookup("camera", "lidar");
-                // Use for sensor fusion alignment
-            }
-        })
+    // Sensor processor queries transforms to map LiDAR points into world
+    SensorProcessorNode processor(tf);
+    sched.add(processor)
+        .order(10)        // after localization — uses updated transforms
+        .budget(5_ms)
+        .on_miss(horus::Miss::Skip)  // skip if overrun — stale LiDAR data is not useful
         .build();
 
-    // Run 100 ticks
-    for (int i = 0; i < 100; i++) sched.tick_once();
+    sched.spin();
+}
+```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `lookup()` returns null | Frame tree is disconnected or frames not registered | Check that parent frames are registered before children |
+| LiDAR points in wrong world position | Static transform does not match physical sensor mount | Measure sensor offsets on the actual robot hardware |
+| Transform stale / outdated | Localization node runs after consumer node | Set localization `order(0)` so it runs first each tick |
+| Rotation wrong | Quaternion components in wrong order | HORUS uses (x, y, z, w) — identity is `{0, 0, 0, 1}` |
+| Frame tree breaks on second run | Stale SHM from previous run | Run `horus clean --shm` between runs |
+| Camera-lidar alignment off | Camera pitch angle wrong in static transform | Recalculate quaternion: `sin(angle/2)` for z-component |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| Static transforms with timestamp 0 | Sensor mounts do not change — setting once avoids redundant updates |
+| Dynamic base_link updated per tick | Robot pose changes continuously from localization |
+| `horus::Node` subclass for consumers | State (transform references) persists cleanly across ticks |
+| Localization at `order(0)` | Downstream nodes need fresh transforms — localization must run first |
+| `can_transform()` before complex queries | Graceful handling when frame tree is incomplete during startup |
+| Quaternion rotation (not Euler angles) | No gimbal lock, composable, compact (4 floats vs 3x3 matrix) |
+| Tree structure (not graph) | Single parent per frame guarantees unique transform paths |
+
+### Variations
+
+**Robot arm with end effector** — chain of joint transforms:
+```cpp
+// Each joint is a child of the previous joint
+tf.register_frame("base_link", "world");
+tf.register_frame("shoulder", "base_link");
+tf.register_frame("elbow", "shoulder");
+tf.register_frame("wrist", "elbow");
+tf.register_frame("end_effector", "wrist");
+
+// Update joint angles each tick (quaternion from joint angle)
+void update_joint(const std::string& name, double angle_rad) {
+    double half = angle_rad / 2.0;
+    tf_.update(name, {0, 0, link_length_},
+        {0, 0, std::sin(half), std::cos(half)}, horus::now_ns());
+}
+```
+
+**Multi-robot transforms** — separate subtrees per robot:
+```cpp
+tf.register_frame("world");
+tf.register_frame("robot_a", "world");
+tf.register_frame("robot_a/lidar", "robot_a");
+tf.register_frame("robot_b", "world");
+tf.register_frame("robot_b/lidar", "robot_b");
+// Now you can lookup robot_a/lidar -> robot_b/lidar for fleet coordination
+```
+
+**Publish transforms on a topic** for cross-process sharing:
+```cpp
+// Publisher node
+horus::msg::TFMessage tf_msg{};
+tf_msg.frame = "base_link";
+tf_msg.parent = "world";
+tf_msg.translation = {x, y, 0};
+tf_msg.rotation = {0, 0, sin_half, cos_half};
+tf_pub_->send(tf_msg);
+
+// Subscriber node in another process
+if (auto msg = tf_sub_->recv()) {
+    tf_.update(msg->get()->frame, msg->get()->translation,
+               msg->get()->rotation, horus::now_ns());
 }
 ```
 
 ### Key Takeaways
 
-- Register frame tree once at startup
-- Static transforms (sensor mounts) set with timestamp 0
-- Dynamic transforms (localization) updated every tick
-- `lookup()` computes chain composition automatically (lidar -> base -> world)
-- `can_transform()` checks path existence before querying
+- Register the frame tree once at startup; update static transforms with timestamp 0
+- Localization must run before any node that queries transforms (`order(0)`)
+- `lookup()` composes transforms along the tree path automatically — no manual chain multiplication
+- Measure sensor offsets on the actual robot — CAD models drift from physical reality
+- `can_transform()` is cheap — use it to guard lookups during startup when the tree may be incomplete
 
 ---
 ## Recipe: Telemetry Logger (C++)
@@ -91683,157 +93684,600 @@ Description: Log robot state to console and horus log at configurable intervals
 
 ## Telemetry Logger (C++)
 
-A low-priority node that subscribes to all robot state topics and logs summary data.
+A low-priority observer node that subscribes to all robot state topics and logs summary telemetry at a configurable rate. Useful for debugging, monitoring, and post-run analysis without affecting real-time performance.
 
-### Code
+### Problem
+
+You need to see what your robot is doing: where it is, what it is commanding, what its sensors read. But logging at full sensor rate (100-200 Hz) floods the terminal, wastes CPU on string formatting, and can cause real-time nodes to miss deadlines if the logger takes too long. You need a lightweight telemetry tap that runs at the lowest priority and logs at a human-readable rate.
+
+### How It Works
+
+The telemetry logger runs at the **lowest execution priority** (`order(100)`) so it never delays real-time nodes. It subscribes to key topics (odometry, velocity commands, IMU) and samples them at a configurable interval.
+
+**Rate-limited logging**: Instead of logging every tick, the node counts ticks and only formats output every Nth tick. At 100 Hz with `log_every_n = 100`, you get 1 Hz logging. This approach is cheaper than running the node at 1 Hz because:
+1. The node still drains subscriber buffers every tick (prevents stale data buildup)
+2. No separate clock or timer needed
+3. The log interval is always an integer multiple of the tick rate
+
+**Why `horus::log::info()` instead of `printf`?** The horus log system is non-blocking and thread-safe. Output appears in `horus log` CLI, can be filtered by tag, and is captured by the blackbox for post-mortem replay. `printf` blocks on stdout and can cause deadline misses in nodes that share the same terminal.
+
+### When To Use
+
+- Debugging any multi-node robot system
+- Monitoring robot state during integration testing
+- Recording summary telemetry for post-run analysis
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
 #include <cstdio>
+#include <cmath>
 using namespace horus::literals;
 
 class TelemetryLogger : public horus::Node {
 public:
-    TelemetryLogger() : Node("telemetry") {
-        odom_sub_ = subscribe<horus::msg::Odometry>("odom");
-        cmd_sub_  = subscribe<horus::msg::CmdVel>("cmd_vel");
-        imu_sub_  = subscribe<horus::msg::Imu>("imu.data");
+    TelemetryLogger(int log_every_n = 100)
+        : Node("telemetry"), log_every_n_(log_every_n)
+    {
+        // Subscribe to all topics we want to monitor
+        odom_sub_  = subscribe<horus::msg::Odometry>("odom");
+        cmd_sub_   = subscribe<horus::msg::CmdVel>("cmd_vel");
+        imu_sub_   = subscribe<horus::msg::Imu>("imu.data");
+        estop_sub_ = subscribe<horus::msg::EmergencyStop>("emergency.stop");
     }
 
     void tick() override {
+        // ── Always drain subscriber buffers ─────────────────────────
+        // Even when not logging, drain to prevent stale data buildup.
+        // This ensures the next log entry shows the *latest* data,
+        // not data that has been sitting in the buffer for seconds.
+        auto odom  = odom_sub_->recv();
+        auto cmd   = cmd_sub_->recv();
+        auto imu   = imu_sub_->recv();
+        auto estop = estop_sub_->recv();
+
+        // Cache latest values for logging
+        if (odom) {
+            last_x_     = odom->get()->pose.x;
+            last_y_     = odom->get()->pose.y;
+            last_theta_ = odom->get()->pose.theta;
+            odom_alive_ = true;
+        }
+        if (cmd) {
+            last_linear_  = cmd->get()->linear;
+            last_angular_ = cmd->get()->angular;
+            cmd_alive_ = true;
+        }
+        if (imu) {
+            last_accel_z_ = imu->get()->linear_acceleration[2];
+            last_gyro_z_  = imu->get()->angular_velocity[2];
+            imu_alive_ = true;
+        }
+        if (estop) {
+            estop_engaged_ = (estop->get()->engaged != 0);
+        }
+
+        // ── Rate-limited logging ────────────────────────────────────
         tick_count_++;
-        if (tick_count_ % 100 != 0) return;  // Log every 100 ticks (1 Hz at 100Hz)
+        if (tick_count_ % log_every_n_ != 0) return;
 
-        // Read latest state from all topics
-        auto odom = odom_sub_->recv();
-        auto cmd  = cmd_sub_->recv();
-        auto imu  = imu_sub_->recv();
-
+        // ── Format and publish summary ──────────────────────────────
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "pos=(%.2f, %.2f) cmd=(%.2f, %.2f) accel_z=%.2f",
-            odom ? odom->get()->pose.x : 0.0,
-            odom ? odom->get()->pose.y : 0.0,
-            cmd ? cmd->get()->linear : 0.0f,
-            cmd ? cmd->get()->angular : 0.0f,
-            imu ? imu->get()->linear_acceleration[2] : 0.0);
-
+            "pos=(%.2f, %.2f) hdg=%.1f deg  "
+            "cmd=(%.2f m/s, %.2f rad/s)  "
+            "az=%.2f m/s^2  gz=%.2f rad/s  "
+            "estop=%s",
+            last_x_, last_y_, last_theta_ * 180.0 / M_PI,
+            last_linear_, last_angular_,
+            last_accel_z_, last_gyro_z_,
+            estop_engaged_ ? "ACTIVE" : "clear");
         horus::log::info("telemetry", buf);
+
+        // ── Health check: warn on missing topics ────────────────────
+        if (!odom_alive_) horus::log::warn("telemetry", "No odom data received");
+        if (!cmd_alive_)  horus::log::warn("telemetry", "No cmd_vel data received");
+        if (!imu_alive_)  horus::log::warn("telemetry", "No IMU data received");
+
+        // Record to blackbox at lower rate (every 10th log = 0.1 Hz)
+        if (tick_count_ % (log_every_n_ * 10) == 0) {
+            char bb[128];
+            std::snprintf(bb, sizeof(bb),
+                "pos=(%.2f,%.2f) cmd=%.2f estop=%d",
+                last_x_, last_y_, last_linear_,
+                estop_engaged_ ? 1 : 0);
+            horus::blackbox::record("telemetry", bb);
+        }
+    }
+
+    void enter_safe_state() override {
+        // Logger has no actuators, but record the event for post-mortem
+        horus::blackbox::record("telemetry",
+            "System entered safe state — final snapshot: "
+            "see preceding log entries for last known state");
+        horus::log::warn("telemetry", "Safe state activated by scheduler");
     }
 
 private:
-    horus::Subscriber<horus::msg::Odometry>* odom_sub_;
-    horus::Subscriber<horus::msg::CmdVel>*   cmd_sub_;
-    horus::Subscriber<horus::msg::Imu>*      imu_sub_;
+    horus::Subscriber<horus::msg::Odometry>*      odom_sub_;
+    horus::Subscriber<horus::msg::CmdVel>*        cmd_sub_;
+    horus::Subscriber<horus::msg::Imu>*           imu_sub_;
+    horus::Subscriber<horus::msg::EmergencyStop>* estop_sub_;
+
+    // Configurable log interval
+    int log_every_n_;
+
+    // Cached latest values
+    double last_x_ = 0, last_y_ = 0, last_theta_ = 0;
+    float last_linear_ = 0, last_angular_ = 0;
+    double last_accel_z_ = 0, last_gyro_z_ = 0;
+    bool estop_engaged_ = false;
+
+    // Health tracking
+    bool odom_alive_ = false;
+    bool cmd_alive_  = false;
+    bool imu_alive_  = false;
+
     int tick_count_ = 0;
 };
 
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(100_hz);
-    TelemetryLogger logger;
-    sched.add(logger).order(100).build();  // Lowest priority
+    sched.tick_rate(100_hz).name("telemetry_demo");
+
+    // Log every 100 ticks = 1 Hz output at 100 Hz tick rate
+    TelemetryLogger logger(100);
+    sched.add(logger)
+        .order(100)                    // lowest priority — never delay real-time nodes
+        .on_miss(horus::Miss::Skip)    // skip if overrun — logging is expendable
+        .build();
+
     sched.spin();
+}
+```
+
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Log output floods terminal | `log_every_n` too small | Increase to 100+ (1 Hz at 100 Hz tick) |
+| Logged data is stale | Not draining subscribers every tick | Call `recv()` every tick, not just on log ticks |
+| Real-time nodes miss deadlines | Logger at too high priority or `printf` blocking stdout | Set `order(100)` and use `horus::log::info()` |
+| Topic shows "no data" forever | Topic name mismatch between publisher and subscriber | Verify topic names match exactly (dots, not slashes) |
+| Blackbox entries too large | Logging too much detail in blackbox | Keep blackbox entries short; detailed logging goes to `horus::log` |
+| Memory grows over time | Subscriber buffers not drained | Ensure `recv()` is called every tick for all subscribers |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| `order(100)` — lowest priority | Logging must never delay safety, control, or sensor nodes |
+| `Miss::Skip` policy | Logging is expendable — skipping a log entry is always acceptable |
+| Drain every tick, log every Nth | Fresh data on every log entry; no stale buffer accumulation |
+| `horus::log::info()` over printf | Non-blocking, thread-safe, filterable, captured by blackbox |
+| Cache values between log entries | Avoid repeated null checks; always have something to log |
+| Health check warnings | Surfaces broken topics early — one of the most useful debugging aids |
+| Blackbox recording at 0.1 Hz | Lightweight persistent record for post-mortem analysis without overhead |
+
+### Variations
+
+**CSV file logging** — write to a file for offline analysis:
+```cpp
+void tick() override {
+    // ... drain subscribers and cache values ...
+    if (tick_count_ % log_every_n_ != 0) return;
+
+    // Append to CSV file
+    FILE* f = std::fopen("/tmp/telemetry.csv", "a");
+    if (f) {
+        std::fprintf(f, "%d,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            tick_count_, last_x_, last_y_, last_theta_,
+            last_linear_, last_angular_);
+        std::fclose(f);
+    }
+}
+```
+
+**Per-topic rate monitoring** — track publish rates to detect stalled sensors:
+```cpp
+int odom_count_ = 0, cmd_count_ = 0, imu_count_ = 0;
+
+void tick() override {
+    if (odom_sub_->recv()) odom_count_++;
+    if (cmd_sub_->recv())  cmd_count_++;
+    if (imu_sub_->recv())  imu_count_++;
+
+    if (tick_count_ % 100 == 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+            "rates: odom=%d Hz  cmd=%d Hz  imu=%d Hz",
+            odom_count_, cmd_count_, imu_count_);
+        horus::log::info("telemetry", buf);
+        odom_count_ = cmd_count_ = imu_count_ = 0;
+    }
+}
+```
+
+**Conditional detail logging** — verbose output only when anomalies detected:
+```cpp
+if (estop_engaged_) {
+    // Log extra detail during E-stop events
+    horus::log::warn("telemetry", "E-stop active — dumping full state");
+    // ... log every subscriber value in detail ...
+} else {
+    // Normal summary only
+    horus::log::info("telemetry", summary_buf);
 }
 ```
 
 ### Key Takeaways
 
-- Logger runs at lowest priority (`order(100)`)
-- Reads from multiple topics without blocking them
-- Uses `horus::log::info()` so output appears in `horus log` CLI
-- Rate-limited logging (every 100th tick) to avoid flooding
+- The telemetry logger runs at `order(100)` with `Miss::Skip` — it must never interfere with real-time nodes
+- Drain all subscriber buffers every tick, even when not logging, to prevent stale data
+- Use `horus::log::info()` instead of printf — it is non-blocking and captured by the blackbox
+- Health check warnings ("no odom data received") are one of the most useful debugging features
+- Rate-limited logging (every Nth tick) is simpler and cheaper than running a separate low-rate node
 
 ---
 ## Recipe: Multi-Rate Pipeline (C++)
 Path: /recipes/multi-rate-pipeline-cpp
-Description: Run sensors at different rates in a single scheduler
+Description: Run sensors at different rates in a single scheduler using tick dividers and deterministic ordering.
 
 ## Multi-Rate Pipeline (C++)
 
-Run a camera at 30 Hz, IMU at 200 Hz, controller at 100 Hz, and logger at 1 Hz — all in one scheduler with deterministic ordering.
+Run an IMU at 200 Hz, a controller at 100 Hz, a camera pipeline at 30 Hz, and a logger at 1 Hz — all in one scheduler with deterministic ordering and per-node budgets. Each node is a `horus::Node` subclass with its own tick divider.
 
-### Code
+### Problem
+
+Your robot has sensors and actuators that operate at fundamentally different rates. The IMU publishes at 200 Hz, the depth camera at 30 Hz, the control loop needs 100 Hz, and diagnostics only need 1 Hz. Running separate schedulers wastes resources and makes ordering non-deterministic. You need a single scheduler where every node runs at its natural rate with guaranteed execution order.
+
+### How It Works
+
+A HORUS scheduler ticks at one master rate — typically the rate of the **fastest node** in the pipeline. Slower nodes use **tick dividers**: an internal counter that increments every tick and only executes the node's real work when the counter hits the divisor. For example, if the scheduler runs at 200 Hz and a node needs 100 Hz, that node's divider is 2 — it does work every 2nd tick and returns immediately on the others.
+
+The key formula is:
+
+```text
+divisor = master_rate / node_rate
+```
+
+So at 200 Hz master: IMU divisor = 1 (every tick), controller divisor = 2 (every other tick), camera divisor = 7 (approximately every 7th tick for ~28.6 Hz), logger divisor = 200 (once per second).
+
+**Ordering** is deterministic within each tick. Nodes with lower `order()` values run first. This guarantees that sensor producers run before consumers: IMU (order 0) publishes before the controller (order 10) reads, and the controller publishes before the logger (order 100) reads. Even nodes that skip their tick via the divider still occupy their slot — they just return immediately.
+
+**Budget enforcement** applies per tick, not per active cycle. If a node is in its skip phase, it consumes near-zero time. If it is in its active phase and overruns the budget, the miss policy kicks in. This means you can give tight budgets to critical nodes and generous budgets to non-critical ones without them interfering.
+
+### When To Use
+
+- Any robot with sensors at different rates (IMU at 200 Hz, camera at 30 Hz, LiDAR at 10 Hz)
+- When you need deterministic execution order across all rates
+- When running multiple schedulers would waste CPU or complicate inter-node communication
+- Embedded systems where a single event loop is simpler than multi-threaded pipelines
+
+### Prerequisites
+
+- HORUS installed ([Installation Guide](/docs/getting-started/installation))
+- Basic understanding of nodes and topics ([C++ Quick Start](/docs/getting-started/quick-start-cpp))
+- Understanding of [scheduling and ordering](/docs/concepts/core-concepts-scheduling)
+
+### Complete Code
 
 ```cpp
 #include <horus/horus.hpp>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 using namespace horus::literals;
 
+// ============================================================
+// IMU Driver — 200 Hz (every tick)
+// Reads the IMU hardware and publishes raw measurements.
+// ============================================================
+class ImuDriver : public horus::Node {
+public:
+    ImuDriver() : Node("imu_driver") {
+        imu_pub_ = advertise<horus::msg::Imu>("imu.data");
+    }
+
+    void tick() override {
+        // Real driver would read SPI/I2C here
+        horus::msg::Imu data{};
+        data.linear_acceleration[0] = 0.02f;   // slight forward tilt (m/s^2)
+        data.linear_acceleration[1] = 0.0f;
+        data.linear_acceleration[2] = 9.81f;   // gravity
+        data.angular_velocity[0] = 0.001f;     // near-zero roll rate (rad/s)
+        data.angular_velocity[1] = 0.0f;
+        data.angular_velocity[2] = 0.05f;      // gentle yaw rate during a turn
+        imu_pub_->send(data);
+    }
+
+private:
+    horus::Publisher<horus::msg::Imu>* imu_pub_;
+};
+
+// ============================================================
+// Camera Pipeline — 30 Hz (every ~7th tick at 200 Hz master)
+// Processes depth frames and publishes detection results.
+// ============================================================
+class CameraPipeline : public horus::Node {
+public:
+    explicit CameraPipeline(int divisor)
+        : Node("camera_pipeline"), divisor_(divisor) {
+        det_pub_ = advertise<horus::msg::CmdVel>("camera.detections");
+    }
+
+    void tick() override {
+        // Tick divider: skip ticks that aren't ours
+        if (++tick_counter_ % divisor_ != 0) return;
+
+        // Simulate depth frame processing — in production this would
+        // run an inference model or stereo matching pipeline
+        float detection_score = 0.87f;  // confidence of nearest obstacle
+        float detection_range = 2.4f;   // meters to detected object
+
+        horus::msg::CmdVel det{};
+        det.linear = detection_range;    // pack range into linear field
+        det.angular = detection_score;   // pack confidence into angular field
+        det_pub_->send(det);
+
+        if (++active_count_ % 30 == 0) {
+            horus::log::info("camera", "Frame processed — 30 Hz active cycle");
+        }
+    }
+
+private:
+    horus::Publisher<horus::msg::CmdVel>* det_pub_;
+    int divisor_;
+    int tick_counter_ = 0;
+    int active_count_ = 0;
+};
+
+// ============================================================
+// Controller — 100 Hz (every 2nd tick at 200 Hz master)
+// Fuses IMU + camera detections into velocity commands.
+// ============================================================
+class Controller : public horus::Node {
+public:
+    explicit Controller(int divisor)
+        : Node("controller"), divisor_(divisor) {
+        imu_sub_ = subscribe<horus::msg::Imu>("imu.data");
+        det_sub_ = subscribe<horus::msg::CmdVel>("camera.detections");
+        cmd_pub_ = advertise<horus::msg::CmdVel>("cmd_vel");
+    }
+
+    void tick() override {
+        // IMPORTANT: always drain subscribers every tick, even on skip ticks.
+        // If you only recv() on active ticks, stale messages pile up in the buffer.
+        auto imu = imu_sub_->recv();
+        auto det = det_sub_->recv();
+
+        // Tick divider: skip the computation but still drained the buffers above
+        if (++tick_counter_ % divisor_ != 0) return;
+
+        // Base forward speed — 0.3 m/s cruising
+        float linear = 0.3f;
+        float angular = 0.0f;
+
+        // If camera detected an obstacle, slow down proportionally
+        if (det) {
+            float range = det->get()->linear;
+            float confidence = det->get()->angular;
+            if (confidence > 0.7f && range < 3.0f) {
+                // Scale speed: full at 3m, zero at 0.5m
+                float factor = std::clamp((range - 0.5f) / 2.5f, 0.0f, 1.0f);
+                linear = 0.3f * factor;
+            }
+        }
+
+        // Use IMU yaw rate for heading correction
+        if (imu) {
+            float gz = imu->get()->angular_velocity[2];
+            // Compensate for drift: if turning unintentionally, correct
+            if (std::abs(gz) > 0.02f) {
+                angular = -0.5f * gz;  // P-controller on yaw drift
+            }
+        }
+
+        horus::msg::CmdVel cmd{};
+        cmd.linear = linear;
+        cmd.angular = angular;
+        cmd_pub_->send(cmd);
+    }
+
+    void enter_safe_state() override {
+        // Zero all motion on safety event
+        horus::msg::CmdVel stop{};
+        cmd_pub_->send(stop);
+        horus::blackbox::record("controller",
+            "Entered safe state — motors zeroed");
+    }
+
+private:
+    horus::Subscriber<horus::msg::Imu>*     imu_sub_;
+    horus::Subscriber<horus::msg::CmdVel>*  det_sub_;
+    horus::Publisher<horus::msg::CmdVel>*    cmd_pub_;
+    int divisor_;
+    int tick_counter_ = 0;
+};
+
+// ============================================================
+// Diagnostics Logger — 1 Hz (every 200th tick at 200 Hz master)
+// Records system health and topic throughput.
+// ============================================================
+class DiagLogger : public horus::Node {
+public:
+    explicit DiagLogger(int divisor)
+        : Node("diag_logger"), divisor_(divisor) {
+        cmd_sub_ = subscribe<horus::msg::CmdVel>("cmd_vel");
+        imu_sub_ = subscribe<horus::msg::Imu>("imu.data");
+    }
+
+    void tick() override {
+        // Drain every tick to count messages
+        if (auto cmd = cmd_sub_->recv()) {
+            last_linear_ = cmd->get()->linear;
+            last_angular_ = cmd->get()->angular;
+            cmd_count_++;
+        }
+        if (auto imu = imu_sub_->recv()) {
+            imu_count_++;
+        }
+
+        if (++tick_counter_ % divisor_ != 0) return;
+
+        // Log once per second
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "cmd_vel=(%.2f m/s, %.2f rad/s)  "
+            "imu_msgs/s=%d  cmd_msgs/s=%d",
+            last_linear_, last_angular_,
+            imu_count_, cmd_count_);
+        horus::log::info("diag", buf);
+
+        // Reset counters for next 1-second window
+        imu_count_ = 0;
+        cmd_count_ = 0;
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Subscriber<horus::msg::Imu>*    imu_sub_;
+    int divisor_;
+    int tick_counter_ = 0;
+    int imu_count_ = 0;
+    int cmd_count_ = 0;
+    float last_linear_ = 0.0f;
+    float last_angular_ = 0.0f;
+};
+
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(200_hz);  // Scheduler runs at fastest node rate
-    sched.name("multi_rate");
+    // Master rate = fastest node (IMU at 200 Hz)
+    sched.tick_rate(200_hz).name("multi_rate_pipeline");
 
-    auto imu_pub = sched.advertise<horus::msg::Imu>("imu.data");
-    auto cmd_pub = sched.advertise<horus::msg::CmdVel>("camera.detections");
-    auto vel_pub = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+    // ── Compute divisors from master rate ───────────────────
+    // IMU:        200 / 200 = 1  (every tick)
+    // Camera:     200 / 30  ~ 7  (every 7th tick = 28.6 Hz)
+    // Controller: 200 / 100 = 2  (every 2nd tick)
+    // Logger:     200 / 1   = 200 (every 200th tick)
 
-    auto imu_sub = sched.subscribe<horus::msg::Imu>("imu.data");
-    auto cam_sub = sched.subscribe<horus::msg::CmdVel>("camera.detections");
-    auto vel_sub = sched.subscribe<horus::msg::CmdVel>("cmd_vel");
-
-    // IMU: 200 Hz (every tick)
-    sched.add("imu_driver")
-        .order(0)
-        .tick([&] {
-            horus::msg::Imu data{};
-            data.linear_acceleration[2] = 9.81;
-            imu_pub.send(data);
-        })
+    ImuDriver imu;
+    sched.add(imu)
+        .order(0)                        // runs first — sensor producer
+        .budget(500_us)                  // SPI/I2C read should be fast
+        .on_miss(horus::Miss::Warn)      // IMU overrun is notable but not fatal
         .build();
 
-    // Camera: 30 Hz (every ~7th tick)
-    static int cam_div = 0;
-    sched.add("camera_driver")
-        .order(1)
-        .tick([&] {
-            if (++cam_div % 7 != 0) return;
-            horus::msg::CmdVel det{};
-            det.linear = 1.0f;  // detection score
-            cmd_pub.send(det);
-        })
+    CameraPipeline camera(7);
+    sched.add(camera)
+        .order(1)                        // after IMU, before controller
+        .budget(15_ms)                   // vision processing takes longer
+        .on_miss(horus::Miss::Skip)      // skip if overrun — stale frame is useless
         .build();
 
-    // Controller: 100 Hz (every 2nd tick)
-    static int ctrl_div = 0;
-    sched.add("controller")
-        .order(10)
-        .budget(3_ms)
-        .on_miss(horus::Miss::Skip)
-        .tick([&] {
-            if (++ctrl_div % 2 != 0) return;
-            auto imu = imu_sub.recv();
-            auto det = cam_sub.recv();
-            horus::msg::CmdVel cmd{};
-            cmd.linear = det ? 0.3f : 0.1f;
-            vel_pub.send(cmd);
-        })
+    Controller ctrl(2);
+    sched.add(ctrl)
+        .order(10)                       // after all sensors
+        .budget(3_ms)                    // control math is lightweight
+        .on_miss(horus::Miss::Skip)      // skip if overrun — stale commands dangerous
         .build();
 
-    // Logger: 1 Hz (every 200th tick)
-    static int log_div = 0;
-    sched.add("logger")
-        .order(100)
-        .tick([&] {
-            if (++log_div % 200 != 0) return;
-            auto vel = vel_sub.recv();
-            if (vel) {
-                std::printf("[1Hz] cmd_vel.linear = %.2f\n", vel->get()->linear);
-            }
-        })
+    DiagLogger logger(200);
+    sched.add(logger)
+        .order(100)                      // runs last — reads everything
+        .budget(5_ms)                    // logging can take a moment
+        .on_miss(horus::Miss::Warn)      // missed log is annoying but harmless
         .build();
 
     sched.spin();
 }
 ```
 
+### Common Errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Subscriber buffer overflows | Only calling `recv()` on active ticks, so 200 Hz messages pile up between 1 Hz reads | Always drain subscribers every tick, even on skip ticks |
+| Camera runs at wrong rate | Divisor calculation is off (200/30 = 6.67, rounded to 7 gives 28.6 Hz not 30) | Accept the approximation, or set master rate to LCM of all rates (e.g., 600 Hz) |
+| Controller sees stale IMU data | Controller `order` is lower than IMU — it runs before IMU publishes | Ensure producers have lower order values than consumers |
+| Logger shows 0 messages/sec | Logger divisor is wrong or logger does not drain on skip ticks | Drain subscribers every tick; only gate the logging output |
+| High CPU usage with many skip ticks | Tick overhead per node even on skip, multiplied by 200 Hz | Reduce master rate if most nodes are slow, or use `Miss::Skip` to shed load |
+| Budget miss on camera node | 15ms budget too tight for inference on the target hardware | Profile actual inference time and set budget to p99 + 2ms headroom |
+
+### Design Decisions
+
+| Choice | Rationale |
+|--------|-----------|
+| Master rate = fastest node (200 Hz) | Ensures the fastest node gets a tick every cycle without needing sub-tick scheduling |
+| Tick dividers inside each Node | Each node owns its rate logic — the scheduler does not need to know about multiple rates |
+| Drain subscribers on every tick | Prevents buffer overflow when a slow consumer reads a fast producer's topic |
+| Separate Node subclasses (not lambdas) | Each node has its own state, `enter_safe_state()`, and testable interface |
+| Controller has `enter_safe_state()` | The controller is the actuator node — it must zero outputs on any safety event |
+| `Miss::Skip` for controller and camera | Stale sensor data or stale commands are worse than skipping a cycle |
+| `Miss::Warn` for IMU and logger | IMU overrun is unusual and worth investigating; logger overrun is harmless |
+
+### Variations
+
+**LCM-based master rate** — if you need exact rates for all nodes, set the master rate to the least common multiple:
+
+```cpp
+// Exact 200 Hz, 100 Hz, 30 Hz, 1 Hz requires LCM = 600 Hz
+sched.tick_rate(600_hz);
+// Divisors: IMU=3, Controller=6, Camera=20, Logger=600
+// Downside: 600 Hz master means more overhead per tick
+```
+
+**Node-level rate configuration** — pass rate as a parameter instead of computing divisors at compile time:
+
+```cpp
+class RateNode : public horus::Node {
+public:
+    RateNode(const char* name, int master_hz, int target_hz)
+        : Node(name), divisor_(master_hz / target_hz) {}
+
+    void tick() override {
+        // Common divider logic
+        if (++counter_ % divisor_ != 0) return;
+        do_work();  // subclass implements actual computation
+    }
+
+protected:
+    virtual void do_work() = 0;
+
+private:
+    int divisor_;
+    int counter_ = 0;
+};
+```
+
+**Priority-based budgeting** — give critical nodes more budget by stealing from non-critical ones:
+
+```cpp
+// Total per-tick budget: 5ms at 200 Hz
+// IMU:        500us (critical — sensor timing matters)
+// Controller: 3ms   (critical — actuator safety)
+// Camera:     15ms  (only runs every 7th tick, can burst)
+// Logger:     1ms   (best effort — can be skipped entirely)
+sched.add(logger)
+    .order(100)
+    .budget(1_ms)
+    .on_miss(horus::Miss::Skip)  // expendable — skip if time is tight
+    .build();
+```
+
 ### Key Takeaways
 
-- One scheduler tick rate = fastest node (200 Hz)
-- Slower nodes use tick dividers: `if (++count % N != 0) return;`
-- Ordering guarantees: IMU (0) -> Camera (1) -> Controller (10) -> Logger (100)
-- Controller has budget enforcement for real-time safety
+- Set the master tick rate to the fastest node's rate — slower nodes use integer divisors
+- Always drain subscriber buffers every tick, even on skip ticks, to prevent stale data accumulation
+- Execution order is deterministic: lower `order()` values run first, guaranteeing producer-before-consumer
+- Each node should be a `horus::Node` subclass with its own state and `enter_safe_state()` for actuator nodes
+- Accept approximate rates from integer division (200/7 = 28.6 Hz instead of 30 Hz) or use LCM master rates for exactness
 
 ---
 ## Recipe: Record & Replay
