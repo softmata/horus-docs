@@ -1,7 +1,7 @@
 # HORUS Documentation (Full)
 
-Generated: 2026-03-31T04:00:48.808Z
-Pages: 288
+Generated: 2026-03-31T04:13:46.157Z
+Pages: 293
 Source: https://docs.horusrobotics.dev
 Condensed overview: https://docs.horusrobotics.dev/llms.txt
 
@@ -13,7 +13,7 @@ AI agents can use this to understand the full framework.
 - Getting Started (17 pages)
 - Learn (4 pages)
 - Core Concepts (25 pages)
-- Tutorials (26 pages)
+- Tutorials (28 pages)
 - Rust (37 pages)
 - Python (66 pages)
 - Development (14 pages)
@@ -25,7 +25,7 @@ AI agents can use this to understand the full framework.
 - Operations (2 pages)
 - Reference (7 pages)
 - Recipes (33 pages)
-- cpp (20 pages)
+- cpp (23 pages)
 
 
 ========================================
@@ -21031,6 +21031,348 @@ For production, use `horus launch` which manages startup ordering automatically.
 - `horus topic list` shows topics from ALL processes
 - No message broker — direct SHM ring buffer, ~170ns cross-process latency
 - Each process can have different tick rates (10 Hz sensor, 50 Hz controller)
+
+---
+## Tutorial 9: Record & Replay (C++)
+Path: /tutorials/09-record-replay-cpp
+Description: Record topic data for debugging and replay it offline
+
+# Tutorial 9: Record & Replay (C++)
+
+Record all topic data while your robot runs, then replay it offline for debugging. This is the robotics equivalent of a flight recorder.
+
+## What You'll Learn
+
+- Using `horus record` CLI to capture topic data
+- Using `horus replay` to play back recorded data
+- Using BlackBox for crash analysis
+- Designing nodes that work with both live and recorded data
+
+## Recording Live Data
+
+While your robot is running:
+
+```bash
+# Record all topics to a file
+horus record --output session_001.horus
+
+# Record specific topics only
+horus record --topics lidar.scan,cmd_vel,odom --output drive_test.horus
+
+# Record for 60 seconds
+horus record --duration 60 --output minute_log.horus
+```
+
+The recording captures every message on every topic with nanosecond timestamps.
+
+## Replaying Recorded Data
+
+Play back recorded data — your subscriber nodes see the same messages as during recording:
+
+```bash
+# Replay at original speed
+horus replay session_001.horus
+
+# Replay at 2x speed (for faster analysis)
+horus replay session_001.horus --rate 2.0
+
+# Replay specific topics only
+horus replay session_001.horus --topics lidar.scan,odom
+```
+
+## Designing for Replay
+
+The key pattern: separate your **processing nodes** from your **hardware drivers**. Processing nodes subscribe to topics — they don't care if data comes from live hardware or a recording.
+
+```cpp
+// This controller works identically with live OR recorded data
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        cmd_pub_  = advertise<horus::msg::CmdVel>("cmd_vel");
+    }
+
+    void tick() override {
+        auto scan = scan_sub_->recv();
+        if (!scan) return;
+
+        // This code runs the same whether lidar.scan comes from
+        // a real LiDAR or from horus replay
+        float min_range = 999.0f;
+        for (int i = 0; i < 360; i++) {
+            float r = scan->get()->ranges[i];
+            if (r > 0.01f && r < min_range) min_range = r;
+        }
+
+        horus::msg::CmdVel cmd{};
+        cmd.linear = min_range > 0.5f ? 0.3f : 0.0f;
+        cmd_pub_->send(cmd);
+    }
+
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
+    horus::Publisher<horus::msg::CmdVel>* cmd_pub_;
+};
+```
+
+## BlackBox for Crash Analysis
+
+The BlackBox records events even if the process crashes:
+
+```cpp
+// Record important events during operation
+horus::blackbox::record("controller", "Obstacle detected at 0.3m");
+horus::blackbox::record("safety", "E-stop triggered");
+horus::blackbox::record("motor", "Current spike: 15A");
+
+// After a crash, inspect with CLI:
+// horus blackbox --last 100
+// horus log --since "5 minutes ago"
+```
+
+## Workflow
+
+```
+1. Run robot        → horus record --output test.horus
+2. Bug happens      → stop recording
+3. Fix controller   → edit code, recompile
+4. Test with replay → horus replay test.horus
+5. Verify fix       → no bug? ship it
+```
+
+No need to set up hardware again. No need to reproduce the exact scenario. The recording has everything.
+
+## Key Takeaways
+
+- `horus record` captures all SHM topic data with timestamps
+- `horus replay` plays it back — subscribers see the same messages
+- Design nodes as pure topic processors — they work with live AND recorded data
+- BlackBox events survive crashes — use for safety-critical logging
+- Replay at different speeds for fast iteration
+
+---
+## Tutorial 10: Write a Reusable Driver (C++)
+Path: /tutorials/10-write-a-driver-cpp
+Description: Package a hardware driver as a reusable horus::Node with configuration, diagnostics, and safety
+
+# Tutorial 10: Write a Reusable Driver (C++)
+
+Turn a hardware interface into a reusable `horus::Node` that other projects can drop in. This tutorial builds a production-quality IMU driver.
+
+## What You'll Learn
+
+- Driver as a self-contained `horus::Node` subclass
+- Configuration via `horus::Params`
+- Health monitoring with `Heartbeat`
+- Diagnostic reporting with `DiagnosticStatus`
+- Safe shutdown on hardware failure
+
+## The Driver Pattern
+
+```
+┌─────────────────────────────────────┐
+│  ImuDriver : horus::Node            │
+│                                     │
+│  init()  → open device, configure   │
+│  tick()  → read data, publish       │
+│  safe()  → zero outputs, close      │
+│                                     │
+│  Publishes:                         │
+│    "imu.data"     (Imu)             │
+│    "imu.heartbeat"(Heartbeat)       │
+│    "imu.status"   (DiagnosticStatus)│
+│                                     │
+│  Params:                            │
+│    imu.port       = "/dev/ttyUSB0"  │
+│    imu.baudrate   = 115200          │
+│    imu.calibrate  = true            │
+└─────────────────────────────────────┘
+```
+
+## Complete Code
+
+```cpp
+#include <horus/horus.hpp>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include <cmath>
+using namespace horus::literals;
+
+class ImuDriver : public horus::Node {
+public:
+    ImuDriver(horus::Params& params)
+        : Node("imu_driver"), params_(params)
+    {
+        imu_pub_    = advertise<horus::msg::Imu>("imu.data");
+        hb_pub_     = advertise<horus::msg::Heartbeat>("imu.heartbeat");
+        status_pub_ = advertise<horus::msg::DiagnosticStatus>("imu.status");
+    }
+
+    void init() override {
+        const char* port = "/dev/ttyUSB0";  // from params in production
+        int baud = static_cast<int>(params_.get<int64_t>("imu.baudrate", 115200));
+
+        fd_ = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd_ < 0) {
+            horus::log::error("imu", "Failed to open " + std::string(port));
+            publish_status(2, "Failed to open serial port");
+            return;
+        }
+
+        // Configure serial port (abbreviated)
+        // ...
+
+        connected_ = true;
+        horus::log::info("imu", "IMU connected on " + std::string(port));
+        publish_status(0, "Connected and calibrating");
+
+        if (params_.get<bool>("imu.calibrate", true)) {
+            calibrate();
+        }
+    }
+
+    void tick() override {
+        tick_count_++;
+
+        if (!connected_) return;
+
+        // Read raw data from IMU (non-blocking)
+        uint8_t buf[64];
+        int n = fd_ >= 0 ? read(fd_, buf, sizeof(buf)) : -1;
+
+        if (n > 0) {
+            parse_and_publish(buf, n);
+            consecutive_errors_ = 0;
+        } else {
+            consecutive_errors_++;
+            if (consecutive_errors_ > 100) {  // 1 second at 100 Hz
+                horus::log::error("imu", "IMU read timeout — 100 consecutive failures");
+                horus::blackbox::record("imu", "Read timeout > 1s");
+                publish_status(2, "Read timeout");
+                connected_ = false;
+            }
+        }
+
+        // Heartbeat at 1 Hz
+        if (tick_count_ % 100 == 0) {
+            horus::msg::Heartbeat hb{};
+            std::strncpy(reinterpret_cast<char*>(hb.node_id), "imu_driver", 31);
+            hb.sequence = tick_count_ / 100;
+            hb.alive = connected_;
+            hb_pub_->send(hb);
+        }
+
+        // Status at 0.2 Hz
+        if (tick_count_ % 500 == 0) {
+            publish_status(connected_ ? 0 : 2,
+                connected_ ? "OK" : "Disconnected");
+        }
+    }
+
+    void enter_safe_state() override {
+        horus::log::warn("imu", "Safe state — closing device");
+        if (fd_ >= 0) { close(fd_); fd_ = -1; }
+        connected_ = false;
+        horus::blackbox::record("imu", "Safe state entered");
+    }
+
+private:
+    void calibrate() {
+        // Read 100 samples, compute bias
+        horus::log::info("imu", "Calibrating (hold still)...");
+        // ... calibration logic ...
+        horus::log::info("imu", "Calibration complete");
+        publish_status(0, "Ready");
+    }
+
+    void parse_and_publish(const uint8_t* buf, int len) {
+        // Parse device-specific protocol into Imu message
+        horus::msg::Imu imu{};
+        imu.orientation[3] = 1.0;         // identity quaternion
+        imu.angular_velocity[2] = 0.01;   // simulated yaw rate
+        imu.linear_acceleration[2] = 9.81; // gravity
+        imu.timestamp_ns = 0;
+
+        // Apply calibration offset
+        imu.angular_velocity[2] -= gyro_bias_z_;
+
+        imu_pub_->send(imu);
+    }
+
+    void publish_status(uint8_t level, const char* msg) {
+        horus::msg::DiagnosticStatus status{};
+        status.level = level;
+        std::strncpy(reinterpret_cast<char*>(status.message), msg, 255);
+        status.message_len = std::strlen(msg);
+        status_pub_->send(status);
+    }
+
+    horus::Params& params_;
+    horus::Publisher<horus::msg::Imu>*              imu_pub_;
+    horus::Publisher<horus::msg::Heartbeat>*         hb_pub_;
+    horus::Publisher<horus::msg::DiagnosticStatus>*  status_pub_;
+    int fd_ = -1;
+    bool connected_ = false;
+    int tick_count_ = 0;
+    int consecutive_errors_ = 0;
+    double gyro_bias_z_ = 0.0;
+};
+
+int main() {
+    horus::Params params;
+    params.set("imu.baudrate", int64_t(115200));
+    params.set("imu.calibrate", true);
+
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz).name("imu_node").prefer_rt();
+
+    ImuDriver imu(params);
+    sched.add(imu)
+        .order(0)
+        .budget(2_ms)
+        .on_miss(horus::Miss::Warn)
+        .watchdog(5_s)
+        .build();
+
+    sched.spin();
+}
+```
+
+## What Makes a Good Driver
+
+| Aspect | Implementation |
+|--------|---------------|
+| **Self-contained** | All hardware access in one Node class |
+| **Configurable** | Port, baudrate, calibration via Params |
+| **Monitored** | Heartbeat + DiagnosticStatus published |
+| **Safe** | `enter_safe_state()` closes device |
+| **Fault-tolerant** | Consecutive error counting, auto-disable |
+| **Logged** | `horus::log` for runtime, `blackbox::record` for crashes |
+| **Non-blocking** | `O_NONBLOCK` on file descriptor |
+
+## Reusing the Driver
+
+Other projects add it as a node:
+
+```cpp
+// In another project's main.cpp
+ImuDriver imu(params);
+sched.add(imu).order(0).budget(2_ms).build();
+
+// Any node can subscribe to imu.data
+auto imu_sub = sched.subscribe<horus::msg::Imu>("imu.data");
+```
+
+## Key Takeaways
+
+- Drivers are `horus::Node` subclasses — portable, reusable, testable
+- Publish 3 topics: data, heartbeat, status — lets monitoring work automatically
+- Non-blocking I/O in `tick()` — never block the scheduler
+- Count consecutive errors — disable after threshold (1 second typical)
+- `enter_safe_state()` closes hardware safely
+- Params for configuration — no hardcoded values
 
 ---
 ## Tutorial 4: Custom Message Types
@@ -95316,6 +95658,50 @@ horus run      # builds + runs
 
 ---
 
+## Duration and Frequency Literals
+
+HORUS provides user-defined literals that match the Rust `DurationExt` trait. Import them with `using namespace horus::literals;`:
+
+| Literal | Type | Example |
+|---------|------|---------|
+| `_hz` | `Frequency` | `100_hz` = 100 Hz tick rate |
+| `_ms` | `Duration` (microseconds) | `5_ms` = 5000 us |
+| `_us` | `Duration` (microseconds) | `200_us` = 200 us |
+| `_ns` | `std::chrono::nanoseconds` | `500_ns` = 500 ns |
+| `_s` | `Duration` (microseconds) | `5_s` = 5000000 us |
+
+```cpp
+using namespace horus::literals;
+
+auto freq = 100_hz;      // Frequency(100.0)
+auto dur  = 5_ms;        // std::chrono::microseconds(5000)
+auto us   = 200_us;      // std::chrono::microseconds(200)
+
+// Frequency helper methods
+auto period   = freq.period();          // 10000 us (10 ms)
+auto budget   = freq.budget_default();  // 8000 us (80% of period)
+auto deadline = freq.deadline_default();// 9500 us (95% of period)
+```
+
+---
+
+## Cross-Language Equivalence
+
+The C++ API mirrors Rust and Python exactly. Code written in one language can be ported line-by-line:
+
+| Concept | Rust | C++ | Python |
+|---------|------|-----|--------|
+| Scheduler | `Scheduler::new()` | `horus::Scheduler()` | `horus.Scheduler()` |
+| Tick rate | `.tick_rate(100.hz())` | `.tick_rate(100_hz)` | `tick_rate=100` |
+| Publish | `topic.send(&msg)?` | `pub.send(msg)` | `node.send("topic", msg)` |
+| Subscribe | `topic.recv()` | `sub.recv()` | `node.recv("topic")` |
+| Node | `impl Node for T` | `class T : public horus::Node` | `horus.Node(name, tick)` |
+| Run | `scheduler.spin()` | `sched.spin()` | `horus.run(node)` |
+
+All three languages share the same SHM transport. A Rust publisher and a C++ subscriber on the same topic communicate with zero serialization overhead.
+
+---
+
 ## Ownership and Move Semantics
 
 All core types (`Scheduler`, `Publisher`, `Subscriber`, `LoanedSample`, `BorrowedSample`, `ServiceClient`, `ServiceServer`, `ActionClient`, `ActionServer`, `GoalHandle`) are **move-only**. Copy constructors and copy assignment are deleted. This matches Rust's ownership model -- each resource has exactly one owner.
@@ -95495,32 +95881,11 @@ sched.add("obstacle_detector")
 
 ### Style 2: Struct-Based Node
 
-For complex nodes with state. Subclass `horus::Node` and override lifecycle methods:
+Subclass `horus::Node` for complex nodes with state (see [Node API](/cpp/api/node)):
 
 ```cpp
-class ArmController : public horus::Node {
-public:
-    ArmController() : Node("arm_ctrl") {
-        joint_sub_ = subscribe<horus::msg::JointState>("joints.state");
-        cmd_pub_   = advertise<horus::msg::JointCommand>("joints.cmd");
-    }
-
-    void tick() override {
-        auto state = joint_sub_->recv();
-        if (!state) return;
-        // compute and publish command...
-    }
-
-private:
-    horus::Subscriber<horus::msg::JointState>* joint_sub_;
-    horus::Publisher<horus::msg::JointCommand>* cmd_pub_;
-};
-
-ArmController ctrl;
-sched.add(ctrl)
-    .rate(100_hz)
-    .budget(2_ms)
-    .build();
+ArmController ctrl;  // subclass of horus::Node
+sched.add(ctrl).rate(100_hz).budget(2_ms).build();
 ```
 
 ### Style 3: LambdaNode
@@ -95646,20 +96011,11 @@ for (int i = 0; i < 1000; ++i) {
 `stop()` is thread-safe. Call it from a signal handler, another thread, or a node's tick callback:
 
 ```cpp
-#include <csignal>
-#include <thread>
-
-horus::Scheduler sched;
-// ... configure ...
-
-std::signal(SIGINT, [](int) { /* handled by scheduler */ });
-
-// Or stop programmatically after 10 seconds:
+// Stop programmatically after 10 seconds:
 std::thread timer([&] {
     std::this_thread::sleep_for(std::chrono::seconds(10));
     sched.stop();
 });
-
 sched.spin();
 timer.join();
 ```
@@ -95702,23 +96058,15 @@ auto sched = horus::Scheduler()
 
 sched.add("safety")
     .rate(1000_hz).budget(50_us).priority(99)
-    .tick([&] { /* fastest, highest priority */ })
-    .build();
+    .tick([&] { /* fastest, highest priority */ }).build();
 
 sched.add("controller")
     .rate(100_hz).budget(2_ms)
-    .tick([&] { /* medium rate */ })
-    .build();
+    .tick([&] { /* medium rate */ }).build();
 
 sched.add("planner")
     .rate(10_hz).compute()
-    .tick([&] { /* slow, CPU-heavy */ })
-    .build();
-
-sched.add("logger")
-    .rate(1_hz)
-    .tick([&] { /* once per second */ })
-    .build();
+    .tick([&] { /* slow, CPU-heavy */ }).build();
 
 sched.spin();
 ```
@@ -95728,41 +96076,26 @@ sched.spin();
 Step through execution deterministically for unit tests:
 
 ```cpp
-auto sched = horus::Scheduler()
-    .tick_rate(100_hz)
-    .deterministic(true);
-
+auto sched = horus::Scheduler().tick_rate(100_hz).deterministic(true);
 auto pub = sched.advertise<horus::msg::CmdVel>("cmd");
 auto sub = sched.subscribe<horus::msg::CmdVel>("cmd");
 
 int tick_count = 0;
-sched.add("producer")
-    .rate(100_hz)
-    .tick([&] {
-        pub.send(horus::msg::CmdVel{0, 1.0f, 0.0f});
-        tick_count++;
-    })
+sched.add("producer").rate(100_hz)
+    .tick([&] { pub.send(horus::msg::CmdVel{0, 1.0f, 0.0f}); tick_count++; })
     .build();
 
 sched.tick_once();
 assert(tick_count == 1);
-
 auto msg = sub.recv();
 assert(msg.has_value());
-assert(msg->linear == 1.0f);
 ```
 
 ### Network-Enabled Scheduler
 
-Enable LAN replication so topics are shared across machines:
-
 ```cpp
-auto sched = horus::Scheduler()
-    .tick_rate(100_hz)
-    .enable_network()   // topics visible on LAN
-    .name("robot_01");
-
-// Topics automatically replicate to other schedulers
+auto sched = horus::Scheduler().tick_rate(100_hz)
+    .enable_network().name("robot_01");  // topics visible on LAN
 auto pub = sched.advertise<horus::msg::Odometry>("robot_01.odom");
 ```
 
@@ -96178,188 +96511,767 @@ sched.add("controller")
 ---
 ## Publisher & Subscriber API
 Path: /cpp/api/topic
-Description: Zero-copy messaging with Publisher<T>, Subscriber<T>, LoanedSample, BorrowedSample
+Description: Complete API reference for HORUS C++ zero-copy IPC — Publisher, Subscriber, LoanedSample, BorrowedSample, and all 51 message types
 
-# Publisher & Subscriber API
+# Publisher and Subscriber API
 
-Zero-copy shared memory messaging. 51 Pod message types supported.
+HORUS uses shared memory (SHM) for inter-process communication. `Publisher` writes messages, `Subscriber` reads them -- both zero-copy. The loan pattern lets you write directly into shared memory without any intermediate buffers or serialization.
 
-## Publisher&lt;T&gt;
-
-Create via `Node::advertise()` or `Scheduler::advertise()` or directly.
-
-| Method | Description |
-|--------|-------------|
-| `Publisher(topic_name)` | Create publisher for topic |
-| `loan()` | Get writable `LoanedSample` (zero-copy SHM, ~3ns) |
-| `publish(LoanedSample&&)` | Make sample visible to subscribers (~3ns) |
-| `send(const T&)` | Send by copy (simpler, ~15ns for small types) |
-| `name()` | Topic name |
-| `is_valid()` | Publisher created successfully? |
-
-### Zero-Copy Loan Pattern
+> **Rust**: See [`Topic`](/rust/api/topic) for the Rust unified pub/sub API.
+> **Python**: See [`node.send()` / `node.recv()`](/python/api) for the Python wrapper.
 
 ```cpp
-auto pub = sched.advertise<horus::msg::LaserScan>("lidar.scan");
-
-auto sample = pub.loan();          // ~3ns — pointer to SHM
-sample->ranges[0] = 1.5f;          // 0ns — direct write
-sample->ranges[1] = 2.0f;          // 0ns — no copies
-pub.publish(std::move(sample));     // ~3ns — publish
-// Total: ~6ns for 1472 bytes
+// simplified
+#include <horus/topic.hpp>
+#include <horus/messages.hpp>
 ```
 
-### Send by Copy
+---
+
+## Quick Reference -- `Publisher`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.loan()` | `LoanedSample` | Get a writable buffer from SHM (zero-copy) |
+| `.publish(LoanedSample&&)` | `void` | Make a loaned sample visible to subscribers |
+| `.send(const T&)` | `void` | Send a message by copy (simpler API) |
+| `.name()` | `const string&` | Get the topic name |
+
+## Quick Reference -- `Subscriber`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.recv()` | `optional>` | Receive the next message (nullopt if none) |
+| `.has_msg()` | `bool` | Check if a message is available without consuming |
+| `.name()` | `const string&` | Get the topic name |
+
+## Quick Reference -- `LoanedSample`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `operator->()` | `T*` / `const T*` | Direct SHM pointer access (zero-copy write) |
+| `operator*()` | `T&` / `const T&` | Dereference to the data |
+| `.get()` | `T*` / `const T*` | Raw pointer to the data |
+
+## Quick Reference -- `BorrowedSample`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `operator->()` | `const T*` | Read-only pointer access |
+| `operator*()` | `const T&` | Read-only dereference |
+| `.get()` | `const T*` | Raw read-only pointer |
+
+---
+
+## Creating Topics
+
+Topics are created on the `Scheduler` or inside a `Node` / `LambdaNode`. Topic names use **dots** as separators (not slashes), required for macOS `shm_open` compatibility.
+
+### On the Scheduler (for Lambda Nodes)
 
 ```cpp
-horus::msg::CmdVel cmd{};
-cmd.linear = 0.3f;
-pub.send(cmd);  // copies 16 bytes to SHM — ~15ns
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+auto scan_sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
 ```
 
-**Rule:** Use `loan()` for messages > 64 bytes. Use `send()` for small messages.
-
-## Subscriber&lt;T&gt;
-
-Create via `Node::subscribe()` or `Scheduler::subscribe()` or directly.
-
-| Method | Description |
-|--------|-------------|
-| `Subscriber(topic_name)` | Create subscriber for topic |
-| `recv()` | Receive → `optional>` |
-| `has_msg()` | Message available? (non-consuming) |
-| `name()` | Topic name |
-| `is_valid()` | Subscriber created successfully? |
+### Inside a Node Subclass (Constructor)
 
 ```cpp
-auto sub = sched.subscribe<horus::msg::CmdVel>("cmd_vel");
-
-auto msg = sub.recv();
-if (msg) {
-    float linear = msg->get()->linear;
-    float angular = msg->get()->angular;
-}
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        cmd_pub_  = advertise<horus::msg::CmdVel>("motor.cmd");
+    }
+    // ...
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
+    horus::Publisher<horus::msg::CmdVel>* cmd_pub_;
+};
 ```
 
-## LoanedSample&lt;T&gt;
+### Inside a LambdaNode (Builder)
 
-Writable handle to SHM. Move-only, RAII.
+```cpp
+auto node = horus::LambdaNode("controller")
+    .sub<horus::msg::LaserScan>("lidar.scan")
+    .pub<horus::msg::CmdVel>("motor.cmd");
+```
 
-| Method | Description |
-|--------|-------------|
-| `operator->()` | Direct SHM pointer (0ns) |
-| `operator*()` | Dereference |
-| `get()` | Raw `T*` pointer |
+---
 
-## BorrowedSample&lt;T&gt;
+## Zero-Copy Loan Pattern
 
-Read-only received message. Move-only, RAII.
+The loan pattern is the primary way to publish messages in HORUS. It eliminates all copies between producer and consumer.
 
-| Method | Description |
-|--------|-------------|
-| `operator->()` | Read pointer (const) |
-| `operator*()` | Dereference (const) |
-| `get()` | Raw `const T*` pointer |
+### How It Works
+
+```
+1. pub.loan()                    --> SHM allocates a slot, returns LoanedSample<T>
+2. sample->field = value         --> writes directly into SHM (0 ns copy overhead)
+3. pub.publish(std::move(sample))--> flips visibility flag, subscribers can read
+```
+
+### Full Example
+
+```cpp
+auto pub = sched.advertise<horus::msg::Odometry>("odom");
+
+sched.add("localizer")
+    .rate(100_hz)
+    .tick([&] {
+        // Step 1: Loan a writable slot from shared memory
+        auto sample = pub.loan();
+
+        // Step 2: Write directly into SHM (zero copy)
+        sample->pose.x = current_x;
+        sample->pose.y = current_y;
+        sample->pose.theta = current_theta;
+        sample->timestamp_ns = now_ns();
+
+        // Step 3: Publish (consumes the sample via move)
+        pub.publish(std::move(sample));
+    })
+    .build();
+```
+
+After `publish()`, the `LoanedSample` is consumed (moved). Attempting to use it after publish is a compile error.
+
+### LoanedSample Access Patterns
+
+```cpp
+auto sample = pub.loan();
+
+// Arrow operator -- most common
+sample->linear = 0.5f;
+sample->angular = 0.1f;
+
+// Dereference operator
+horus::msg::CmdVel& ref = *sample;
+ref.linear = 0.5f;
+
+// Raw pointer
+horus::msg::CmdVel* ptr = sample.get();
+ptr->linear = 0.5f;
+```
+
+---
+
+## Send-by-Copy Pattern
+
+For simplicity or small messages, `send()` copies the message into shared memory in one call:
+
+```cpp
+auto pub = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+
+// Single-call publish -- copies msg into SHM
+pub.send(horus::msg::CmdVel{0, 0.5f, 0.1f});
+```
+
+This is equivalent to `loan()` + write + `publish()` but performs one copy. For small messages like `CmdVel` (16 bytes), the overhead is negligible. For large messages like `LaserScan` (1468 bytes) or `Odometry`, prefer the loan pattern.
+
+| Pattern | Copy Count | Best For |
+|---------|-----------|----------|
+| `loan()` + `publish()` | **0** | Large messages, high-frequency topics |
+| `send()` | **1** | Small messages, simple code |
+
+---
+
+## Receiving Messages
+
+### Basic Receive
+
+`recv()` returns `std::optional>`. If no message is available, it returns `std::nullopt`:
+
+```cpp
+auto sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+
+sched.add("processor")
+    .rate(50_hz)
+    .tick([&] {
+        auto scan = sub.recv();
+        if (!scan) return;  // no message this tick
+
+        // Access fields through arrow operator (read-only)
+        float front_range = scan->ranges[0];
+        float min_range = scan->min_range;
+
+        // Dereference
+        const horus::msg::LaserScan& data = *scan;
+
+        // Raw pointer
+        const horus::msg::LaserScan* ptr = scan->get();
+    })
+    .build();
+```
+
+### Check Before Consuming
+
+Use `has_msg()` to check availability without consuming the message:
+
+```cpp
+sched.add("conditional_processor")
+    .rate(50_hz)
+    .tick([&] {
+        if (!scan_sub.has_msg()) {
+            // No scan available -- do something else
+            return;
+        }
+        auto scan = scan_sub.recv();
+        // guaranteed to have a value
+    })
+    .build();
+```
+
+### BorrowedSample Lifetime
+
+The `BorrowedSample` is valid until it goes out of scope. RAII releases the SHM slot automatically:
+
+```cpp
+{
+    auto scan = sub.recv();
+    if (scan) {
+        process(*scan);   // valid here
+    }
+}   // BorrowedSample released here -- SHM slot freed
+```
+
+---
+
+## Move Semantics
+
+All topic types are **move-only**. Copy constructors and copy assignment operators are deleted. This enforces single ownership, matching Rust's ownership model:
+
+```cpp
+auto pub = sched.advertise<horus::msg::CmdVel>("cmd");
+// auto pub2 = pub;                 // COMPILE ERROR: copy deleted
+auto pub2 = std::move(pub);         // OK: ownership transferred
+
+auto sample = pub2.loan();
+// auto sample2 = sample;           // COMPILE ERROR: copy deleted
+pub2.publish(std::move(sample));     // OK: consumed by publish
+// sample->linear = 1.0;            // COMPILE ERROR: sample was moved
+```
+
+---
 
 ## Supported Message Types (51)
 
-All `horus::msg::` types with `Publisher` / `Subscriber` specializations:
+All message types live in the `horus::msg` namespace. They are `#[repr(C)]` compatible with Rust for zero-copy SHM IPC. Each type gets a `Publisher` and `Subscriber` template specialization generated internally via `HORUS_TOPIC_IMPL` in `impl/topic_impl.hpp`.
 
-**Sensor:** LaserScan, Imu, Odometry, JointState, RangeSensor, BatteryState, NavSatFix, MagneticField, Temperature, FluidPressure, Illuminance
+**Geometry (12):** `Point3`, `Vector3`, `Quaternion`, `Twist`, `Pose2D`, `TransformStamped`, `Pose3D`, `PoseStamped`, `PoseWithCovariance`, `TwistWithCovariance`, `Accel`, `AccelStamped`
 
-**Control:** CmdVel, MotorCommand, ServoCommand, DifferentialDriveCommand, PidConfig, TrajectoryPoint, JointCommand
+**Sensor (11):** `LaserScan`, `Imu`, `Odometry`, `RangeSensor`, `BatteryState`, `NavSatFix`, `MagneticField`, `Temperature`, `FluidPressure`, `Illuminance`, `JointState`
 
-**Geometry:** Twist, Pose2D, Pose3D, Point3, Vector3, Quaternion, TransformStamped, PoseStamped, PoseWithCovariance, TwistWithCovariance, Accel, AccelStamped
+**Control (7):** `CmdVel`, `MotorCommand`, `DifferentialDriveCommand`, `ServoCommand`, `PidConfig`, `TrajectoryPoint`, `JointCommand`
 
-**Detection:** BoundingBox2D, BoundingBox3D, Detection, Detection3D
+**Navigation (5):** `NavGoal`, `GoalResult`, `Waypoint`, `VelocityObstacle`, `PathPlan`
 
-**Vision:** CameraInfo, RegionOfInterest, StereoInfo
+**Diagnostics (8):** `Heartbeat`, `DiagnosticStatus`, `EmergencyStop`, `ResourceUsage`, `NodeHeartbeat`, `SafetyStatus`, `DiagnosticValue`, `DiagnosticReport`
 
-**Navigation:** NavGoal, GoalResult, Waypoint, VelocityObstacle, PathPlan
+**Detection (12):** `BoundingBox2D`, `BoundingBox3D`, `Detection`, `Detection3D`, `Landmark`, `Landmark3D`, `LandmarkArray`, `TrackedObject`, `TrackingHeader`, `PlaneDetection`, `SegmentationMask`, `PointField`
 
-**Diagnostics:** Heartbeat, EmergencyStop, DiagnosticStatus, ResourceUsage, NodeHeartbeat, SafetyStatus
+**Vision (3):** `CameraInfo`, `RegionOfInterest`, `StereoInfo`
 
-**Force:** WrenchStamped, ForceCommand, ContactInfo, HapticFeedback, ImpedanceParameters
+**Force (5):** `WrenchStamped`, `ImpedanceParameters`, `ForceCommand`, `ContactInfo`, `HapticFeedback`
 
-**Other:** TrackedObject, TrackingHeader, SegmentationMask, Landmark, Landmark3D, LandmarkArray, KeyboardInput, JoystickInput, AudioFrame, Clock, TimeReference, PointField, PlaneDetection
+**Time (4):** `Clock`, `TimeReference`, `SimSync`, `RateRequest`
+
+**Input (3):** `KeyboardInput`, `JoystickInput`, `AudioFrame`
+
+---
+
+## Common Patterns
+
+### Multi-Topic Node
+
+A single node can publish and subscribe to multiple topics:
+
+```cpp
+auto imu_sub   = sched.subscribe<horus::msg::Imu>("imu.data");
+auto odom_sub  = sched.subscribe<horus::msg::Odometry>("odom");
+auto cmd_pub   = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+auto diag_pub  = sched.advertise<horus::msg::Heartbeat>("health.ctrl");
+
+sched.add("fusion_controller")
+    .rate(100_hz)
+    .tick([&] {
+        auto imu = imu_sub.recv();
+        auto odom = odom_sub.recv();
+
+        if (imu && odom) {
+            auto cmd = cmd_pub.loan();
+            cmd->linear = compute_speed(*odom);
+            cmd->angular = compute_turn(*imu);
+            cmd_pub.publish(std::move(cmd));
+        }
+
+        // Always publish heartbeat
+        uint64_t seq = 0;
+        diag_pub.send(horus::msg::Heartbeat{
+            {}, seq++, true, 0.0f, 0.0f, 0
+        });
+    })
+    .build();
+```
+
+### Pipeline Pattern
+
+Chain nodes through topics to form a processing pipeline:
+
+```cpp
+auto raw_sub  = sched.subscribe<horus::msg::LaserScan>("lidar.raw");
+auto filt_pub = sched.advertise<horus::msg::LaserScan>("lidar.filtered");
+auto filt_sub = sched.subscribe<horus::msg::LaserScan>("lidar.filtered");
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+
+// Stage 1: Filter raw scan
+sched.add("filter")
+    .rate(50_hz).order(1)
+    .tick([&] {
+        auto raw = raw_sub.recv();
+        if (!raw) return;
+        auto filtered = filt_pub.loan();
+        *filtered = *raw;  // copy, then modify in place
+        for (int i = 0; i < 360; ++i) {
+            if (filtered->ranges[i] < 0.05f)
+                filtered->ranges[i] = 0.0f;
+        }
+        filt_pub.publish(std::move(filtered));
+    })
+    .build();
+
+// Stage 2: React to filtered scan
+sched.add("controller")
+    .rate(50_hz).order(2)
+    .tick([&] {
+        auto scan = filt_sub.recv();
+        if (!scan) return;
+        cmd_pub.send(horus::msg::CmdVel{0, 0.3f, 0.0f});
+    })
+    .build();
+```
+
+### Topic Name Conventions
+
+Use dot-separated hierarchical names:
+
+```
+sensor.lidar.scan        # LiDAR data
+sensor.imu.data          # IMU readings
+motor.cmd                # Motor commands
+nav.goal                 # Navigation goal
+safety.alert             # Safety alerts
+diagnostics.heartbeat    # Heartbeat
+```
+
+---
 
 ## See Also
 
-- [Node API](/docs/cpp/api/node) — `advertise()` / `subscribe()` on nodes
-- [Guide: Performance](/docs/cpp/performance) — loan vs copy benchmarks
+- [Scheduler API](/cpp/api/scheduler) -- Topic creation via `advertise` and `subscribe`
+- [Node API](/cpp/api/node) -- Node styles and lifecycle
+- [Services and Actions API](/cpp/api/services) -- Request/response and long-running tasks
+- [C++ API Overview](/cpp/api) -- All classes at a glance
+- [Rust Topic API](/rust/api/topic) -- Equivalent Rust API
 
 ---
 ## Services & Actions API
 Path: /cpp/api/services
-Description: Request/response RPC and long-running tasks with progress
+Description: Complete API reference for HORUS C++ services (request/response RPC) and actions (long-running tasks with progress and cancellation)
 
-# Services & Actions API
+# Services and Actions API
 
-## ServiceClient
+HORUS provides two communication patterns beyond pub/sub topics: **services** for synchronous request/response RPC, and **actions** for long-running tasks with progress feedback and cancellation. Both use JSON as the wire format over shared memory topics, so they work same-process and cross-process with zero configuration.
 
-| Method | Description |
-|--------|-------------|
-| `ServiceClient(name)` | Create client for named service |
-| `call(json, timeout)` | Send request, wait for response → `optional<string>` |
-| `operator bool()` | Check if valid |
+> **Rust**: See [Services](/rust/api/services) and [Actions](/rust/api/actions) for the Rust API.
+> **Python**: Services and actions are available via the Python bindings.
 
 ```cpp
+// simplified
+#include <horus/service.hpp>
+#include <horus/action.hpp>
+```
+
+---
+
+## Quick Reference -- ServiceClient
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ServiceClient(name)` | -- | Construct a client for the named service |
+| `.call(json, timeout)` | `optional<string>` | Send request JSON, wait for response |
+| `operator bool()` | `bool` | Check if the client handle is valid |
+
+## Quick Reference -- ServiceServer
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ServiceServer(name)` | -- | Construct a server for the named service |
+| `.set_handler(fn)` | `void` | Set the request handler callback |
+| `operator bool()` | `bool` | Check if the server handle is valid |
+
+## Quick Reference -- ActionClient
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ActionClient(name)` | -- | Construct a client for the named action |
+| `.send_goal(json)` | `GoalHandle` | Send a goal and get a handle to track it |
+| `operator bool()` | `bool` | Check if the client handle is valid |
+
+## Quick Reference -- ActionServer
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ActionServer(name)` | -- | Construct a server for the named action |
+| `.set_accept_handler(fn)` | `void` | Set the goal acceptance callback |
+| `.set_execute_handler(fn)` | `void` | Set the goal execution callback |
+| `.is_ready()` | `bool` | Check if both handlers are set |
+| `operator bool()` | `bool` | Check if the server handle is valid |
+
+## Quick Reference -- GoalHandle
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.status()` | `GoalStatus` | Current status of the goal |
+| `.id()` | `uint64_t` | Unique goal identifier |
+| `.is_active()` | `bool` | True if Pending or Active |
+| `.cancel()` | `void` | Request cancellation of the goal |
+| `operator bool()` | `bool` | Check if the handle is valid |
+
+## Quick Reference -- GoalStatus Enum
+
+| Value | Description |
+|-------|-------------|
+| `GoalStatus::Pending` | Goal accepted, waiting to start |
+| `GoalStatus::Active` | Goal is executing |
+| `GoalStatus::Succeeded` | Goal completed successfully |
+| `GoalStatus::Aborted` | Goal failed during execution |
+| `GoalStatus::Canceled` | Goal was canceled by client |
+| `GoalStatus::Rejected` | Goal was rejected by server |
+
+---
+
+## Services -- Request/Response RPC
+
+Services implement a synchronous request/response pattern. A client sends a JSON request and blocks until the server responds or a timeout expires.
+
+### ServiceClient
+
+Create a client by name. Call `.call()` with a JSON string and a timeout:
+
+```cpp
+#include <horus/service.hpp>
+#include <chrono>
+
+using namespace std::chrono_literals;
+
 horus::ServiceClient client("add_two_ints");
-auto resp = client.call(R"({"a":3,"b":4})", std::chrono::milliseconds(1000));
-if (resp) {
-    // resp.value() == "{\"sum\":7}"
+
+// Check that the handle was created successfully
+if (!client) {
+    fprintf(stderr, "Failed to create service client\n");
+    return;
+}
+
+// Send request, wait up to 1 second for response
+auto response = client.call(R"({"a": 3, "b": 4})", 1000ms);
+
+if (response) {
+    printf("Response: %s\n", response->c_str());
+    // Output: {"sum": 7}
+} else {
+    printf("Service call timed out or failed\n");
 }
 ```
 
-## ServiceServer
+The `call()` method accepts both `const char*` and `const std::string&`:
 
-| Method | Description |
-|--------|-------------|
-| `ServiceServer(name)` | Create server for named service |
-| `set_handler(fn)` | Set: `bool(const uint8_t* req, size_t len, uint8_t* res, size_t* res_len)` |
-| `operator bool()` | Check if valid |
+```cpp
+// String literal
+auto r1 = client.call(R"({"x": 1.0})", 500ms);
 
-## ActionClient
+// std::string
+std::string request = R"({"x": 1.0, "y": 2.0})";
+auto r2 = client.call(request, 500ms);
+```
 
-| Method | Description |
-|--------|-------------|
-| `ActionClient(name)` | Create client for named action |
-| `send_goal(json)` | Send goal → `GoalHandle` |
-| `operator bool()` | Check if valid |
+### ServiceServer
 
-## GoalHandle
+Create a server and set a handler function. The handler receives raw bytes (the JSON request) and writes raw bytes (the JSON response):
 
-| Method | Description |
-|--------|-------------|
-| `status()` | `GoalStatus` enum |
-| `id()` | Goal ID (`uint64_t`) |
-| `is_active()` | Still running? |
-| `cancel()` | Request cancellation |
-| `operator bool()` | Valid handle? |
+```cpp
+#include <horus/service.hpp>
+#include <cstring>
+#include <cstdio>
 
-`GoalStatus`: `Pending`, `Active`, `Succeeded`, `Aborted`, `Canceled`, `Rejected`
+horus::ServiceServer server("add_two_ints");
 
-## ActionServer
+server.set_handler([](const uint8_t* req, size_t req_len,
+                      uint8_t* res, size_t* res_len) -> bool {
+    // Parse request (in production, use a JSON library)
+    // For this example, assume req is: {"a": 3, "b": 4}
+    int a = 3, b = 4;  // parsed from req
 
-| Method | Description |
-|--------|-------------|
-| `ActionServer(name)` | Create server |
-| `set_accept_handler(fn)` | `uint8_t(const uint8_t* goal, size_t len)` → 0=accept, 1=reject |
-| `set_execute_handler(fn)` | `void(uint64_t goal_id, const uint8_t* goal, size_t len)` |
-| `is_ready()` | Both handlers set? |
-| `operator bool()` | Check if valid |
+    // Write response
+    int written = snprintf(reinterpret_cast<char*>(res), 4096,
+                           R"({"sum": %d})", a + b);
+    *res_len = static_cast<size_t>(written);
+    return true;  // true = success, false = error
+});
+```
 
-## Transport
+The handler signature is:
 
-Services and actions use `JsonWireMessage` (4KB Pod struct) over SHM topics:
-- Service: `{name}.request` + `{name}.response.{client_pid}`
-- Action: `{name}.goal` + `{name}.feedback` + `{name}.result`
+```cpp
+using Handler = bool(*)(const uint8_t* req, size_t req_len,
+                        uint8_t* res, size_t* res_len);
+```
 
-Works same-process and cross-process.
+- `req` / `req_len`: Request payload (JSON bytes)
+- `res` / `res_len`: Response buffer (4096 bytes max) -- write your response here
+- Return `true` for success, `false` for error
+
+---
+
+## Actions -- Long-Running Tasks
+
+Actions handle operations that take time to complete, like navigation or trajectory execution. The client sends a goal and gets a `GoalHandle` to track progress and request cancellation. The server accepts or rejects goals and executes them asynchronously.
+
+### ActionClient
+
+Create a client, send a goal as JSON, and track it via `GoalHandle`:
+
+```cpp
+#include <horus/action.hpp>
+
+horus::ActionClient client("navigate_to_pose");
+if (!client) return;
+
+auto goal = client.send_goal(R"({"target_x": 5.0, "target_y": 3.0})");
+if (!goal) return;
+
+printf("Goal %lu submitted\n", goal.id());
+
+// Poll until complete
+while (goal.is_active()) { /* do other work or sleep */ }
+
+if (goal.status() == horus::GoalStatus::Succeeded) {
+    printf("Navigation complete!\n");
+}
+```
+
+### Canceling a Goal
+
+Call `cancel()` on the `GoalHandle` to request cancellation:
+
+```cpp
+auto goal = client.send_goal(R"({"x": 10.0, "y": 0.0})");
+// Cancel after 5 seconds if not done
+std::this_thread::sleep_for(std::chrono::seconds(5));
+if (goal.is_active()) goal.cancel();
+```
+
+### GoalHandle Lifecycle
+
+```
+send_goal() --> Pending --> Active --> Succeeded
+                  |           |
+                  |           +--> Aborted (server error)
+                  |           +--> Canceled (client cancel)
+                  |
+                  +--> Rejected (server rejects)
+```
+
+The `is_active()` method returns `true` for `Pending` and `Active` states, `false` for all terminal states.
+
+### ActionServer
+
+Create a server with two handlers: one to accept/reject goals, one to execute them:
+
+```cpp
+#include <horus/action.hpp>
+
+horus::ActionServer server("navigate_to_pose");
+
+// Accept handler: receives goal data, returns 0 to accept, 1 to reject
+server.set_accept_handler([](const uint8_t* goal_data, size_t len) -> uint8_t {
+    // Parse goal JSON, validate parameters
+    // Return 0 = accept, 1 = reject
+    return 0;  // accept all goals
+});
+
+// Execute handler: receives goal_id and goal data, runs the task
+server.set_execute_handler([](uint64_t goal_id,
+                              const uint8_t* goal_data, size_t len) {
+    printf("Executing goal %lu\n", goal_id);
+    // Parse goal, execute navigation...
+    // When done, the goal transitions to Succeeded/Aborted automatically
+});
+
+// Verify both handlers are set
+if (server.is_ready()) {
+    printf("Action server ready\n");
+}
+```
+
+The handler signatures are:
+
+```cpp
+using AcceptHandler  = uint8_t(*)(const uint8_t* goal, size_t len);
+using ExecuteHandler = void(*)(uint64_t goal_id, const uint8_t* goal, size_t len);
+```
+
+---
+
+## JSON Wire Transport
+
+Services and actions use JSON as the wire format, serialized into `JsonWireMessage` Pod structs (4 KB each) transported over SHM topics. This design means:
+
+- **No code generation**: No `.srv` or `.action` IDL files. Just send/receive JSON strings
+- **Cross-language**: A Rust service server can handle requests from a C++ client (and vice versa)
+- **Cross-process**: Uses the same SHM transport as topics -- works across processes automatically
+- **Debugging**: JSON payloads are human-readable in `horus monitor` and BlackBox recordings
+
+### Topic Layout
+
+Each service creates two internal topics:
+
+```
+{name}.request                    -- client sends request here
+{name}.response.{client_pid}      -- server sends response here (per-client)
+```
+
+Each action creates three internal topics:
+
+```
+{name}.goal                       -- client sends goals here
+{name}.feedback                   -- server publishes progress here
+{name}.result                     -- server publishes final result here
+```
+
+These are standard HORUS topics -- you can monitor them with `horus topic list` and `horus monitor`.
+
+## Ownership and Move Semantics
+
+All service and action types are **move-only**. Copy is deleted:
+
+```cpp
+horus::ServiceClient a("my_svc");
+// horus::ServiceClient b = a;           // COMPILE ERROR
+horus::ServiceClient b = std::move(a);   // OK
+
+horus::GoalHandle g = client.send_goal("{}");
+// horus::GoalHandle g2 = g;             // COMPILE ERROR
+horus::GoalHandle g2 = std::move(g);     // OK
+```
+
+Resources are released in destructors via the C FFI (`horus_*_destroy` functions). Use RAII -- do not call destroy manually.
+
+---
+
+## Common Patterns
+
+### Service with JSON Library
+
+In production, use a JSON library (nlohmann/json, rapidjson, simdjson) for parsing:
+
+```cpp
+#include <horus/service.hpp>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+horus::ServiceServer server("compute_ik");
+
+server.set_handler([](const uint8_t* req, size_t req_len,
+                      uint8_t* res, size_t* res_len) -> bool {
+    auto request = json::parse(req, req + req_len);
+
+    double x = request["target_x"];
+    double y = request["target_y"];
+    double z = request["target_z"];
+
+    // Compute inverse kinematics...
+    json response = {
+        {"joint_angles", {0.1, 0.5, -0.3, 0.0, 1.2, 0.0}},
+        {"success", true}
+    };
+
+    std::string resp_str = response.dump();
+    std::memcpy(res, resp_str.data(), resp_str.size());
+    *res_len = resp_str.size();
+    return true;
+});
+```
+
+### Cross-Process Service Call
+
+Services work across processes with no extra configuration. Start the server in one process and the client in another -- they communicate via SHM automatically:
+
+```cpp
+// Process A: server
+horus::ServiceServer server("robot.status");
+server.set_handler([](const uint8_t*, size_t,
+                      uint8_t* res, size_t* res_len) -> bool {
+    const char* s = R"({"battery": 85, "state": "idle"})";
+    std::memcpy(res, s, strlen(s));
+    *res_len = strlen(s);
+    return true;
+});
+```
+
+```cpp
+// Process B: client
+horus::ServiceClient client("robot.status");
+auto resp = client.call("{}", std::chrono::milliseconds(500));
+if (resp) printf("Robot status: %s\n", resp->c_str());
+```
+
+### Action with Scheduler Integration
+
+Run an action server inside a scheduled node for navigation:
+
+```cpp
+horus::ActionServer nav_server("navigate");
+bool nav_active = false;
+
+nav_server.set_accept_handler([&](const uint8_t*, size_t) -> uint8_t {
+    return nav_active ? 1 : 0;  // reject if already navigating
+});
+nav_server.set_execute_handler([&](uint64_t id, const uint8_t* data, size_t len) {
+    nav_active = true;
+    // parse target from data...
+});
+
+auto odom_sub = sched.subscribe<horus::msg::Odometry>("odom");
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+
+sched.add("nav_executor").rate(50_hz)
+    .tick([&] {
+        if (!nav_active) return;
+        auto odom = odom_sub.recv();
+        if (!odom) return;
+        double dist = std::sqrt(/* dx^2 + dy^2 */);
+        if (dist < 0.1) {
+            nav_active = false;
+            cmd_pub.send(horus::msg::CmdVel{0, 0.0f, 0.0f});
+        } else {
+            cmd_pub.send(horus::msg::CmdVel{0, 0.3f, 0.0f});
+        }
+    }).build();
+```
+
+---
 
 ## See Also
 
-- [Tutorial: Services & Actions](/docs/tutorials/06-services-actions-cpp)
+- [Scheduler API](/cpp/api/scheduler) -- Where services and actions are registered alongside nodes
+- [Node API](/cpp/api/node) -- Node lifecycle for hosting service/action servers
+- [Publisher and Subscriber API](/cpp/api/topic) -- The underlying SHM transport
+- [C++ API Overview](/cpp/api) -- All classes at a glance
+- [Rust Services API](/rust/api/services) -- Equivalent Rust service API
+- [Rust Actions API](/rust/api/actions) -- Equivalent Rust action API
 
 ---
 ## TensorPool, Image & PointCloud API
@@ -96387,7 +97299,7 @@ The pool system has four classes arranged in a hierarchy:
 | `Image` | Camera frame with width, height, and pixel encoding |
 | `PointCloud` | Lidar scan with per-point fields (XYZ, intensity, color) |
 
-`Image` and `PointCloud` are convenience wrappers over pool-backed memory. All three data types share the same underlying SHM mechanism -- when you publish an `Image` on a topic, subscribers get a pointer into the same memory region with zero copies.
+`Image` and `PointCloud` are convenience wrappers over pool-backed memory. When you publish any pool-backed type on a topic, subscribers get a pointer into the same SHM region -- zero copies.
 
 ---
 
@@ -96479,29 +97391,13 @@ horus::Tensor tensor(
 | `ndim` | `size_t` | Number of dimensions (rank of the tensor). |
 | `dtype` | `Dtype` | Element data type. See Dtype enum below. |
 
-### data()
+### Methods
 
-```cpp
-uint8_t* data() const;
-```
-
-Returns a raw pointer to the tensor's memory. Cast to the appropriate type based on `dtype`.
-
-### nbytes()
-
-```cpp
-uint64_t nbytes() const;
-```
-
-Returns the total size of the tensor in bytes (product of all dimensions multiplied by element size).
-
-### release()
-
-```cpp
-void release();
-```
-
-Explicitly returns the memory slot to the pool. Called automatically on destruction, but can be called early to free the slot sooner.
+| Method | Return | Description |
+|--------|--------|-------------|
+| `data()` | `uint8_t*` | Raw pointer to tensor memory. Cast based on `dtype`. |
+| `nbytes()` | `uint64_t` | Total size in bytes (product of dimensions * element size). |
+| `release()` | `void` | Returns the slot to the pool early. Called automatically on destruction. |
 
 ---
 
@@ -97055,16 +97951,10 @@ Adds a frame to the tree under the specified parent.
 
 ```cpp
 horus::TransformFrame tf;
-
-// Root frame (no parent)
-tf.register_frame("world");
-
-// Child frames
-tf.register_frame("base_link", "world");
-tf.register_frame("shoulder", "base_link");
-tf.register_frame("elbow", "shoulder");
-tf.register_frame("wrist", "elbow");
-tf.register_frame("camera", "base_link");
+tf.register_frame("world");                    // root (no parent)
+tf.register_frame("base_link", "world");       // child of world
+tf.register_frame("shoulder", "base_link");    // child of base_link
+tf.register_frame("camera", "base_link");      // another child of base_link
 ```
 
 ---
@@ -97127,9 +98017,7 @@ Computes the transform that converts a point in the `source` frame to the `targe
 auto result = tf.lookup("camera", "world");
 if (result.has_value()) {
     auto& t = *result;
-    // t.translation = [x, y, z] of camera in world frame
-    // t.rotation    = [qx, qy, qz, qw] of camera in world frame
-    double cam_x = t.translation[0];
+    double cam_x = t.translation[0];  // camera X in world frame
     double cam_y = t.translation[1];
     double cam_z = t.translation[2];
 }
@@ -98308,3 +99196,250 @@ cam.distortion[4] = 0.0;    // k3
 
 - [Sensor Messages](/docs/cpp/api/sensor-messages) — LaserScan, Imu for perception input
 - [TensorPool API](/docs/cpp/api/pool) — Image and PointCloud for raw perception data
+
+---
+## Diagnostics Messages
+Path: /cpp/api/diagnostics-messages
+Description: Heartbeat, EmergencyStop, DiagnosticStatus, ResourceUsage, SafetyStatus, NodeHeartbeat
+
+# Diagnostics Messages (C++)
+
+System health and safety types in `horus::msg::`. Include via `<horus/msg/diagnostics.hpp>`.
+
+## Quick Reference
+
+| Type | Key Fields | Use Case |
+|------|------------|----------|
+| `Heartbeat` | `node_id[32]`, `sequence`, `alive`, `cpu_usage`, `memory_usage` | Node liveness |
+| `EmergencyStop` | `engaged` (u8), `reason[64]`, `source[32]`, `auto_reset` | Safety stop |
+| `DiagnosticStatus` | `level` (0-3), `message[256]` | Component health |
+| `ResourceUsage` | `cpu_percent`, `memory_mb`, `disk_percent` | System resources |
+| `NodeHeartbeat` | `node_name[32]`, `tick_rate`, `cpu_usage`, `uptime_ms` | Per-node metrics |
+| `SafetyStatus` | `safe` (bool), `confidence`, `last_fault[128]` | Safety system state |
+| `DiagnosticValue` | `key[32]`, `value[64]`, `value_type` | Key-value diagnostic |
+| `DiagnosticReport` | `component[32]`, `values[16]`, `level` | Multi-value report |
+
+## Heartbeat
+
+Published periodically to prove a node is alive:
+
+```cpp
+class HeartbeatPublisher : public horus::Node {
+public:
+    HeartbeatPublisher() : Node("heartbeat_pub") {
+        hb_pub_ = advertise<horus::msg::Heartbeat>("heartbeat");
+    }
+
+    void tick() override {
+        if (++tick_ % 100 != 0) return;  // 1 Hz at 100 Hz scheduler
+
+        horus::msg::Heartbeat hb{};
+        std::strncpy(reinterpret_cast<char*>(hb.node_id), "motor_ctrl", 31);
+        hb.sequence = seq_++;
+        hb.alive = true;
+        hb.cpu_usage = 12.5f;     // percent
+        hb.memory_usage = 45.0f;  // MB
+        hb_pub_->send(hb);
+    }
+
+private:
+    horus::Publisher<horus::msg::Heartbeat>* hb_pub_;
+    uint64_t seq_ = 0;
+    int tick_ = 0;
+};
+```
+
+## EmergencyStop
+
+The most safety-critical message. `engaged=1` means all actuators must stop immediately:
+
+```cpp
+// Trigger e-stop
+horus::msg::EmergencyStop estop{};
+estop.engaged = 1;
+std::strncpy(reinterpret_cast<char*>(estop.reason), "Obstacle < 10cm", 63);
+std::strncpy(reinterpret_cast<char*>(estop.source), "safety_monitor", 31);
+estop.auto_reset = 0;  // manual reset required
+estop_pub_->send(estop);
+
+// Clear e-stop
+horus::msg::EmergencyStop clear{};
+clear.engaged = 0;
+estop_pub_->send(clear);
+```
+
+**Convention:** Every actuator node must subscribe to `"emergency.stop"` and zero outputs when `engaged == 1`.
+
+## DiagnosticReport — Multi-Value Health Check
+
+```cpp
+horus::msg::DiagnosticReport report{};
+std::strncpy(reinterpret_cast<char*>(report.component), "motor_driver", 31);
+report.level = 1;  // 0=OK, 1=WARN, 2=ERROR
+report.value_count = 3;
+
+// Value 0: temperature
+std::strncpy(reinterpret_cast<char*>(report.values[0].key), "temperature", 31);
+std::strncpy(reinterpret_cast<char*>(report.values[0].value), "72.5", 63);
+report.values[0].value_type = 2;  // float
+
+// Value 1: current
+std::strncpy(reinterpret_cast<char*>(report.values[1].key), "current_amps", 31);
+std::strncpy(reinterpret_cast<char*>(report.values[1].value), "3.2", 63);
+report.values[1].value_type = 2;
+
+// Value 2: status
+std::strncpy(reinterpret_cast<char*>(report.values[2].key), "status", 31);
+std::strncpy(reinterpret_cast<char*>(report.values[2].value), "overheating", 63);
+report.values[2].value_type = 0;  // string
+```
+
+## See Also
+
+- [Recipe: Emergency Stop](/docs/recipes/emergency-stop-cpp) — full safety monitor implementation
+- [Guide: Real-Time](/docs/cpp/realtime) — watchdog and miss policies
+
+---
+## Force & Tactile Messages
+Path: /cpp/api/force-messages
+Description: WrenchStamped, ForceCommand, ContactInfo, HapticFeedback, ImpedanceParameters
+
+# Force & Tactile Messages (C++)
+
+Force/torque sensing and haptic types in `horus::msg::`. Include via `<horus/msg/force.hpp>`.
+
+## Quick Reference
+
+| Type | Key Fields | Use Case |
+|------|------------|----------|
+| `WrenchStamped` | `force[3]`, `torque[3]` | Force/torque sensor |
+| `ForceCommand` | `target_force[3]`, `target_torque[3]`, `stiffness`, `damping` | Force control |
+| `ContactInfo` | `position[3]`, `normal[3]`, `force_magnitude`, `in_contact` | Contact detection |
+| `HapticFeedback` | `force[3]`, `vibration_amplitude/freq`, `enabled` | Haptic devices |
+| `ImpedanceParameters` | `stiffness[6]`, `damping[6]`, `mass[6]` | Impedance control |
+
+## WrenchStamped — Force/Torque Sensor
+
+```cpp
+horus::msg::WrenchStamped wrench{};
+wrench.force[0] = 0.0;    // Fx (N)
+wrench.force[1] = 0.0;    // Fy (N)
+wrench.force[2] = -9.81;  // Fz (N) — gravity
+wrench.torque[0] = 0.0;   // Tx (Nm)
+wrench.torque[1] = 0.1;   // Ty (Nm)
+wrench.torque[2] = 0.0;   // Tz (Nm)
+wrench.timestamp_ns = 0;
+```
+
+## ForceCommand — Impedance/Force Control
+
+```cpp
+horus::msg::ForceCommand cmd{};
+cmd.target_force[2] = -5.0;   // push down 5N
+cmd.stiffness = 500.0f;        // N/m
+cmd.damping = 10.0f;           // Ns/m
+cmd.max_force = 20.0f;         // safety limit
+```
+
+## ContactInfo — Collision Detection
+
+```cpp
+// In a contact detection node:
+auto contact = contact_sub_->recv();
+if (contact && contact->get()->in_contact) {
+    double fx = contact->get()->force_magnitude;
+    horus::log::warn("contact", "Contact detected, force=" + std::to_string(fx) + "N");
+}
+```
+
+## See Also
+
+- [Sensor Messages](/docs/cpp/api/sensor-messages) — complementary sensor types
+- [Control Messages](/docs/cpp/api/control-messages) — MotorCommand, ServoCommand
+
+---
+## Tracking & Perception Messages
+Path: /cpp/api/tracking-messages
+Description: TrackedObject, Landmark, SegmentationMask, PointField, PlaneDetection
+
+# Tracking & Perception Messages (C++)
+
+Object tracking, landmarks, segmentation, and point cloud field types.
+
+## Tracking
+
+| Type | Key Fields | Use Case |
+|------|------------|----------|
+| `TrackedObject` | `track_id`, `position[3]`, `velocity[3]`, `confidence`, `age` | Multi-object tracking |
+| `TrackingHeader` | `frame_count`, `active_tracks` | Tracker metadata |
+
+```cpp
+horus::msg::TrackedObject obj{};
+obj.track_id = 42;
+obj.position[0] = 1.5;  // x meters
+obj.position[1] = 0.3;  // y
+obj.position[2] = 0.0;  // z
+obj.velocity[0] = 0.5;  // vx m/s
+obj.confidence = 0.92f;
+obj.age = 15;            // frames since first detection
+```
+
+## Landmarks
+
+| Type | Key Fields | Use Case |
+|------|------------|----------|
+| `Landmark` | `id`, `x`, `y`, `covariance[4]` | 2D SLAM landmark |
+| `Landmark3D` | `x`, `y`, `z`, `visibility`, `index` | Pose estimation (packed) |
+| `LandmarkArray` | `num_landmarks`, `confidence`, `bbox_*` | Body/hand pose output |
+
+```cpp
+horus::msg::LandmarkArray pose{};
+pose.num_landmarks = 21;    // hand keypoints
+pose.dimension = 3;         // 3D
+pose.confidence = 0.85f;
+pose.bbox_x = 100.0f;       // bounding box
+pose.bbox_y = 200.0f;
+pose.bbox_width = 80.0f;
+pose.bbox_height = 120.0f;
+```
+
+## Segmentation
+
+```cpp
+horus::msg::SegmentationMask mask{};
+mask.width = 640;
+mask.height = 480;
+mask.num_classes = 21;    // COCO classes
+mask.mask_type = 0;       // 0=semantic, 1=instance
+// Pixel data stored separately via Image/TensorPool
+```
+
+## Point Cloud Fields
+
+```cpp
+horus::msg::PointField field{};
+std::strncpy(reinterpret_cast<char*>(field.name), "x", 15);
+field.offset = 0;
+field.datatype = 0;   // 0=f32
+field.count = 1;
+```
+
+## Clock & Time
+
+| Type | Key Fields | Use Case |
+|------|------------|----------|
+| `Clock` | `nanoseconds`, `source` | Time synchronization |
+| `TimeReference` | `time_ref_ns`, `source[32]` | External time source |
+
+## Input
+
+| Type | Key Fields | Use Case |
+|------|------------|----------|
+| `KeyboardInput` | `key_code`, `pressed`, `modifiers` | Keyboard teleop |
+| `JoystickInput` | `axes[8]`, `buttons[16]`, `num_axes/buttons` | Gamepad control |
+| `AudioFrame` | `samples[4096]`, `sample_rate`, `channels` | Audio processing |
+
+## See Also
+
+- [Detection Messages](/docs/cpp/api/detection-messages) — BoundingBox, Detection
+- [TensorPool API](/docs/cpp/api/pool) — Image and PointCloud for raw data

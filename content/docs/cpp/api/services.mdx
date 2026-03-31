@@ -1,74 +1,399 @@
 ---
 title: "Services & Actions API"
-description: "Request/response RPC and long-running tasks with progress"
+description: "Complete API reference for HORUS C++ services (request/response RPC) and actions (long-running tasks with progress and cancellation)"
 sidebar_section: "C++"
 order: 54
 ---
 
-# Services & Actions API
+# Services and Actions API
 
-## ServiceClient
+HORUS provides two communication patterns beyond pub/sub topics: **services** for synchronous request/response RPC, and **actions** for long-running tasks with progress feedback and cancellation. Both use JSON as the wire format over shared memory topics, so they work same-process and cross-process with zero configuration.
 
-| Method | Description |
-|--------|-------------|
-| `ServiceClient(name)` | Create client for named service |
-| `call(json, timeout)` | Send request, wait for response → `optional<string>` |
-| `operator bool()` | Check if valid |
+> **Rust**: See [Services](/rust/api/services) and [Actions](/rust/api/actions) for the Rust API.
+> **Python**: Services and actions are available via the Python bindings.
 
 ```cpp
+// simplified
+#include <horus/service.hpp>
+#include <horus/action.hpp>
+```
+
+---
+
+## Quick Reference -- ServiceClient
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ServiceClient(name)` | -- | Construct a client for the named service |
+| `.call(json, timeout)` | `optional<string>` | Send request JSON, wait for response |
+| `operator bool()` | `bool` | Check if the client handle is valid |
+
+## Quick Reference -- ServiceServer
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ServiceServer(name)` | -- | Construct a server for the named service |
+| `.set_handler(fn)` | `void` | Set the request handler callback |
+| `operator bool()` | `bool` | Check if the server handle is valid |
+
+## Quick Reference -- ActionClient
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ActionClient(name)` | -- | Construct a client for the named action |
+| `.send_goal(json)` | `GoalHandle` | Send a goal and get a handle to track it |
+| `operator bool()` | `bool` | Check if the client handle is valid |
+
+## Quick Reference -- ActionServer
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `ActionServer(name)` | -- | Construct a server for the named action |
+| `.set_accept_handler(fn)` | `void` | Set the goal acceptance callback |
+| `.set_execute_handler(fn)` | `void` | Set the goal execution callback |
+| `.is_ready()` | `bool` | Check if both handlers are set |
+| `operator bool()` | `bool` | Check if the server handle is valid |
+
+## Quick Reference -- GoalHandle
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.status()` | `GoalStatus` | Current status of the goal |
+| `.id()` | `uint64_t` | Unique goal identifier |
+| `.is_active()` | `bool` | True if Pending or Active |
+| `.cancel()` | `void` | Request cancellation of the goal |
+| `operator bool()` | `bool` | Check if the handle is valid |
+
+## Quick Reference -- GoalStatus Enum
+
+| Value | Description |
+|-------|-------------|
+| `GoalStatus::Pending` | Goal accepted, waiting to start |
+| `GoalStatus::Active` | Goal is executing |
+| `GoalStatus::Succeeded` | Goal completed successfully |
+| `GoalStatus::Aborted` | Goal failed during execution |
+| `GoalStatus::Canceled` | Goal was canceled by client |
+| `GoalStatus::Rejected` | Goal was rejected by server |
+
+---
+
+## Services -- Request/Response RPC
+
+Services implement a synchronous request/response pattern. A client sends a JSON request and blocks until the server responds or a timeout expires.
+
+### ServiceClient
+
+Create a client by name. Call `.call()` with a JSON string and a timeout:
+
+```cpp
+#include <horus/service.hpp>
+#include <chrono>
+
+using namespace std::chrono_literals;
+
 horus::ServiceClient client("add_two_ints");
-auto resp = client.call(R"({"a":3,"b":4})", std::chrono::milliseconds(1000));
-if (resp) {
-    // resp.value() == "{\"sum\":7}"
+
+// Check that the handle was created successfully
+if (!client) {
+    fprintf(stderr, "Failed to create service client\n");
+    return;
+}
+
+// Send request, wait up to 1 second for response
+auto response = client.call(R"({"a": 3, "b": 4})", 1000ms);
+
+if (response) {
+    printf("Response: %s\n", response->c_str());
+    // Output: {"sum": 7}
+} else {
+    printf("Service call timed out or failed\n");
 }
 ```
 
-## ServiceServer
+The `call()` method accepts both `const char*` and `const std::string&`:
 
-| Method | Description |
-|--------|-------------|
-| `ServiceServer(name)` | Create server for named service |
-| `set_handler(fn)` | Set: `bool(const uint8_t* req, size_t len, uint8_t* res, size_t* res_len)` |
-| `operator bool()` | Check if valid |
+```cpp
+// String literal
+auto r1 = client.call(R"({"x": 1.0})", 500ms);
 
-## ActionClient
+// std::string
+std::string request = R"({"x": 1.0, "y": 2.0})";
+auto r2 = client.call(request, 500ms);
+```
 
-| Method | Description |
-|--------|-------------|
-| `ActionClient(name)` | Create client for named action |
-| `send_goal(json)` | Send goal → `GoalHandle` |
-| `operator bool()` | Check if valid |
+### ServiceServer
 
-## GoalHandle
+Create a server and set a handler function. The handler receives raw bytes (the JSON request) and writes raw bytes (the JSON response):
 
-| Method | Description |
-|--------|-------------|
-| `status()` | `GoalStatus` enum |
-| `id()` | Goal ID (`uint64_t`) |
-| `is_active()` | Still running? |
-| `cancel()` | Request cancellation |
-| `operator bool()` | Valid handle? |
+```cpp
+#include <horus/service.hpp>
+#include <cstring>
+#include <cstdio>
 
-`GoalStatus`: `Pending`, `Active`, `Succeeded`, `Aborted`, `Canceled`, `Rejected`
+horus::ServiceServer server("add_two_ints");
 
-## ActionServer
+server.set_handler([](const uint8_t* req, size_t req_len,
+                      uint8_t* res, size_t* res_len) -> bool {
+    // Parse request (in production, use a JSON library)
+    // For this example, assume req is: {"a": 3, "b": 4}
+    int a = 3, b = 4;  // parsed from req
 
-| Method | Description |
-|--------|-------------|
-| `ActionServer(name)` | Create server |
-| `set_accept_handler(fn)` | `uint8_t(const uint8_t* goal, size_t len)` → 0=accept, 1=reject |
-| `set_execute_handler(fn)` | `void(uint64_t goal_id, const uint8_t* goal, size_t len)` |
-| `is_ready()` | Both handlers set? |
-| `operator bool()` | Check if valid |
+    // Write response
+    int written = snprintf(reinterpret_cast<char*>(res), 4096,
+                           R"({"sum": %d})", a + b);
+    *res_len = static_cast<size_t>(written);
+    return true;  // true = success, false = error
+});
+```
 
-## Transport
+The handler signature is:
 
-Services and actions use `JsonWireMessage` (4KB Pod struct) over SHM topics:
-- Service: `{name}.request` + `{name}.response.{client_pid}`
-- Action: `{name}.goal` + `{name}.feedback` + `{name}.result`
+```cpp
+using Handler = bool(*)(const uint8_t* req, size_t req_len,
+                        uint8_t* res, size_t* res_len);
+```
 
-Works same-process and cross-process.
+- `req` / `req_len`: Request payload (JSON bytes)
+- `res` / `res_len`: Response buffer (4096 bytes max) -- write your response here
+- Return `true` for success, `false` for error
+
+---
+
+## Actions -- Long-Running Tasks
+
+Actions handle operations that take time to complete, like navigation or trajectory execution. The client sends a goal and gets a `GoalHandle` to track progress and request cancellation. The server accepts or rejects goals and executes them asynchronously.
+
+### ActionClient
+
+Create a client, send a goal as JSON, and track it via `GoalHandle`:
+
+```cpp
+#include <horus/action.hpp>
+
+horus::ActionClient client("navigate_to_pose");
+if (!client) return;
+
+auto goal = client.send_goal(R"({"target_x": 5.0, "target_y": 3.0})");
+if (!goal) return;
+
+printf("Goal %lu submitted\n", goal.id());
+
+// Poll until complete
+while (goal.is_active()) { /* do other work or sleep */ }
+
+if (goal.status() == horus::GoalStatus::Succeeded) {
+    printf("Navigation complete!\n");
+}
+```
+
+### Canceling a Goal
+
+Call `cancel()` on the `GoalHandle` to request cancellation:
+
+```cpp
+auto goal = client.send_goal(R"({"x": 10.0, "y": 0.0})");
+// Cancel after 5 seconds if not done
+std::this_thread::sleep_for(std::chrono::seconds(5));
+if (goal.is_active()) goal.cancel();
+```
+
+### GoalHandle Lifecycle
+
+```
+send_goal() --> Pending --> Active --> Succeeded
+                  |           |
+                  |           +--> Aborted (server error)
+                  |           +--> Canceled (client cancel)
+                  |
+                  +--> Rejected (server rejects)
+```
+
+The `is_active()` method returns `true` for `Pending` and `Active` states, `false` for all terminal states.
+
+### ActionServer
+
+Create a server with two handlers: one to accept/reject goals, one to execute them:
+
+```cpp
+#include <horus/action.hpp>
+
+horus::ActionServer server("navigate_to_pose");
+
+// Accept handler: receives goal data, returns 0 to accept, 1 to reject
+server.set_accept_handler([](const uint8_t* goal_data, size_t len) -> uint8_t {
+    // Parse goal JSON, validate parameters
+    // Return 0 = accept, 1 = reject
+    return 0;  // accept all goals
+});
+
+// Execute handler: receives goal_id and goal data, runs the task
+server.set_execute_handler([](uint64_t goal_id,
+                              const uint8_t* goal_data, size_t len) {
+    printf("Executing goal %lu\n", goal_id);
+    // Parse goal, execute navigation...
+    // When done, the goal transitions to Succeeded/Aborted automatically
+});
+
+// Verify both handlers are set
+if (server.is_ready()) {
+    printf("Action server ready\n");
+}
+```
+
+The handler signatures are:
+
+```cpp
+using AcceptHandler  = uint8_t(*)(const uint8_t* goal, size_t len);
+using ExecuteHandler = void(*)(uint64_t goal_id, const uint8_t* goal, size_t len);
+```
+
+---
+
+## JSON Wire Transport
+
+Services and actions use JSON as the wire format, serialized into `JsonWireMessage` Pod structs (4 KB each) transported over SHM topics. This design means:
+
+- **No code generation**: No `.srv` or `.action` IDL files. Just send/receive JSON strings
+- **Cross-language**: A Rust service server can handle requests from a C++ client (and vice versa)
+- **Cross-process**: Uses the same SHM transport as topics -- works across processes automatically
+- **Debugging**: JSON payloads are human-readable in `horus monitor` and BlackBox recordings
+
+### Topic Layout
+
+Each service creates two internal topics:
+
+```
+{name}.request                    -- client sends request here
+{name}.response.{client_pid}      -- server sends response here (per-client)
+```
+
+Each action creates three internal topics:
+
+```
+{name}.goal                       -- client sends goals here
+{name}.feedback                   -- server publishes progress here
+{name}.result                     -- server publishes final result here
+```
+
+These are standard HORUS topics -- you can monitor them with `horus topic list` and `horus monitor`.
+
+## Ownership and Move Semantics
+
+All service and action types are **move-only**. Copy is deleted:
+
+```cpp
+horus::ServiceClient a("my_svc");
+// horus::ServiceClient b = a;           // COMPILE ERROR
+horus::ServiceClient b = std::move(a);   // OK
+
+horus::GoalHandle g = client.send_goal("{}");
+// horus::GoalHandle g2 = g;             // COMPILE ERROR
+horus::GoalHandle g2 = std::move(g);     // OK
+```
+
+Resources are released in destructors via the C FFI (`horus_*_destroy` functions). Use RAII -- do not call destroy manually.
+
+---
+
+## Common Patterns
+
+### Service with JSON Library
+
+In production, use a JSON library (nlohmann/json, rapidjson, simdjson) for parsing:
+
+```cpp
+#include <horus/service.hpp>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+horus::ServiceServer server("compute_ik");
+
+server.set_handler([](const uint8_t* req, size_t req_len,
+                      uint8_t* res, size_t* res_len) -> bool {
+    auto request = json::parse(req, req + req_len);
+
+    double x = request["target_x"];
+    double y = request["target_y"];
+    double z = request["target_z"];
+
+    // Compute inverse kinematics...
+    json response = {
+        {"joint_angles", {0.1, 0.5, -0.3, 0.0, 1.2, 0.0}},
+        {"success", true}
+    };
+
+    std::string resp_str = response.dump();
+    std::memcpy(res, resp_str.data(), resp_str.size());
+    *res_len = resp_str.size();
+    return true;
+});
+```
+
+### Cross-Process Service Call
+
+Services work across processes with no extra configuration. Start the server in one process and the client in another -- they communicate via SHM automatically:
+
+```cpp
+// Process A: server
+horus::ServiceServer server("robot.status");
+server.set_handler([](const uint8_t*, size_t,
+                      uint8_t* res, size_t* res_len) -> bool {
+    const char* s = R"({"battery": 85, "state": "idle"})";
+    std::memcpy(res, s, strlen(s));
+    *res_len = strlen(s);
+    return true;
+});
+```
+
+```cpp
+// Process B: client
+horus::ServiceClient client("robot.status");
+auto resp = client.call("{}", std::chrono::milliseconds(500));
+if (resp) printf("Robot status: %s\n", resp->c_str());
+```
+
+### Action with Scheduler Integration
+
+Run an action server inside a scheduled node for navigation:
+
+```cpp
+horus::ActionServer nav_server("navigate");
+bool nav_active = false;
+
+nav_server.set_accept_handler([&](const uint8_t*, size_t) -> uint8_t {
+    return nav_active ? 1 : 0;  // reject if already navigating
+});
+nav_server.set_execute_handler([&](uint64_t id, const uint8_t* data, size_t len) {
+    nav_active = true;
+    // parse target from data...
+});
+
+auto odom_sub = sched.subscribe<horus::msg::Odometry>("odom");
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+
+sched.add("nav_executor").rate(50_hz)
+    .tick([&] {
+        if (!nav_active) return;
+        auto odom = odom_sub.recv();
+        if (!odom) return;
+        double dist = std::sqrt(/* dx^2 + dy^2 */);
+        if (dist < 0.1) {
+            nav_active = false;
+            cmd_pub.send(horus::msg::CmdVel{0, 0.0f, 0.0f});
+        } else {
+            cmd_pub.send(horus::msg::CmdVel{0, 0.3f, 0.0f});
+        }
+    }).build();
+```
+
+---
 
 ## See Also
 
-- [Tutorial: Services & Actions](/docs/tutorials/06-services-actions-cpp)
+- [Scheduler API](/cpp/api/scheduler) -- Where services and actions are registered alongside nodes
+- [Node API](/cpp/api/node) -- Node lifecycle for hosting service/action servers
+- [Publisher and Subscriber API](/cpp/api/topic) -- The underlying SHM transport
+- [C++ API Overview](/cpp/api) -- All classes at a glance
+- [Rust Services API](/rust/api/services) -- Equivalent Rust service API
+- [Rust Actions API](/rust/api/actions) -- Equivalent Rust action API
