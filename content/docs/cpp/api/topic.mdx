@@ -1,0 +1,481 @@
+---
+title: "Publisher & Subscriber API"
+description: "Complete API reference for HORUS C++ zero-copy IPC — Publisher, Subscriber, LoanedSample, BorrowedSample, and all 51 message types"
+sidebar_section: "C++"
+order: 53
+---
+
+# Publisher and Subscriber API
+
+HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` writes messages, `Subscriber<T>` reads them -- both zero-copy. The loan pattern lets you write directly into shared memory without any intermediate buffers or serialization.
+
+> **Rust**: See [`Topic<T>`](/rust/api/topic) for the Rust unified pub/sub API.
+> **Python**: See [`node.send()` / `node.recv()`](/python/api) for the Python wrapper.
+
+```cpp
+// simplified
+#include <horus/topic.hpp>
+#include <horus/messages.hpp>
+```
+
+---
+
+## Quick Reference -- `Publisher<T>`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.loan()` | `LoanedSample<T>` | Get a writable buffer from SHM (zero-copy) |
+| `.publish(LoanedSample<T>&&)` | `void` | Make a loaned sample visible to subscribers |
+| `.send(const T&)` | `void` | Send a message by copy (simpler API) |
+| `.name()` | `const string&` | Get the topic name |
+
+## Quick Reference -- `Subscriber<T>`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.recv()` | `optional<BorrowedSample<T>>` | Receive the next message (nullopt if none) |
+| `.has_msg()` | `bool` | Check if a message is available without consuming |
+| `.name()` | `const string&` | Get the topic name |
+
+## Quick Reference -- `LoanedSample<T>`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `operator->()` | `T*` / `const T*` | Direct SHM pointer access (zero-copy write) |
+| `operator*()` | `T&` / `const T&` | Dereference to the data |
+| `.get()` | `T*` / `const T*` | Raw pointer to the data |
+
+## Quick Reference -- `BorrowedSample<T>`
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `operator->()` | `const T*` | Read-only pointer access |
+| `operator*()` | `const T&` | Read-only dereference |
+| `.get()` | `const T*` | Raw read-only pointer |
+
+---
+
+## Creating Topics
+
+Topics are created on the `Scheduler` or inside a `Node` / `LambdaNode`. Topic names use **dots** as separators (not slashes), required for macOS `shm_open` compatibility.
+
+### On the Scheduler (for Lambda Nodes)
+
+```cpp
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+auto scan_sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+```
+
+### Inside a Node Subclass (Constructor)
+
+```cpp
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        cmd_pub_  = advertise<horus::msg::CmdVel>("motor.cmd");
+    }
+    // ...
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
+    horus::Publisher<horus::msg::CmdVel>* cmd_pub_;
+};
+```
+
+### Inside a LambdaNode (Builder)
+
+```cpp
+auto node = horus::LambdaNode("controller")
+    .sub<horus::msg::LaserScan>("lidar.scan")
+    .pub<horus::msg::CmdVel>("motor.cmd");
+```
+
+---
+
+## Zero-Copy Loan Pattern
+
+The loan pattern is the primary way to publish messages in HORUS. It eliminates all copies between producer and consumer.
+
+### How It Works
+
+```
+1. pub.loan()                    --> SHM allocates a slot, returns LoanedSample<T>
+2. sample->field = value         --> writes directly into SHM (0 ns copy overhead)
+3. pub.publish(std::move(sample))--> flips visibility flag, subscribers can read
+```
+
+### Full Example
+
+```cpp
+auto pub = sched.advertise<horus::msg::Odometry>("odom");
+
+sched.add("localizer")
+    .rate(100_hz)
+    .tick([&] {
+        // Step 1: Loan a writable slot from shared memory
+        auto sample = pub.loan();
+
+        // Step 2: Write directly into SHM (zero copy)
+        sample->pose.x = current_x;
+        sample->pose.y = current_y;
+        sample->pose.theta = current_theta;
+        sample->timestamp_ns = now_ns();
+
+        // Step 3: Publish (consumes the sample via move)
+        pub.publish(std::move(sample));
+    })
+    .build();
+```
+
+After `publish()`, the `LoanedSample` is consumed (moved). Attempting to use it after publish is a compile error.
+
+### LoanedSample Access Patterns
+
+```cpp
+auto sample = pub.loan();
+
+// Arrow operator -- most common
+sample->linear = 0.5f;
+sample->angular = 0.1f;
+
+// Dereference operator
+horus::msg::CmdVel& ref = *sample;
+ref.linear = 0.5f;
+
+// Raw pointer
+horus::msg::CmdVel* ptr = sample.get();
+ptr->linear = 0.5f;
+```
+
+---
+
+## Send-by-Copy Pattern
+
+For simplicity or small messages, `send()` copies the message into shared memory in one call:
+
+```cpp
+auto pub = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+
+// Single-call publish -- copies msg into SHM
+pub.send(horus::msg::CmdVel{0, 0.5f, 0.1f});
+```
+
+This is equivalent to `loan()` + write + `publish()` but performs one copy. For small messages like `CmdVel` (16 bytes), the overhead is negligible. For large messages like `LaserScan` (1468 bytes) or `Odometry`, prefer the loan pattern.
+
+| Pattern | Copy Count | Best For |
+|---------|-----------|----------|
+| `loan()` + `publish()` | **0** | Large messages, high-frequency topics |
+| `send()` | **1** | Small messages, simple code |
+
+---
+
+## Receiving Messages
+
+### Basic Receive
+
+`recv()` returns `std::optional<BorrowedSample<T>>`. If no message is available, it returns `std::nullopt`:
+
+```cpp
+auto sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+
+sched.add("processor")
+    .rate(50_hz)
+    .tick([&] {
+        auto scan = sub.recv();
+        if (!scan) return;  // no message this tick
+
+        // Access fields through arrow operator (read-only)
+        float front_range = scan->ranges[0];
+        float min_range = scan->min_range;
+
+        // Dereference
+        const horus::msg::LaserScan& data = *scan;
+
+        // Raw pointer
+        const horus::msg::LaserScan* ptr = scan->get();
+    })
+    .build();
+```
+
+### Check Before Consuming
+
+Use `has_msg()` to check availability without consuming the message:
+
+```cpp
+sched.add("conditional_processor")
+    .rate(50_hz)
+    .tick([&] {
+        if (!scan_sub.has_msg()) {
+            // No scan available -- do something else
+            return;
+        }
+        auto scan = scan_sub.recv();
+        // guaranteed to have a value
+    })
+    .build();
+```
+
+### BorrowedSample Lifetime
+
+The `BorrowedSample` is valid until it goes out of scope. RAII releases the SHM slot automatically:
+
+```cpp
+{
+    auto scan = sub.recv();
+    if (scan) {
+        process(*scan);   // valid here
+    }
+}   // BorrowedSample released here -- SHM slot freed
+```
+
+---
+
+## Move Semantics
+
+All topic types are **move-only**. Copy constructors and copy assignment operators are deleted. This enforces single ownership, matching Rust's ownership model:
+
+```cpp
+auto pub = sched.advertise<horus::msg::CmdVel>("cmd");
+// auto pub2 = pub;                 // COMPILE ERROR: copy deleted
+auto pub2 = std::move(pub);         // OK: ownership transferred
+
+auto sample = pub2.loan();
+// auto sample2 = sample;           // COMPILE ERROR: copy deleted
+pub2.publish(std::move(sample));     // OK: consumed by publish
+// sample->linear = 1.0;            // COMPILE ERROR: sample was moved
+```
+
+---
+
+## HORUS_TOPIC_IMPL Macro (Internal)
+
+Each supported message type gets a `Publisher<T>` and `Subscriber<T>` template specialization generated via the `HORUS_TOPIC_IMPL` macro in `impl/topic_impl.hpp`. The macro routes each type through the type-specific C API functions (`horus_publisher_<name>_send`, etc.):
+
+```cpp
+// Internal -- users do not call this
+#define HORUS_TOPIC_IMPL(CppType, c_snake)  // generates specializations
+```
+
+This is transparent to users. You simply use `Publisher<horus::msg::CmdVel>` and the correct specialization is selected at compile time.
+
+---
+
+## Supported Message Types (51)
+
+All message types live in the `horus::msg` namespace. They are `#[repr(C)]` compatible with Rust for zero-copy SHM IPC.
+
+### Geometry (12 types)
+
+| Type | Size | Description |
+|------|------|-------------|
+| `Point3` | 24 B | 3D point (x, y, z) |
+| `Vector3` | 24 B | 3D vector (x, y, z) |
+| `Quaternion` | 32 B | Quaternion rotation (x, y, z, w) |
+| `Twist` | 56 B | 6-DOF velocity (linear + angular) |
+| `Pose2D` | 32 B | 2D position + orientation |
+| `TransformStamped` | 64 B | 3D translation + quaternion |
+| `Pose3D` | 64 B | 3D position + orientation |
+| `PoseStamped` | 120 B | Pose3D with frame ID |
+| `PoseWithCovariance` | -- | Pose3D with 6x6 covariance |
+| `TwistWithCovariance` | -- | Twist with 6x6 covariance |
+| `Accel` | 56 B | 6-DOF acceleration |
+| `AccelStamped` | -- | Accel with frame ID |
+
+### Sensor (11 types)
+
+| Type | Description |
+|------|-------------|
+| `LaserScan` | 2D LiDAR scan (360 fixed ranges) |
+| `Imu` | Orientation + angular velocity + linear acceleration |
+| `Odometry` | Pose + velocity with covariance |
+| `RangeSensor` | Ultrasonic/infrared range |
+| `BatteryState` | Voltage, current, charge, health |
+| `NavSatFix` | GPS/GNSS fix with covariance |
+| `MagneticField` | Magnetometer reading |
+| `Temperature` | Temperature in Celsius |
+| `FluidPressure` | Pressure in Pascals |
+| `Illuminance` | Light level in Lux |
+| `JointState` | Joint positions, velocities, efforts (up to 16) |
+
+### Control (7 types)
+
+| Type | Description |
+|------|-------------|
+| `CmdVel` | 2D velocity command (linear + angular, 16 B) |
+| `MotorCommand` | Single motor control |
+| `DifferentialDriveCommand` | Two-wheel drive |
+| `ServoCommand` | Servo/actuator position |
+| `PidConfig` | PID tuning parameters |
+| `TrajectoryPoint` | Waypoint with velocities + accelerations |
+| `JointCommand` | Joint target position + velocity |
+
+### Navigation (5 types)
+
+| Type | Description |
+|------|-------------|
+| `NavGoal` | 2D navigation target |
+| `GoalResult` | Navigation result (success, errors) |
+| `Waypoint` | Single path waypoint |
+| `VelocityObstacle` | Collision avoidance obstacle |
+| `PathPlan` | Full path (up to 256 waypoints) |
+
+### Diagnostics (8 types)
+
+| Type | Description |
+|------|-------------|
+| `Heartbeat` | Node liveness signal |
+| `DiagnosticStatus` | Status message (OK/WARN/ERROR/CRITICAL) |
+| `EmergencyStop` | E-stop signal |
+| `ResourceUsage` | CPU, memory, disk usage |
+| `NodeHeartbeat` | Per-node heartbeat with metrics |
+| `SafetyStatus` | Safety system status |
+| `DiagnosticValue` | Key-value diagnostic pair |
+| `DiagnosticReport` | Multi-value diagnostic report |
+
+### Detection and Perception (10 types)
+
+| Type | Description |
+|------|-------------|
+| `BoundingBox2D` | 2D bounding box |
+| `BoundingBox3D` | 3D bounding box with rotation |
+| `Detection` | 2D object detection |
+| `Detection3D` | 3D detection with velocity |
+| `Landmark` | 2D landmark |
+| `Landmark3D` | 3D landmark |
+| `LandmarkArray` | Landmark collection with metadata |
+| `TrackedObject` | Tracked object with velocity |
+| `TrackingHeader` | Tracking frame metadata |
+| `PlaneDetection` | Plane coefficients + inliers |
+| `SegmentationMask` | Segmentation mask metadata |
+| `PointField` | Point cloud field descriptor |
+
+### Vision (3 types)
+
+| Type | Description |
+|------|-------------|
+| `CameraInfo` | Camera intrinsic calibration |
+| `RegionOfInterest` | Image ROI |
+| `StereoInfo` | Stereo camera calibration |
+
+### Force and Haptics (5 types)
+
+| Type | Description |
+|------|-------------|
+| `WrenchStamped` | Force/torque measurement |
+| `ImpedanceParameters` | Impedance control parameters |
+| `ForceCommand` | Force control command |
+| `ContactInfo` | Contact point information |
+| `HapticFeedback` | Haptic feedback command |
+
+### Time (4 types)
+
+| Type | Description |
+|------|-------------|
+| `Clock` | System clock (wall, sim, replay) |
+| `TimeReference` | Time sync reference |
+| `SimSync` | Simulator time synchronization |
+| `RateRequest` | Rate control request |
+
+### Input (3 types)
+
+| Type | Description |
+|------|-------------|
+| `KeyboardInput` | Keyboard event |
+| `JoystickInput` | Gamepad/joystick input |
+| `AudioFrame` | PCM audio frame |
+
+---
+
+## Common Patterns
+
+### Multi-Topic Node
+
+A single node can publish and subscribe to multiple topics:
+
+```cpp
+auto imu_sub   = sched.subscribe<horus::msg::Imu>("imu.data");
+auto odom_sub  = sched.subscribe<horus::msg::Odometry>("odom");
+auto cmd_pub   = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+auto diag_pub  = sched.advertise<horus::msg::Heartbeat>("health.ctrl");
+
+sched.add("fusion_controller")
+    .rate(100_hz)
+    .tick([&] {
+        auto imu = imu_sub.recv();
+        auto odom = odom_sub.recv();
+
+        if (imu && odom) {
+            auto cmd = cmd_pub.loan();
+            cmd->linear = compute_speed(*odom);
+            cmd->angular = compute_turn(*imu);
+            cmd_pub.publish(std::move(cmd));
+        }
+
+        // Always publish heartbeat
+        uint64_t seq = 0;
+        diag_pub.send(horus::msg::Heartbeat{
+            {}, seq++, true, 0.0f, 0.0f, 0
+        });
+    })
+    .build();
+```
+
+### Pipeline Pattern
+
+Chain nodes through topics to form a processing pipeline:
+
+```cpp
+auto raw_sub  = sched.subscribe<horus::msg::LaserScan>("lidar.raw");
+auto filt_pub = sched.advertise<horus::msg::LaserScan>("lidar.filtered");
+auto filt_sub = sched.subscribe<horus::msg::LaserScan>("lidar.filtered");
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+
+// Stage 1: Filter raw scan
+sched.add("filter")
+    .rate(50_hz).order(1)
+    .tick([&] {
+        auto raw = raw_sub.recv();
+        if (!raw) return;
+        auto filtered = filt_pub.loan();
+        *filtered = *raw;  // copy, then modify in place
+        for (int i = 0; i < 360; ++i) {
+            if (filtered->ranges[i] < 0.05f)
+                filtered->ranges[i] = 0.0f;
+        }
+        filt_pub.publish(std::move(filtered));
+    })
+    .build();
+
+// Stage 2: React to filtered scan
+sched.add("controller")
+    .rate(50_hz).order(2)
+    .tick([&] {
+        auto scan = filt_sub.recv();
+        if (!scan) return;
+        cmd_pub.send(horus::msg::CmdVel{0, 0.3f, 0.0f});
+    })
+    .build();
+```
+
+### Topic Name Conventions
+
+Use dot-separated hierarchical names:
+
+```
+sensor.lidar.scan        # LiDAR data
+sensor.imu.data          # IMU readings
+motor.cmd                # Motor commands
+nav.goal                 # Navigation goal
+safety.alert             # Safety alerts
+diagnostics.heartbeat    # Heartbeat
+```
+
+---
+
+## See Also
+
+- [Scheduler API](/cpp/api/scheduler) -- Topic creation via `advertise` and `subscribe`
+- [Node API](/cpp/api/node) -- Node styles and lifecycle
+- [Services and Actions API](/cpp/api/services) -- Request/response and long-running tasks
+- [C++ API Overview](/cpp/api) -- All classes at a glance
+- [Rust Topic API](/rust/api/topic) -- Equivalent Rust API

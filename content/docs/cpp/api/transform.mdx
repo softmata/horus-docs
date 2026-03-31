@@ -1,0 +1,305 @@
+---
+title: "TransformFrame API"
+description: "Coordinate frame tree for tracking spatial relationships between robot links, sensors, and world frames"
+sidebar_section: "C++"
+order: 57
+---
+
+# TransformFrame API
+
+`horus::TransformFrame` maintains a tree of coordinate frames -- world, base link, sensors, end effectors -- and computes transforms between any two frames. This is the C++ equivalent of ROS TF2: register frames in a parent-child hierarchy, update their poses over time, and query the transform between arbitrary frames.
+
+```cpp
+#include <horus/transform.hpp>
+```
+
+---
+
+## Quick Reference
+
+| Method | Description |
+|--------|-------------|
+| `TransformFrame()` | Create frame tree with default capacity |
+| `TransformFrame(max_frames)` | Create frame tree with reserved capacity |
+| `register_frame(name, parent)` | Add a frame to the tree |
+| `update(frame, pos, rot, ts)` | Set a frame's current pose |
+| `lookup(source, target)` | Compute transform between two frames |
+| `can_transform(source, target)` | Check if a path exists between frames |
+
+---
+
+## Transform Struct
+
+The result of a `lookup()` call. Contains translation and rotation.
+
+```cpp
+struct Transform {
+    std::array<double, 3> translation;  // [x, y, z] in meters
+    std::array<double, 4> rotation;     // [qx, qy, qz, qw] quaternion
+};
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `translation` | `std::array<double, 3>` | Position offset as [x, y, z] in meters |
+| `rotation` | `std::array<double, 4>` | Orientation as quaternion [qx, qy, qz, qw]. Identity = [0, 0, 0, 1] |
+
+The quaternion convention is Hamilton (scalar-last): `qx, qy, qz` are the imaginary components, `qw` is the real (scalar) component. Identity rotation is `{0, 0, 0, 1}`.
+
+---
+
+## Constructors
+
+### Default
+
+```cpp
+horus::TransformFrame tf;
+```
+
+Creates a frame tree with default capacity. Suitable for most robots.
+
+### With Capacity
+
+```cpp
+horus::TransformFrame tf(size_t max_frames);
+```
+
+Pre-allocates storage for `max_frames` frames. Use when you know the frame count ahead of time to avoid reallocation.
+
+```cpp
+// Robot with 20 joints + 5 sensors + world + base = 27 frames
+horus::TransformFrame tf(32);
+```
+
+`TransformFrame` is move-only. Copy construction and copy assignment are deleted.
+
+---
+
+## register_frame()
+
+```cpp
+int register_frame(const char* name, const char* parent = nullptr);
+```
+
+Adds a frame to the tree under the specified parent.
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `name` | `const char*` | Unique name for this frame (e.g., `"base_link"`, `"camera_optical"`). |
+| `parent` | `const char*` | Parent frame name, or `nullptr`/`""` for a root frame. |
+
+**Returns** the frame ID (non-negative) on success, or `-1` on error (duplicate name, parent not found).
+
+**Rules**:
+- The first frame registered with no parent becomes the root.
+- Every subsequent frame must have a parent that already exists in the tree.
+- Frame names must be unique within the tree.
+
+```cpp
+horus::TransformFrame tf;
+
+// Root frame (no parent)
+tf.register_frame("world");
+
+// Child frames
+tf.register_frame("base_link", "world");
+tf.register_frame("shoulder", "base_link");
+tf.register_frame("elbow", "shoulder");
+tf.register_frame("wrist", "elbow");
+tf.register_frame("camera", "base_link");
+```
+
+---
+
+## update()
+
+```cpp
+bool update(
+    const char*                  frame,
+    const std::array<double, 3>& pos,
+    const std::array<double, 4>& rot,
+    uint64_t                     timestamp_ns
+);
+```
+
+Sets the current pose of a frame relative to its parent.
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `frame` | `const char*` | Name of the frame to update. Must already be registered. |
+| `pos` | `std::array<double, 3>` | Translation [x, y, z] in meters relative to parent. |
+| `rot` | `std::array<double, 4>` | Rotation [qx, qy, qz, qw] quaternion relative to parent. |
+| `timestamp_ns` | `uint64_t` | Timestamp in nanoseconds. Use monotonic clock for consistency. |
+
+**Returns** `true` on success, `false` if the frame is not found.
+
+```cpp
+uint64_t now = get_monotonic_ns();
+
+// Base link is 0.5m above ground, no rotation
+tf.update("base_link", {0.0, 0.0, 0.5}, {0, 0, 0, 1}, now);
+
+// Shoulder rotated 45 degrees about Z
+// qz = sin(pi/8), qw = cos(pi/8)
+tf.update("shoulder", {0.0, 0.0, 0.3}, {0, 0, 0.3827, 0.9239}, now);
+```
+
+---
+
+## lookup()
+
+```cpp
+std::optional<Transform> lookup(const char* source, const char* target) const;
+```
+
+Computes the transform that converts a point in the `source` frame to the `target` frame. Traverses the tree through the common ancestor.
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `source` | `const char*` | Frame to transform from. |
+| `target` | `const char*` | Frame to transform to. |
+
+**Returns** `std::optional<Transform>` -- the transform if a path exists, `std::nullopt` if either frame is unknown or they are in disconnected subtrees.
+
+```cpp
+auto result = tf.lookup("camera", "world");
+if (result.has_value()) {
+    auto& t = *result;
+    double cam_x = t.translation[0];  // camera X in world frame
+    double cam_y = t.translation[1];
+    double cam_z = t.translation[2];
+}
+```
+
+### Transform Direction
+
+`lookup("A", "B")` gives you the transform **from A to B**. To transform a point `p` expressed in frame A into frame B coordinates, apply this transform:
+
+```
+p_in_B = rotation * p_in_A + translation
+```
+
+---
+
+## can_transform()
+
+```cpp
+bool can_transform(const char* source, const char* target) const;
+```
+
+Returns `true` if a path exists between the two frames in the tree. Use this to check connectivity before calling `lookup()`.
+
+```cpp
+if (tf.can_transform("lidar", "base_link")) {
+    auto t = tf.lookup("lidar", "base_link");
+    // guaranteed to succeed
+}
+```
+
+---
+
+## Static vs Dynamic Transforms
+
+**Static transforms** are set once and never change -- sensor mounts, fixed joints, calibration offsets.
+
+**Dynamic transforms** change every tick -- joint angles, odometry, SLAM corrections.
+
+Both use the same `update()` call. The distinction is in how often you call it.
+
+```cpp
+void init() {
+    tf.register_frame("world");
+    tf.register_frame("base_link", "world");
+    tf.register_frame("camera", "base_link");
+    tf.register_frame("lidar", "base_link");
+
+    uint64_t now = get_monotonic_ns();
+
+    // Static: camera mounted 0.1m forward, 0.3m up, no rotation
+    tf.update("camera", {0.1, 0.0, 0.3}, {0, 0, 0, 1}, now);
+
+    // Static: lidar mounted 0.0m forward, 0.4m up, no rotation
+    tf.update("lidar", {0.0, 0.0, 0.4}, {0, 0, 0, 1}, now);
+}
+
+void tick() {
+    uint64_t now = get_monotonic_ns();
+
+    // Dynamic: base_link updated from odometry every tick
+    double odom_x = get_odometry_x();
+    double odom_y = get_odometry_y();
+    double odom_yaw = get_odometry_yaw();
+
+    double qz = std::sin(odom_yaw / 2.0);
+    double qw = std::cos(odom_yaw / 2.0);
+    tf.update("base_link", {odom_x, odom_y, 0.5}, {0, 0, qz, qw}, now);
+
+    // Now lookup camera position in world frame
+    auto cam_world = tf.lookup("camera", "world");
+    // Automatically chains: camera -> base_link -> world
+}
+```
+
+---
+
+## Example: Multi-Sensor Robot
+
+A mobile robot with a camera, lidar, and IMU, each at a fixed offset from the base.
+
+```cpp
+#include <horus/transform.hpp>
+
+struct SensorFusion {
+    horus::TransformFrame tf;
+
+    void init() {
+        tf.register_frame("world");
+        tf.register_frame("odom", "world");
+        tf.register_frame("base_link", "odom");
+        tf.register_frame("camera_link", "base_link");
+        tf.register_frame("camera_optical", "camera_link");
+        tf.register_frame("lidar", "base_link");
+
+        uint64_t now = get_monotonic_ns();
+
+        // Static sensor mounts (set once)
+        tf.update("camera_link", {0.12, 0.0, 0.25}, {0, 0, 0, 1}, now);
+        tf.update("camera_optical", {0, 0, 0}, {-0.5, 0.5, -0.5, 0.5}, now);
+        tf.update("lidar", {0.0, 0.0, 0.35}, {0, 0, 0, 1}, now);
+    }
+
+    void tick() {
+        uint64_t now = get_monotonic_ns();
+        tf.update("odom", {odom_x, odom_y, 0}, {0, 0, odom_qz, odom_qw}, now);
+
+        // Fuse lidar points into world frame
+        if (tf.can_transform("lidar", "world")) {
+            auto t = tf.lookup("lidar", "world");
+            // t->translation = lidar position in world coordinates
+        }
+    }
+
+    double odom_x = 0, odom_y = 0, odom_qz = 0, odom_qw = 1;
+};
+```
+
+---
+
+## Frame Tree Conventions
+
+Follow these naming conventions for consistency with the HORUS ecosystem and ROS interop:
+
+| Frame | Parent | Purpose |
+|-------|--------|---------|
+| `world` | (root) | Fixed global reference |
+| `odom` | `world` | Odometry origin (may drift) |
+| `base_link` | `odom` | Robot center (on ground plane) |
+| `base_footprint` | `base_link` | Projected to ground (optional) |
+| `*_link` | `base_link` | Sensor mount points |
+| `*_optical` | `*_link` | Optical convention (Z-forward) |

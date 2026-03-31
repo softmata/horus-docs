@@ -1,0 +1,299 @@
+---
+title: "Duration & Frequency API"
+description: "User-defined literals for durations and frequencies, plus the Miss policy enum for deadline handling"
+sidebar_section: "C++"
+order: 59
+---
+
+# Duration & Frequency API
+
+HORUS provides user-defined literals that mirror the Rust `DurationExt` trait: `100_hz`, `10_ms`, `200_us`. These make scheduling configuration readable and type-safe.
+
+```cpp
+#include <horus/duration.hpp>
+using namespace horus::literals;
+```
+
+---
+
+## Quick Reference
+
+| Literal | Type | Example | Value |
+|---------|------|---------|-------|
+| `_hz` | `horus::Frequency` | `100_hz` | 100 Hz frequency |
+| `_s` | `std::chrono::microseconds` | `5_s` | 5,000,000 us |
+| `_ms` | `std::chrono::microseconds` | `10_ms` | 10,000 us |
+| `_us` | `std::chrono::microseconds` | `200_us` | 200 us |
+| `_ns` | `std::chrono::nanoseconds` | `500_ns` | 500 ns |
+
+All duration literals produce `std::chrono` types. The `_hz` literal produces `horus::Frequency`.
+
+---
+
+## Duration Type
+
+```cpp
+using horus::Duration = std::chrono::microseconds;
+```
+
+HORUS uses microseconds as the standard duration unit internally. The `_s` and `_ms` literals convert to microseconds automatically.
+
+---
+
+## Literals
+
+Enable the literals with:
+
+```cpp
+using namespace horus::literals;
+```
+
+### Signatures
+
+```cpp
+constexpr horus::Frequency           operator""_hz(unsigned long long hz);
+constexpr std::chrono::microseconds  operator""_s(unsigned long long s);
+constexpr std::chrono::microseconds  operator""_ms(unsigned long long ms);
+constexpr std::chrono::microseconds  operator""_us(unsigned long long us);
+constexpr std::chrono::nanoseconds   operator""_ns(unsigned long long ns);
+```
+
+Note: `_ns` returns `std::chrono::nanoseconds`; all other duration literals return `std::chrono::microseconds`.
+
+### Examples
+
+```cpp
+auto rate = 100_hz;     // Frequency(100.0)
+auto timeout = 5_s;     // 5,000,000 microseconds
+auto budget = 10_ms;    // 10,000 microseconds
+auto jitter = 800_us;   // 800 microseconds
+auto precise = 500_ns;  // 500 nanoseconds
+```
+
+---
+
+## Frequency Class
+
+`horus::Frequency` wraps a frequency value in Hz and provides methods to derive scheduling parameters.
+
+### Constructor
+
+```cpp
+constexpr explicit Frequency(double hz);
+```
+
+Creates a frequency from a `double`. Prefer the `_hz` literal for integer frequencies.
+
+### value()
+
+```cpp
+constexpr double value() const;
+```
+
+Returns the frequency in Hz.
+
+```cpp
+auto rate = 100_hz;
+double hz = rate.value();  // 100.0
+```
+
+### period()
+
+```cpp
+constexpr std::chrono::microseconds period() const;
+```
+
+Returns the period (time between ticks) as microseconds. Computed as `1,000,000 / hz`.
+
+```cpp
+auto rate = 100_hz;
+auto p = rate.period();    // 10,000 us = 10 ms
+```
+
+| Frequency | Period |
+|-----------|--------|
+| `10_hz` | 100,000 us (100 ms) |
+| `50_hz` | 20,000 us (20 ms) |
+| `100_hz` | 10,000 us (10 ms) |
+| `500_hz` | 2,000 us (2 ms) |
+| `1000_hz` | 1,000 us (1 ms) |
+
+### budget_default()
+
+```cpp
+constexpr std::chrono::microseconds budget_default() const;
+```
+
+Returns the default compute budget: **80% of the period**. This is the maximum time a node's `tick()` should take under normal conditions.
+
+```cpp
+auto rate = 100_hz;
+auto budget = rate.budget_default();  // 8,000 us = 8 ms (80% of 10 ms)
+```
+
+### deadline_default()
+
+```cpp
+constexpr std::chrono::microseconds deadline_default() const;
+```
+
+Returns the default deadline: **95% of the period**. If `tick()` exceeds this, the `Miss` policy is triggered.
+
+```cpp
+auto rate = 100_hz;
+auto deadline = rate.deadline_default();  // 9,500 us = 9.5 ms (95% of 10 ms)
+```
+
+### Derived Timing Table
+
+| Frequency | Period | Budget (80%) | Deadline (95%) |
+|-----------|--------|-------------|----------------|
+| `10_hz` | 100 ms | 80 ms | 95 ms |
+| `50_hz` | 20 ms | 16 ms | 19 ms |
+| `100_hz` | 10 ms | 8 ms | 9.5 ms |
+| `500_hz` | 2 ms | 1.6 ms | 1.9 ms |
+| `1000_hz` | 1 ms | 0.8 ms | 0.95 ms |
+
+---
+
+## Miss Enum
+
+Defines what happens when a node's `tick()` exceeds its deadline.
+
+```cpp
+enum class Miss {
+    Warn,      // Log a warning, continue running
+    Skip,      // Skip the next tick to catch up
+    SafeMode,  // Call enter_safe_state() on the node
+    Stop,      // Stop the scheduler entirely
+};
+```
+
+| Variant | Behavior | Use Case |
+|---------|----------|----------|
+| `Miss::Warn` | Logs a deadline-miss warning. Node keeps running at normal rate. | Non-critical nodes: logging, visualization, telemetry |
+| `Miss::Skip` | Skips the next scheduled tick to recover timing. Prevents cascading overruns. | Compute-heavy nodes: planning, perception |
+| `Miss::SafeMode` | Calls `enter_safe_state()` on the node, then continues. | Safety-critical nodes: motor control, force limiting |
+| `Miss::Stop` | Triggers scheduler shutdown. All nodes receive `shutdown()`. | Hard real-time systems where any overrun is catastrophic |
+
+---
+
+## Using with NodeBuilder
+
+Durations and frequencies are designed for the scheduler's builder API.
+
+### rate()
+
+Sets the node's tick frequency. The scheduler calls `tick()` at this rate.
+
+```cpp
+using namespace horus::literals;
+horus::Scheduler sched;
+
+sched.add("motor_ctrl")
+    .rate(1000_hz)
+    .tick([&] { /* runs every 1 ms */ })
+    .build();
+```
+
+### budget()
+
+Sets the maximum expected execution time for `tick()`. If exceeded, the watchdog records a budget overrun.
+
+```cpp
+sched.add("motor_ctrl")
+    .rate(1000_hz)
+    .budget(800_us)   // tick() should finish within 800 us
+    .tick([&] { /* motor control */ })
+    .build();
+```
+
+### deadline()
+
+Sets the hard deadline. If exceeded, the `Miss` policy is triggered.
+
+```cpp
+sched.add("motor_ctrl")
+    .rate(1000_hz)
+    .budget(800_us)
+    .deadline(950_us)
+    .on_miss(horus::Miss::SafeMode)
+    .tick([&] { /* motor control */ })
+    .build();
+```
+
+### Full Example
+
+A complete scheduler setup with three nodes at different rates and miss policies.
+
+```cpp
+#include <horus/node.hpp>
+#include <horus/duration.hpp>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(1000_hz);
+
+    // Hard RT: motor control at 1 kHz, enters safe state on overrun
+    sched.add("motor_ctrl")
+        .rate(1000_hz)
+        .budget(800_us)
+        .deadline(950_us)
+        .on_miss(horus::Miss::SafeMode)
+        .pin_core(2)
+        .priority(90)
+        .order(0)
+        .tick([&] { /* PID loop */ })
+        .build();
+
+    // Soft RT: state estimation at 200 Hz, skips on overrun
+    sched.add("estimator")
+        .rate(200_hz)
+        .budget(4_ms)
+        .deadline(4500_us)
+        .on_miss(horus::Miss::Skip)
+        .order(10)
+        .tick([&] { /* EKF update */ })
+        .build();
+
+    // Best effort: logging at 10 Hz, warns on overrun
+    sched.add("logger")
+        .rate(10_hz)
+        .budget(50_ms)
+        .on_miss(horus::Miss::Warn)
+        .order(100)
+        .tick([&] { /* write logs */ })
+        .build();
+
+    sched.run();
+}
+```
+
+---
+
+## Conversion Examples
+
+### Frequency to Duration
+
+```cpp
+auto rate = 100_hz;
+auto period = rate.period();              // 10,000 us
+auto budget = rate.budget_default();      // 8,000 us
+auto deadline = rate.deadline_default();  // 9,500 us
+```
+
+### Duration Arithmetic
+
+Since durations are `std::chrono` types, standard arithmetic works:
+
+```cpp
+auto a = 500_us;
+auto b = 300_us;
+auto sum = a + b;        // 800 us
+auto diff = a - b;       // 200 us
+auto scaled = a * 2;     // 1000 us
+
+// Compare
+bool fits = (800_us < 1_ms);  // true
+```
