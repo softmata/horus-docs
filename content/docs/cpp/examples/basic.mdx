@@ -1,0 +1,274 @@
+---
+title: "Basic Examples"
+description: "Complete working C++ projects — from hello world to multi-node pub/sub"
+sidebar_section: "C++"
+order: 70
+---
+
+# Basic Examples
+
+Complete, runnable C++ projects. Each includes `horus.toml`, `CMakeLists.txt`, and `src/main.cpp`.
+
+---
+
+## Example 1: Hello Node
+
+The simplest HORUS program — one node that prints on each tick.
+
+### horus.toml
+
+```toml
+[package]
+name = "hello_node"
+version = "0.1.0"
+language = "cpp"
+```
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(1_hz).name("hello");
+
+    int count = 0;
+    sched.add("greeter")
+        .tick([&] {
+            std::printf("Hello from HORUS! tick=%d\n", ++count);
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+```bash
+horus new hello_node --lang cpp
+# paste the code above
+horus run
+```
+
+---
+
+## Example 2: Publisher + Subscriber
+
+Two nodes sharing data over a topic.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz).name("pubsub_demo");
+
+    auto pub = sched.advertise<horus::msg::CmdVel>("demo.cmd");
+    auto sub = sched.subscribe<horus::msg::CmdVel>("demo.cmd");
+
+    int seq = 0;
+    sched.add("publisher")
+        .order(0)
+        .tick([&] {
+            auto msg = pub.loan();
+            msg->linear = static_cast<float>(seq) * 0.1f;
+            msg->angular = 0.0f;
+            msg->timestamp_ns = static_cast<uint64_t>(seq);
+            pub.publish(std::move(msg));
+            seq++;
+        })
+        .build();
+
+    sched.add("subscriber")
+        .order(10)
+        .tick([&] {
+            auto msg = sub.recv();
+            if (msg) {
+                std::printf("Received: linear=%.2f seq=%lu\n",
+                    msg->get()->linear, msg->get()->timestamp_ns);
+            }
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+---
+
+## Example 3: Struct-Based Node
+
+A proper Node subclass with state, pub/sub, and lifecycle hooks.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+#include <cmath>
+using namespace horus::literals;
+
+class SineWaveGenerator : public horus::Node {
+public:
+    SineWaveGenerator() : Node("sine_wave") {
+        pub_ = advertise<horus::msg::CmdVel>("wave.output");
+    }
+
+    void init() override {
+        horus::log::info("sine", "Generator started at 50 Hz");
+    }
+
+    void tick() override {
+        double t = tick_++ * 0.02;  // 50 Hz → 20ms per tick
+        horus::msg::CmdVel msg{};
+        msg.linear = static_cast<float>(std::sin(2.0 * M_PI * 0.5 * t));  // 0.5 Hz sine
+        msg.angular = static_cast<float>(std::cos(2.0 * M_PI * 0.5 * t));
+        pub_->send(msg);
+    }
+
+private:
+    horus::Publisher<horus::msg::CmdVel>* pub_;
+    int tick_ = 0;
+};
+
+class Plotter : public horus::Node {
+public:
+    Plotter() : Node("plotter") {
+        sub_ = subscribe<horus::msg::CmdVel>("wave.output");
+    }
+
+    void tick() override {
+        auto msg = sub_->recv();
+        if (!msg) return;
+        if (++count_ % 25 != 0) return;  // print at 2 Hz
+
+        float v = msg->get()->linear;
+        int bar = static_cast<int>((v + 1.0f) * 20);  // scale to 0-40
+        std::printf("[%6d] ", count_);
+        for (int i = 0; i < bar; i++) std::printf("█");
+        std::printf(" %.2f\n", v);
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* sub_;
+    int count_ = 0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(50_hz).name("sine_demo");
+
+    SineWaveGenerator gen;
+    sched.add(gen).order(0).build();
+
+    Plotter plot;
+    sched.add(plot).order(10).build();
+
+    sched.spin();
+}
+```
+
+---
+
+## Example 4: Runtime Parameters
+
+Change behavior without recompiling.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Params params;
+    params.set("speed", 0.3);
+    params.set("enabled", true);
+    params.set("robot_name", "atlas");
+
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz);
+
+    auto pub = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+
+    sched.add("driver")
+        .tick([&] {
+            bool enabled = params.get<bool>("enabled", true);
+            double speed = params.get<double>("speed", 0.3);
+            std::string name = params.get<std::string>("robot_name", "unknown");
+
+            horus::msg::CmdVel cmd{};
+            cmd.linear = enabled ? static_cast<float>(speed) : 0.0f;
+            pub.send(cmd);
+
+            static int t = 0;
+            if (++t % 10 == 0) {
+                std::printf("[%s] speed=%.1f enabled=%s\n",
+                    name.c_str(), speed, enabled ? "yes" : "no");
+            }
+        })
+        .build();
+
+    // Simulate parameter change after 3 seconds
+    for (int i = 0; i < 100; i++) {
+        sched.tick_once();
+        if (i == 30) {
+            params.set("speed", 0.8);
+            std::printf(">>> Speed changed to 0.8\n");
+        }
+        if (i == 60) {
+            params.set("enabled", false);
+            std::printf(">>> Motor disabled\n");
+        }
+    }
+}
+```
+
+---
+
+## Example 5: Transform Frames
+
+Coordinate frame tree for a robot with sensors.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::TransformFrame tf;
+    tf.register_frame("world");
+    tf.register_frame("base_link", "world");
+    tf.register_frame("lidar", "base_link");
+    tf.register_frame("camera", "base_link");
+
+    // Static mounts
+    tf.update("lidar",  {0.2, 0.0, 0.3}, {0, 0, 0, 1}, 0);
+    tf.update("camera", {0.1, 0.0, 0.25}, {0, 0, 0, 1}, 0);
+
+    // Simulate robot moving forward
+    for (int i = 0; i < 50; i++) {
+        double x = i * 0.1;
+        tf.update("base_link", {x, 0.0, 0.0}, {0, 0, 0, 1}, 0);
+
+        if (auto t = tf.lookup("lidar", "world")) {
+            std::printf("tick %2d: lidar in world = (%.1f, %.1f, %.1f)\n",
+                i, t->translation[0], t->translation[1], t->translation[2]);
+        }
+    }
+}
+```
+
+## See Also
+
+- [Advanced Examples](/docs/cpp/examples/advanced) — multi-process, cross-language, RT
+- [Quick Start](/docs/getting-started/quick-start-cpp) — step-by-step first project

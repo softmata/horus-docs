@@ -1,7 +1,7 @@
 # HORUS Documentation (Full)
 
-Generated: 2026-03-31T04:13:46.157Z
-Pages: 293
+Generated: 2026-03-31T04:18:32.474Z
+Pages: 295
 Source: https://docs.horusrobotics.dev
 Condensed overview: https://docs.horusrobotics.dev/llms.txt
 
@@ -25,7 +25,7 @@ AI agents can use this to understand the full framework.
 - Operations (2 pages)
 - Reference (7 pages)
 - Recipes (33 pages)
-- cpp (23 pages)
+- cpp (25 pages)
 
 
 ========================================
@@ -99443,3 +99443,611 @@ field.count = 1;
 
 - [Detection Messages](/docs/cpp/api/detection-messages) — BoundingBox, Detection
 - [TensorPool API](/docs/cpp/api/pool) — Image and PointCloud for raw data
+
+---
+## Basic Examples
+Path: /cpp/examples/basic
+Description: Complete working C++ projects — from hello world to multi-node pub/sub
+
+# Basic Examples
+
+Complete, runnable C++ projects. Each includes `horus.toml`, `CMakeLists.txt`, and `src/main.cpp`.
+
+---
+
+## Example 1: Hello Node
+
+The simplest HORUS program — one node that prints on each tick.
+
+### horus.toml
+
+```toml
+[package]
+name = "hello_node"
+version = "0.1.0"
+language = "cpp"
+```
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(1_hz).name("hello");
+
+    int count = 0;
+    sched.add("greeter")
+        .tick([&] {
+            std::printf("Hello from HORUS! tick=%d\n", ++count);
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+```bash
+horus new hello_node --lang cpp
+# paste the code above
+horus run
+```
+
+---
+
+## Example 2: Publisher + Subscriber
+
+Two nodes sharing data over a topic.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz).name("pubsub_demo");
+
+    auto pub = sched.advertise<horus::msg::CmdVel>("demo.cmd");
+    auto sub = sched.subscribe<horus::msg::CmdVel>("demo.cmd");
+
+    int seq = 0;
+    sched.add("publisher")
+        .order(0)
+        .tick([&] {
+            auto msg = pub.loan();
+            msg->linear = static_cast<float>(seq) * 0.1f;
+            msg->angular = 0.0f;
+            msg->timestamp_ns = static_cast<uint64_t>(seq);
+            pub.publish(std::move(msg));
+            seq++;
+        })
+        .build();
+
+    sched.add("subscriber")
+        .order(10)
+        .tick([&] {
+            auto msg = sub.recv();
+            if (msg) {
+                std::printf("Received: linear=%.2f seq=%lu\n",
+                    msg->get()->linear, msg->get()->timestamp_ns);
+            }
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+---
+
+## Example 3: Struct-Based Node
+
+A proper Node subclass with state, pub/sub, and lifecycle hooks.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+#include <cmath>
+using namespace horus::literals;
+
+class SineWaveGenerator : public horus::Node {
+public:
+    SineWaveGenerator() : Node("sine_wave") {
+        pub_ = advertise<horus::msg::CmdVel>("wave.output");
+    }
+
+    void init() override {
+        horus::log::info("sine", "Generator started at 50 Hz");
+    }
+
+    void tick() override {
+        double t = tick_++ * 0.02;  // 50 Hz → 20ms per tick
+        horus::msg::CmdVel msg{};
+        msg.linear = static_cast<float>(std::sin(2.0 * M_PI * 0.5 * t));  // 0.5 Hz sine
+        msg.angular = static_cast<float>(std::cos(2.0 * M_PI * 0.5 * t));
+        pub_->send(msg);
+    }
+
+private:
+    horus::Publisher<horus::msg::CmdVel>* pub_;
+    int tick_ = 0;
+};
+
+class Plotter : public horus::Node {
+public:
+    Plotter() : Node("plotter") {
+        sub_ = subscribe<horus::msg::CmdVel>("wave.output");
+    }
+
+    void tick() override {
+        auto msg = sub_->recv();
+        if (!msg) return;
+        if (++count_ % 25 != 0) return;  // print at 2 Hz
+
+        float v = msg->get()->linear;
+        int bar = static_cast<int>((v + 1.0f) * 20);  // scale to 0-40
+        std::printf("[%6d] ", count_);
+        for (int i = 0; i < bar; i++) std::printf("█");
+        std::printf(" %.2f\n", v);
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* sub_;
+    int count_ = 0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(50_hz).name("sine_demo");
+
+    SineWaveGenerator gen;
+    sched.add(gen).order(0).build();
+
+    Plotter plot;
+    sched.add(plot).order(10).build();
+
+    sched.spin();
+}
+```
+
+---
+
+## Example 4: Runtime Parameters
+
+Change behavior without recompiling.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::Params params;
+    params.set("speed", 0.3);
+    params.set("enabled", true);
+    params.set("robot_name", "atlas");
+
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz);
+
+    auto pub = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+
+    sched.add("driver")
+        .tick([&] {
+            bool enabled = params.get<bool>("enabled", true);
+            double speed = params.get<double>("speed", 0.3);
+            std::string name = params.get<std::string>("robot_name", "unknown");
+
+            horus::msg::CmdVel cmd{};
+            cmd.linear = enabled ? static_cast<float>(speed) : 0.0f;
+            pub.send(cmd);
+
+            static int t = 0;
+            if (++t % 10 == 0) {
+                std::printf("[%s] speed=%.1f enabled=%s\n",
+                    name.c_str(), speed, enabled ? "yes" : "no");
+            }
+        })
+        .build();
+
+    // Simulate parameter change after 3 seconds
+    for (int i = 0; i < 100; i++) {
+        sched.tick_once();
+        if (i == 30) {
+            params.set("speed", 0.8);
+            std::printf(">>> Speed changed to 0.8\n");
+        }
+        if (i == 60) {
+            params.set("enabled", false);
+            std::printf(">>> Motor disabled\n");
+        }
+    }
+}
+```
+
+---
+
+## Example 5: Transform Frames
+
+Coordinate frame tree for a robot with sensors.
+
+### src/main.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+using namespace horus::literals;
+
+int main() {
+    horus::TransformFrame tf;
+    tf.register_frame("world");
+    tf.register_frame("base_link", "world");
+    tf.register_frame("lidar", "base_link");
+    tf.register_frame("camera", "base_link");
+
+    // Static mounts
+    tf.update("lidar",  {0.2, 0.0, 0.3}, {0, 0, 0, 1}, 0);
+    tf.update("camera", {0.1, 0.0, 0.25}, {0, 0, 0, 1}, 0);
+
+    // Simulate robot moving forward
+    for (int i = 0; i < 50; i++) {
+        double x = i * 0.1;
+        tf.update("base_link", {x, 0.0, 0.0}, {0, 0, 0, 1}, 0);
+
+        if (auto t = tf.lookup("lidar", "world")) {
+            std::printf("tick %2d: lidar in world = (%.1f, %.1f, %.1f)\n",
+                i, t->translation[0], t->translation[1], t->translation[2]);
+        }
+    }
+}
+```
+
+## See Also
+
+- [Advanced Examples](/docs/cpp/examples/advanced) — multi-process, cross-language, RT
+- [Quick Start](/docs/getting-started/quick-start-cpp) — step-by-step first project
+
+---
+## Advanced Examples
+Path: /cpp/examples/advanced
+Description: Multi-process pipelines, cross-language systems, RT control, and production patterns
+
+# Advanced Examples
+
+Production-grade patterns for real robots.
+
+---
+
+## Example 1: Multi-Process Robot
+
+Three separate binaries communicating over SHM.
+
+### sensor_driver.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class LidarDriver : public horus::Node {
+public:
+    LidarDriver() : Node("lidar") {
+        pub_ = advertise<horus::msg::LaserScan>("lidar.scan");
+    }
+    void tick() override {
+        auto scan = pub_->loan();
+        for (int i = 0; i < 360; i++)
+            scan->ranges[i] = 2.0f + 0.3f * std::sin(i * 0.1f + tick_ * 0.05f);
+        scan->angle_min = 0.0f;
+        scan->angle_max = 6.28318f;
+        pub_->publish(std::move(scan));
+        tick_++;
+    }
+private:
+    horus::Publisher<horus::msg::LaserScan>* pub_;
+    int tick_ = 0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz).name("lidar_proc");
+    LidarDriver lidar;
+    sched.add(lidar).order(0).build();
+    sched.spin();
+}
+```
+
+### controller.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        cmd_  = advertise<horus::msg::CmdVel>("cmd_vel");
+    }
+    void tick() override {
+        auto scan = scan_->recv();
+        if (!scan) return;
+        float min_r = 999.0f;
+        for (int i = 0; i < 360; i++)
+            if (scan->get()->ranges[i] > 0.01f && scan->get()->ranges[i] < min_r)
+                min_r = scan->get()->ranges[i];
+        horus::msg::CmdVel cmd{};
+        cmd.linear = min_r > 0.5f ? 0.3f : 0.0f;
+        cmd.angular = min_r > 0.5f ? 0.0f : 0.5f;
+        cmd_->send(cmd);
+    }
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        cmd_->send(stop);
+    }
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_;
+    horus::Publisher<horus::msg::CmdVel>* cmd_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(50_hz).name("ctrl_proc").prefer_rt();
+    Controller ctrl;
+    sched.add(ctrl).order(0).budget(5_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.spin();
+}
+```
+
+### Run
+
+```bash
+# Terminal 1 (start subscriber first)
+LD_LIBRARY_PATH=target/debug ./controller &
+sleep 0.5
+# Terminal 2
+LD_LIBRARY_PATH=target/debug ./sensor_driver &
+# Terminal 3
+horus topic list    # shows lidar.scan + cmd_vel
+horus topic echo cmd_vel
+```
+
+---
+
+## Example 2: Cross-Language Pipeline
+
+C++ sensor + Python AI + C++ motor control.
+
+### cpp_sensor.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(30_hz);
+
+    auto pub = sched.advertise<horus::msg::CmdVel>("camera.detections");
+
+    sched.add("camera")
+        .tick([&] {
+            horus::msg::CmdVel det{};
+            det.linear = 0.95f;   // detection confidence
+            det.angular = 1.0f;   // class: person
+            pub.send(det);
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+### python_ai.py
+
+```python
+import horus
+from horus._horus import Topic, CmdVel
+
+src = Topic(CmdVel)  # reads "cmd_vel"
+
+def ai_tick(node):
+    det = node.recv("camera.detections")
+    if det is not None and det.linear > 0.8:
+        # High-confidence detection → slow down
+        node.send("ai.decision", CmdVel(linear=0.1, angular=0.0))
+    else:
+        node.send("ai.decision", CmdVel(linear=0.3, angular=0.0))
+
+horus.run(
+    horus.Node(name="ai", subs=["camera.detections"],
+               pubs=["ai.decision"], tick=ai_tick, rate=10)
+)
+```
+
+### cpp_motor.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class MotorCtrl : public horus::Node {
+public:
+    MotorCtrl() : Node("motor") {
+        sub_ = subscribe<horus::msg::CmdVel>("ai.decision");
+        pub_ = advertise<horus::msg::CmdVel>("motor.pwm");
+    }
+    void tick() override {
+        auto cmd = sub_->recv();
+        if (!cmd) return;
+        // Scale to PWM range
+        horus::msg::CmdVel pwm{};
+        pwm.linear = cmd->get()->linear * 255.0f;
+        pub_->send(pwm);
+    }
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        pub_->send(stop);
+    }
+private:
+    horus::Subscriber<horus::msg::CmdVel>* sub_;
+    horus::Publisher<horus::msg::CmdVel>* pub_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz).prefer_rt();
+    MotorCtrl motor;
+    sched.add(motor).order(0).budget(2_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.spin();
+}
+```
+
+### Run all three
+
+```bash
+./cpp_motor &        # C++ motor (subscriber — start first)
+python3 python_ai.py &  # Python AI
+./cpp_sensor &       # C++ sensor (publisher)
+
+horus topic list     # 3 topics from 3 languages
+horus node list      # 3 nodes with different PIDs
+```
+
+---
+
+## Example 3: 1 kHz RT Control Loop
+
+Production motor control with jitter tracking.
+
+```cpp
+#include <horus/horus.hpp>
+#include <chrono>
+#include <cstdio>
+using namespace horus::literals;
+
+class RtMotor : public horus::Node {
+public:
+    RtMotor() : Node("rt_motor") {
+        cmd_ = subscribe<horus::msg::CmdVel>("motor.target");
+        pwm_ = advertise<horus::msg::CmdVel>("motor.pwm");
+    }
+
+    void init() override {
+        last_ = std::chrono::steady_clock::now();
+    }
+
+    void tick() override {
+        auto now = std::chrono::steady_clock::now();
+        auto dt = std::chrono::duration_cast<std::chrono::microseconds>(now - last_).count();
+        last_ = now;
+
+        if (dt > max_jitter_) max_jitter_ = dt;
+        ticks_++;
+
+        auto cmd = cmd_->recv();
+        double target = cmd ? cmd->get()->linear : 0.0;
+
+        // PID
+        double error = target - velocity_;
+        integral_ += error * 0.001;
+        double output = 2.0 * error + 0.1 * integral_;
+        velocity_ += output * 0.001;  // simulate dynamics
+
+        horus::msg::CmdVel pwm{};
+        pwm.linear = static_cast<float>(output);
+        pwm_->send(pwm);
+
+        if (ticks_ % 1000 == 0) {
+            std::printf("[RT] max_jitter=%ldus ticks=%d vel=%.3f\n",
+                max_jitter_, ticks_, velocity_);
+        }
+    }
+
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        pwm_->send(stop);
+        std::printf("[RT] SAFE STATE — max jitter was %ldus\n", max_jitter_);
+        horus::blackbox::record("rt_motor",
+            "Safe state, max_jitter=" + std::to_string(max_jitter_) + "us");
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* cmd_;
+    horus::Publisher<horus::msg::CmdVel>* pwm_;
+    std::chrono::steady_clock::time_point last_;
+    double velocity_ = 0, integral_ = 0;
+    long max_jitter_ = 0;
+    int ticks_ = 0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(1000_hz).name("rt_demo").prefer_rt();
+
+    RtMotor motor;
+    sched.add(motor)
+        .order(0)
+        .budget(500_us)
+        .deadline(900_us)
+        .on_miss(horus::Miss::SafeMode)
+        .pin_core(3)
+        .priority(95)
+        .build();
+
+    sched.spin();
+}
+```
+
+---
+
+## Example 4: Service + Action
+
+Request/response RPC and long-running navigation goal.
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstring>
+#include <cstdio>
+
+int main() {
+    // Service: add two numbers
+    horus::ServiceServer server("calc.add");
+    server.set_handler([](const uint8_t* req, size_t len,
+                          uint8_t* res, size_t* res_len) -> bool {
+        int a = 0, b = 0;
+        std::sscanf(reinterpret_cast<const char*>(req), R"({"a":%d,"b":%d})", &a, &b);
+        *res_len = std::snprintf(reinterpret_cast<char*>(res), 4096,
+                                  R"({"sum":%d})", a + b);
+        return true;
+    });
+
+    horus::ServiceClient client("calc.add");
+    auto resp = client.call(R"({"a":10,"b":32})", std::chrono::milliseconds(1000));
+    if (resp) std::printf("10 + 32 = %s\n", resp->c_str());
+
+    // Action: navigate to goal
+    horus::ActionClient nav("navigate");
+    auto goal = nav.send_goal(R"({"x":5.0,"y":3.0})");
+    std::printf("Goal %lu: %s\n", goal.id(),
+        goal.is_active() ? "active" : "done");
+    goal.cancel();
+    std::printf("Canceled: %s\n",
+        goal.status() == horus::GoalStatus::Canceled ? "yes" : "no");
+}
+```
+
+## See Also
+
+- [Basic Examples](/docs/cpp/examples/basic) — hello world, pub/sub, params, TF
+- [Tutorial 3: Full Robot](/docs/tutorials/03-full-robot-cpp) — 6-node system
+- [Cross-Language Interop](/docs/tutorials/cross-language-interop) — C++ + Rust + Python
