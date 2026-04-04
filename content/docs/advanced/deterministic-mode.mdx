@@ -63,16 +63,17 @@ You need reproducible, bit-identical execution across runs for simulation, testi
 
 | Aspect | Normal Mode | Deterministic Mode |
 |--------|-------------|-------------------|
-| Clock | Wall clock (real time) | Virtual SimClock (fixed dt per tick) |
+| Clock | Wall clock (real time) | Virtual SimClock (fixed dt per step) |
 | RNG | System entropy | Tick-seeded (reproducible) |
-| Execution order | Parallel by execution class | Dependency-ordered steps |
-| Independent nodes | Parallel | Still parallel |
-| Dependent nodes | Parallel (races possible) | Sequenced (producer before consumer) |
+| Dependency graph | Same graph (from topic metadata) | Same graph (from topic metadata) |
+| Independent nodes | **Parallel** (ready-dispatch) | **Sequential** (reproducible order) |
+| Dependent nodes | Causal order (producer before consumer) | Causal order (producer before consumer) |
+| BestEffort execution | Ready-dispatch (optimal parallelism) | Sequential within steps, SimClock between steps |
 | Execution classes | All active | All active |
 | Failure policies | Active | Active |
 | Watchdog | Active | Active |
 
-**What does NOT change**: execution classes (RT, Compute, AsyncIo, Event, BestEffort), failure policies, watchdog, budget/deadline monitoring. Deterministic mode does not degrade the scheduling system — it adds ordering guarantees.
+**Both modes use the same dependency graph.** The difference is execution strategy: normal mode dispatches independent nodes to a thread pool for maximum parallelism; deterministic mode executes them sequentially for bit-identical reproducibility. Dependent nodes (publisher → subscriber) are always causally ordered in both modes.
 
 ## Framework Time API
 
@@ -136,7 +137,7 @@ See the [Time API reference](/rust/time-api) for the full API.
 
 ## Dependency Ordering
 
-The scheduler builds a dependency graph from nodes' `publishers()` and `subscribers()` metadata. Dependent nodes are sequenced (producer before consumer). Independent nodes run in parallel.
+The scheduler builds a dependency graph automatically from topic `send()`/`recv()` calls. When a node calls `send()` on a topic, it registers as a publisher. When another calls `recv()`, it registers as a subscriber. The scheduler detects these edges and sequences producer before consumer. **No manual metadata or trait methods needed.**
 
 ```rust
 // simplified
@@ -146,15 +147,8 @@ struct SensorDriver {
 
 impl Node for SensorDriver {
     fn name(&self) -> &str { "sensor" }
-
-    fn publishers(&self) -> Vec<TopicMetadata> {
-        vec![TopicMetadata {
-            topic_name: "scan".into(),
-            type_name: "LaserScan".into(),
-        }]
-    }
-
     fn tick(&mut self) {
+        // send() registers this node as publisher of "scan"
         self.scan_topic.send(self.read_hardware());
     }
 }
@@ -166,35 +160,24 @@ struct Controller {
 
 impl Node for Controller {
     fn name(&self) -> &str { "controller" }
-
-    fn subscribers(&self) -> Vec<TopicMetadata> {
-        vec![TopicMetadata {
-            topic_name: "scan".into(),
-            type_name: "LaserScan".into(),
-        }]
-    }
-
-    fn publishers(&self) -> Vec<TopicMetadata> {
-        vec![TopicMetadata {
-            topic_name: "cmd".into(),
-            type_name: "CmdVel".into(),
-        }]
-    }
-
     fn tick(&mut self) {
-        if let Some(scan) = self.scan_topic.try_recv() {
+        // recv() registers as subscriber of "scan"
+        if let Some(scan) = self.scan_topic.recv() {
             let cmd = self.compute_velocity(&scan);
+            // send() registers as publisher of "cmd"
             self.cmd_topic.send(cmd);
         }
     }
 }
 ```
 
-The scheduler automatically ensures `sensor` ticks before `controller` because `controller` subscribes to a topic that `sensor` publishes.
+The scheduler automatically ensures `sensor` ticks before `controller` because `controller` subscribes to a topic that `sensor` publishes. No `.order()` values needed — the dependency graph handles it.
+
+In **normal mode**, independent nodes (no shared topics) run in parallel via the ready-dispatch executor. In **deterministic mode**, they run sequentially within each dependency step for reproducibility.
 
 ### Fallback Without Metadata
 
-If nodes don't implement `publishers()` / `subscribers()`, the scheduler uses `.order()` values as a proxy: lower order runs first, same order = independent (parallel).
+If nodes don't call `send()`/`recv()` during `init()` or the first tick, the scheduler has no topic metadata to build edges from. It falls back to `.order()` tiers: lower order runs first, same order = independent (parallel in normal mode, sequential in deterministic mode).
 
 ## Normal vs Deterministic: When to Use Which
 

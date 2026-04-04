@@ -1,6 +1,6 @@
 # HORUS Documentation (Full)
 
-Generated: 2026-03-31T04:18:32.474Z
+Generated: 2026-04-04T04:47:30.542Z
 Pages: 295
 Source: https://docs.horusrobotics.dev
 Condensed overview: https://docs.horusrobotics.dev/llms.txt
@@ -809,14 +809,10 @@ fn main() -> Result<()> {
 
     let mut scheduler = Scheduler::new();
 
-    // Order matters: sensor publishes (0) before monitor subscribes (1)
-    scheduler.add(TemperatureSensor::new()?)
-        .order(0)
-        .build()?;
-
-    scheduler.add(TemperatureMonitor::new()?)
-        .order(1)
-        .build()?;
+    // The scheduler auto-detects order from topics:
+    // sensor publishes "temperature", monitor subscribes → sensor runs first
+    scheduler.add(TemperatureSensor::new()?).build()?;
+    scheduler.add(TemperatureMonitor::new()?).build()?;
 
     // Run until Ctrl+C
     scheduler.run()?;
@@ -927,13 +923,9 @@ The scheduler runs nodes in priority order each tick cycle:
 // simplified
 let mut scheduler = Scheduler::new();
 
-scheduler.add(sensor)
-    .order(0)       // runs first
-    .build()?;
-
-scheduler.add(monitor)
-    .order(1)       // runs second
-    .build()?;
+// Scheduler auto-detects order from topic dependencies
+scheduler.add(sensor).build()?;
+scheduler.add(monitor).build()?;
 
 scheduler.run()?;   // loop until Ctrl+C
 ```
@@ -7312,21 +7304,19 @@ The speedup is most dramatic for small, frequent messages (CmdVel, IMU) — exac
 
 ## Architecture
 
-### HORUS: Tick-Based, Deterministic
+### HORUS: Dependency-Driven, Auto-Parallel
 
-Every tick cycle, the scheduler executes all nodes in a guaranteed order:
+The scheduler builds a dependency graph from topic `send()`/`recv()` metadata. Dependent nodes execute in causal order. Independent nodes run in parallel — automatically:
 
 ```
-Scheduler tick:
-  → order 0: SafetyMonitor    (always first)
-  → order 1: SensorReader     (always second)
-  → order 2: Controller       (always third)
-  → order 3: Actuator         (always last)
-  → sleep to maintain tick rate
-  → repeat
+Scheduler tick (ready-dispatch):
+  t=0ms:   SafetyMonitor, SensorReader start     (independent → parallel)
+  t=0.1ms: SafetyMonitor done
+  t=2ms:   SensorReader done → Controller starts  (depends on SensorReader)
+  t=5ms:   Controller done → Actuator starts       (depends on Controller)
 ```
 
-Node 2 (Controller) always sees Node 1's (SensorReader) latest data. The safety monitor always runs before the actuator. Every tick, guaranteed. Two runs of the same code produce the same execution order.
+Controller always sees SensorReader's latest data. The dependency graph guarantees causal ordering. Independent nodes like SafetyMonitor and SensorReader run simultaneously — no wasted time waiting for each other. Two runs of the same code produce the same causal execution order.
 
 ### ROS2: Callback-Based, Event-Driven
 
@@ -8610,26 +8600,31 @@ You don't write loops or manage threads. You add nodes, configure their order an
 
 ### Execution Order
 
-SensorNode"] --> B["order 1<br/>ControlNode"] --> C["order 2<br/>LoggerNode"]
+The scheduler figures out the right execution order **automatically** from your topics. When a node calls `send()` on a topic and another calls `recv()` on the same topic, the scheduler knows the sender must run first.
+
+publishes scan"] --> B["ControlNode<br/>subscribes scan"]
+        B --> C["LoggerNode<br/>subscribes cmd"]
     end
-    C --> A
+    C -.->|"next tick"| A
 
     style A fill:#22c55e,stroke:#16a34a,color:#000
     style B fill:#3b82f6,stroke:#2563eb,color:#fff
     style C fill:#a855f7,stroke:#9333ea,color:#fff
 `}
-  caption="Nodes execute in order every tick, then the cycle repeats"
+  caption="The scheduler infers order from topic dependencies — no manual .order() needed"
 />
 
-**Lower order number = runs first.** This is how you ensure data flows correctly through your system:
+**The scheduler builds a dependency graph from your topics.** If ControlNode subscribes to a topic that SensorNode publishes, ControlNode always runs after SensorNode — automatically. You don't need to set `.order()` values.
 
-| Order | Node | Why This Order |
-|-------|------|----------------|
-| 0 | SensorNode | Reads data from hardware first |
-| 1 | ControlNode | Processes sensor data and computes commands |
-| 2 | LoggerNode | Records everything that happened this tick |
+| Node | Topics | Scheduler Action |
+|------|--------|------------------|
+| SensorNode | publishes `scan` | Runs first (no dependencies) |
+| ControlNode | subscribes `scan`, publishes `cmd` | Runs after SensorNode |
+| LoggerNode | subscribes `cmd` | Runs after ControlNode |
 
-If two nodes have the same order, they run in the order they were added to the scheduler. The scheduler provides order-range guidelines:
+**Independent nodes run in parallel.** If you have a Camera node and a LiDAR node that publish to different topics with no shared dependencies, the scheduler runs them simultaneously — no configuration needed.
+
+You can still use `.order()` as a **tiebreaker** for nodes with no topic relationship, or when you want explicit control over independent nodes. The scheduler provides order-range guidelines:
 
 | Range | Category | Examples |
 |-------|----------|----------|
@@ -9777,18 +9772,21 @@ Every tick cycle, the scheduler does the following:
 />
 
 **Key details**:
-- Nodes execute **sequentially in order** within the BestEffort class. RT, Compute, Event, and AsyncIo nodes run on their own threads and are synchronized at tick boundaries.
+- **BestEffort nodes auto-parallelize**: the scheduler builds a dependency graph from topic `send()`/`recv()` metadata. Independent nodes (no shared topics) run in parallel via the **ready-dispatch executor**. Dependent nodes (one subscribes to another's topic) execute in causal order — the publisher always finishes before the subscriber starts. RT, Compute, Event, and AsyncIo nodes run on their own dedicated threads.
 - Rate limiting is per-node: a 10 Hz node inside a 1 kHz scheduler only has `tick()` called every 100th cycle.
 - Budget enforcement happens *after* `tick()` returns — the scheduler doesn't preempt mid-tick. It records the overrun and applies the `Miss` policy.
+- `.order()` is **optional** — when nodes have topic dependencies, the graph determines execution order automatically. `.order()` serves as a tiebreaker for independent nodes with no topic relationship.
 
 ### Initialization
 
 When you call `scheduler.run()`, initialization happens **lazily** — not when nodes are added:
 
 1. All pending node configurations are finalized (execution class inference, budget/deadline auto-derivation)
-2. `init()` is called on every node, in order
-3. If a node's `init()` returns `Err`, that node enters Error state and is excluded from ticking. Other nodes continue.
-4. The main tick loop begins
+2. `init()` is called on every node — topic `send()`/`recv()` calls during `init()` register with the TopicNodeRegistry
+3. The **dependency graph** is built from the registry: edges from publishers to subscribers, cycle detection, topological sort
+4. If a node's `init()` returns `Err`, that node enters Error state and is excluded from ticking. Other nodes continue.
+5. The main tick loop begins
+6. After the first tick, the graph is rebuilt once if new topic registrations were detected (for topics created lazily during `tick()`)
 
 This lazy initialization means you can configure nodes in any order and the scheduler resolves dependencies at startup.
 
@@ -10056,17 +10054,19 @@ HORUS solves this with **execution classes**: five different executors, each opt
 
 ### BestEffort (Default)
 
-Nodes tick sequentially in the main loop, ordered by `.order()`. This is the simplest and lowest-overhead class.
+The default class. The scheduler **automatically parallelizes** independent BestEffort nodes using a dependency graph built from topic `send()`/`recv()` metadata. Nodes that share no topics run simultaneously. Nodes with topic dependencies execute in causal order (publisher before subscriber). When no topic metadata exists, nodes fall back to `.order()` tiers.
 
 
-**How it works**: The main scheduler thread calls `tick()` on each BestEffort node in sequence, once per scheduler cycle. No threads are spawned. No synchronization is needed.
+**How it works**: At startup, the scheduler builds a dependency graph from topic metadata. Independent nodes are dispatched to a thread pool via the **ready-dispatch executor** — each node starts the instant its last dependency finishes, with no barriers. Dependent nodes execute in causal order. The graph is built after `init()` and rebuilt once after the first tick to capture any lazily-registered topics.
 
-**Use for**: Logging, telemetry, display, diagnostic reporting — anything without timing requirements or heavy computation.
+**Use for**: Sensors, controllers, planners, logging, telemetry — most nodes. The scheduler automatically determines what can run in parallel.
 
 **Characteristics**:
 - Runs at the scheduler's global `tick_rate()`
-- Deterministic ordering (same sequence every cycle)
-- Lowest overhead — no thread spawn, no atomics, no synchronization
+- Independent nodes execute in parallel (automatic — no configuration needed)
+- Dependent nodes execute in causal order (publisher before subscriber)
+- `.order()` is optional — used as tiebreaker for nodes with no topic relationship
+- Falls back to sequential `.order()` tiers when no topic metadata is available
 
 ### Rt (Real-Time)
 
@@ -25145,7 +25145,7 @@ use horus::prelude::*;
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `.order(n)` | 100 | Sets execution priority (lower = runs first) |
+| `.order(n)` | 100 | Optional tiebreaker for independent nodes (lower = runs first). Ordering is automatic when nodes have topic dependencies. |
 | `.rate(freq)` | global | Sets per-node tick rate, auto-enables RT |
 | `.budget(duration)` | 80% of period | Sets maximum tick execution time |
 | `.deadline(duration)` | 95% of period | Sets hard deadline per tick |
@@ -25658,7 +25658,7 @@ pub fn order(self, order: u32) -> Self
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `order` | `u32` | yes | Execution priority. Default: 100. |
+| `order` | `u32` | no | Tiebreaker for independent nodes. Default: 100. Ordering is automatic when nodes have topic dependencies via `send()`/`recv()`. |
 
 **Returns**
 
@@ -39498,7 +39498,7 @@ HORUS solves this with **execution classes**: five different executors, each opt
 
 ### BestEffort (Default)
 
-Nodes tick sequentially in the main loop, ordered by `order=`. This is the simplest and lowest-overhead class.
+The default class. The scheduler **automatically parallelizes** independent BestEffort nodes using a dependency graph built from topic `send()`/`recv()` calls. Nodes that share no topics run simultaneously. Nodes with topic dependencies execute in causal order (publisher before subscriber). When no topic metadata exists, nodes fall back to `order=` tiers.
 
 ```python
 # simplified
@@ -39518,14 +39518,15 @@ display = horus.Node(
 )
 ```
 
-**How it works**: The main scheduler thread calls `tick()` on each BestEffort node in sequence, once per scheduler cycle. No threads are spawned. No synchronization is needed.
+**How it works**: At startup, the scheduler builds a dependency graph from topic metadata. Independent nodes are dispatched to a thread pool via the **ready-dispatch executor** — each node starts the instant its last dependency finishes. Dependent nodes execute in causal order.
 
-**Use for**: Logging, telemetry, display, diagnostic reporting — anything without timing requirements or heavy computation.
+**Use for**: Sensors, controllers, planners, logging, telemetry — most nodes. The scheduler automatically determines what can run in parallel.
 
 **Characteristics**:
 - Runs at the scheduler's global `tick_rate`
-- Deterministic ordering (same sequence every cycle)
-- Lowest overhead — no thread spawn, no atomics, no synchronization
+- Independent nodes execute in parallel (automatic — no configuration needed)
+- Dependent nodes execute in causal order (publisher before subscriber)
+- `order=` is optional — used as tiebreaker for nodes with no topic relationship
 
 ### Rt (Real-Time)
 
@@ -61562,30 +61563,33 @@ horus.run(horus.Node(tick=infer, rate=10, subs=["input"], pubs=["output"]))
 ## Performance Tips
 
 - **Use `compute=True`** for CPU-bound inference — runs on thread pool, releases GIL during C extension calls (NumPy, ONNX, PyTorch):
-  ```python
+
+```python
 # simplified
-  horus.Node(tick=detect, rate=30, compute=True, ...)
-  ```
+horus.Node(tick=detect, rate=30, compute=True, ...)
+```
 
 - **Set realistic `budget`** to detect slow inference:
-  ```python
+
+```python
 # simplified
-  horus.Node(tick=detect, rate=30, budget=50 * horus.ms, on_miss="skip")
-  ```
+horus.Node(tick=detect, rate=30, budget=50 * horus.ms, on_miss="skip")
+```
 
 - **Use `horus.Image.to_torch()`** for zero-copy GPU transfer — no pixel data copied.
 
 - **Batch with `recv_all()`** if messages queue up:
-  ```python
+
+```python
 # simplified
-  def batch_infer(node):
-      frames = node.recv_all("camera")
-      if frames:
-          batch = np.stack([f.to_numpy() for f in frames])
-          outputs = session.run(None, {"images": batch})
-          for det in outputs[0]:
-              node.send("detections", det)
-  ```
+def batch_infer(node):
+    frames = node.recv_all("camera")
+    if frames:
+        batch = np.stack([f.to_numpy() for f in frames])
+        outputs = session.run(None, {"images": batch})
+        for det in outputs[0]:
+            node.send("detections", det)
+```
 
 ### GPU Memory Management
 
@@ -61645,7 +61649,7 @@ def my_init(node):
 
 | Framework | Import | Zero-Copy From Image | Inference Pattern |
 |-----------|--------|---------------------|-------------------|
-| ONNX Runtime | `import onnxruntime as ort` | `img.to_numpy()` | `session.run(None, {"images": arr})` |
+| ONNX Runtime | `import onnxruntime as ort` | `img.to_numpy()` | `session.run(None, input_dict)` |
 | PyTorch | `import torch` | `img.to_torch()` | `model(tensor.unsqueeze(0).cuda())` |
 | OpenCV | `import cv2` | `img.to_numpy()` | `cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)` |
 | TensorFlow | `import tensorflow as tf` | `img.to_numpy()` | `model(tf.convert_to_tensor(arr))` |
@@ -76466,16 +76470,17 @@ You need reproducible, bit-identical execution across runs for simulation, testi
 
 | Aspect | Normal Mode | Deterministic Mode |
 |--------|-------------|-------------------|
-| Clock | Wall clock (real time) | Virtual SimClock (fixed dt per tick) |
+| Clock | Wall clock (real time) | Virtual SimClock (fixed dt per step) |
 | RNG | System entropy | Tick-seeded (reproducible) |
-| Execution order | Parallel by execution class | Dependency-ordered steps |
-| Independent nodes | Parallel | Still parallel |
-| Dependent nodes | Parallel (races possible) | Sequenced (producer before consumer) |
+| Dependency graph | Same graph (from topic metadata) | Same graph (from topic metadata) |
+| Independent nodes | **Parallel** (ready-dispatch) | **Sequential** (reproducible order) |
+| Dependent nodes | Causal order (producer before consumer) | Causal order (producer before consumer) |
+| BestEffort execution | Ready-dispatch (optimal parallelism) | Sequential within steps, SimClock between steps |
 | Execution classes | All active | All active |
 | Failure policies | Active | Active |
 | Watchdog | Active | Active |
 
-**What does NOT change**: execution classes (RT, Compute, AsyncIo, Event, BestEffort), failure policies, watchdog, budget/deadline monitoring. Deterministic mode does not degrade the scheduling system — it adds ordering guarantees.
+**Both modes use the same dependency graph.** The difference is execution strategy: normal mode dispatches independent nodes to a thread pool for maximum parallelism; deterministic mode executes them sequentially for bit-identical reproducibility. Dependent nodes (publisher → subscriber) are always causally ordered in both modes.
 
 ## Framework Time API
 
@@ -76486,7 +76491,7 @@ See the [Time API reference](/rust/time-api) for the full API.
 
 ## Dependency Ordering
 
-The scheduler builds a dependency graph from nodes' `publishers()` and `subscribers()` metadata. Dependent nodes are sequenced (producer before consumer). Independent nodes run in parallel.
+The scheduler builds a dependency graph automatically from topic `send()`/`recv()` calls. When a node calls `send()` on a topic, it registers as a publisher. When another calls `recv()`, it registers as a subscriber. The scheduler detects these edges and sequences producer before consumer. **No manual metadata or trait methods needed.**
 
 ```rust
 // simplified
@@ -76496,15 +76501,8 @@ struct SensorDriver {
 
 impl Node for SensorDriver {
     fn name(&self) -> &str { "sensor" }
-
-    fn publishers(&self) -> Vec<TopicMetadata> {
-        vec![TopicMetadata {
-            topic_name: "scan".into(),
-            type_name: "LaserScan".into(),
-        }]
-    }
-
     fn tick(&mut self) {
+        // send() registers this node as publisher of "scan"
         self.scan_topic.send(self.read_hardware());
     }
 }
@@ -76516,35 +76514,24 @@ struct Controller {
 
 impl Node for Controller {
     fn name(&self) -> &str { "controller" }
-
-    fn subscribers(&self) -> Vec<TopicMetadata> {
-        vec![TopicMetadata {
-            topic_name: "scan".into(),
-            type_name: "LaserScan".into(),
-        }]
-    }
-
-    fn publishers(&self) -> Vec<TopicMetadata> {
-        vec![TopicMetadata {
-            topic_name: "cmd".into(),
-            type_name: "CmdVel".into(),
-        }]
-    }
-
     fn tick(&mut self) {
-        if let Some(scan) = self.scan_topic.try_recv() {
+        // recv() registers as subscriber of "scan"
+        if let Some(scan) = self.scan_topic.recv() {
             let cmd = self.compute_velocity(&scan);
+            // send() registers as publisher of "cmd"
             self.cmd_topic.send(cmd);
         }
     }
 }
 ```
 
-The scheduler automatically ensures `sensor` ticks before `controller` because `controller` subscribes to a topic that `sensor` publishes.
+The scheduler automatically ensures `sensor` ticks before `controller` because `controller` subscribes to a topic that `sensor` publishes. No `.order()` values needed — the dependency graph handles it.
+
+In **normal mode**, independent nodes (no shared topics) run in parallel via the ready-dispatch executor. In **deterministic mode**, they run sequentially within each dependency step for reproducibility.
 
 ### Fallback Without Metadata
 
-If nodes don't implement `publishers()` / `subscribers()`, the scheduler uses `.order()` values as a proxy: lower order runs first, same order = independent (parallel).
+If nodes don't call `send()`/`recv()` during `init()` or the first tick, the scheduler has no topic metadata to build edges from. It falls back to `.order()` tiers: lower order runs first, same order = independent (parallel in normal mode, sequential in deterministic mode).
 
 ## Normal vs Deterministic: When to Use Which
 
@@ -76997,7 +76984,7 @@ If no execution class is specified, the node defaults to **BestEffort**. A node 
 
 | Method | Description |
 |--------|-------------|
-| `.order(n)` | Execution priority within a tick (lower = runs first) |
+| `.order(n)` | Tiebreaker for independent nodes (lower = runs first). Optional when nodes have topic dependencies — the dependency graph handles ordering automatically |
 | `.rate(Frequency)` | Node-specific tick rate — auto-derives budget (80%) and deadline (95%), auto-marks as RT |
 | `.budget(Duration)` | Override auto-derived tick budget (max execution time) |
 | `.deadline(Duration)` | Override auto-derived absolute deadline |
@@ -77055,74 +77042,65 @@ Compose the builder methods you need for each deployment stage:
 
 ## Execution Modes
 
-HORUS supports sequential and parallel execution. You configure this through `Scheduler::new()` and per-node execution classes.
+HORUS **automatically parallelizes independent nodes** while maintaining causal ordering for dependent nodes. No manual configuration needed — the scheduler builds a dependency graph from topic `send()`/`recv()` metadata.
 
 
-### Sequential Mode (Default)
+### Default Mode (Auto-Parallel)
 
-Nodes execute one-by-one in priority order — same execution order every tick. Predictable and certification-ready.
+The scheduler builds a dependency graph from topic metadata and dispatches independent nodes to a thread pool via the **ready-dispatch executor**. Each node starts the instant its last dependency finishes — no barriers, no wasted time.
 
 | Metric | Value |
 |--------|-------|
-| Latency | ~100-500ns per node |
-| Predictable | **Yes** — same order every tick |
-| Multi-core | No (single thread) |
-| Best For | Safety-critical, certification |
-
-**When to use:** Medical/surgical robots, systems needing reproducible behavior, debugging timing issues, formal verification.
+| Independent nodes | **Parallel** (multi-core) |
+| Dependent nodes | **Causal order** (publisher before subscriber) |
+| Latency | Optimal — critical path only |
+| `.order()` needed | **No** — optional tiebreaker |
 
 ```rust,ignore
 use horus::prelude::*;
 
-// Safety-critical robot controller — 1 kHz tick
-// rate() auto-marks nodes as RT with derived budget + deadline
-let mut scheduler = Scheduler::new()
-    .require_rt()
-    .watchdog(500_u64.ms())
-    .blackbox(64)
-    .tick_rate(1000_u64.hz());
-scheduler.add(safety_monitor).order(0).rate(1000_u64.hz()).on_miss(Miss::Stop).build()?;
-scheduler.add(controller).order(1).rate(1000_u64.hz()).on_miss(Miss::SafeMode).build()?;
+let mut scheduler = Scheduler::new();
+
+// Independent sensors — run in parallel automatically
+scheduler.add(lidar_node).build()?;    // publishes "scan"
+scheduler.add(camera_node).build()?;   // publishes "image"
+scheduler.add(imu_node).build()?;      // publishes "imu"
+
+// Fusion depends on all three — waits for all to complete
+scheduler.add(fusion_node).build()?;   // subscribes "scan", "image", "imu"
 scheduler.run()?;
 ```
 
-### Parallel Mode
+### Deterministic Mode
 
-Schedules independent nodes on different CPU cores. Nodes at the same `order` level run concurrently:
+Uses the **same dependency graph** but executes nodes sequentially within each step. SimClock advances between steps. Produces bit-identical results across runs.
 
 | Metric | Value |
 |--------|-------|
-| Latency | Variable (depends on workload) |
-| Predictable | Ordering within same priority level varies |
-| Multi-core | **Yes** |
-| Best For | Multi-sensor fusion, compute-heavy pipelines |
-
-**When to use:** Multi-sensor robots, compute-heavy pipelines, systems with many independent nodes.
+| Independent nodes | **Sequential** (reproducible order) |
+| Dependent nodes | **Causal order** (same as default) |
+| Clock | Virtual SimClock |
+| Best For | Simulation, testing, replay, CI |
 
 ```rust,ignore
 use horus::prelude::*;
 
-// Research robot with many sensors — parallel sensor processing
-let mut scheduler = Scheduler::new();
-
-// These sensor nodes run in parallel (same order number)
-scheduler.add(lidar_node).order(0).build()?;
-scheduler.add(camera_node).order(0).build()?;
-scheduler.add(imu_node).order(0).build()?;
-
-// Fusion runs after all sensors (higher order number)
-scheduler.add(fusion_node).order(1).build()?;
+let mut scheduler = Scheduler::new()
+    .deterministic(true)
+    .tick_rate(100_u64.hz());
+scheduler.add(sensor).build()?;
+scheduler.add(controller).build()?;
 scheduler.run()?;
 ```
 
 ### Mode Comparison
 
-| Feature | Sequential | Parallel |
-|---------|------------|----------|
-| Predictable Order | **Yes** | Per-priority level |
-| Multi-core | No | **Yes** |
-| Best Latency | 87-313ns | Variable |
-| Certification Ready | **Yes** | No |
+| Feature | Default (Auto-Parallel) | Deterministic |
+|---------|------------------------|---------------|
+| Independent nodes | Parallel (multi-core) | Sequential (reproducible) |
+| Dependent nodes | Causal order | Causal order |
+| Clock | Wall clock | SimClock |
+| Certification ready | Yes (causal ordering guaranteed) | Yes (fully reproducible) |
 
 ## DurationExt and Frequency
 
@@ -77218,7 +77196,7 @@ Explicit ordering is predictable and debuggable. Automatic dependency ordering (
 | Deadline misses on every tick | Budget too tight for actual computation time | Profile with `horus monitor`, then increase `.budget()` or lower `.rate()` |
 | Node never ticks | `.on(topic)` set but no publisher on that topic | Verify another node publishes to the same topic name |
 | `.build()` returns error | Conflicting configuration (e.g., `.on()` with `.budget()`) | Event nodes cannot have budgets. Remove timing constraints from event nodes |
-| Nodes execute in wrong order | `.order()` values not set or identical | Assign distinct `.order()` values. Lower = runs first |
+| Nodes execute in wrong order | Topic dependencies not detected (no `send()`/`recv()` calls) | Ensure nodes call `send()`/`recv()` during `init()` or first tick. Use `.order()` as fallback for non-topic dependencies |
 
 ## See Also
 

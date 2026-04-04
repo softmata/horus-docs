@@ -178,7 +178,7 @@ If no execution class is specified, the node defaults to **BestEffort**. A node 
 
 | Method | Description |
 |--------|-------------|
-| `.order(n)` | Execution priority within a tick (lower = runs first) |
+| `.order(n)` | Tiebreaker for independent nodes (lower = runs first). Optional when nodes have topic dependencies — the dependency graph handles ordering automatically |
 | `.rate(Frequency)` | Node-specific tick rate — auto-derives budget (80%) and deadline (95%), auto-marks as RT |
 | `.budget(Duration)` | Override auto-derived tick budget (max execution time) |
 | `.deadline(Duration)` | Override auto-derived absolute deadline |
@@ -288,88 +288,77 @@ Compose the builder methods you need for each deployment stage:
 
 ## Execution Modes
 
-HORUS supports sequential and parallel execution. You configure this through `Scheduler::new()` and per-node execution classes.
+HORUS **automatically parallelizes independent nodes** while maintaining causal ordering for dependent nodes. No manual configuration needed — the scheduler builds a dependency graph from topic `send()`/`recv()` metadata.
 
-<Callout type="info" title="Quick Answer: Which Mode Should I Use?">
+<Callout type="info" title="Quick Answer: Do I Need to Configure Anything?">
 
-**Use the default.** `Scheduler::new()` gives you predictable, priority-ordered execution that works for most robots.
+**No.** `Scheduler::new()` gives you automatic parallelism with dependency-based ordering. Independent nodes run on multiple cores. Dependent nodes execute in the correct causal order. Just add your nodes and call `run()`.
 
 | Your Situation | Recommended Setup |
 |----------------|------------------|
-| Learning HORUS | `Scheduler::new()` with defaults |
+| Learning HORUS | `Scheduler::new()` — parallelism is automatic |
 | Prototyping | `Scheduler::new()` |
-| Need maximum speed | `Scheduler::new()` with `.compute()` on heavy nodes |
+| Need reproducible runs | `Scheduler::new().deterministic(true)` — same graph, sequential execution |
 | Safety-critical (medical, aerospace) | `Scheduler::new().require_rt().tick_rate(1000_u64.hz())` with `.rate()` |
-
-**Don't overthink this.** Start with `Scheduler::new()` and configure per-node execution classes as needed.
 
 </Callout>
 
-### Sequential Mode (Default)
+### Default Mode (Auto-Parallel)
 
-Nodes execute one-by-one in priority order — same execution order every tick. Predictable and certification-ready.
+The scheduler builds a dependency graph from topic metadata and dispatches independent nodes to a thread pool via the **ready-dispatch executor**. Each node starts the instant its last dependency finishes — no barriers, no wasted time.
 
 | Metric | Value |
 |--------|-------|
-| Latency | ~100-500ns per node |
-| Predictable | **Yes** — same order every tick |
-| Multi-core | No (single thread) |
-| Best For | Safety-critical, certification |
-
-**When to use:** Medical/surgical robots, systems needing reproducible behavior, debugging timing issues, formal verification.
+| Independent nodes | **Parallel** (multi-core) |
+| Dependent nodes | **Causal order** (publisher before subscriber) |
+| Latency | Optimal — critical path only |
+| `.order()` needed | **No** — optional tiebreaker |
 
 ```rust,ignore
 use horus::prelude::*;
 
-// Safety-critical robot controller — 1 kHz tick
-// rate() auto-marks nodes as RT with derived budget + deadline
-let mut scheduler = Scheduler::new()
-    .require_rt()
-    .watchdog(500_u64.ms())
-    .blackbox(64)
-    .tick_rate(1000_u64.hz());
-scheduler.add(safety_monitor).order(0).rate(1000_u64.hz()).on_miss(Miss::Stop).build()?;
-scheduler.add(controller).order(1).rate(1000_u64.hz()).on_miss(Miss::SafeMode).build()?;
+let mut scheduler = Scheduler::new();
+
+// Independent sensors — run in parallel automatically
+scheduler.add(lidar_node).build()?;    // publishes "scan"
+scheduler.add(camera_node).build()?;   // publishes "image"
+scheduler.add(imu_node).build()?;      // publishes "imu"
+
+// Fusion depends on all three — waits for all to complete
+scheduler.add(fusion_node).build()?;   // subscribes "scan", "image", "imu"
 scheduler.run()?;
 ```
 
-### Parallel Mode
+### Deterministic Mode
 
-Schedules independent nodes on different CPU cores. Nodes at the same `order` level run concurrently:
+Uses the **same dependency graph** but executes nodes sequentially within each step. SimClock advances between steps. Produces bit-identical results across runs.
 
 | Metric | Value |
 |--------|-------|
-| Latency | Variable (depends on workload) |
-| Predictable | Ordering within same priority level varies |
-| Multi-core | **Yes** |
-| Best For | Multi-sensor fusion, compute-heavy pipelines |
-
-**When to use:** Multi-sensor robots, compute-heavy pipelines, systems with many independent nodes.
+| Independent nodes | **Sequential** (reproducible order) |
+| Dependent nodes | **Causal order** (same as default) |
+| Clock | Virtual SimClock |
+| Best For | Simulation, testing, replay, CI |
 
 ```rust,ignore
 use horus::prelude::*;
 
-// Research robot with many sensors — parallel sensor processing
-let mut scheduler = Scheduler::new();
-
-// These sensor nodes run in parallel (same order number)
-scheduler.add(lidar_node).order(0).build()?;
-scheduler.add(camera_node).order(0).build()?;
-scheduler.add(imu_node).order(0).build()?;
-
-// Fusion runs after all sensors (higher order number)
-scheduler.add(fusion_node).order(1).build()?;
+let mut scheduler = Scheduler::new()
+    .deterministic(true)
+    .tick_rate(100_u64.hz());
+scheduler.add(sensor).build()?;
+scheduler.add(controller).build()?;
 scheduler.run()?;
 ```
 
 ### Mode Comparison
 
-| Feature | Sequential | Parallel |
-|---------|------------|----------|
-| Predictable Order | **Yes** | Per-priority level |
-| Multi-core | No | **Yes** |
-| Best Latency | 87-313ns | Variable |
-| Certification Ready | **Yes** | No |
+| Feature | Default (Auto-Parallel) | Deterministic |
+|---------|------------------------|---------------|
+| Independent nodes | Parallel (multi-core) | Sequential (reproducible) |
+| Dependent nodes | Causal order | Causal order |
+| Clock | Wall clock | SimClock |
+| Certification ready | Yes (causal ordering guaranteed) | Yes (fully reproducible) |
 
 ## DurationExt and Frequency
 
@@ -465,7 +454,7 @@ Explicit ordering is predictable and debuggable. Automatic dependency ordering (
 | Deadline misses on every tick | Budget too tight for actual computation time | Profile with `horus monitor`, then increase `.budget()` or lower `.rate()` |
 | Node never ticks | `.on(topic)` set but no publisher on that topic | Verify another node publishes to the same topic name |
 | `.build()` returns error | Conflicting configuration (e.g., `.on()` with `.budget()`) | Event nodes cannot have budgets. Remove timing constraints from event nodes |
-| Nodes execute in wrong order | `.order()` values not set or identical | Assign distinct `.order()` values. Lower = runs first |
+| Nodes execute in wrong order | Topic dependencies not detected (no `send()`/`recv()` calls) | Ensure nodes call `send()`/`recv()` during `init()` or first tick. Use `.order()` as fallback for non-topic dependencies |
 
 ## See Also
 
