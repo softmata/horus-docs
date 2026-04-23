@@ -83,12 +83,12 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
                 <LanguageSelector />
                 <ThemeToggle />
                 <a
-                  href="https://gitlab.com/softmata/horus"
+                  href="https://github.com/softmata/horus"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="p-2 text-[var(--text-tertiary)] hover:text-[var(--text)] hover:bg-[var(--surface)] transition-colors"
-                  title="GitLab"
-                  aria-label="GitLab Repository"
+                  title="GitHub"
+                  aria-label="GitHub Repository"
                 >
                   <FiGithub className="w-5 h-5" />
                 </a>

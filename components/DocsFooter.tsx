@@ -108,13 +108,13 @@ export function DocsFooter() {
             <ul className="space-y-3 text-sm">
               <li>
                 <a
-                  href="https://gitlab.com/softmata/horus"
+                  href="https://github.com/softmata/horus"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors inline-flex items-center gap-1"
                 >
                   <FiGithub className="w-4 h-4" />
-                  GitLab
+                  GitHub
                 </a>
               </li>
               <li>
@@ -130,7 +130,7 @@ export function DocsFooter() {
               </li>
               <li>
                 <a
-                  href="https://gitlab.com/softmata/horus/issues"
+                  href="https://github.com/softmata/horus/issues"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors inline-flex items-center gap-1"
@@ -141,7 +141,7 @@ export function DocsFooter() {
               </li>
               <li>
                 <a
-                  href="https://gitlab.com/softmata/horus/blob/main/CONTRIBUTING.md"
+                  href="https://github.com/softmata/horus/blob/main/CONTRIBUTING.md"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors inline-flex items-center gap-1"
@@ -164,7 +164,7 @@ export function DocsFooter() {
           </div>
           <div className="flex items-center gap-6 text-sm text-[var(--text-tertiary)]">
             <a
-              href="https://gitlab.com/softmata/horus/blob/main/LICENSE"
+              href="https://github.com/softmata/horus/blob/main/LICENSE"
               target="_blank"
               rel="noopener noreferrer"
               className="hover:text-[var(--text-secondary)] transition-colors"

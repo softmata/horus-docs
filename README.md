@@ -1,6 +1,6 @@
 # HORUS Documentation
 
-Official documentation site for [HORUS](https://gitlab.com/softmata/horus) — a real-time robotics framework with zero-copy IPC and deterministic scheduling.
+Official documentation site for [HORUS](https://github.com/softmata/horus) — a real-time robotics framework with zero-copy IPC and deterministic scheduling.
 
 **Live**: [docs.horusrobotics.dev](https://docs.horusrobotics.dev)
 
@@ -105,10 +105,10 @@ Cross-reference strategy: [CROSS_REFERENCES.md](./CROSS_REFERENCES.md)
 
 ## Links
 
-- **Framework**: [gitlab.com/softmata/horus](https://gitlab.com/softmata/horus)
+- **Framework**: [github.com/softmata/horus](https://github.com/softmata/horus)
 - **Live Docs**: [docs.horusrobotics.dev](https://docs.horusrobotics.dev)
 - **Discord**: [discord.gg/hEZC3ev2Nf](https://discord.gg/hEZC3ev2Nf)
-- **Issues**: [gitlab.com/softmata/horus-docs/-/issues](https://gitlab.com/softmata/horus-docs/-/issues)
+- **Issues**: [github.com/softmata/horus-docs/issues](https://github.com/softmata/horus-docs/issues)
 
 ## License
 
