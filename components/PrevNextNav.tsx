@@ -3,6 +3,11 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiArrowLeft, FiArrowRight } from "react-icons/fi";
+import { useEffect, useState } from "react";
+import { pageLanguage, type Language } from "@/lib/language-pairs";
+
+const LANG_STORAGE_KEY = 'horus-docs-language';
+const LANG_SYNC_EVENT = 'horus-language-change';
 
 interface DocLink {
   title: string;
@@ -210,9 +215,44 @@ const allPages: DocLink[] = [
 export function PrevNextNav() {
   const pathname = usePathname();
 
-  const currentIndex = allPages.findIndex(page => page.href === pathname);
-  const prevPage = currentIndex > 0 ? allPages[currentIndex - 1] : null;
-  const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1] : null;
+  // Track the selected language so prev/next skips pages in the other languages.
+  const [language, setLanguage] = useState<Language | null>(null);
+
+  useEffect(() => {
+    const stored = typeof window !== 'undefined'
+      ? (localStorage.getItem(LANG_STORAGE_KEY) as Language | null)
+      : null;
+    if (stored === 'Rust' || stored === 'Python' || stored === 'C++') {
+      setLanguage(stored);
+    } else {
+      setLanguage('Rust');
+    }
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail === 'Rust' || detail === 'Python' || detail === 'C++') {
+        setLanguage(detail);
+      }
+    };
+    window.addEventListener(LANG_SYNC_EVENT, handler);
+    return () => window.removeEventListener(LANG_SYNC_EVENT, handler);
+  }, []);
+
+  // Keep only pages that match the selected language, plus language-agnostic
+  // pages. This ensures "Next" from a Rust page goes to the next Rust page
+  // (or a shared concept page) and skips /python/* and /cpp/* entries.
+  const visiblePages = allPages.filter((p) => {
+    const pLang = pageLanguage(p.href);
+    return !pLang || !language || pLang === language;
+  });
+
+  const currentIndex = visiblePages.findIndex((page) => page.href === pathname);
+  const prevPage = currentIndex > 0 ? visiblePages[currentIndex - 1] : null;
+  const nextPage = currentIndex !== -1 && currentIndex < visiblePages.length - 1
+    ? visiblePages[currentIndex + 1]
+    : null;
 
   if (!prevPage && !nextPage) {
     return null;

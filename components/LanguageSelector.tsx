@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { getLanguagePair, type Language } from '@/lib/language-pairs';
+import { getLanguagePair, pageLanguage, type Language } from '@/lib/language-pairs';
 
 const STORAGE_KEY = 'horus-docs-language';
 const SYNC_EVENT = 'horus-language-change';
@@ -47,6 +47,24 @@ export default function LanguageSelector() {
     window.addEventListener('storage', handler);
     return () => window.removeEventListener('storage', handler);
   }, []);
+
+  // When the user arrives on a language-specific page via a link (not via this
+  // toggle), the toggle must reflect what they're actually looking at —
+  // otherwise "Rust" shows in the header while Python content is on screen.
+  // Update the toggle + persist + broadcast so inline LanguageTabs instances
+  // switch too.
+  useEffect(() => {
+    if (!pathname) return;
+    const currentLang = pageLanguage(pathname);
+    if (currentLang && currentLang !== language) {
+      setLanguage(currentLang);
+      localStorage.setItem(STORAGE_KEY, currentLang);
+      window.dispatchEvent(new CustomEvent(SYNC_EVENT, { detail: currentLang }));
+    }
+    // `language` is intentionally excluded — we only want to react to path
+    // changes, not to manual toggle changes (which are handled elsewhere).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname]);
 
   // Close dropdown on outside click
   useEffect(() => {
