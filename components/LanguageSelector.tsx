@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { usePathname, useRouter } from 'next/navigation';
+import { getLanguagePair, type Language } from '@/lib/language-pairs';
 
 const STORAGE_KEY = 'horus-docs-language';
 const SYNC_EVENT = 'horus-language-change';
@@ -20,6 +22,8 @@ export default function LanguageSelector() {
   });
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const pathname = usePathname();
+  const router = useRouter();
 
   // Sync from other LanguageTabs or LanguageSelector instances
   useEffect(() => {
@@ -69,6 +73,14 @@ export default function LanguageSelector() {
     setOpen(false);
     localStorage.setItem(STORAGE_KEY, lang);
     window.dispatchEvent(new CustomEvent(SYNC_EVENT, { detail: lang }));
+
+    // If the current page has a counterpart in the selected language, navigate.
+    // Otherwise stay on the current page (the language preference still updates
+    // so inline <LanguageTabs> instances respect the choice).
+    const paired = getLanguagePair(pathname || '/', lang as Language);
+    if (paired && paired !== pathname) {
+      router.push(paired);
+    }
   };
 
   return (

@@ -4,6 +4,10 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
 import { useState, useEffect } from "react";
+import { pageLanguage, type Language } from "@/lib/language-pairs";
+
+const LANG_STORAGE_KEY = 'horus-docs-language';
+const LANG_SYNC_EVENT = 'horus-language-change';
 
 /**
  * Auto-generated sidebar navigation.
@@ -57,6 +61,61 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
   });
 
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({});
+
+  // Selected language — used to filter per-language sidebar entries.
+  // SSR: start as null so first render shows all entries; hydration populates
+  // from localStorage and subsequent renders filter.
+  const [language, setLanguage] = useState<Language | null>(null);
+
+  useEffect(() => {
+    const stored = typeof window !== 'undefined'
+      ? (localStorage.getItem(LANG_STORAGE_KEY) as Language | null)
+      : null;
+    if (stored === 'Rust' || stored === 'Python' || stored === 'C++') {
+      setLanguage(stored);
+    } else {
+      setLanguage('Rust');
+    }
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail === 'Rust' || detail === 'Python' || detail === 'C++') {
+        setLanguage(detail);
+      }
+    };
+    window.addEventListener(LANG_SYNC_EVENT, handler);
+    return () => window.removeEventListener(LANG_SYNC_EVENT, handler);
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: StorageEvent) => {
+      if (e.key === LANG_STORAGE_KEY && (e.newValue === 'Rust' || e.newValue === 'Python' || e.newValue === 'C++')) {
+        setLanguage(e.newValue);
+      }
+    };
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
+
+  // Recursively filter a link's children, dropping any that belong to a
+  // different language than the one currently selected.
+  const filterLink = (link: DocLink): DocLink | null => {
+    const linkLang = pageLanguage(link.href);
+    if (linkLang && language && linkLang !== language) return null;
+    const filteredChildren = link.children
+      ? (link.children.map(filterLink).filter(Boolean) as DocLink[])
+      : undefined;
+    return { ...link, children: filteredChildren };
+  };
+
+  const visibleSections: SidebarSection[] = sections
+    .map((section) => ({
+      ...section,
+      links: section.links.map(filterLink).filter(Boolean) as DocLink[],
+    }))
+    .filter((section) => section.links.length > 0);
 
   const toggleSection = (title: string) => {
     setExpandedSections((prev) => ({ ...prev, [title]: !prev[title] }));
@@ -132,7 +191,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
 
   const sidebarContent = (
     <div className="p-6 space-y-6 pb-12">
-      {sections.map((section) => {
+      {visibleSections.map((section) => {
         const isExpanded = expandedSections[section.title];
 
         return (
