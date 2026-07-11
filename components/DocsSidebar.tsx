@@ -36,6 +36,10 @@ interface DocLink {
   href: string;
   order?: number;
   children?: DocLink[];
+  /** Explicit language from frontmatter (build-sidebar.js), overrides the
+   *  path heuristic. Set for language-specific pages whose per-language
+   *  siblings live at mismatched slugs. */
+  language?: Language;
 }
 
 interface SidebarSection {
@@ -102,7 +106,8 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
   // Recursively filter a link's children, dropping any that belong to a
   // different language than the one currently selected.
   const filterLink = (link: DocLink): DocLink | null => {
-    const linkLang = pageLanguage(link.href);
+    // Explicit frontmatter language wins; otherwise fall back to the path heuristic.
+    const linkLang = link.language ?? pageLanguage(link.href);
     if (linkLang && language && linkLang !== language) return null;
     const filteredChildren = link.children
       ? (link.children.map(filterLink).filter(Boolean) as DocLink[])

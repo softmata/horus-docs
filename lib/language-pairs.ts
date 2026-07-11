@@ -25,9 +25,10 @@ const LANG_DIR: Record<Language, string> = {
   'C++': 'cpp',
 };
 
-// Suffix applied to getting-started filenames for split variants.
-// Rust is the default (no suffix).
-const GS_SUFFIX: Record<Language, string> = {
+// Suffix applied to a filename for its per-language split variant, in ANY
+// section (getting-started, tutorials, recipes, ...). Rust is the default
+// (no suffix); e.g. `01-sensor-node` / `01-sensor-node-python` / `-cpp`.
+const LANG_SUFFIX: Record<Language, string> = {
   'Rust': '',
   'Python': '-python',
   'C++': '-cpp',
@@ -60,30 +61,38 @@ export function docPathExists(path: string): boolean {
  *     subtrees and getting-started split variants)
  *   - null for language-agnostic pages (concepts, tutorials, stdlib, ...)
  *
- * For getting-started, a page is treated as Rust-default only if a matching
- * `-python` or `-cpp` sibling exists — otherwise it's language-agnostic
- * (e.g., installation.mdx, simulation.mdx).
+ * A base page (no language suffix) is treated as the Rust default only if a
+ * matching `-python` or `-cpp` sibling exists — otherwise it's language-agnostic
+ * (e.g., installation.mdx, simulation.mdx, cross-language-interop.mdx).
  */
 export function pageLanguage(href: string): Language | null {
+  // 1. Per-language subtrees: /rust/..., /python/..., /cpp/...
   if (href === '/rust' || href.startsWith('/rust/')) return 'Rust';
   if (href === '/python' || href.startsWith('/python/')) return 'Python';
   if (href === '/cpp' || href.startsWith('/cpp/')) return 'C++';
 
-  const gsPrefix = '/getting-started/';
-  if (href.startsWith(gsPrefix)) {
-    const rest = href.substring(gsPrefix.length);
-    if (rest === 'rust') return 'Rust';
-    if (rest === 'python') return 'Python';
-    if (rest === 'cpp') return 'C++';
-    if (rest.endsWith('-python')) return 'Python';
-    if (rest.endsWith('-cpp')) return 'C++';
-    // Rust-default split: treat as Rust only if a -python or -cpp sibling exists.
-    if (docPathExists(`${gsPrefix}${rest}-python`) || docPathExists(`${gsPrefix}${rest}-cpp`)) {
-      return 'Rust';
-    }
-    return null;
+  // 2. getting-started language intro pages: /getting-started/{rust,python,cpp}
+  if (href === '/getting-started/rust') return 'Rust';
+  if (href === '/getting-started/python') return 'Python';
+  if (href === '/getting-started/cpp') return 'C++';
+
+  // 3. Split-filename variants in ANY section (tutorials, recipes,
+  //    getting-started, reference, ...). Classify on the last path segment.
+  const seg = href.split('/').filter(Boolean).pop() ?? '';
+  // 3a. `-python` / `-cpp` suffix — the canonical language-variant marker.
+  if (seg.endsWith('-python')) return 'Python';
+  if (seg.endsWith('-cpp')) return 'C++';
+  // 3b. `python-` / `cpp-` / `rust-` slug prefix — standalone language-specific
+  //     pages (e.g. reference/cpp-api, recipes/python-cv-node).
+  if (seg.startsWith('python-')) return 'Python';
+  if (seg.startsWith('cpp-')) return 'C++';
+  if (seg.startsWith('rust-')) return 'Rust';
+  // 3c. A base page is the Rust default only when a -python or -cpp sibling exists.
+  if (docPathExists(`${href}-python`) || docPathExists(`${href}-cpp`)) {
+    return 'Rust';
   }
 
+  // 4. Language-agnostic (concepts, stdlib, most of development, ...).
   return null;
 }
 
@@ -120,13 +129,15 @@ export function getLanguagePair(currentPath: string, targetLang: Language): stri
     return docPathExists(target) ? target : null;
   }
 
-  // Case 3: split getting-started filenames — X / X-python / X-cpp
-  if (parts[0] === 'getting-started' && parts.length === 2) {
+  // Case 3: split filenames in any single-level section (getting-started,
+  // tutorials, recipes, ...) — X / X-python / X-cpp.
+  if (parts.length === 2) {
     const base = parts[1].replace(/-python$/, '').replace(/-cpp$/, '');
-    const target = `/getting-started/${base}${GS_SUFFIX[targetLang]}`;
-    return docPathExists(target) ? target : null;
+    const target = `/${parts[0]}/${base}${LANG_SUFFIX[targetLang]}`;
+    if (docPathExists(target)) return target;
   }
 
-  // Language-agnostic page — no navigation.
+  // Language-agnostic page (or no counterpart in the target language) — no
+  // navigation; caller still updates the language preference.
   return null;
 }

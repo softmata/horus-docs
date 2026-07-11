@@ -16,6 +16,33 @@ const contentDir = path.join(__dirname, '..', 'content/docs');
 const outputPath = path.join(__dirname, '..', 'lib/sidebar-data.json');
 
 /**
+ * Normalize a frontmatter `language` value to the canonical sidebar language.
+ * Lets a page explicitly declare which language filter it belongs to, overriding
+ * the path heuristic in lib/language-pairs.ts. Use this for language-specific
+ * pages whose per-language siblings live at mismatched slugs (which the heuristic
+ * cannot pair), e.g. tutorials/05-hardware-drivers ↔ 05-hardware-and-rt-python.
+ * Returns undefined for absent/unknown values (page stays heuristic-classified).
+ */
+function normalizeLang(v) {
+  if (!v) return undefined;
+  const s = String(v).trim().toLowerCase();
+  if (s === 'rust') return 'Rust';
+  if (s === 'python' || s === 'py') return 'Python';
+  if (s === 'cpp' || s === 'c++') return 'C++';
+  return undefined;
+}
+
+/** Build a sidebar link object, carrying an explicit language only when set. */
+function toLink(page) {
+  return {
+    title: page.title,
+    href: page.href,
+    order: page.order,
+    ...(page.language && { language: page.language }),
+  };
+}
+
+/**
  * Directory-to-section mapping.
  * Pages in these directories automatically appear in the named section.
  * Override per-page with `sidebar_section` frontmatter.
@@ -99,6 +126,7 @@ function scanDir(dir, basePath = []) {
         section: data.sidebar_section || DIRECTORY_SECTION_MAP[basePath[0]] || basePath[0],
         directory: basePath.join('/'),
         depth: basePath.length,
+        language: normalizeLang(data.language),
       });
     }
   }
@@ -124,22 +152,14 @@ function buildNested(pages, sectionName) {
         if (!childMap.has(targetParent)) {
           childMap.set(targetParent, []);
         }
-        childMap.get(targetParent).push({
-          title: page.title,
-          href: page.href,
-          order: page.order,
-        });
+        childMap.get(targetParent).push(toLink(page));
         nested = true;
         break;
       }
     }
 
     if (!nested) {
-      topLevel.push({
-        title: page.title,
-        href: page.href,
-        order: page.order,
-      });
+      topLevel.push(toLink(page));
     }
   }
 
@@ -192,7 +212,7 @@ for (const [title, sectionPages] of sectionMap) {
 
   const links = hasNesting
     ? buildNested(sectionPages, title)
-    : sectionPages.map(p => ({ title: p.title, href: p.href, order: p.order }))
+    : sectionPages.map(toLink)
         .sort((a, b) => a.order - b.order);
 
   sections.push({ title, links });

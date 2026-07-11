@@ -141,9 +141,6 @@ export default function LanguageSelector() {
               }`}
             >
               {lang}
-              {lang === 'C++' && (
-                <span className="ml-1.5 text-[10px] opacity-50">(soon)</span>
-              )}
             </button>
           ))}
         </div>
