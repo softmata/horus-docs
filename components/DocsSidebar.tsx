@@ -42,9 +42,16 @@ interface DocLink {
   language?: Language;
 }
 
+interface SidebarGroup {
+  label: string;
+  links: DocLink[];
+}
+
 interface SidebarSection {
   title: string;
   links: DocLink[];
+  /** Labelled sub-groups within the section (from `sidebar_group` frontmatter). */
+  groups?: SidebarGroup[];
 }
 
 const sections: SidebarSection[] = sidebarData as SidebarSection[];
@@ -119,8 +126,11 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
     .map((section) => ({
       ...section,
       links: section.links.map(filterLink).filter(Boolean) as DocLink[],
+      groups: section.groups
+        ?.map((g) => ({ ...g, links: g.links.map(filterLink).filter(Boolean) as DocLink[] }))
+        .filter((g) => g.links.length > 0),
     }))
-    .filter((section) => section.links.length > 0);
+    .filter((section) => section.links.length > 0 || (section.groups?.length ?? 0) > 0);
 
   const toggleSection = (title: string) => {
     setExpandedSections((prev) => ({ ...prev, [title]: !prev[title] }));
@@ -214,11 +224,27 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
             </button>
 
             {isExpanded && (
-              <ul className="space-y-1 ml-6">
-                {section.links
-                  .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-                  .map((link) => renderLink(link, 0))}
-              </ul>
+              <div className="ml-6 space-y-4">
+                {section.links.length > 0 && (
+                  <ul className="space-y-1">
+                    {section.links
+                      .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
+                      .map((link) => renderLink(link, 0))}
+                  </ul>
+                )}
+                {section.groups?.map((group) => (
+                  <div key={group.label}>
+                    <div className="px-3 mb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+                      {group.label}
+                    </div>
+                    <ul className="space-y-1">
+                      {group.links
+                        .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
+                        .map((link) => renderLink(link, 0))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         );

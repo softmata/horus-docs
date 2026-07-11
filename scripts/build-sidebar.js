@@ -32,14 +32,44 @@ function normalizeLang(v) {
   return undefined;
 }
 
-/** Build a sidebar link object, carrying an explicit language only when set. */
+/** Build a sidebar link object, carrying explicit language/group only when set. */
 function toLink(page) {
   return {
     title: page.title,
     href: page.href,
     order: page.order,
     ...(page.language && { language: page.language }),
+    ...(page.group && { group: page.group }),
   };
+}
+
+const byOrder = (a, b) => (a.order ?? 999) - (b.order ?? 999);
+const stripGroup = ({ group, ...rest }) => rest;
+
+/**
+ * Partition a flat list of links into ungrouped links + labelled sub-groups
+ * (from `sidebar_group` frontmatter). Groups are ordered by the lowest page
+ * order they contain; ungrouped links render first. Returns { links, groups? }.
+ */
+function applyGroups(links) {
+  if (!links.some((l) => l.group)) {
+    return { links: [...links].sort(byOrder) };
+  }
+  const ungrouped = links.filter((l) => !l.group).sort(byOrder).map(stripGroup);
+  const map = new Map();
+  for (const l of links) {
+    if (!l.group) continue;
+    if (!map.has(l.group)) map.set(l.group, []);
+    map.get(l.group).push(l);
+  }
+  const groups = [...map.entries()]
+    .map(([label, gl]) => ({
+      label,
+      order: Math.min(...gl.map((l) => l.order ?? 999)),
+      links: gl.sort(byOrder).map(stripGroup),
+    }))
+    .sort((a, b) => a.order - b.order);
+  return { links: ungrouped, groups };
 }
 
 /**
@@ -57,11 +87,11 @@ const DIRECTORY_SECTION_MAP = {
   'python': 'Python',
   'development': 'Development',
   'advanced': 'Advanced Topics',
-  'operations': 'Operations',
-  'plugins': 'Plugins',
-  'package-management': 'Package Management',
+  'operations': 'Deployment & Performance',
+  'plugins': 'Packages & Plugins',
+  'package-management': 'Packages & Plugins',
   'stdlib': 'Standard Library',
-  'performance': 'Performance',
+  'performance': 'Deployment & Performance',
   'reference': 'Reference',
   'learn': 'Getting Started',
 };
@@ -77,12 +107,10 @@ const SECTION_ORDER = {
   'Python': 6,
   'Development': 7,
   'Advanced Topics': 8,
-  'Operations': 9,
-  'Plugins': 10,
-  'Package Management': 11,
-  'Standard Library': 12,
-  'Performance': 13,
-  'Reference': 14,
+  'Deployment & Performance': 9,
+  'Packages & Plugins': 10,
+  'Standard Library': 11,
+  'Reference': 12,
 };
 
 /**
@@ -129,6 +157,7 @@ function scanDir(dir, basePath = []) {
         directory: basePath.join('/'),
         depth: basePath.length,
         language: normalizeLang(data.language),
+        group: data.sidebar_group || undefined,
       });
     }
   }
@@ -212,12 +241,12 @@ for (const [title, sectionPages] of sectionMap) {
     return Object.keys(NESTING_PARENTS).some(parent => p.href.startsWith(parent + '/'));
   });
 
-  const links = hasNesting
-    ? buildNested(sectionPages, title)
-    : sectionPages.map(toLink)
-        .sort((a, b) => a.order - b.order);
-
-  sections.push({ title, links });
+  if (hasNesting) {
+    sections.push({ title, links: buildNested(sectionPages, title) });
+  } else {
+    const { links, groups } = applyGroups(sectionPages.map(toLink));
+    sections.push({ title, links, ...(groups && { groups }) });
+  }
 }
 
 sections.sort((a, b) => {
@@ -232,6 +261,9 @@ const totalPages = sections.reduce((n, s) => {
   let count = s.links.length;
   for (const link of s.links) {
     if (link.children) count += link.children.length;
+  }
+  for (const group of s.groups || []) {
+    count += group.links.length;
   }
   return n + count;
 }, 0);
