@@ -96,6 +96,8 @@ const NESTING_PARENTS = {
   '/python/api': 'API Reference',
   '/python/library': 'Library',
   '/python/messages': '/python/library', // merge into /python/library parent
+  '/cpp/api': 'API Reference',
+  '/cpp/examples': 'Examples',
 };
 
 function scanDir(dir, basePath = []) {
