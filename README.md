@@ -6,11 +6,11 @@ Official documentation site for [HORUS](https://github.com/softmata/horus) — a
 
 ## Stats
 
-- **244 pages** across 15 sections
-- **Rust + Python** with full language parity (LanguageTabs on all pages)
-- **31 Rust API pages**, **31 Python API pages**, **12 message category pages** per language
-- **21 recipes** (copy-paste robotics patterns), **12 tutorials** (step-by-step)
-- **31 pre-rendered Mermaid diagrams**, **7 interactive Recharts benchmark charts**
+- **295 pages** across 15 sidebar sections
+- **Rust + Python + C++** with per-language paired navigation (header toggle) and synced `<LanguageTabs>` on shared-concept pages
+- **32 Rust API pages**, **31 Python API pages**, plus a 15-page C++ API reference at near-Rust parity
+- **33 recipes** (copy-paste robotics patterns), **28 tutorials** (step-by-step)
+- **40+ pre-rendered Mermaid diagrams** (static SVG via `mmdc`), interactive Recharts benchmark charts
 - Full-text search (FlexSearch), dark/light mode, Vercel CDN deployment
 
 ## Running Locally
@@ -18,7 +18,7 @@ Official documentation site for [HORUS](https://github.com/softmata/horus) — a
 ```bash
 npm install
 npm run dev        # http://localhost:3009
-npm run build      # Production build (244 pages)
+npm run build      # Production build (295 pages)
 npm start          # Production server
 ```
 
@@ -26,22 +26,22 @@ npm start          # Production server
 
 ```
 content/docs/
-  getting-started/   # 12 pages — installation, quick start, language guides
-  tutorials/         # 12 pages — numbered step-by-step (Rust + Python pairs)
-  recipes/           # 21 pages — copy-paste robotics patterns
-  concepts/          # 22 pages — architecture, nodes, topics, scheduler, RT
-  rust/api/          # 31 pages — Node, Topic, Scheduler, messages, drivers
-  python/api/        # 31 pages — Node, Topic, Scheduler, messages, drivers
-  python/            # 19 pages — guides (GIL, NumPy, deployment, testing, etc.)
-  stdlib/            # 17 pages — per-message deep dives (Imu, CmdVel, LaserScan)
-  advanced/          # 9 pages  — RT setup, safety monitor, blackbox, record/replay
+  getting-started/   # 17 pages — installation, quick start, language guides
+  tutorials/         # 28 pages — numbered step-by-step (Rust / Python / C++)
+  recipes/           # 33 pages — copy-paste robotics patterns
+  concepts/          # 25 pages — architecture, nodes, topics, scheduler, RT
+  rust/              # 37 pages — API (rust/api/ 32) + guides
+  python/            # 66 pages — API (python/api/ 31) + guides (GIL, NumPy, deploy…)
+  cpp/               # 25 pages — C++ API reference + guides (near-Rust parity)
+  stdlib/            # 16 pages — per-message deep dives (Imu, CmdVel, LaserScan)
   development/       # 14 pages — CLI reference, testing, debugging, monitoring
-  operations/        # 2 pages  — deployment (SSH, Docker, systemd)
-  performance/       # 3 pages  — benchmarks (measured), optimization guide
+  advanced/          # 9 pages  — RT setup, safety monitor, blackbox, record/replay
+  reference/         # 7 pages  — cheatsheets, API index, internals
   package-management/ # 5 pages — horus.toml, lockfile, registry, publishing
-  plugins/           # 3 pages  — plugin system
-  reference/         # 5 pages  — cheatsheets, API index, internals
   learn/             # 4 pages  — vs ROS2, why HORUS
+  performance/       # 4 pages  — benchmarks (measured), optimization guide
+  plugins/           # 3 pages  — plugin system
+  operations/        # 2 pages  — deployment (SSH, Docker, systemd)
 ```
 
 ## Tech Stack
