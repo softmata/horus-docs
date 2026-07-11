@@ -117,6 +117,18 @@ function checkHorusAvailable(python) {
 // ─── Code Analysis ───────────────────────────────────────────────────────────
 
 /**
+ * A block is a "simplified snippet" if its first non-empty line is `# simplified`
+ * or its `flags` array contains "simplified". These blocks are illustrative API
+ * shapes (often method signatures with type annotations like `tick_once(node_names: list = None)`)
+ * that are not valid standalone Python; we skip them rather than fail them.
+ */
+function isSimplifiedSnippet(code, flags) {
+  if (Array.isArray(flags) && flags.includes('simplified')) return true;
+  const firstLine = code.split('\n').find(l => l.trim().length > 0) || '';
+  return /^\s*#\s*simplified\b/i.test(firstLine);
+}
+
+/**
  * Check if Python code imports horus.
  */
 function usesHorus(code) {
@@ -333,6 +345,21 @@ function main() {
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i];
       const progress = `[${i + 1}/${blocks.length}]`;
+
+      // Skip illustrative snippets marked `# simplified` (signatures with type
+      // annotations like `tick_once(node_names: list = None)`) — they are not
+      // valid standalone Python and py_compile rejects them.
+      if (isSimplifiedSnippet(block.code, block.flags)) {
+        log(`${progress} SKIP ${block.id} — # simplified snippet`);
+        results.push({
+          id: block.id, file: block.file, lineStart: block.lineStart,
+          status: 'skipped', level: 'simplified',
+          error: 'simplified snippet (not standalone)',
+          unknownApis: [],
+        });
+        skipped++;
+        continue;
+      }
 
       // Level 1: Syntax check
       const syntaxResult = syntaxCheck(python, block.code, tmpFile, options.timeout);

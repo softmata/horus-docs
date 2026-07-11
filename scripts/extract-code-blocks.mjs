@@ -221,14 +221,26 @@ function extractFromFile(filePath, relativePath) {
         // Handles: rust, rust,ignore, bash:filename.sh, etc.
         const language = fullLang.split(/[,:]/, 1)[0] || 'text';
 
+        // Parse rustdoc-style suffixes after the comma: `rust,ignore`,
+        // `rust,no_run`, `rust,should_panic`, `rust,compile_fail`, etc.
+        // We treat `ignore` and `compile_fail` as opt-out markers.
+        const suffixes = fullLang.split(',').slice(1).map(s => s.trim()).filter(Boolean);
+
         const isVerifiable = VERIFIABLE_LANGUAGES.includes(language);
         const isReference = REFERENCE_LANGUAGES.includes(language);
         const flags = detectFlags(code, language);
+        for (const sfx of suffixes) {
+          if (sfx === 'ignore' || sfx === 'compile_fail' || sfx === 'should_panic') {
+            // Rustdoc convention: don't run / don't expect to compile.
+            if (!flags.includes('rustdoc-ignore')) flags.push('rustdoc-ignore');
+          }
+        }
 
         // Determine if this block can be verified
         const verifiable = isVerifiable &&
           !flags.includes('has-markers') &&
-          !flags.includes('partial');
+          !flags.includes('partial') &&
+          !flags.includes('rustdoc-ignore');
 
         blocks.push({
           id: `${relativePath.replace(/\.mdx?$/, '')}:${currentBlock.lineStart}:${language}`,

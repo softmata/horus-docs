@@ -21,6 +21,7 @@ const KNOWN_DIRS = [
   'getting-started', 'tutorials', 'recipes', 'concepts',
   'rust', 'rust/api', 'rust/examples',
   'python', 'python/api', 'python/examples', 'python/library', 'python/messages',
+  'cpp', 'cpp/api', 'cpp/examples',
   'development', 'advanced', 'operations', 'plugins',
   'package-management', 'stdlib', 'stdlib/messages',
   'performance', 'reference', 'learn',

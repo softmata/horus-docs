@@ -1,185 +1,85 @@
-import { MetadataRoute } from 'next'
+import { MetadataRoute } from 'next';
+import fs from 'fs';
+import path from 'path';
+
+const BASE_URL = 'https://docs.horusrobotics.dev';
+
+/**
+ * Priority + change-frequency by top-level section. Conversion/landing sections
+ * (getting-started, learn, performance) rank highest; reference material lowest.
+ * Anything unlisted falls back to DEFAULT_TIER.
+ */
+const SECTION_TIER: Record<string, { priority: number; changeFrequency: MetadataRoute.Sitemap[number]['changeFrequency'] }> = {
+  'getting-started': { priority: 0.95, changeFrequency: 'weekly' },
+  'learn':           { priority: 0.9,  changeFrequency: 'weekly' },
+  'performance':     { priority: 0.9,  changeFrequency: 'weekly' },
+  'concepts':        { priority: 0.8,  changeFrequency: 'weekly' },
+  'tutorials':       { priority: 0.8,  changeFrequency: 'weekly' },
+  'recipes':         { priority: 0.75, changeFrequency: 'weekly' },
+  'rust':            { priority: 0.7,  changeFrequency: 'weekly' },
+  'python':          { priority: 0.7,  changeFrequency: 'weekly' },
+  'cpp':             { priority: 0.7,  changeFrequency: 'weekly' },
+  'advanced':        { priority: 0.65, changeFrequency: 'monthly' },
+  'development':     { priority: 0.6,  changeFrequency: 'monthly' },
+  'operations':      { priority: 0.6,  changeFrequency: 'monthly' },
+  'plugins':         { priority: 0.6,  changeFrequency: 'monthly' },
+  'package-management': { priority: 0.6, changeFrequency: 'monthly' },
+  'stdlib':          { priority: 0.6,  changeFrequency: 'monthly' },
+  'reference':       { priority: 0.55, changeFrequency: 'monthly' },
+};
+const DEFAULT_TIER = { priority: 0.7, changeFrequency: 'weekly' as const };
+
+/**
+ * Walk content/docs the same way generateStaticParams() does, so the sitemap and
+ * the set of statically-rendered routes stay in exact 1:1 correspondence. Uses each
+ * source file's mtime as lastModified for an accurate freshness signal.
+ */
+function collectDocRoutes(): MetadataRoute.Sitemap {
+  const contentDir = path.join(process.cwd(), 'content/docs');
+  const entries: MetadataRoute.Sitemap = [];
+
+  function walk(dir: string, basePath: string[] = []): void {
+    for (const file of fs.readdirSync(dir)) {
+      const filePath = path.join(dir, file);
+      const stat = fs.statSync(filePath);
+
+      if (stat.isDirectory()) {
+        walk(filePath, [...basePath, file]);
+        continue;
+      }
+      if (!file.endsWith('.mdx')) continue;
+
+      const fileName = file.replace(/\.mdx$/, '');
+      // index.mdx maps to its directory; root index.mdx is handled separately below.
+      const slug = fileName === 'index' ? basePath : [...basePath, fileName];
+      if (slug.length === 0) continue;
+
+      const tier = SECTION_TIER[slug[0]] ?? DEFAULT_TIER;
+      entries.push({
+        url: `${BASE_URL}/${slug.join('/')}`,
+        lastModified: stat.mtime,
+        changeFrequency: tier.changeFrequency,
+        priority: tier.priority,
+      });
+    }
+  }
+
+  walk(contentDir);
+  return entries.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+}
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const baseUrl = 'https://docs.horusrobotics.dev'
+  const now = new Date();
 
   return [
-    // AI-READABLE DOCUMENTATION
-    {
-      url: `${baseUrl}/llms.txt`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/llms-full.txt`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.7,
-    },
+    // Landing / discovery root
+    { url: BASE_URL, lastModified: now, changeFrequency: 'daily', priority: 1.0 },
 
-    // HIGHEST PRIORITY - Landing & Discovery Pages
-    {
-      url: baseUrl,
-      lastModified: new Date(),
-      changeFrequency: 'daily',
-      priority: 1.0,
-    },
-    {
-      url: `${baseUrl}/docs/what-is-horus`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 1.0,
-    },
-    {
-      url: `${baseUrl}/docs/complete-beginners-guide`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 1.0,
-    },
+    // AI-readable corpus — kept explicit because these are not content/docs routes
+    { url: `${BASE_URL}/llms.txt`, lastModified: now, changeFrequency: 'weekly', priority: 0.8 },
+    { url: `${BASE_URL}/llms-full.txt`, lastModified: now, changeFrequency: 'weekly', priority: 0.7 },
 
-    // HIGH PRIORITY - Getting Started (Conversion Pages)
-    {
-      url: `${baseUrl}/getting-started/installation`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.95,
-    },
-    {
-      url: `${baseUrl}/getting-started/quick-start`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.95,
-    },
-    {
-      url: `${baseUrl}/getting-started`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.9,
-    },
-
-    // HIGH PRIORITY - Performance & Comparisons (Decision Pages)
-    {
-      url: `${baseUrl}/performance/benchmarks`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.9,
-    },
-    {
-      url: `${baseUrl}/learn/vs-ros2`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.95,
-    },
-    {
-      url: `${baseUrl}/learn/why-horus`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.95,
-    },
-    {
-      url: `${baseUrl}/getting-started/quick-start-python`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.9,
-    },
-
-    // MEDIUM-HIGH - Examples & Tutorials
-    {
-      url: `${baseUrl}/basic-examples`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.85,
-    },
-    {
-      url: `${baseUrl}/tutorials`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.85,
-    },
-
-    // MEDIUM - Core Concepts (Education Pages)
-    {
-      url: `${baseUrl}/core-concepts`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/core-concepts/nodes`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/core-concepts/hub`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/core-concepts/scheduler`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-
-    // MEDIUM - Multi-Language Support
-    {
-      url: `${baseUrl}/multi-language/python-bindings`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/multi-language/rust-guide`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-
-    // MEDIUM - Architecture
-    {
-      url: `${baseUrl}/architecture`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.75,
-    },
-
-    // MEDIUM-LOW - Development Tools
-    {
-      url: `${baseUrl}/development/cli-reference`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-    {
-      url: `${baseUrl}/development/monitor`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-
-    // LOWER - Advanced Topics
-    {
-      url: `${baseUrl}/advanced`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.65,
-    },
-    {
-      url: `${baseUrl}/advanced/custom-nodes`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.6,
-    },
-
-    // API Reference
-    {
-      url: `${baseUrl}/api`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.6,
-    },
-  ]
+    // Every documentation page, generated from content/docs (was: 26 hand-listed URLs)
+    ...collectDocRoutes(),
+  ];
 }

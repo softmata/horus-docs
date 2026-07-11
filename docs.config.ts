@@ -149,9 +149,29 @@ const docsConfig: SectionConfig[] = [
     ],
   },
   {
+    title: "C++",
+    directory: "cpp",
+    order: 6,
+    purpose: "C++ API reference and guides for the HORUS C++ bindings",
+    rules: [
+      "PUT HERE: C++ API pages, real-time guide, hardware integration, and C++ examples",
+      "DON'T PUT HERE: Rust API (use rust/), Python API (use python/), language-agnostic concepts (use concepts/)",
+    ],
+    children: [
+      {
+        title: "API Reference",
+        directory: "cpp/api",
+      },
+      {
+        title: "Examples",
+        directory: "cpp/examples",
+      },
+    ],
+  },
+  {
     title: "Standard Library",
     directory: "stdlib",
-    order: 11,
+    order: 12,
     purpose: "Per-message-type deep dives — fields, constructors, patterns, ROS2 equivalents",
     rules: [
       "One page per message type (Imu, CmdVel, LaserScan, etc.)",
@@ -164,7 +184,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Development",
     directory: "development",
-    order: 6,
+    order: 7,
     purpose: "Developer tools and workflows — CLI, testing, debugging, monitoring",
     rules: [
       "CLI reference is the biggest page — all 45+ commands",
@@ -176,7 +196,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Advanced Topics",
     directory: "advanced",
-    order: 7,
+    order: 8,
     purpose: "Power user features — RT setup, blackbox, record/replay, deterministic mode",
     rules: [
       "Prerequisites: user has completed getting-started and at least one tutorial",
@@ -188,7 +208,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Operations",
     directory: "operations",
-    order: 8,
+    order: 9,
     purpose: "Deploying and running HORUS in production — deploy, cross-compile",
     rules: [
       "PUT HERE: deploy-to-robot, cross-compilation, production configuration",
@@ -198,7 +218,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Plugins",
     directory: "plugins",
-    order: 9,
+    order: 10,
     purpose: "Plugin system — creating, managing, and distributing CLI plugins",
     rules: [
       "PUT HERE: plugin creation guide, plugin management, plugin registry",
@@ -207,7 +227,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Package Management",
     directory: "package-management",
-    order: 10,
+    order: 11,
     purpose: "Dependency management — horus.toml configuration, lockfile, registry",
     rules: [
       "PUT HERE: configuration reference, lockfile, package management overview",
@@ -217,7 +237,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Performance",
     directory: "performance",
-    order: 12,
+    order: 13,
     purpose: "Performance optimization and benchmarks",
     rules: [
       "PUT HERE: optimization guide, benchmark results, profiling",
@@ -226,7 +246,7 @@ const docsConfig: SectionConfig[] = [
   {
     title: "Reference",
     directory: "reference",
-    order: 13,
+    order: 14,
     purpose: "Quick-lookup references — cheatsheets, AI context, internals",
     rules: [
       "PUT HERE: API cheatsheet, API lookup by task, AI context, internals",

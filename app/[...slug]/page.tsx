@@ -169,11 +169,42 @@ export default async function DocPage({ params }: PageProps) {
     itemListElement: breadcrumbItems,
   };
 
+  // TechArticle JSON-LD — the schema.org type Google recommends for developer/technical
+  // docs, and the one answer engines lean on when extracting how-to content. This is the
+  // AEO lever the site was previously missing (it only emitted SoftwareApplication + Breadcrumb).
+  const pageUrl = `https://docs.horusrobotics.dev/${slug.join('/')}`;
+  const techArticleJsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'TechArticle',
+    headline: doc.frontmatter.title,
+    description: doc.frontmatter.description,
+    url: pageUrl,
+    dateModified: doc.lastModified,
+    inLanguage: 'en',
+    image: 'https://docs.horusrobotics.dev/og-image.png',
+    author: { '@type': 'Organization', name: 'HORUS Robotics', url: 'https://horusrobotics.dev' },
+    publisher: {
+      '@type': 'Organization',
+      name: 'HORUS Robotics',
+      logo: { '@type': 'ImageObject', url: 'https://docs.horusrobotics.dev/og-image.png' },
+    },
+    isPartOf: {
+      '@type': 'WebSite',
+      name: 'HORUS Documentation',
+      url: 'https://docs.horusrobotics.dev',
+    },
+    mainEntityOfPage: { '@type': 'WebPage', '@id': pageUrl },
+  };
+
   return (
     <DocsLayout>
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+      />
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(techArticleJsonLd) }}
       />
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         <article className="prose max-w-none prose-headings:scroll-mt-20 prose-p:text-[var(--text-secondary)] prose-p:leading-relaxed prose-li:text-[var(--text-secondary)]">

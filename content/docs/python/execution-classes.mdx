@@ -1,6 +1,6 @@
 ---
 title: "Execution Classes (Python)"
-description: "The 5 Python execution classes — Rt, Compute, Event, AsyncIo, BestEffort — and when to use each"
+description: "The 6 Python execution classes — Rt, Compute, Event, AsyncIo, Gpu, BestEffort — and when to use each"
 order: 1
 ---
 
@@ -10,9 +10,9 @@ A motor controller that misses its deadline by even a millisecond can cause a ro
 
 These are fundamentally different workloads. Running them all the same way — in a single sequential loop — forces every node to compromise. The fast ones wait for the slow ones. The critical ones share a thread with the optional ones. A single slow node can cascade timing failures across the entire system.
 
-HORUS solves this with **execution classes**: five different executors, each optimized for a specific workload type. The scheduler automatically selects the right class based on how you configure the `Node()` constructor — you describe what your node needs, and the scheduler figures out how to run it.
+HORUS solves this with **execution classes**: six different executors, each optimized for a specific workload type. The scheduler automatically selects the right class based on how you configure the `Node()` constructor — you describe what your node needs, and the scheduler figures out how to run it.
 
-## The Five Classes
+## The Six Classes
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
@@ -22,12 +22,14 @@ flowchart TD
     A -->|"compute=True"| C["Compute<br/>Thread pool, parallel"]
     A -->|"on='topic.name'"| D["Event<br/>Sleeps until message"]
     A -->|"async def tick"| E["AsyncIo<br/>Tokio runtime, non-blocking"]
+    A -->|"gpu=True"| G["Gpu<br/>CUDA stream per node"]
 
     style F fill:#6b7280,stroke:#4b5563,color:#fff
     style B fill:#ef4444,stroke:#dc2626,color:#fff
     style C fill:#3b82f6,stroke:#2563eb,color:#fff
     style D fill:#22c55e,stroke:#16a34a,color:#000
     style E fill:#a855f7,stroke:#9333ea,color:#fff
+    style G fill:#f59e0b,stroke:#d97706,color:#000
 `}
   caption="The scheduler selects the execution class from your Node() configuration"
 />
@@ -251,6 +253,42 @@ uploader = horus.Node(
 Unlike Rust (which uses an explicit `.async_io()` builder method), Python auto-detects async from the function definition. Writing `async def tick(node):` is all you need — no `async_io=True` parameter exists.
 </Callout>
 
+### Gpu
+
+For nodes that launch CUDA kernels. The scheduler manages a dedicated GPU thread with one CUDA stream per node. Kernels launched in `tick()` execute asynchronously on the GPU; the executor synchronizes after all GPU nodes have launched.
+
+```python
+# simplified
+import horus
+import torch
+
+def preprocess_tick(node):
+    img = node.recv("camera.rgb")
+    if img is None:
+        return
+    # Zero-copy GPU transfer via DLPack
+    tensor = torch.from_dlpack(img)
+    # CUDA kernel launches non-blocking on the scheduler-managed stream
+    out = torch.nn.functional.interpolate(tensor.unsqueeze(0), size=(224, 224))
+    node.send("camera.preprocessed", out)
+
+preprocess = horus.Node(
+    name="preprocess",
+    subs=["camera.rgb"],
+    pubs=["camera.preprocessed"],
+    tick=preprocess_tick,
+    rate=30,
+    gpu=True,            # Run on the GPU executor
+    order=2,
+)
+```
+
+**How it works**: The GpuExecutor runs on a dedicated thread with a CUDA context. Each GPU node gets its own CUDA stream. Per tick cycle: (1) all ready nodes call `tick()` which launches GPU kernels non-blocking, (2) all streams synchronize, (3) GPU-side timing is recorded via CUDA events.
+
+**Use for**: Image preprocessing (resize, normalize, color convert), neural network inference, point cloud filtering, any CUDA kernel work. `gpu=True` takes precedence over `rate=` for execution class — a GPU node with `rate=30, gpu=True` runs on the GPU executor at 30 Hz, not the RT executor.
+
+**Graceful degradation**: If CUDA is not available, the GpuExecutor logs a warning and GPU nodes fall back to BestEffort execution on the main thread.
+
 ## How Classes Are Selected
 
 The scheduler selects the execution class based on **which `Node()` parameters you set**:
@@ -267,8 +305,10 @@ The scheduler selects the execution class based on **which `Node()` parameters y
 | `on="topic.name"` | Event |
 | `async def tick` | AsyncIo |
 | `async def tick, rate=1` | AsyncIo (rate-limited, not RT) |
+| `gpu=True` | Gpu |
+| `gpu=True, rate=30` | Gpu (rate-limited, CUDA stream managed) |
 
-**Key rule**: `rate=` only auto-enables RT when no explicit execution class (`compute=True`, `on=`, `async def`) is set. When combined with an explicit class, `rate=` just limits tick frequency.
+**Key rule**: `rate=` only auto-enables RT when no explicit execution class (`compute=True`, `on=`, `async def`, `gpu=True`) is set. When combined with an explicit class, `rate=` just limits tick frequency.
 
 ### The `rate=` Dual Meaning
 
@@ -329,6 +369,9 @@ horus.Node(compute=True, on="topic", tick=fn)  # → Event, NOT Compute
 | Upload telemetry to cloud | **AsyncIo** | `async def tick` |
 | Write logs to database | **AsyncIo** | `async def tick` |
 | WebSocket streaming | **AsyncIo** | `async def tick` |
+| Image preprocessing on GPU | **Gpu** | `gpu=True` |
+| Neural-network inference (CUDA) | **Gpu** | `gpu=True, rate=30` |
+| Point-cloud filtering on GPU | **Gpu** | `gpu=True` |
 | Display dashboard updates | **BestEffort** | (default) |
 | Simple diagnostics | **BestEffort** | (default) |
 

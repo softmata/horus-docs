@@ -59,6 +59,8 @@ export interface DocContent {
   slug: string;
   frontmatter: DocFrontmatter;
   content: React.ReactElement;
+  /** ISO timestamp of the source .mdx file's last modification (for dateModified / sitemap lastmod). */
+  lastModified: string;
 }
 
 /**
@@ -105,6 +107,7 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
     }
 
     const source = fs.readFileSync(filePath, 'utf-8');
+    const lastModified = fs.statSync(filePath).mtime.toISOString();
     const { data, content: mdxContent } = matter(source);
 
     const { content } = await compileMDX<DocFrontmatter>({
@@ -289,6 +292,7 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
       slug: slug.join('/'),
       frontmatter: data as DocFrontmatter,
       content,
+      lastModified,
     };
   } catch (error) {
     console.error('Error loading doc:', error);

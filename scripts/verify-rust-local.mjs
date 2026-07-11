@@ -92,6 +92,71 @@ Options:
 // ─── Rust Code Wrapping ──────────────────────────────────────────────────────
 
 /**
+ * A block is a "simplified snippet" if its first non-empty line is `// simplified`
+ * or its `flags` array contains "simplified". These blocks are illustrative API
+ * shapes (often method signatures or partial bodies), not standalone programs,
+ * and `cargo check` will reject them. We mark them skipped rather than failed.
+ *
+ * We also auto-detect three common illustrative patterns even when the
+ * `// simplified` marker is missing, since hand-flagging every fragment is
+ * tedious and the patterns are unambiguous:
+ *
+ *  1. A bare method body with `&self` / `&mut self` outside an `impl` block —
+ *     fragments lifted out of an `impl Node` block to show one method.
+ *  2. An external-package wildcard import like `use pid_controller::*` where
+ *     the crate is not horus/std/serde/etc. — these are example registry
+ *     packages, not bundled.
+ *  3. A partial builder chain starting with `scheduler.add(...)` /
+ *     `sched.add(...)` / `node.send(...)` etc. — assumes a previously-defined
+ *     instance.
+ */
+const STDLIB_OR_HORUS_CRATE = /^(horus|horus_\w+|std|core|alloc|serde|serde_json|rand|tokio|libc|anyhow|thiserror|chrono|log|tracing|parking_lot|bytemuck|crossbeam|paste|memmap2)$/;
+const PARTIAL_CHAIN_IDENTS = /^(scheduler|sched|node|topic|publisher|subscriber|client|server|sensor|controller|planner|estop|lidar_node|imu_node|cmd_pub|cmd_sub|tf|frame|bb|blackbox)\b/;
+
+function isSimplifiedSnippet(code, flags) {
+  if (Array.isArray(flags) && flags.includes('simplified')) return true;
+
+  const lines = code.split('\n');
+  const firstLine = lines.find(l => l.trim().length > 0) || '';
+  if (/^\s*\/\/\s*simplified\b/i.test(firstLine)) return true;
+
+  // Pattern 1: contains `fn X(&self ...)` / `fn X(&mut self ...)` but no `impl` block
+  // wrapping it (top-level method body extracted from an impl).
+  if (/\bfn\s+\w+\s*\(\s*&\s*(?:mut\s+)?self\b/.test(code) && !/^\s*(?:pub\s+)?impl\s+/m.test(code)) {
+    return true;
+  }
+
+  // Pattern 2: external-package wildcard import
+  const useMatches = code.matchAll(/^\s*use\s+(\w+)(?:::|\s*;)/gm);
+  for (const m of useMatches) {
+    const crate = m[1];
+    if (!STDLIB_OR_HORUS_CRATE.test(crate)) {
+      // Not a horus/std/known crate → external package example
+      return true;
+    }
+  }
+
+  // Pattern 3: partial builder chain — any non-comment, non-import line
+  // calls `.method(...)` on a known instance identifier WITHOUT a corresponding
+  // declaration (`let ident =` / `let mut ident =`) in the same block.
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('//') || line.startsWith('use ')) continue;
+    const callMatch = line.match(/^(\w+)\.\w+\s*\(/);
+    if (callMatch && PARTIAL_CHAIN_IDENTS.test(callMatch[1])) {
+      const ident = callMatch[1];
+      const declRe = new RegExp(`\\blet\\s+(?:mut\\s+)?${ident}\\b`);
+      const argRe = new RegExp(`\\bfn\\s+\\w+\\s*\\([^)]*\\b${ident}\\b\\s*:`);
+      if (!declRe.test(code) && !argRe.test(code)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
  * Determine if code already has `use horus::prelude::*;` or similar.
  */
 function hasHorusImport(code) {
@@ -148,6 +213,21 @@ function wrapRustCode(code, flags) {
 
   if (!hasHorusImport(wrapped)) {
     autoImports += 'use horus::prelude::*;\n';
+  }
+  // Conditionally inject ecosystem-package imports when their types are
+  // referenced. Since the 2026-04-04 decomposition, `horus::prelude` no
+  // longer re-exports horus-robotics types (CmdVel, Imu, LaserScan, …) or
+  // horus-tf types (TransformFrame, Transform, FrameId, …). Many doc
+  // snippets reference them bare as if they were still in horus::prelude.
+  // We add the imports only when we see the type names, to avoid bogus
+  // unresolved-import errors in blocks that don't need them.
+  const HOROBOTS_TYPES = /\b(CmdVel|Imu|LaserScan|Odometry|JointState|JointCommand|MotorCommand|ServoCommand|BatteryState|NavSatFix|MagneticField|Temperature|FluidPressure|Illuminance|RangeSensor|NavGoal|NavPath|Waypoint|PathPlan|OccupancyGrid|CostMap|GoalResult|VelocityObstacle|Heartbeat|DiagnosticStatus|DiagnosticReport|EmergencyStop|SafetyStatus|ResourceUsage|Detection|Detection3D|TrackedObject|Landmark|SegmentationMask|PlaneDetection|WrenchStamped|ForceCommand|ContactInfo|HapticFeedback|TactileArray|CompressedImage|CameraInfo|RegionOfInterest|StereoInfo|JoystickInput|KeyboardInput|AudioFrame|Clock|TimeReference)\b/;
+  const HORUS_TF_TYPES = /\b(TransformFrame|TransformFrameConfig|TransformFrameStats|FrameId|FrameInfo|FrameBuilder|FrameSlot|FrameRegistry|TransformEntry|TransformQuery|TransformFramePublisher|NO_PARENT)\b/;
+  if (HOROBOTS_TYPES.test(code)) {
+    autoImports += 'use horus_robotics::prelude::*;\n';
+  }
+  if (HORUS_TF_TYPES.test(code)) {
+    autoImports += 'use horus_tf::prelude::*;\n';
   }
 
   // Add serde derives if code uses Serialize/Deserialize
@@ -217,6 +297,18 @@ function createTempCrate(horusPath, crateIndex) {
   // Resolve absolute horus path for Cargo.toml
   const absHorus = path.resolve(horusPath);
 
+  // Prefer local sibling checkouts of horus-tf and horus-robotics if they exist
+  // (faster, easier to test in-progress changes); fall back to git deps otherwise.
+  const horusParent = path.dirname(absHorus);
+  const localTfPath = path.join(horusParent, 'horus-tf');
+  const localRoboticsPath = path.join(horusParent, 'horus-robotics');
+  const tfDep = fs.existsSync(path.join(localTfPath, 'Cargo.toml'))
+    ? `horus-tf = { path = "${localTfPath}" }`
+    : `horus-tf = { git = "https://github.com/softmata/horus-tf.git" }`;
+  const roboticsDep = fs.existsSync(path.join(localRoboticsPath, 'Cargo.toml'))
+    ? `horus-robotics = { path = "${localRoboticsPath}" }`
+    : `horus-robotics = { git = "https://github.com/softmata/horus-robotics.git" }`;
+
   const cargoToml = `[package]
 name = "horus-docs-verify-${crateIndex}"
 version = "0.1.0"
@@ -225,11 +317,25 @@ edition = "2021"
 [dependencies]
 horus = { path = "${absHorus}/horus" }
 horus_core = { path = "${absHorus}/horus_core" }
-horus_library = { path = "${absHorus}/horus_library" }
+horus_types = { path = "${absHorus}/horus_types" }
 horus_macros = { path = "${absHorus}/horus_macros" }
+${tfDep}
+${roboticsDep}
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
+
+# horus-tf and horus-robotics reference horus_core / horus_types / horus_macros
+# via relative paths in their own workspaces. Patch them to use the local horus
+# checkout under test, mirroring the [patch] section of horus/Cargo.toml.
+[patch."https://github.com/softmata/horus-tf.git"]
+horus_core = { path = "${absHorus}/horus_core" }
+horus_macros = { path = "${absHorus}/horus_macros" }
+
+[patch."https://github.com/softmata/horus-robotics.git"]
+horus_core = { path = "${absHorus}/horus_core" }
+horus_types = { path = "${absHorus}/horus_types" }
+horus_macros = { path = "${absHorus}/horus_macros" }
 
 [workspace]
 `;
@@ -366,6 +472,15 @@ function main() {
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i];
       const progress = `[${i + 1}/${blocks.length}]`;
+
+      // Skip illustrative snippets marked `// simplified` (signatures, partial
+      // bodies, etc.) — they are not standalone programs and won't compile.
+      if (isSimplifiedSnippet(block.code, block.flags)) {
+        log(`${progress} SKIP ${block.id} — // simplified snippet`);
+        results.push({ id: block.id, file: block.file, lineStart: block.lineStart, status: 'skipped', error: 'simplified snippet (not standalone)' });
+        skipped++;
+        continue;
+      }
 
       // Wrap the code
       const wrapped = wrapRustCode(block.code, block.flags);
