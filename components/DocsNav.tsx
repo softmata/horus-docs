@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FiGithub, FiMenu, FiSearch } from "react-icons/fi";
+import { FiGithub, FiMenu, FiSearch, FiStar } from "react-icons/fi";
 import { ThemeToggle } from "./ThemeToggle";
 import { SearchModal } from "./SearchModal";
 import LanguageSelector from "./LanguageSelector";
@@ -69,12 +69,26 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
                 </kbd>
               </button>
 
+              {/* Star-on-GitHub call to action */}
+              <a
+                href="https://github.com/softmata/horus"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="group inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-[var(--text)] border border-[var(--border)] hover:border-[var(--accent)] hover:text-[var(--accent)] hover:bg-[var(--surface)] transition-colors"
+                title="Enjoying HORUS? Star it on GitHub"
+                aria-label="Star HORUS on GitHub"
+              >
+                <FiStar className="w-4 h-4 group-hover:fill-[var(--accent)] transition-colors" />
+                <span className="hidden sm:inline">Star on GitHub</span>
+                <span className="sm:hidden">Star</span>
+              </a>
+
               {/* Registry */}
               <a
                 href="https://registry.horusrobotics.dev/"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="hidden sm:inline-flex items-center px-3 py-1.5 text-sm font-medium text-[var(--text)] border border-[var(--border)] hover:border-[var(--border-hover)] hover:bg-[var(--surface)] transition-colors"
+                className="hidden md:inline-flex items-center px-3 py-1.5 text-sm font-medium text-[var(--text)] border border-[var(--border)] hover:border-[var(--border-hover)] hover:bg-[var(--surface)] transition-colors"
               >
                 Registry
               </a>
