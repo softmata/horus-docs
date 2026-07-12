@@ -2,6 +2,7 @@ import { getDoc } from '@/lib/mdx';
 import { DocsLayout } from '@/components/DocsLayout';
 import { TableOfContents } from '@/components/TableOfContents';
 import { PrevNextNav } from '@/components/PrevNextNav';
+import { ReportIssue } from '@/components/ReportIssue';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
 
@@ -211,6 +212,7 @@ export default async function DocPage({ params }: PageProps) {
           {doc.content}
         </article>
         <PrevNextNav />
+        <ReportIssue pageTitle={doc.frontmatter?.title || 'this page'} />
       </main>
       <TableOfContents />
     </DocsLayout>
