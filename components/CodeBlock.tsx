@@ -111,9 +111,9 @@ export default function CodeBlock({ children, className = '' }: CodeBlockProps) 
           onClick={handleReport}
           title="Report an issue with this code block"
           aria-label="Report an issue with this code block"
-          className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 px-2 py-1 text-xs font-medium bg-[var(--bg)] border border-[var(--border)] text-[var(--text-tertiary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
+          className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 px-2 py-1 text-xs font-medium bg-[var(--bg)] border border-[var(--border)] text-[var(--text-tertiary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-all duration-150"
         >
-          Report
+          Report an issue
         </button>
         <button
           onClick={handleCopy}
