@@ -198,6 +198,142 @@ description = "IMU + odometry complementary filter"
     run(fusion, rt=True)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <cmath>
+    #include <cstdio>
+    using namespace horus::literals;
+
+    class SensorFusion : public horus::Node {
+    public:
+        SensorFusion(double alpha = 0.95)
+            : Node("sensor_fusion"), alpha_(alpha)
+        {
+            // Subscribe to both sensor sources
+            imu_sub_   = subscribe<horus::msg::Imu>("imu.data");
+            odom_sub_  = subscribe<horus::msg::Odometry>("odom");
+            // Publish the fused estimate
+            fused_pub_ = advertise<horus::msg::Odometry>("fused.pose");
+        }
+
+        void tick() override {
+            // ── Always drain both subscribers to avoid stale data ────────
+            auto imu  = imu_sub_->recv();
+            auto odom = odom_sub_->recv();
+
+            double dt = 1.0 / 100.0;  // matches 100 Hz tick rate
+
+            // ── Predict from odometry (position + heading reference) ────
+            if (odom) {
+                // Position comes directly from odometry — no IMU correction
+                // IMU accelerometer is too noisy for position estimation
+                x_ = odom->get()->pose.x;
+                y_ = odom->get()->pose.y;
+
+                // Odometry heading provides long-term reference (no gyro drift)
+                odom_theta_ = odom->get()->pose.theta;
+                has_odom_ = true;
+            }
+
+            // ── Correct heading from IMU gyroscope ──────────────────────
+            if (imu) {
+                double gz = imu->get()->angular_velocity[2];  // yaw rate (rad/s)
+
+                if (has_odom_) {
+                    // Complementary filter: gyro for short-term, odom for long-term
+                    // alpha_ high (0.95) = trust gyro more = smooth during wheel slip
+                    // alpha_ low (0.80) = trust odom more = corrects gyro drift faster
+                    theta_ = alpha_ * (theta_ + gz * dt) + (1.0 - alpha_) * odom_theta_;
+                } else {
+                    // No odometry yet — integrate gyro only (will drift)
+                    theta_ += gz * dt;
+                }
+                has_imu_ = true;
+            } else if (has_odom_ && !has_imu_) {
+                // No IMU data — fall back to odometry heading
+                theta_ = odom_theta_;
+            }
+
+            // Normalize theta to [-pi, pi]
+            if (theta_ > M_PI)  theta_ -= 2.0 * M_PI;
+            if (theta_ < -M_PI) theta_ += 2.0 * M_PI;
+
+            // ── Publish fused estimate ──────────────────────────────────
+            horus::msg::Odometry fused{};
+            fused.pose.x     = x_;
+            fused.pose.y     = y_;
+            fused.pose.theta = theta_;
+            fused_pub_->send(fused);
+
+            // Log at 2 Hz (every 50th tick at 100 Hz)
+            if (++tick_count_ % 50 == 0) {
+                double heading_diff = theta_ - odom_theta_;
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "fused=(%.2f, %.2f, %.1f deg)  odom_drift=%.1f deg",
+                    x_, y_, theta_ * 180.0 / M_PI,
+                    heading_diff * 180.0 / M_PI);
+                horus::log::info("fusion", buf);
+
+                // Log large heading disagreement as a warning
+                if (std::abs(heading_diff) > 0.17) {  // ~10 degrees
+                    horus::log::warn("fusion",
+                        "Large IMU/odom heading disagreement — possible wheel slip");
+                }
+            }
+        }
+
+        void enter_safe_state() override {
+            // Publish last known good pose with a flag indicating degraded mode.
+            // Downstream nodes (e.g., navigation) should check for stale data
+            // and switch to a conservative behavior.
+            horus::msg::Odometry last{};
+            last.pose.x     = x_;
+            last.pose.y     = y_;
+            last.pose.theta = theta_;
+            fused_pub_->send(last);
+            horus::blackbox::record("fusion",
+                "Entered safe state — publishing last known pose");
+            horus::log::warn("fusion",
+                "Safe state active — fused estimate may be stale");
+        }
+
+    private:
+        horus::Subscriber<horus::msg::Imu>*      imu_sub_;
+        horus::Subscriber<horus::msg::Odometry>* odom_sub_;
+        horus::Publisher<horus::msg::Odometry>*  fused_pub_;
+
+        // Filter parameter
+        double alpha_;  // IMU trust factor (0.80-0.99 typical)
+
+        // Fused state (double for running-sum precision)
+        double x_ = 0, y_ = 0, theta_ = 0;
+        double odom_theta_ = 0;
+
+        // Data availability flags
+        bool has_odom_ = false;
+        bool has_imu_  = false;
+
+        int tick_count_ = 0;
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(100_hz).name("fusion_demo");
+
+        // alpha=0.95: 95% gyro trust for heading, 5% odometry correction
+        SensorFusion fusion(0.95);
+        sched.add(fusion)
+            .order(20)           // after odometry (0-10) and IMU (5) nodes
+            .budget(2_ms)        // lightweight math
+            .on_miss(horus::Miss::Warn)  // warn but don't stop — downstream can tolerate a stale estimate
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ### Expected Output

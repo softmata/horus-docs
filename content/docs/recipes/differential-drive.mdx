@@ -200,6 +200,122 @@ description = "2-wheel differential drive with safe shutdown"
     run(drive, rt=True)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <cmath>
+    #include <cstdio>
+    #include <algorithm>
+    using namespace horus::literals;
+
+    class DiffDrive : public horus::Node {
+    public:
+        DiffDrive(double wheel_base, double wheel_radius, double max_wheel_speed)
+            : Node("diff_drive"),
+              wheel_base_(wheel_base),
+              wheel_radius_(wheel_radius),
+              max_wheel_speed_(max_wheel_speed)
+        {
+            // Subscribe to velocity commands from planner/teleop
+            cmd_sub_   = subscribe<horus::msg::CmdVel>("cmd_vel");
+            // Publish odometry for localization / SLAM
+            odom_pub_  = advertise<horus::msg::Odometry>("odom");
+            // Publish individual wheel velocities for the motor driver
+            motor_pub_ = advertise<horus::msg::CmdVel>("motor.wheels");
+        }
+
+        void tick() override {
+            // Always drain the subscriber buffer to avoid stale commands
+            if (auto cmd = cmd_sub_->recv()) {
+                last_v_ = cmd->get()->linear;
+                last_w_ = cmd->get()->angular;
+            }
+
+            // ── Inverse kinematics: CmdVel -> wheel angular velocities ──
+            // Left wheel traces the inner arc, right wheel the outer arc
+            double v_left  = (last_v_ - last_w_ * wheel_base_ / 2.0) / wheel_radius_;
+            double v_right = (last_v_ + last_w_ * wheel_base_ / 2.0) / wheel_radius_;
+
+            // Clamp to motor limits — prevents burning out motors on bad commands
+            v_left  = std::clamp(v_left,  -max_wheel_speed_, max_wheel_speed_);
+            v_right = std::clamp(v_right, -max_wheel_speed_, max_wheel_speed_);
+
+            // Pack into CmdVel (linear=left, angular=right) for the motor driver
+            horus::msg::CmdVel wheels{};
+            wheels.linear  = static_cast<float>(v_left);
+            wheels.angular = static_cast<float>(v_right);
+            motor_pub_->send(wheels);
+
+            // ── Forward kinematics: update dead-reckoning odometry ──────
+            double dt = 1.0 / 50.0;  // matches 50 Hz tick rate
+            x_     += last_v_ * std::cos(theta_) * dt;
+            y_     += last_v_ * std::sin(theta_) * dt;
+            theta_ += last_w_ * dt;
+
+            // Normalize theta to [-pi, pi] to prevent float drift
+            if (theta_ > M_PI)  theta_ -= 2.0 * M_PI;
+            if (theta_ < -M_PI) theta_ += 2.0 * M_PI;
+
+            horus::msg::Odometry odom{};
+            odom.pose.x     = x_;
+            odom.pose.y     = y_;
+            odom.pose.theta = theta_;
+            odom_pub_->send(odom);
+
+            // Log at 1 Hz (every 50th tick at 50 Hz)
+            if (++tick_count_ % 50 == 0) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "pos=(%.2f, %.2f) theta=%.1f deg  wheels=(%.1f, %.1f) rad/s",
+                    x_, y_, theta_ * 180.0 / M_PI, v_left, v_right);
+                horus::log::info("diff_drive", buf);
+            }
+        }
+
+        void enter_safe_state() override {
+            // Zero both motors immediately on safety event
+            horus::msg::CmdVel stop{};
+            motor_pub_->send(stop);
+            last_v_ = 0;
+            last_w_ = 0;
+            horus::blackbox::record("diff_drive", "Entered safe state, motors zeroed");
+        }
+
+    private:
+        horus::Subscriber<horus::msg::CmdVel>*  cmd_sub_;
+        horus::Publisher<horus::msg::Odometry>*  odom_pub_;
+        horus::Publisher<horus::msg::CmdVel>*   motor_pub_;
+
+        // Physical parameters
+        double wheel_base_;
+        double wheel_radius_;
+        double max_wheel_speed_;  // rad/s limit per wheel
+
+        // Command state (persists between ticks for hold-last-value behavior)
+        double last_v_ = 0;
+        double last_w_ = 0;
+
+        // Odometry state (double precision — running sums accumulate error with f32)
+        double x_ = 0, y_ = 0, theta_ = 0;
+        int tick_count_ = 0;
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(50_hz).name("diff_drive_demo");
+
+        // TurtleBot3 Burger: 16cm wheelbase, 3.3cm wheel radius, ~60 rad/s max
+        DiffDrive drive(0.16, 0.033, 61.5);
+        sched.add(drive)
+            .order(10)
+            .budget(5_ms)
+            .on_miss(horus::Miss::Warn)  // warn on overrun — not safety-critical alone
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ## Odometry: Closing the Loop

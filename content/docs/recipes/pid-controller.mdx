@@ -285,6 +285,119 @@ description = "Generic PID with anti-windup and derivative filtering"
     run(pid_node, rt=True)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <algorithm>
+    #include <cmath>
+    #include <cstdio>
+    using namespace horus::literals;
+
+    class PidController : public horus::Node {
+    public:
+        PidController(double kp, double ki, double kd)
+            : Node("pid_controller"), kp_(kp), ki_(ki), kd_(kd)
+        {
+            setpoint_sub_    = subscribe<horus::msg::CmdVel>("pid.setpoint");
+            measurement_sub_ = subscribe<horus::msg::CmdVel>("pid.measurement");
+            output_pub_      = advertise<horus::msg::CmdVel>("pid.output");
+        }
+
+        void tick() override {
+            // IMPORTANT: always recv() every tick to drain buffers
+            if (auto sp = setpoint_sub_->recv()) {
+                target_ = sp->get()->linear;
+            }
+            if (auto fb = measurement_sub_->recv()) {
+                measured_ = fb->get()->linear;
+            }
+
+            double error = target_ - measured_;
+            double dt = 0.01;  // 100 Hz tick rate
+
+            // ── Proportional ────────────────────────────────────────
+            double p_term = kp_ * error;
+
+            // ── Integral with anti-windup ───────────────────────────
+            integral_ += error * dt;
+            integral_ = std::clamp(integral_, -integral_max_, integral_max_);
+            double i_term = ki_ * integral_;
+
+            // ── Derivative with low-pass filter ─────────────────────
+            // Raw derivative amplifies sensor noise.
+            // Filter: alpha * prev + (1 - alpha) * new
+            double raw_derivative = (error - prev_error_) / dt;
+            filtered_derivative_ = alpha_ * filtered_derivative_
+                                 + (1.0 - alpha_) * raw_derivative;
+            double d_term = kd_ * filtered_derivative_;
+            prev_error_ = error;
+
+            // ── Output (clamped to actuator limits) ─────────────────
+            double output = std::clamp(p_term + i_term + d_term,
+                                       output_min_, output_max_);
+
+            // Publish with diagnostic fields
+            horus::msg::CmdVel cmd{};
+            cmd.linear = static_cast<float>(output);
+            cmd.angular = static_cast<float>(error);  // expose error for monitoring
+            output_pub_->send(cmd);
+
+            // Log every 100 ticks (1 Hz at 100 Hz)
+            if (++tick_count_ % 100 == 0) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "err=%.3f P=%.3f I=%.3f D=%.3f out=%.3f",
+                    error, p_term, i_term, d_term, output);
+                horus::log::info("pid", buf);
+            }
+        }
+
+        void enter_safe_state() override {
+            // Zero output on safety event — stop actuator
+            horus::msg::CmdVel stop{};
+            output_pub_->send(stop);
+            integral_ = 0;  // reset integral to prevent windup during recovery
+            horus::blackbox::record("pid", "Entered safe state, output zeroed");
+        }
+
+    private:
+        horus::Subscriber<horus::msg::CmdVel>* setpoint_sub_;
+        horus::Subscriber<horus::msg::CmdVel>* measurement_sub_;
+        horus::Publisher<horus::msg::CmdVel>*  output_pub_;
+
+        // Gains
+        double kp_, ki_, kd_;
+
+        // State
+        double integral_ = 0;
+        double prev_error_ = 0;
+        double filtered_derivative_ = 0;
+        double target_ = 0;
+        double measured_ = 0;
+        int tick_count_ = 0;
+
+        // Limits
+        double output_min_ = -1.0;
+        double output_max_ = 1.0;
+        double integral_max_ = 0.5;   // anti-windup clamp
+        double alpha_ = 0.8;          // derivative filter (0=no filter, 0.99=heavy)
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(100_hz).name("pid_demo");
+
+        PidController pid(1.0, 0.1, 0.05);  // Kp=1, Ki=0.1, Kd=0.05
+        sched.add(pid)
+            .order(10)
+            .budget(5_ms)
+            .on_miss(horus::Miss::Skip)  // skip if overrun — don't accumulate lag
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ### Expected Output

@@ -200,6 +200,135 @@ description = "Non-blocking topic logger to CSV"
     run(logger)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <cstdio>
+    #include <cmath>
+    using namespace horus::literals;
+
+    class TelemetryLogger : public horus::Node {
+    public:
+        TelemetryLogger(int log_every_n = 100)
+            : Node("telemetry"), log_every_n_(log_every_n)
+        {
+            // Subscribe to all topics we want to monitor
+            odom_sub_  = subscribe<horus::msg::Odometry>("odom");
+            cmd_sub_   = subscribe<horus::msg::CmdVel>("cmd_vel");
+            imu_sub_   = subscribe<horus::msg::Imu>("imu.data");
+            estop_sub_ = subscribe<horus::msg::EmergencyStop>("emergency.stop");
+        }
+
+        void tick() override {
+            // ── Always drain subscriber buffers ─────────────────────────
+            // Even when not logging, drain to prevent stale data buildup.
+            // This ensures the next log entry shows the *latest* data,
+            // not data that has been sitting in the buffer for seconds.
+            auto odom  = odom_sub_->recv();
+            auto cmd   = cmd_sub_->recv();
+            auto imu   = imu_sub_->recv();
+            auto estop = estop_sub_->recv();
+
+            // Cache latest values for logging
+            if (odom) {
+                last_x_     = odom->get()->pose.x;
+                last_y_     = odom->get()->pose.y;
+                last_theta_ = odom->get()->pose.theta;
+                odom_alive_ = true;
+            }
+            if (cmd) {
+                last_linear_  = cmd->get()->linear;
+                last_angular_ = cmd->get()->angular;
+                cmd_alive_ = true;
+            }
+            if (imu) {
+                last_accel_z_ = imu->get()->linear_acceleration[2];
+                last_gyro_z_  = imu->get()->angular_velocity[2];
+                imu_alive_ = true;
+            }
+            if (estop) {
+                estop_engaged_ = (estop->get()->engaged != 0);
+            }
+
+            // ── Rate-limited logging ────────────────────────────────────
+            tick_count_++;
+            if (tick_count_ % log_every_n_ != 0) return;
+
+            // ── Format and publish summary ──────────────────────────────
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "pos=(%.2f, %.2f) hdg=%.1f deg  "
+                "cmd=(%.2f m/s, %.2f rad/s)  "
+                "az=%.2f m/s^2  gz=%.2f rad/s  "
+                "estop=%s",
+                last_x_, last_y_, last_theta_ * 180.0 / M_PI,
+                last_linear_, last_angular_,
+                last_accel_z_, last_gyro_z_,
+                estop_engaged_ ? "ACTIVE" : "clear");
+            horus::log::info("telemetry", buf);
+
+            // ── Health check: warn on missing topics ────────────────────
+            if (!odom_alive_) horus::log::warn("telemetry", "No odom data received");
+            if (!cmd_alive_)  horus::log::warn("telemetry", "No cmd_vel data received");
+            if (!imu_alive_)  horus::log::warn("telemetry", "No IMU data received");
+
+            // Record to blackbox at lower rate (every 10th log = 0.1 Hz)
+            if (tick_count_ % (log_every_n_ * 10) == 0) {
+                char bb[128];
+                std::snprintf(bb, sizeof(bb),
+                    "pos=(%.2f,%.2f) cmd=%.2f estop=%d",
+                    last_x_, last_y_, last_linear_,
+                    estop_engaged_ ? 1 : 0);
+                horus::blackbox::record("telemetry", bb);
+            }
+        }
+
+        void enter_safe_state() override {
+            // Logger has no actuators, but record the event for post-mortem
+            horus::blackbox::record("telemetry",
+                "System entered safe state — final snapshot: "
+                "see preceding log entries for last known state");
+            horus::log::warn("telemetry", "Safe state activated by scheduler");
+        }
+
+    private:
+        horus::Subscriber<horus::msg::Odometry>*      odom_sub_;
+        horus::Subscriber<horus::msg::CmdVel>*        cmd_sub_;
+        horus::Subscriber<horus::msg::Imu>*           imu_sub_;
+        horus::Subscriber<horus::msg::EmergencyStop>* estop_sub_;
+
+        // Configurable log interval
+        int log_every_n_;
+
+        // Cached latest values
+        double last_x_ = 0, last_y_ = 0, last_theta_ = 0;
+        float last_linear_ = 0, last_angular_ = 0;
+        double last_accel_z_ = 0, last_gyro_z_ = 0;
+        bool estop_engaged_ = false;
+
+        // Health tracking
+        bool odom_alive_ = false;
+        bool cmd_alive_  = false;
+        bool imu_alive_  = false;
+
+        int tick_count_ = 0;
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(100_hz).name("telemetry_demo");
+
+        // Log every 100 ticks = 1 Hz output at 100 Hz tick rate
+        TelemetryLogger logger(100);
+        sched.add(logger)
+            .order(100)                    // lowest priority — never delay real-time nodes
+            .on_miss(horus::Miss::Skip)    // skip if overrun — logging is expendable
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ### Expected Output

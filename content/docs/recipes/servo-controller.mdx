@@ -218,6 +218,169 @@ description = "Multi-servo bus with safe shutdown"
     run(servo, rt=True)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <cmath>
+    #include <cstdio>
+    #include <algorithm>
+    using namespace horus::literals;
+
+    class ServoController : public horus::Node {
+    public:
+        ServoController() : Node("servo_controller") {
+            // Subscribe to position targets from upstream (planner, teleop, etc.)
+            target_sub_   = subscribe<horus::msg::CmdVel>("servo.target");
+            // Subscribe to actual position feedback from servo encoder
+            feedback_sub_ = subscribe<horus::msg::CmdVel>("servo.feedback");
+            // Publish effort commands to the servo driver
+            motor_pub_    = advertise<horus::msg::ServoCommand>("servo.cmd");
+        }
+
+        void tick() override {
+            // ── Read runtime parameters (can be changed without restart) ─
+            double kp         = params_.get<double>("servo_kp", 2.0);
+            double max_effort = params_.get<double>("servo_max_effort", 5.0);
+            double max_vel    = params_.get<double>("servo_max_velocity", 2.0);  // rad/s
+            double deadband   = params_.get<double>("servo_deadband", 0.005);    // rad
+
+            // ── Read latest target and feedback ─────────────────────────
+            // IMPORTANT: always recv() every tick to drain buffers even if
+            // you don't use the value this tick.
+            if (auto target = target_sub_->recv()) {
+                target_pos_ = target->get()->linear;
+            }
+            if (auto feedback = feedback_sub_->recv()) {
+                prev_pos_ = current_pos_;
+                current_pos_ = feedback->get()->linear;
+                has_feedback_ = true;
+                no_feedback_count_ = 0;
+            }
+
+            // ── Safety: do not command without position feedback ────────
+            if (!has_feedback_) {
+                if (++no_feedback_count_ % 200 == 0) {  // warn every 2s at 100 Hz
+                    horus::log::warn("servo",
+                        "No feedback for 2s — holding zero effort for safety");
+                }
+                horus::msg::ServoCommand cmd{};
+                cmd.target_position = static_cast<float>(target_pos_);
+                cmd.target_velocity = 0.0f;
+                cmd.max_force = 0.0f;  // zero effort without feedback
+                motor_pub_->send(cmd);
+                return;
+            }
+
+            // ── Deadband: ignore errors smaller than encoder resolution ─
+            double error = target_pos_ - current_pos_;
+            if (std::abs(error) < deadband) {
+                // Close enough — hold position with zero effort to save power
+                horus::msg::ServoCommand cmd{};
+                cmd.target_position = static_cast<float>(current_pos_);
+                cmd.target_velocity = 0.0f;
+                cmd.max_force = static_cast<float>(max_effort);
+                motor_pub_->send(cmd);
+                return;
+            }
+
+            // ── Proportional control ────────────────────────────────────
+            double effort = std::clamp(kp * error,
+                                       -max_effort, max_effort);
+
+            // ── Velocity limiting ───────────────────────────────────────
+            // Estimate current velocity from position delta
+            double dt = 0.01;  // 100 Hz tick rate
+            double measured_vel = (current_pos_ - prev_pos_) / dt;
+
+            // Clamp effort to keep velocity under max_vel
+            // If already moving faster than max_vel, reduce effort
+            if (std::abs(measured_vel) > max_vel) {
+                double brake = std::copysign(max_effort * 0.5, -measured_vel);
+                effort = brake;  // actively brake if overspeeding
+            } else {
+                // Limit implied acceleration
+                double implied_vel = std::abs(effort) / kp;
+                if (implied_vel > max_vel) {
+                    effort = std::copysign(max_vel * kp, effort);
+                    effort = std::clamp(effort, -max_effort, max_effort);
+                }
+            }
+
+            // ── Publish servo command ───────────────────────────────────
+            horus::msg::ServoCommand cmd{};
+            cmd.target_position = static_cast<float>(target_pos_);
+            cmd.target_velocity = static_cast<float>(effort);
+            cmd.max_force       = static_cast<float>(max_effort);
+            motor_pub_->send(cmd);
+
+            // ── Diagnostics at 2 Hz (every 50th tick at 100 Hz) ────────
+            if (++tick_count_ % 50 == 0) {
+                char buf[196];
+                std::snprintf(buf, sizeof(buf),
+                    "target=%.3f  actual=%.3f  error=%.4f  effort=%.2f  "
+                    "vel=%.2f  kp=%.1f  max_eff=%.1f",
+                    target_pos_, current_pos_, error, effort,
+                    measured_vel, kp, max_effort);
+                horus::log::info("servo", buf);
+            }
+        }
+
+        void enter_safe_state() override {
+            // Zero effort on safety event — servo coasts to stop under friction.
+            // Holding position under power during an emergency is dangerous:
+            // a jammed servo draws maximum current and can overheat or break
+            // mechanical linkages.
+            horus::msg::ServoCommand stop{};
+            stop.target_position = static_cast<float>(current_pos_);
+            stop.target_velocity = 0.0f;
+            stop.max_force = 0.0f;
+            motor_pub_->send(stop);
+
+            horus::blackbox::record("servo",
+                "Entered safe state, effort zeroed, servo coasting");
+        }
+
+        void set_params(horus::Params& p) { params_ = std::move(p); }
+
+    private:
+        horus::Subscriber<horus::msg::CmdVel>*     target_sub_;
+        horus::Subscriber<horus::msg::CmdVel>*     feedback_sub_;
+        horus::Publisher<horus::msg::ServoCommand>* motor_pub_;
+        horus::Params params_;
+
+        // State
+        double target_pos_  = 0;
+        double current_pos_ = 0;
+        double prev_pos_    = 0;
+        bool has_feedback_  = false;
+        int no_feedback_count_ = 0;
+        int tick_count_ = 0;
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(100_hz).name("servo_demo");
+
+        // Set initial parameters (adjustable at runtime via `horus param set`)
+        horus::Params params;
+        params.set("servo_kp", 2.0);           // proportional gain
+        params.set("servo_max_effort", 5.0);   // Nm (set to 80% of servo rated max)
+        params.set("servo_max_velocity", 2.0); // rad/s
+        params.set("servo_deadband", 0.005);   // rad (~0.3 degrees)
+
+        ServoController servo;
+        servo.set_params(params);
+
+        sched.add(servo)
+            .order(10)
+            .budget(2_ms)
+            .on_miss(horus::Miss::Skip)  // skip if overrun — stale effort is dangerous
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ### Expected Output

@@ -181,6 +181,126 @@ description = "100 Hz IMU sensor with orientation publishing"
     run(imu_node, rt=True)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <cmath>
+    #include <cstdio>
+    using namespace horus::literals;
+
+    class ImuReader : public horus::Node {
+    public:
+        ImuReader(double alpha = 0.98)
+            : Node("imu_reader"), alpha_(alpha)
+        {
+            // Subscribe to raw IMU data from the hardware driver
+            imu_sub_  = subscribe<horus::msg::Imu>("imu.raw");
+            // Publish filtered orientation for downstream consumers
+            pose_pub_ = advertise<horus::msg::Pose2D>("imu.orientation");
+        }
+
+        void tick() override {
+            auto data = imu_sub_->recv();
+            if (!data) return;
+
+            const auto* imu = data->get();
+
+            // ── Extract sensor readings ─────────────────────────────────
+            double ax = imu->linear_acceleration[0];
+            double ay = imu->linear_acceleration[1];
+            double az = imu->linear_acceleration[2];
+            double gx = imu->angular_velocity[0];   // roll rate (rad/s)
+            double gy = imu->angular_velocity[1];   // pitch rate (rad/s)
+            double gz = imu->angular_velocity[2];   // yaw rate (rad/s)
+
+            double dt = 1.0 / 200.0;  // matches 200 Hz tick rate
+
+            // ── Accelerometer angles from gravity vector ────────────────
+            // Only valid when linear acceleration is negligible
+            double accel_roll  = std::atan2(ay, az);
+            double accel_pitch = std::atan2(-ax, std::sqrt(ay * ay + az * az));
+
+            // ── Complementary filter ────────────────────────────────────
+            // Gyro integration for short-term accuracy,
+            // accelerometer correction for long-term drift elimination
+            roll_  = alpha_ * (roll_  + gx * dt) + (1.0 - alpha_) * accel_roll;
+            pitch_ = alpha_ * (pitch_ + gy * dt) + (1.0 - alpha_) * accel_pitch;
+
+            // Yaw from gyro only — accelerometer cannot sense yaw
+            // (magnetometer would be needed for absolute yaw reference)
+            yaw_ += gz * dt;
+
+            // Normalize yaw to [-pi, pi]
+            if (yaw_ > M_PI)  yaw_ -= 2.0 * M_PI;
+            if (yaw_ < -M_PI) yaw_ += 2.0 * M_PI;
+
+            // ── Publish orientation ─────────────────────────────────────
+            horus::msg::Pose2D pose{};
+            pose.x     = roll_;   // repurpose x for roll (radians)
+            pose.y     = pitch_;  // repurpose y for pitch (radians)
+            pose.theta = yaw_;    // theta for yaw (radians)
+            pose_pub_->send(pose);
+
+            // ── Detect anomalies ────────────────────────────────────────
+            // Gravity magnitude should be ~9.81 m/s^2. Large deviations
+            // indicate high linear acceleration — filter becomes less reliable
+            double gravity_mag = std::sqrt(ax * ax + ay * ay + az * az);
+            if (std::abs(gravity_mag - 9.81) > 2.0) {
+                horus::log::warn("imu_reader",
+                    "High linear acceleration detected — filter accuracy degraded");
+            }
+
+            // Log at 1 Hz (every 200th tick at 200 Hz)
+            if (++tick_count_ % 200 == 0) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "roll=%.1f  pitch=%.1f  yaw=%.1f deg  |g|=%.2f",
+                    roll_ * 180.0 / M_PI, pitch_ * 180.0 / M_PI,
+                    yaw_ * 180.0 / M_PI, gravity_mag);
+                horus::log::info("imu_reader", buf);
+            }
+        }
+
+        void enter_safe_state() override {
+            // IMU reader has no actuators, but publish a zeroed orientation
+            // so downstream controllers see a neutral state and stop moving
+            horus::msg::Pose2D zero{};
+            pose_pub_->send(zero);
+            horus::blackbox::record("imu_reader",
+                "Entered safe state, published zero orientation");
+        }
+
+    private:
+        horus::Subscriber<horus::msg::Imu>*   imu_sub_;
+        horus::Publisher<horus::msg::Pose2D>*  pose_pub_;
+
+        // Filter parameter
+        double alpha_;  // gyro trust factor (0.90-0.99 typical)
+
+        // Orientation state (radians)
+        double roll_  = 0;
+        double pitch_ = 0;
+        double yaw_   = 0;
+
+        int tick_count_ = 0;
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(200_hz).name("imu_demo");
+
+        // alpha=0.98: 98% gyro, 2% accel — good default for ground robots
+        ImuReader imu(0.98);
+        sched.add(imu)
+            .order(5)            // run early — downstream nodes depend on orientation
+            .budget(200_us)      // IMU processing is lightweight
+            .on_miss(horus::Miss::Skip)  // skip if overrun — stale orientation is worse than missing one
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ## Understanding the Code

@@ -217,6 +217,159 @@ description = "E-stop monitor with safety state handling"
     run(estop, rt=True, watchdog_ms=500)
     ```
   </LangTab>
+  <LangTab language="C++">
+    ```cpp
+    #include <horus/horus.hpp>
+    #include <cstdio>
+    using namespace horus::literals;
+
+    class SafetyMonitor : public horus::Node {
+    public:
+        SafetyMonitor(float critical_dist = 0.15f, int clear_threshold = 25)
+            : Node("safety_monitor"),
+              critical_dist_(critical_dist),
+              clear_threshold_(clear_threshold)
+        {
+            scan_sub_  = subscribe<horus::msg::LaserScan>("lidar.scan");
+            estop_pub_ = advertise<horus::msg::EmergencyStop>("emergency.stop");
+            cmd_pub_   = advertise<horus::msg::CmdVel>("cmd_vel");
+        }
+
+        void tick() override {
+            auto scan = scan_sub_->recv();
+
+            // ── Fail-safe: no scan data = sensor failure ────────────────
+            // If the LiDAR node crashed, we have no sensor coverage.
+            // Treat silence as danger, not safety.
+            if (!scan) {
+                ticks_without_scan_++;
+                if (ticks_without_scan_ > 10 && !estop_active_) {
+                    estop_active_ = true;
+                    consecutive_clears_ = 0;
+                    horus::log::error("safety",
+                        "No LiDAR data for 10 ticks — activating E-stop");
+                    horus::blackbox::record("safety",
+                        "E-stop triggered: LiDAR timeout (sensor failure)");
+                }
+                // Always zero cmd_vel while E-stop is active
+                if (estop_active_) {
+                    horus::msg::CmdVel stop{};
+                    cmd_pub_->send(stop);
+                    horus::msg::EmergencyStop estop{};
+                    estop.engaged = 1;
+                    estop_pub_->send(estop);
+                }
+                return;
+            }
+            ticks_without_scan_ = 0;
+
+            // ── Check all beams for critical proximity ──────────────────
+            bool danger = false;
+            for (int i = 0; i < 360; i++) {
+                float r = scan->get()->ranges[i];
+                // Valid reading below critical distance = imminent collision
+                if (r > 0.02f && r < critical_dist_) {
+                    danger = true;
+                    break;
+                }
+            }
+
+            // ── E-stop state machine ────────────────────────────────────
+            if (danger && !estop_active_) {
+                // TRIGGER: immediate activation, no debounce
+                estop_active_ = true;
+                consecutive_clears_ = 0;
+
+                horus::msg::EmergencyStop estop{};
+                estop.engaged = 1;
+                estop_pub_->send(estop);
+
+                horus::log::error("safety",
+                    "EMERGENCY STOP — obstacle within 15cm");
+                horus::blackbox::record("safety",
+                    "E-stop triggered: obstacle within critical distance");
+
+                // Zero all motor commands immediately
+                horus::msg::CmdVel stop{};
+                cmd_pub_->send(stop);
+            }
+            else if (danger && estop_active_) {
+                // Still in danger — reset clear counter, keep sending stop
+                consecutive_clears_ = 0;
+                horus::msg::CmdVel stop{};
+                cmd_pub_->send(stop);
+            }
+            else if (!danger && estop_active_) {
+                // Danger cleared — debounce before releasing
+                consecutive_clears_++;
+                if (consecutive_clears_ >= clear_threshold_) {
+                    estop_active_ = false;
+                    horus::msg::EmergencyStop clear{};
+                    clear.engaged = 0;
+                    estop_pub_->send(clear);
+                    horus::log::info("safety", "E-stop cleared after debounce");
+                    horus::blackbox::record("safety",
+                        "E-stop released after clear threshold met");
+                } else {
+                    // Still debouncing — keep motors stopped
+                    horus::msg::CmdVel stop{};
+                    cmd_pub_->send(stop);
+                }
+            }
+
+            // Log at 1 Hz (every 50th tick at 50 Hz)
+            if (++tick_count_ % 50 == 0) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "estop=%s  clears=%d/%d",
+                    estop_active_ ? "ACTIVE" : "clear",
+                    consecutive_clears_, clear_threshold_);
+                horus::log::info("safety", buf);
+            }
+        }
+
+        void enter_safe_state() override {
+            // Called by scheduler on deadline miss — force E-stop
+            horus::msg::CmdVel stop{};
+            cmd_pub_->send(stop);
+            estop_active_ = true;
+            consecutive_clears_ = 0;
+            horus::blackbox::record("safety",
+                "Scheduler forced safe state (deadline miss or watchdog)");
+        }
+
+    private:
+        horus::Subscriber<horus::msg::LaserScan>*   scan_sub_;
+        horus::Publisher<horus::msg::EmergencyStop>* estop_pub_;
+        horus::Publisher<horus::msg::CmdVel>*        cmd_pub_;
+
+        // Configuration
+        float critical_dist_;    // meters — trigger threshold
+        int clear_threshold_;    // consecutive clear ticks before release
+
+        // State
+        bool estop_active_ = false;
+        int consecutive_clears_ = 0;
+        int ticks_without_scan_ = 0;
+        int tick_count_ = 0;
+    };
+
+    int main() {
+        horus::Scheduler sched;
+        sched.tick_rate(50_hz).name("safety_demo");
+
+        // 15cm critical distance, 25 clear readings (0.5s at 50 Hz) to release
+        SafetyMonitor safety(0.15f, 25);
+        sched.add(safety)
+            .order(0)                        // highest priority — runs first
+            .budget(2_ms)                    // tight budget for safety-critical code
+            .on_miss(horus::Miss::SafeMode)  // strictest policy — force safe state on any overrun
+            .build();
+
+        sched.spin();
+    }
+    ```
+  </LangTab>
 </LanguageTabs>
 
 ## Understanding the Code
