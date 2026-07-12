@@ -1,95 +1,134 @@
 ---
-title: "Tutorial 1: LiDAR Sensor Node (C++)"
-description: "Build a LiDAR sensor node that publishes scan data and processes it for obstacle avoidance"
+title: "Tutorial 1: IMU Sensor Node (C++)"
+description: "Build an IMU sensor node in C++ that publishes accelerometer and gyroscope readings, plus a display node that consumes them"
 order: 12
 ---
 
-# Tutorial 1: LiDAR Sensor Node (C++)
+# Tutorial 1: IMU Sensor Node (C++)
 
-In this tutorial, you'll build a complete obstacle avoidance robot controller in C++. You'll learn:
+<Callout type="info">Prefer another language? See [Tutorial 1: IMU Sensor Node](/tutorials/01-sensor-node) (Rust) or [Tutorial 1: IMU Sensor Node (Python)](/tutorials/01-sensor-node-python).</Callout>
 
-- Creating a scheduler with real-time settings
-- Publishing sensor data with the zero-copy loan pattern
-- Subscribing to data and processing it
-- Multi-node pipelines with execution ordering
+Inertial Measurement Units (IMUs) are one of the most common sensors in robotics. Drones rely on them for stabilization, self-driving cars fuse IMU data with GPS for localization, and warehouse AGVs use them to track heading. In this tutorial you'll build a HORUS node that simulates an IMU — publishing accelerometer and gyroscope readings at 100 Hz — and a second node that subscribes to that stream and displays it. This is the foundational publish/subscribe pattern you'll use for every sensor in HORUS.
+
+## Prerequisites
+
+- [Quick Start](/getting-started/quick-start) completed
+- A C++17 compiler and HORUS installed (`horus --help` working)
+
+## What You'll Build
+
+An IMU sensor node that:
+
+1. Generates accelerometer data (x, y, z in m/s²)
+2. Generates gyroscope data (roll, pitch, yaw rates in rad/s)
+3. Publishes the standard `horus::msg::Imu` message on a topic at 100 Hz
+4. A display node that prints the data once per second
+
+**Time estimate**: ~15 minutes
 
 ## Step 1: Create the Project
 
 ```bash
-horus new lidar_robot --cpp
-cd lidar_robot
+horus new imu-demo --lang cpp
+cd imu-demo
 ```
 
-## Step 2: Write the Controller
+You should see `horus.toml`, `src/main.cpp`, and `.horus/` in the project directory.
 
-Replace `src/main.cpp` with:
+## Step 2: Write the Code
+
+HORUS ships a standard `horus::msg::Imu` message — a 9-axis reading with an orientation quaternion, angular velocity, and linear acceleration. Replace `src/main.cpp` with two nodes: a sensor that publishes it and a display that consumes it.
 
 ```cpp
 #include <horus/horus.hpp>
+#include <cmath>
+#include <cstdio>
 using namespace horus::literals;
 
+// ── Sensor Node: simulates an IMU at 100 Hz ──────────────────────────────
+class ImuSensor : public horus::Node {
+public:
+    ImuSensor() : Node("imu_sensor") {
+        // Publish IMU readings for any downstream consumer.
+        imu_pub_ = advertise<horus::msg::Imu>("imu.data");
+    }
+
+    void tick() override {
+        double t = tick_count_ * 0.01;  // 100 Hz → 0.01 s per tick
+
+        horus::msg::Imu imu{};
+        // Accelerometer (m/s²): a level robot feels ~1 g on the z axis.
+        imu.linear_acceleration[0] = 0.0;
+        imu.linear_acceleration[1] = 0.0;
+        imu.linear_acceleration[2] = 9.81;
+        // Gyroscope (rad/s): a gentle yaw oscillation as the robot turns.
+        imu.angular_velocity[0] = 0.0;
+        imu.angular_velocity[1] = 0.0;
+        imu.angular_velocity[2] = 0.1 * std::sin(t * 0.5);
+        // Orientation quaternion (qx, qy, qz, qw) — identity for now.
+        imu.orientation[3] = 1.0;
+        imu.timestamp_ns = static_cast<uint64_t>(t * 1e9);
+
+        imu_pub_->send(imu);
+        tick_count_++;
+    }
+
+private:
+    horus::Publisher<horus::msg::Imu>* imu_pub_;
+    uint64_t tick_count_ = 0;
+};
+
+// ── Display Node: prints the IMU stream once per second ──────────────────
+class ImuDisplay : public horus::Node {
+public:
+    ImuDisplay() : Node("imu_display") {
+        imu_sub_ = subscribe<horus::msg::Imu>("imu.data");
+    }
+
+    void tick() override {
+        // Call recv() every tick to drain the topic buffer.
+        auto data = imu_sub_->recv();
+        if (!data) return;                 // no new message this tick
+        const auto* imu = data->get();
+
+        // Print every 100th sample → once per second at 100 Hz.
+        if (++sample_count_ % 100 == 0) {
+            std::printf(
+                "accel=(%.2f, %.2f, %.2f)  gyro=(%.3f, %.3f, %.3f)\n",
+                imu->linear_acceleration[0], imu->linear_acceleration[1],
+                imu->linear_acceleration[2],
+                imu->angular_velocity[0], imu->angular_velocity[1],
+                imu->angular_velocity[2]);
+        }
+    }
+
+private:
+    horus::Subscriber<horus::msg::Imu>* imu_sub_;
+    uint64_t sample_count_ = 0;
+};
+
+// ── Main ─────────────────────────────────────────────────────────────────
 int main() {
     horus::Scheduler sched;
-    sched.tick_rate(100_hz).prefer_rt();
+    sched.tick_rate(100_hz).name("imu_demo");
 
-    // ── Topics ─────────────────────────────────────────────
-    auto scan_pub = sched.advertise<horus::msg::LaserScan>("lidar.scan");
-    auto scan_sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
-    auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+    // Sensor publishes (order 0) before the display subscribes (order 1).
+    ImuSensor sensor;
+    sched.add(sensor).order(0).build();
 
-    // ── Node 1: Simulated LiDAR Driver ─────────────────────
-    sched.add("lidar_driver")
-        .rate(100_hz)
-        .order(0)
-        .tick([&] {
-            auto scan = scan_pub.loan();
-            // Simulate: obstacles at 45° and 315°
-            for (int i = 0; i < 360; ++i) {
-                if (i > 40 && i < 50) {
-                    scan->ranges[i] = 0.3f;  // close obstacle
-                } else {
-                    scan->ranges[i] = 5.0f;  // clear
-                }
-            }
-            scan->angle_min = 0.0f;
-            scan->angle_max = 6.28318f;
-            scan_pub.publish(std::move(scan));
-        })
-        .build();
+    ImuDisplay display;
+    sched.add(display).order(1).build();
 
-    // ── Node 2: Obstacle Avoidance Controller ──────────────
-    sched.add("controller")
-        .rate(50_hz)
-        .order(10)
-        .budget(5_ms)
-        .on_miss(horus::Miss::Skip)
-        .tick([&] {
-            auto scan = scan_sub.recv();
-            if (!scan) return;
-
-            // Find minimum range in front 60° arc
-            float min_front = 999.0f;
-            for (int i = 150; i < 210; ++i) {
-                if (scan->ranges[i] > 0.01f && scan->ranges[i] < min_front) {
-                    min_front = scan->ranges[i];
-                }
-            }
-
-            auto cmd = cmd_pub.loan();
-            if (min_front < 0.5f) {
-                cmd->linear  = 0.0f;
-                cmd->angular = 0.5f;  // turn
-            } else {
-                cmd->linear  = 0.3f;
-                cmd->angular = 0.0f;  // go straight
-            }
-            cmd_pub.publish(std::move(cmd));
-        })
-        .build();
-
+    std::printf("IMU demo running at 100 Hz (Ctrl+C to stop)\n");
     sched.spin();
 }
 ```
+
+A few things to notice:
+
+- **A node is a class** deriving from `horus::Node`. Topics are created once in the constructor with `advertise<T>()` / `subscribe<T>()`; the returned `Publisher<T>*` / `Subscriber<T>*` are stored as members.
+- **`send()` / `recv()`** move a message through a lock-free shared-memory ring buffer. `recv()` returns an empty optional when no new message is waiting, so always check it.
+- **Execution order** — `order(0)` runs before `order(1)` each tick, so the sensor publishes fresh data before the display reads it.
 
 ## Step 3: Build and Run
 
@@ -98,27 +137,43 @@ horus build
 horus run
 ```
 
-## Step 4: Monitor
+You should see one line per second:
 
-In another terminal:
+```
+IMU demo running at 100 Hz (Ctrl+C to stop)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.048)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.084)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.097)
+```
+
+Press **Ctrl+C** to stop.
+
+## Step 4: Introspect While Running
+
+With the demo still running, open a **second terminal** and inspect the live system:
 
 ```bash
-horus topic list          # see active topics
-horus topic hz cmd_vel    # check publish rate
-horus node list           # see running nodes
-horus topic echo cmd_vel  # watch velocity commands
+horus topic list          # active topics, types, and rates
+horus topic hz imu.data   # confirm the 100 Hz publish rate
+horus topic echo imu.data # stream every message to your terminal
+horus node list           # see the running nodes
 ```
+
+`horus topic echo` is a read-only observer — it never interferes with the running system, which makes it invaluable for debugging. If a subscriber isn't receiving data, use it to confirm the publisher is actually sending.
 
 ## Key Takeaways
 
-1. **Captured pub/sub** — create topics outside the tick lambda, capture by reference
-2. **Loan pattern** — `pub.loan()` gives you a direct SHM pointer (0ns data access)
-3. **Execution order** — `order(0)` runs before `order(10)`, ensuring sensor data is fresh
-4. **Budget enforcement** — `budget(5_ms)` + `on_miss(Skip)` keeps the system responsive
-5. **Zero configuration** — no XML launch files, no msg files, no codegen step
+1. **Nodes are classes** that derive from `horus::Node` and create their topics in the constructor.
+2. **Standard messages** like `horus::msg::Imu` are ready to use — no `.msg` files, no codegen step.
+3. **`send()` / `recv()`** move data over a zero-copy shared-memory ring buffer; `recv()` returns an empty optional when there's nothing new.
+4. **Execution order** (`order(0)` before `order(1)`) guarantees the sensor publishes before the display reads.
 
 ## Next Steps
 
-- Add a third node for motor control
-- Use `horus record` to capture and replay the session
-- Try `horus sim3d` for 3D simulation with physics
+- [Tutorial 2: Motor Controller (C++)](/tutorials/02-motor-controller-cpp) — subscribe to velocity commands and publish state feedback
+
+## See Also
+
+- [Imu Message](/stdlib/messages/imu) — the standard IMU message type
+- [C++ Topic API](/cpp/api/topic) — full Publisher/Subscriber reference
+- [IMU Reader Recipe (C++)](/recipes/imu-reader-cpp) — a production complementary-filter pipeline
