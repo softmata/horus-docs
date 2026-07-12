@@ -17,10 +17,39 @@ interface PageProps {
   }>;
 }
 
+// i18n: English is served at the root (unchanged); zh/ja/de translations live under a locale prefix and
+// read from content/i18n/{locale}/, falling back to English content when a page isn't translated yet.
+const I18N_LOCALES = ['zh', 'ja', 'de'] as const;
+const HREFLANG: Record<string, string> = { en: 'en', zh: 'zh-Hans', ja: 'ja', de: 'de' };
+const SITE_URL = 'https://docs.horusrobotics.dev';
+function isI18nLocale(s?: string): boolean { return !!s && (I18N_LOCALES as readonly string[]).includes(s); }
+
+async function loadLocalized(slug: string[]) {
+  const locale = isI18nLocale(slug[0]) ? slug[0] : null;
+  const enSlug = locale ? slug.slice(1) : slug; // path relative to the English tree
+  if (locale) {
+    const t = await getDoc(['i18n', locale, ...enSlug]);
+    return { doc: t ?? (await getDoc(['docs', ...enSlug])), locale, enSlug };
+  }
+  return { doc: await getDoc(['docs', ...enSlug]), locale: null as string | null, enSlug };
+}
+
+function hreflangAlternates(enSlug: string[]): Record<string, string> {
+  const fs = require('fs');
+  const path = require('path');
+  const out: Record<string, string> = { [HREFLANG.en]: `${SITE_URL}/${enSlug.join('/')}` };
+  for (const l of I18N_LOCALES) {
+    const base = path.join(process.cwd(), 'content/i18n', l, ...enSlug);
+    if (fs.existsSync(base + '.mdx') || fs.existsSync(path.join(base, 'index.mdx'))) {
+      out[HREFLANG[l]] = `${SITE_URL}/${l}/${enSlug.join('/')}`;
+    }
+  }
+  return out;
+}
+
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const { slug } = await params;
-  const docPath = ['docs', ...slug];
-  const doc = await getDoc(docPath);
+  const { doc, locale, enSlug } = await loadLocalized(slug);
 
   if (!doc) {
     return {
@@ -78,7 +107,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       url,
       siteName: 'HORUS - World\'s Fastest Robotics Framework',
       type: 'article',
-      locale: 'en_US',
+      locale: locale ? HREFLANG[locale] : 'en_US',
       images: [
         {
           url: 'https://docs.horusrobotics.dev/og-image.png',
@@ -98,6 +127,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     },
     alternates: {
       canonical: url,
+      languages: hreflangAlternates(enSlug),
     },
     robots: {
       index: true,
@@ -145,10 +175,8 @@ function segmentLabel(segment: string): string {
 export default async function DocPage({ params }: PageProps) {
   const { slug } = await params;
 
-  // Always prepend 'docs' to the path
-  const docPath = ['docs', ...slug];
-
-  const doc = await getDoc(docPath);
+  // i18n-aware load: locale prefix → content/i18n/{locale}/… (English fallback), else content/docs/…
+  const { doc } = await loadLocalized(slug);
 
   if (!doc) {
     notFound();
@@ -256,6 +284,14 @@ export async function generateStaticParams() {
   }
 
   findMdxFiles(contentDir);
+
+  // Localized routes: for each translated page under content/i18n/{locale}, emit /{locale}/<path>.
+  // Only translated pages get a locale URL (no fallback explosion); dynamicParams=false means untranslated
+  // locale paths 404 rather than duplicating English under every locale.
+  for (const locale of I18N_LOCALES) {
+    const ldir = path.join(process.cwd(), 'content/i18n', locale);
+    if (fs.existsSync(ldir)) findMdxFiles(ldir, [locale]);
+  }
 
   return routes;
 }
