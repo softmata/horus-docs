@@ -3,6 +3,7 @@ import { DocsLayout } from '@/components/DocsLayout';
 import { TableOfContents } from '@/components/TableOfContents';
 import { PrevNextNav } from '@/components/PrevNextNav';
 import { ReportIssue } from '@/components/ReportIssue';
+import { jsonLdScript } from '@/lib/json-ld';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
 
@@ -201,11 +202,11 @@ export default async function DocPage({ params }: PageProps) {
     <DocsLayout>
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonLdScript(breadcrumbJsonLd) }}
       />
       <script
         type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(techArticleJsonLd) }}
+        dangerouslySetInnerHTML={{ __html: jsonLdScript(techArticleJsonLd) }}
       />
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         <article className="prose max-w-none prose-headings:scroll-mt-20 prose-p:text-[var(--text-secondary)] prose-p:leading-relaxed prose-li:text-[var(--text-secondary)]">

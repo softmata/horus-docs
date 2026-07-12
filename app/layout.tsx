@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Analytics } from "@vercel/analytics/react";
+import { jsonLdScript } from "@/lib/json-ld";
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://docs.horusrobotics.dev'),
@@ -124,7 +125,7 @@ export default function RootLayout({
       <head>
         <script
           type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+          dangerouslySetInnerHTML={{ __html: jsonLdScript(jsonLd) }}
         />
       </head>
       <body className="font-mono antialiased">
