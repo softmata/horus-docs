@@ -170,42 +170,31 @@ tensor = node.recv("features")
 arr = tensor.numpy()             # shape matches creation — zero-copy
 ```
 
-### GPU Interop via DLPack
+### ML Framework Interop via NumPy
 
-Pool-backed types support zero-copy conversion to PyTorch and JAX through the DLPack protocol. When data is on GPU, DLPack exports a CUDA device pointer -- PyTorch receives a CUDA tensor directly, no CPU roundtrip:
+Pool-backed types expose a zero-copy NumPy view (`to_numpy()`), and any framework that accepts NumPy arrays wraps it without copying. `torch.from_numpy()` shares the memory (zero-copy for CPU tensors); move to your own GPU with the framework's own transfer:
 
 ```python
 # simplified
 import torch
+import jax.numpy as jnp
 
-# CPU Image to PyTorch — zero-copy via SHM
+# Image to PyTorch — zero-copy via the SHM-backed NumPy view
 img = node.recv("camera")
-tensor = img.to_torch()               # torch.Tensor on CPU, backed by SHM
+tensor = torch.from_numpy(img.to_numpy())   # torch.Tensor on CPU, backed by SHM
 
-# GPU Image to PyTorch — zero-copy via CUDA pointer
-gpu_img = img.to_gpu()                # copy to CUDA managed memory
-gpu_tensor = gpu_img.to_torch()       # torch.Tensor on CUDA, zero-copy
+# Move to your GPU with the framework's own transfer
+gpu_tensor = tensor.cuda()                   # CPU → GPU (PCIe copy)
 
-# Transfer between devices
-cpu_img = gpu_img.to_cpu()            # copy back to CPU
-print(gpu_img.device)                 # "cuda:0"
-print(gpu_img.is_gpu)                 # True
-
-# Tensor to PyTorch — zero-copy
+# Tensor to PyTorch — shares the pool memory
 features = node.recv("features")
-pt = torch.from_dlpack(features)      # standard DLPack protocol
+pt = torch.from_numpy(features.numpy())
 
-# Tensor to JAX — zero-copy
-import jax
-jax_arr = features.to_jax()
-
-# GPU detection
-print(horus.cuda_available())         # True if GPU present
-print(horus.cuda_device_count())      # Number of GPUs
-print(horus.gpu_platform())           # e.g., "NVIDIA GeForce RTX 4090 (sm_89, 24.0 GB)"
+# Tensor to JAX — via NumPy view
+jax_arr = jnp.asarray(features.numpy())
 ```
 
-DLPack is the standard zero-copy tensor exchange protocol supported by NumPy (1.25+), PyTorch (1.10+), JAX (0.4+), CuPy, and TensorFlow. One protocol covers all frameworks. GPU tensors export with `device_type=kDLCUDA`, enabling direct GPU-to-GPU transfer between HORUS and ML frameworks.
+The NumPy view is backed directly by the shared-memory pool, so `torch.from_numpy()` / `jnp.asarray()` add no copy. Any NumPy-compatible framework (PyTorch, JAX, OpenCV, ONNX Runtime, TensorFlow) works through the same view.
 
 ### The Zero-Copy Chain
 
@@ -214,19 +203,19 @@ For pool-backed types, the full data path involves zero copies on the receive si
 ```text
 Rust allocator ──► SHM pool ──► Python receives descriptor
                       │
-                      └──► img.to_numpy() ──► NumPy view (same memory)
-                      └──► img.to_torch() ──► PyTorch tensor (same memory)
-                      └──► img.to_jax()   ──► JAX array (same memory)
+                      └──► img.to_numpy()                    ──► NumPy view (same memory)
+                      └──► torch.from_numpy(img.to_numpy())  ──► PyTorch tensor (same memory)
+                      └──► jnp.asarray(img.to_numpy())       ──► JAX array (same memory)
 ```
 
-`from_numpy()` and `from_torch()` do copy once — they place data into the pool so it can be shared. `to_numpy()` and `to_torch()` do not copy — they create views into existing pool memory.
+`from_numpy()` copies once — it places data into the pool so it can be shared. `to_numpy()` does not copy — it creates a view into existing pool memory.
 
 | Direction | Method | Copies | Why |
 |-----------|--------|--------|-----|
 | Python to SHM | `Image.from_numpy(arr)` | 1 | Data must go into a pool slot at a specific address |
-| Python to SHM | `Tensor.from_torch(t)` | 1 | Same reason |
+| Python to SHM | `Tensor.from_numpy(t.numpy())` | 1 | Same reason |
 | SHM to Python | `img.to_numpy()` | 0 | Returns a view into the pool slot |
-| SHM to Python | `torch.from_dlpack(tensor)` | 0 | DLPack wraps the pool pointer |
+| SHM to Python | `torch.from_numpy(img.to_numpy())` | 0 | Wraps the pool pointer (CPU tensors) |
 
 ---
 

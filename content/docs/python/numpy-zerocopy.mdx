@@ -1,6 +1,6 @@
 ---
 title: "NumPy & Zero-Copy"
-description: "Zero-copy data transfer between HORUS and NumPy/PyTorch via DLPack and pool-backed shared memory"
+description: "Zero-copy data transfer between HORUS and NumPy/PyTorch via pool-backed shared memory"
 order: 21
 ---
 
@@ -10,12 +10,11 @@ HORUS transfers images, point clouds, and tensors between Rust and Python with z
 
 ---
 
-## The Three Paths
+## The Two Paths
 
 | Method | Latency | Copy? | Use When |
 |--------|---------|:-----:|----------|
-| `np.from_dlpack(img)` | ~1.1μs | No | ML inference, GPU pipelines |
-| `img.to_numpy()` | ~3.0μs | No (SHM view) | General numpy processing |
+| `img.to_numpy()` | ~3.0μs | No (SHM view) | Zero-copy numpy processing, ML inference |
 | `np.array(img)` / `np.copy()` | ~14μs | Yes | Need to modify data or hold past next `recv()` |
 
 ---
@@ -35,9 +34,6 @@ def detect_tick(node):
     # Zero-copy — returns a numpy view backed by shared memory
     frame = img.to_numpy()  # shape: (480, 640, 3), dtype: uint8
     # ~3μs — no data movement
-
-    # Or use DLPack for maximum performance
-    frame = np.from_dlpack(img)  # ~1.1μs — true zero-copy
 
     # Process with numpy/OpenCV
     mean_brightness = frame.mean()
@@ -80,6 +76,8 @@ def tick(node):
 
 ## Image to PyTorch
 
+`torch.from_numpy()` wraps the NumPy view without copying — zero-copy for CPU tensors:
+
 ```python
 # simplified
 import torch
@@ -89,8 +87,8 @@ def inference_tick(node):
     if img is None:
         return
 
-    # Zero-copy to PyTorch tensor via DLPack
-    tensor = torch.from_dlpack(img)  # (H, W, C) uint8 on CPU
+    # Zero-copy to PyTorch tensor via the SHM-backed NumPy view
+    tensor = torch.from_numpy(img.to_numpy())  # (H, W, C) uint8 on CPU
 
     # Move to GPU for inference
     tensor = tensor.permute(2, 0, 1).unsqueeze(0).float() / 255.0
@@ -155,13 +153,12 @@ Data from [Benchmarks](/performance/benchmarks) page, measured on i9-14900K:
 
 | Operation | Latency | Throughput |
 |-----------|---------|-----------|
-| `np.from_dlpack()` (640x480 RGB) | **1.1μs** | 3.5M/s |
 | `img.to_numpy()` (640x480 RGB) | **3.0μs** | 1.5M/s |
 | `np.copy()` (640x480 RGB) | 14.0μs | 334K/s |
 | Typed message send+recv (`CmdVel`) | **1.7μs** | 2.7M/s |
 | Dict send+recv (small) | 6.2μs | 714K/s |
 
-**DLPack is 13x faster than copying** — it returns a numpy/torch array backed directly by the shared memory pool.
+**`to_numpy()` is ~5x faster than `np.copy()`** — it returns a numpy array backed directly by the shared memory pool.
 
 ---
 
@@ -177,8 +174,8 @@ def detect_tick(node):
     if img is None:
         return
 
-    # Zero-copy to numpy (1.1μs via DLPack)
-    frame = np.from_dlpack(img)
+    # Zero-copy to numpy (~3μs, view into the SHM pool)
+    frame = img.to_numpy()
 
     # Run YOLO inference (~20-100ms)
     results = model.predict(frame)

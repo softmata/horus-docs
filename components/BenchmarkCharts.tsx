@@ -1633,8 +1633,7 @@ export function PythonZeroCopyChart() {
   const colors = useColors();
 
   const data = [
-    { name: 'np.from_dlpack\n(zero-copy)', latency: 1.1, throughput: 3.5, color: colors.horus },
-    { name: 'Image.to_numpy\n(SHM view)', latency: 3.0, throughput: 1.5, color: colors.horusLink },
+    { name: 'Image.to_numpy\n(SHM view)', latency: 3.0, throughput: 1.5, color: colors.horus },
     { name: 'np.copy\n(baseline)', latency: 14.0, throughput: 0.334, color: colors.ros2 },
   ];
 
@@ -1647,7 +1646,7 @@ export function PythonZeroCopyChart() {
         Python Image Zero-Copy
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
-        640&times;480 RGB image transfer latency (&mu;s). DLPack is 13x faster than copying.
+        640&times;480 RGB image transfer latency (&mu;s). to_numpy() is a zero-copy view into shared memory — ~4.7x faster than copying.
       </p>
       <ResponsiveContainer width="100%" height={300}>
         <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>

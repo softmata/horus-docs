@@ -1,6 +1,6 @@
 ---
 title: "Tensor"
-description: "Zero-copy tensor descriptor with DLPack interop for ML pipelines"
+description: "Zero-copy tensor descriptor for ML pipelines"
 weight: 63
 ---
 
@@ -30,9 +30,6 @@ use horus::prelude::*;
 | `numel()` | `u64` | Total number of elements |
 | `nbytes()` | `u64` | Total size in bytes (`numel * dtype.element_size()`) |
 | `dtype()` | `TensorDtype` | Element data type |
-| `device()` | `Device` | Device location (CPU or CUDA) |
-| `is_cpu()` | `bool` | True if data resides on CPU / shared memory |
-| `is_cuda()` | `bool` | True if device descriptor is set to CUDA |
 | `is_contiguous()` | `bool` | True if memory layout is C-contiguous |
 | `view(new_shape)` | `Option` | Reshape without copying (fails if not contiguous or element count changes) |
 | `slice_first_dim(start, end)` | `Option` | Slice along the first dimension, adjusting strides |
@@ -95,41 +92,6 @@ let parsed = TensorDtype::parse("uint8").unwrap();   // U8
 let parsed = TensorDtype::parse("bool").unwrap();     // Bool
 ```
 
-## Device
-
-Fixed-size device descriptor supporting CPU and CUDA device tags. `Device::cuda(N)` targets CUDA GPU index N. The optimal GPU memory backend is auto-detected at runtime: unified memory on Jetson, managed memory on discrete GPUs.
-
-```rust
-// simplified
-// Constructors
-let cpu = Device::cpu();
-let gpu0 = Device::cuda(0);  // CUDA device 0
-
-// Check device type
-assert!(cpu.is_cpu());
-assert!(gpu0.is_cuda());
-
-// Display
-println!("{}", gpu0); // "cuda:0"
-
-// Parse from string
-let dev = Device::parse("cpu").unwrap();
-let dev = Device::parse("cuda:0").unwrap();
-
-// GPU detection
-if horus::cuda_available() {
-    println!("{} GPU(s) found", horus::cuda_device_count());
-}
-
-// GPU-backed Image
-let gpu_img = Image::new(640, 480, ImageEncoding::Rgb8)?.to_gpu(Device::cuda(0))?;
-assert!(gpu_img.is_cuda());
-
-// Transfer between devices
-let cpu_img = gpu_img.to_cpu()?;
-let back_on_gpu = cpu_img.to_gpu(Device::cuda(0))?;
-```
-
 ## ML Pipeline Example
 
 A camera node captures frames using `Image`, while a preprocessing node converts them into batched `Tensor` data for model inference:
@@ -169,7 +131,6 @@ node! {
                     let tensor = Tensor::from_shape(
                         &[4, 3, 224, 224],
                         TensorDtype::F32,
-                        Device::cpu(),
                     );
                     // ... resize, normalize, and copy frames into tensor ...
                     self.batch.send(&tensor);
@@ -198,23 +159,25 @@ node! {
 
 ## Python Usage
 
-In Python, use `Image`, `PointCloud`, or `DepthImage` for zero-copy tensor data — they wrap the pool-backed tensor system automatically and provide `.to_numpy()`, `.to_torch()`, `.to_jax()` conversions:
+In Python, use `Image`, `PointCloud`, or `DepthImage` for zero-copy tensor data — they wrap the pool-backed tensor system automatically and provide `.to_numpy()` / `.from_numpy()` conversions. Bridge into PyTorch or JAX through the NumPy view — `torch.from_numpy(...)` shares memory (zero-copy for CPU tensors):
 
 ```python
 import horus
 import numpy as np
+import torch
+import jax.numpy as jnp
 
 # Image → NumPy (zero-copy)
 img = horus.Image(480, 640, "rgb8")
 arr = img.to_numpy()  # shape: (480, 640, 3), dtype: uint8
 
-# PointCloud → PyTorch (zero-copy via DLPack)
+# PointCloud → PyTorch (via NumPy, zero-copy for CPU tensors)
 cloud = horus.PointCloud.from_numpy(np.random.randn(1000, 3).astype(np.float32))
-tensor = cloud.to_torch()
+tensor = torch.from_numpy(cloud.to_numpy())
 
-# DepthImage → JAX
+# DepthImage → JAX (via NumPy)
 depth = horus.DepthImage(480, 640, "float32")
-jax_arr = depth.to_jax()
+jax_arr = jnp.asarray(depth.to_numpy())
 ```
 
 See [Python Image](/python/api/image), [Python PointCloud](/python/api/pointcloud), and [Python DepthImage](/python/api/depth-image) for the full APIs.
@@ -223,7 +186,7 @@ See [Python Image](/python/api/image), [Python PointCloud](/python/api/pointclou
 
 ## TensorDtype
 
-Enumerates all supported tensor element types. Matches common ML framework dtypes for seamless interop with PyTorch, NumPy, JAX, and DLPack.
+Enumerates all supported tensor element types. Matches common ML framework dtypes for seamless interop with PyTorch, NumPy, and JAX.
 
 | Variant | Value | Size | NumPy | Use Case |
 |---------|-------|------|-------|----------|
@@ -255,14 +218,6 @@ assert_eq!(dtype.element_size(), 4);
 // NumPy type string (for __array_interface__)
 assert_eq!(dtype.numpy_typestr(), "<f4");
 
-// DLPack interop (code, bits, lanes)
-let (code, bits, lanes) = dtype.to_dlpack();
-assert_eq!((code, bits, lanes), (2, 32, 1)); // FLOAT, 32-bit, 1 lane
-
-// Round-trip from DLPack
-let recovered = TensorDtype::from_dlpack(code, bits, lanes);
-assert_eq!(recovered, Some(TensorDtype::F32));
-
 // Parse from string
 let parsed = TensorDtype::parse("f16");
 assert_eq!(parsed, Some(TensorDtype::F16));
@@ -271,79 +226,6 @@ assert_eq!(parsed, Some(TensorDtype::F16));
 let safe = TensorDtype::from_raw(255); // invalid → defaults to F32
 assert_eq!(safe, TensorDtype::F32);
 ```
-
----
-
-## Device
-
-Specifies where tensor data resides: CPU or CUDA GPU. Supports unlimited GPU indices.
-
-### Layout
-
-```text
-device_type (1 byte): 0=CPU, 1=CUDA
-_pad        (3 bytes): alignment
-device_id   (4 bytes): GPU index (0 for CPU)
-Total: 8 bytes
-```
-
-### Methods
-
-```rust
-// simplified
-use horus::prelude::*;
-
-// CPU (default)
-let cpu = Device::cpu();
-assert!(cpu.is_cpu());
-
-// CUDA GPU 0
-let gpu0 = Device::cuda(0);
-assert!(gpu0.is_cuda());
-
-// CUDA GPU 3 (multi-GPU)
-let gpu3 = Device::cuda(3);
-
-// Parse from string
-let dev = Device::parse("cuda:1").unwrap();
-assert!(dev.is_cuda());
-assert_eq!(dev.device_id, 1);
-
-// Also supports "gpu" alias
-let dev = Device::parse("gpu:0").unwrap();
-assert!(dev.is_cuda());
-
-// Constants
-let _ = Device::CPU;   // CPU constant
-let _ = Device::CUDA0; // CUDA device 0 constant
-```
-
-### DLPack Interop
-
-```rust
-// simplified
-use horus::prelude::*;
-
-let device = Device::cuda(2);
-
-// Convert to DLPack format
-let dl_type = device.to_dlpack_device_type(); // 2 = kDLCUDA
-let dl_id = device.to_dlpack_device_id();     // 2
-
-// Create from DLPack
-let recovered = Device::from_dlpack(2, 2); // kDLCUDA, device 2
-assert_eq!(recovered, Some(Device::cuda(2)));
-```
-
-### String Parsing
-
-| Input | Result |
-|-------|--------|
-| `"cpu"` | `Device::cpu()` |
-| `"cuda"` or `"gpu"` | `Device::cuda(0)` |
-| `"cuda:0"` or `"gpu:0"` | `Device::cuda(0)` |
-| `"cuda:3"` | `Device::cuda(3)` |
-| `"tpu"` | `None` (unsupported) |
 
 ---
 

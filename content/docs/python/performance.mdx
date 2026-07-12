@@ -1,12 +1,12 @@
 ---
 title: "Performance Guide (Python)"
-description: "Optimization techniques for Python HORUS nodes — topic types, GIL management, zero-copy patterns, GPU interop, and profiling"
+description: "Optimization techniques for Python HORUS nodes — topic types, GIL management, zero-copy patterns, ML framework interop, and profiling"
 order: 14
 ---
 
 # Performance Guide (Python)
 
-Your Python node works. Now you want it faster. This page covers every optimization available to Python HORUS nodes — from topic type selection to GPU interop — with concrete latency numbers so you can decide what matters for your application.
+Your Python node works. Now you want it faster. This page covers every optimization available to Python HORUS nodes — from topic type selection to ML framework interop — with concrete latency numbers so you can decide what matters for your application.
 
 **Golden rule:** Optimize only after your system works correctly. A fast controller that computes the wrong output is worse than a slow one that gets it right.
 
@@ -20,9 +20,8 @@ Your Python node works. Now you want it faster. This page covers every optimizat
 | Dict topic send (small, 3-5 keys) | ~6-12 us | MessagePack serialization |
 | Dict topic send (large, 50+ keys) | ~50-110 us | Proportional to dict size |
 | `Image.to_numpy()` | ~3 us | Zero-copy view into SHM pool |
-| `Image.to_torch()` | ~3 us | Zero-copy via DLPack |
+| `torch.from_numpy(img.to_numpy())` | ~3 us | Wraps the SHM view — zero-copy for CPU tensors |
 | `Image.from_numpy()` | ~50-200 us | One copy into SHM pool (size-dependent) |
-| `torch.from_dlpack(tensor)` | ~1 us | Zero-copy tensor exchange |
 | `tensor.cuda()` (CPU to GPU) | ~50 us | Unavoidable PCIe transfer |
 | GIL acquire per tick | ~3 us | Fixed overhead per Python tick |
 | Runtime custom message | ~20-40 us | `struct` serialization |
@@ -153,9 +152,9 @@ Camera Node (Rust, 30Hz)
     ▼
 Python Node
     │
-    ├── img.to_numpy()       ~3 μs  (NumPy view into SHM, no copy)
-    ├── img.to_torch()       ~3 μs  (DLPack, no copy)
-    ├── img.to_jax()         ~3 μs  (DLPack, no copy)
+    ├── img.to_numpy()                    ~3 μs  (NumPy view into SHM, no copy)
+    ├── torch.from_numpy(img.to_numpy())  ~3 μs  (wraps the view, no copy)
+    ├── jnp.asarray(img.to_numpy())       ~3 μs  (via NumPy view)
     │
     │  Processing happens on SHM data directly
     │
@@ -163,18 +162,16 @@ Python Node
     └── node.send()          ~1.5 μs     (descriptor only)
 ```
 
-**Key insight:** `to_*()` methods are zero-copy. `from_*()` methods copy once into the pool. Design your pipeline to minimize `from_*()` calls.
+**Key insight:** `to_numpy()` is zero-copy. `from_numpy()` copies once into the pool. Design your pipeline to minimize `from_*()` calls.
 
 ### What Copies and What Does Not
 
 | Operation | Copy? | Latency | Why |
 |-----------|-------|---------|-----|
 | `img.to_numpy()` | No | ~3 us | Returns view into existing SHM |
-| `img.to_torch()` | No | ~3 us | DLPack wraps SHM pointer |
-| `img.to_jax()` | No | ~3 us | DLPack wraps SHM pointer |
+| `torch.from_numpy(img.to_numpy())` | No | ~3 us | Wraps the SHM view (CPU tensors) |
 | `img.as_tensor()` | No | ~3 us | Tensor shares same SHM slot |
 | `Image.from_numpy(arr)` | Yes (1x) | ~50-200 us | Must place data in pool slot |
-| `Image.from_torch(t)` | Yes (1x) | ~50-200 us | Must place data in pool slot |
 | `node.send("topic", dict)` | Yes | ~6-50 us | MessagePack serialization |
 | `node.send("topic", typed)` | No | ~1.5 us | Pod copied into ring buffer slot |
 
@@ -256,11 +253,11 @@ if cloud:
 
 ---
 
-## GPU Interop
+## ML Framework Interop
 
-HORUS supports zero-copy tensor exchange with PyTorch, JAX, and CuPy via DLPack.
+HORUS shares tensor data with PyTorch, JAX, and other frameworks through the zero-copy NumPy view — `torch.from_numpy()` / `jnp.asarray()` wrap it without copying (zero-copy for CPU tensors).
 
-### DLPack with PyTorch
+### PyTorch
 
 ```python
 # simplified
@@ -271,8 +268,8 @@ def ml_tick(node):
     if img is None:
         return
 
-    # Zero-copy: SHM → PyTorch CPU tensor
-    cpu_tensor = img.to_torch()  # ~3 μs, no copy
+    # Zero-copy: SHM → NumPy view → PyTorch CPU tensor
+    cpu_tensor = torch.from_numpy(img.to_numpy())  # ~3 μs, no copy
 
     # CPU → GPU (unavoidable PCIe transfer, ~50 μs)
     gpu_tensor = cpu_tensor.cuda().float() / 255.0
@@ -287,19 +284,20 @@ def ml_tick(node):
     node.send("detections", parse_results(results))
 ```
 
-### DLPack with JAX
+### JAX
 
 ```python
 # simplified
 import jax
+import jax.numpy as jnp
 
 def jax_tick(node):
     img = node.recv("camera.rgb")
     if img is None:
         return
 
-    # Zero-copy: SHM → JAX array
-    jax_array = img.to_jax()  # ~3 μs
+    # SHM → NumPy view → JAX array
+    jax_array = jnp.asarray(img.to_numpy())  # ~3 μs
 
     # JAX processing
     processed = jax.numpy.mean(jax_array, axis=2)
@@ -308,7 +306,7 @@ def jax_tick(node):
 
 ### Tensor Bridge for Custom Data
 
-Use `.as_tensor()` to get a general-purpose Tensor from any pool-backed type, then pass it to any framework via DLPack:
+Use `.as_tensor()` to get a general-purpose Tensor from any pool-backed type, then bridge into any framework through its NumPy view:
 
 ```python
 # simplified
@@ -316,15 +314,15 @@ import torch
 
 img = node.recv("camera.rgb")
 t = img.as_tensor()                    # shape=[480, 640, 3], zero-copy
-pt = torch.from_dlpack(t)             # zero-copy to PyTorch
+pt = torch.from_numpy(t.numpy())       # zero-copy to PyTorch (CPU tensors)
 # Process with PyTorch...
 ```
 
 ### GPU Pipeline Performance
 
 ```
-img.to_torch()           ~3 μs     (SHM → CPU tensor, zero-copy)
-tensor.cuda()            ~50 μs    (CPU → GPU, PCIe transfer)
+torch.from_numpy(img.to_numpy())  ~3 μs     (SHM → CPU tensor, zero-copy)
+tensor.cuda()                     ~50 μs    (CPU → GPU, PCIe transfer)
 model(tensor)            ~5-30 ms  (GPU inference)
 output.cpu()             ~20 μs    (GPU → CPU)
 node.send(results)       ~6-12 μs  (dict) or ~1.5 μs (typed)
@@ -551,7 +549,7 @@ For pool-backed types, the pool handles reuse automatically. For typed Pod messa
 | GIL release during `run()` | Other Python threads run freely | ~3 us re-acquire per tick |
 | Dict topics for flexibility | Any Python object works | ~5-50 us vs ~1.5 us for typed |
 | Pool-backed large data | Zero-copy IPC for images/clouds | One copy on `from_numpy()` |
-| DLPack for GPU interop | Works with PyTorch, JAX, CuPy | Requires framework-specific import |
+| NumPy bridge to ML frameworks | Works with PyTorch, JAX, OpenCV, ONNX | Requires framework-specific import |
 | Pre-allocation for speed | No GC pressure in tick | More setup code, less flexibility |
 | `budget_remaining()` for adaptive work | Maximizes budget usage | Adds branching complexity |
 | Disabling GC | Eliminates GC pauses | Risks memory growth |
