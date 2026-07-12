@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
-import { Analytics } from "@vercel/analytics/react";
 import { jsonLdScript } from "@/lib/json-ld";
 
 export const metadata: Metadata = {
@@ -132,7 +131,6 @@ export default function RootLayout({
         <main className="min-h-screen">
           {children}
         </main>
-        <Analytics />
       </body>
     </html>
   );

@@ -2,6 +2,8 @@ import { MetadataRoute } from 'next';
 import fs from 'fs';
 import path from 'path';
 
+export const dynamic = 'force-static';
+
 const BASE_URL = 'https://docs.horusrobotics.dev';
 
 /**

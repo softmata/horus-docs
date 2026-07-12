@@ -1,9 +1,11 @@
 import { MetadataRoute } from 'next';
 
+export const dynamic = 'force-static';
+
 export default function robots(): MetadataRoute.Robots {
   return {
-    // AI-accessible files: /llms.txt (summary), /llms-full.txt (complete docs),
-    // /api/docs/* (raw JSON content API). All under '/' which is already allowed.
+    // AI-accessible files: /llms.txt (summary) and /llms-full.txt (complete docs),
+    // both under '/' which is already allowed.
     rules: [
       {
         userAgent: '*',
