@@ -10,7 +10,6 @@ interface CodeBlockProps {
 
 export default function CodeBlock({ children, className = '' }: CodeBlockProps) {
   const codeRef = useRef<HTMLElement>(null);
-  const [highlighted, setHighlighted] = useState(false);
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
   const [copied, setCopied] = useState(false);
   const language = className.replace(/language-/, '') || 'text';
@@ -75,7 +74,6 @@ export default function CodeBlock({ children, className = '' }: CodeBlockProps) 
 
           // Re-highlight with Prism
           Prism.highlightElement(codeRef.current);
-          setHighlighted(true);
         }
       } catch (error) {
         console.warn('Failed to load syntax highlighting:', error);

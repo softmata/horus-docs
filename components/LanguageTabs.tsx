@@ -4,9 +4,6 @@ import React, { useState, useEffect, useCallback } from 'react';
 
 const STORAGE_KEY = 'horus-docs-language';
 const SYNC_EVENT = 'horus-language-change';
-const LANGUAGES = ['Rust', 'Python', 'C++'] as const;
-
-type Language = typeof LANGUAGES[number];
 
 interface LanguageTabsProps {
   children: React.ReactNode;

@@ -98,7 +98,7 @@ export function Breadcrumb() {
 
   // Build breadcrumb trail
   let currentPath = "";
-  segments.forEach((segment, index) => {
+  segments.forEach((segment) => {
     currentPath += `/${segment}`;
     breadcrumbs.push({
       label: formatSegment(segment),

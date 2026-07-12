@@ -20,7 +20,7 @@ export function TableOfContents() {
     const headingElements = article.querySelectorAll("h2, h3");
     const extractedHeadings: Heading[] = [];
 
-    headingElements.forEach((heading, index) => {
+    headingElements.forEach((heading) => {
       const text = heading.textContent || "";
       let id = heading.id;
 
