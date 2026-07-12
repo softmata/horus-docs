@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FiGithub, FiMenu, FiSearch, FiStar } from "react-icons/fi";
+import { FiMenu, FiSearch, FiStar } from "react-icons/fi";
 import { ThemeToggle } from "./ThemeToggle";
 import { SearchModal } from "./SearchModal";
 import LanguageSelector from "./LanguageSelector";
@@ -96,16 +96,6 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
               <div className="flex items-center gap-1 ml-1">
                 <LanguageSelector />
                 <ThemeToggle />
-                <a
-                  href="https://github.com/softmata/horus"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="p-2 text-[var(--text-tertiary)] hover:text-[var(--text)] hover:bg-[var(--surface)] transition-colors"
-                  title="GitHub"
-                  aria-label="GitHub Repository"
-                >
-                  <FiGithub className="w-5 h-5" />
-                </a>
               </div>
             </div>
           </div>
