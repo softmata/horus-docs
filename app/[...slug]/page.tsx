@@ -128,6 +128,11 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     alternates: {
       canonical: url,
       languages: hreflangAlternates(enSlug),
+      // Machine-readable representation (raw content API) — helps GEO/AEO agents
+      // discover the structured source for this page.
+      types: {
+        'application/json': `/api/docs/${slug.join('/')}.json`,
+      },
     },
     robots: {
       index: true,
@@ -226,6 +231,29 @@ export default async function DocPage({ params }: PageProps) {
     mainEntityOfPage: { '@type': 'WebPage', '@id': pageUrl },
   };
 
+  // HowTo structured data for procedural pages (tutorials/recipes) — a strong AEO
+  // signal for answer engines extracting step-by-step content. Quality-gated: we
+  // drop meta sections and only emit when >= 2 genuine step headings remain, so
+  // non-procedural pages (most recipes) are skipped rather than mislabelled.
+  const SKIP_STEP = /^(prerequisites|what you.?ll (build|learn)|what we.?re building|see also|next steps?|key (takeaways|points|concepts)|troubleshooting|complete (file|code)|expected output|problem|when to use|variations|common (errors|mistakes)|design decisions)$/i;
+  const stepHeadings = doc.headings.filter((h) => h.level === 2 && !SKIP_STEP.test(h.text));
+  const isProcedural = slug[0] === 'tutorials' || slug[0] === 'recipes';
+  const howToJsonLd = isProcedural && stepHeadings.length >= 2
+    ? {
+        '@context': 'https://schema.org',
+        '@type': 'HowTo',
+        name: doc.frontmatter.title,
+        description: doc.frontmatter.description,
+        inLanguage: 'en',
+        step: stepHeadings.map((h, i) => ({
+          '@type': 'HowToStep',
+          position: i + 1,
+          name: h.text,
+          url: `${pageUrl}#${h.id}`,
+        })),
+      }
+    : null;
+
   return (
     <DocsLayout>
       <script
@@ -236,6 +264,12 @@ export default async function DocPage({ params }: PageProps) {
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: jsonLdScript(techArticleJsonLd) }}
       />
+      {howToJsonLd && (
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: jsonLdScript(howToJsonLd) }}
+        />
+      )}
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         <article className="prose max-w-none prose-headings:scroll-mt-20 prose-p:text-[var(--text-secondary)] prose-p:leading-relaxed prose-li:text-[var(--text-secondary)]">
           {doc.content}

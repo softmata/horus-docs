@@ -61,6 +61,8 @@ export interface DocContent {
   content: React.ReactElement;
   /** ISO timestamp of the source .mdx file's last modification (for dateModified / sitemap lastmod). */
   lastModified: string;
+  /** h2/h3 headings (code blocks excluded) — used for HowTo structured data. */
+  headings: { level: number; text: string; id: string }[];
 }
 
 /**
@@ -288,11 +290,21 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
       },
     });
 
+    // Extract h2/h3 headings (excluding fenced code) for HowTo structured data.
+    const headings = (mdxContent.replace(/```[\s\S]*?```/g, '').match(/^#{2,3}\s+.+$/gm) || [])
+      .map((h) => {
+        const level = (h.match(/^#+/) as RegExpMatchArray)[0].length;
+        const text = h.replace(/^#+\s+/, '').replace(/[*_`]/g, '').trim();
+        const id = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+        return { level, text, id };
+      });
+
     return {
       slug: slug.join('/'),
       frontmatter: data as DocFrontmatter,
       content,
       lastModified,
+      headings,
     };
   } catch (error) {
     console.error('Error loading doc:', error);
