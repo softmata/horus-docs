@@ -83,16 +83,6 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
                 <span className="sm:hidden">Star</span>
               </a>
 
-              {/* Registry */}
-              <a
-                href="https://registry.horusrobotics.dev/"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hidden md:inline-flex items-center px-3 py-1.5 text-sm font-medium text-[var(--text)] border border-[var(--border)] hover:border-[var(--border-hover)] hover:bg-[var(--surface)] transition-colors"
-              >
-                Registry
-              </a>
-
               <div className="flex items-center gap-1 ml-1">
                 <LanguageSelector />
                 <ThemeToggle />
