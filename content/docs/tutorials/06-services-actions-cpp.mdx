@@ -48,6 +48,17 @@ int main() {
         return true;
     });
 
+    // The server must be driven to answer requests. Pump process() on a
+    // background thread here; in a real app you'd call it from your main loop
+    // (or a scheduled node tick), typically in the server's own process.
+    std::atomic<bool> running{true};
+    std::thread server_thread([&] {
+        while (running.load()) {
+            server.process();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
     // ── Client: sends request, waits for response ───────────────
     horus::ServiceClient client("add_two_ints");
 
@@ -59,6 +70,9 @@ int main() {
     } else {
         std::printf("Service call timed out\n");
     }
+
+    running.store(false);
+    server_thread.join();
 }
 ```
 
@@ -99,21 +113,24 @@ int main() {
         return 1;
     }
 
-    std::printf("Goal sent (id=%lu), status: Pending\n", goal.id());
+    std::printf("Goal sent (id=%lu)\n", goal.id());
 
-    // Monitor status
-    while (goal.is_active()) {
-        // In a real system, poll feedback topic
-        std::printf("  Status: %s\n",
-            goal.status() == horus::GoalStatus::Pending ? "Pending" :
-            goal.status() == horus::GoalStatus::Active  ? "Active"  : "?");
-        break;  // demo — normally poll in tick loop
+    // Poll for feedback and the final result. The client handle's own status()
+    // is local; live status/feedback/result arrive over the topics via poll_*.
+    horus::GoalStatus status;
+    std::string result_json;
+    uint64_t fb_id;
+    std::string fb_json;
+    while (!client.poll_result(goal.id(), status, result_json)) {
+        if (client.poll_feedback(fb_id, fb_json)) {
+            std::printf("  feedback: %s\n", fb_json.c_str());
+        }
+        // client.cancel(goal.id());  // request cancellation at any time
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // Cancel if needed
-    // goal.cancel();
-
-    std::printf("Final status: %d\n", static_cast<int>(goal.status()));
+    std::printf("Final status: %d, result: %s\n",
+        static_cast<int>(status), result_json.c_str());
 }
 ```
 
@@ -135,22 +152,43 @@ Client                          Server
 
 ### Action Server
 
+Each accepted goal runs on its own thread, so the server stays responsive to
+cancellation while a goal executes. Drive the server by calling `process()` in a
+loop on the thread that created it.
+
 ```cpp
 horus::ActionServer server("navigate");
 
-// Accept handler: decide whether to accept the goal
+// Accept handler: decide whether to accept the goal (0 = accept, 1 = reject).
 server.set_accept_handler([](const uint8_t* goal, size_t len) -> uint8_t {
-    // 0 = accept, 1 = reject
     return 0;  // accept all goals
 });
 
-// Execute handler: called when goal is accepted
-server.set_execute_handler([](uint64_t goal_id, const uint8_t* goal, size_t len) {
-    // Start navigation...
-    // Publish feedback periodically
-    // Publish result when done
+// Execute handler: runs on a dedicated thread per accepted goal. Wrap the raw
+// handle, poll for cancellation, publish feedback, and finish the goal.
+server.set_execute_handler([](HorusActionGoalHandle* h, const uint8_t* goal, size_t len) {
+    horus::ActionGoalHandle g(h);
+    while (!g.is_cancel_requested()) {
+        // ... do a step of work ...
+        g.publish_feedback(R"({"progress": 0.5})");
+        if (/* arrived */ true) {
+            g.succeed(R"({"success": true})");
+            return;
+        }
+    }
+    g.canceled(R"({"success": false})");  // cancellation was requested
 });
+
+// Drive the server (same thread it was constructed on).
+while (running) {
+    server.process();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
 ```
+
+If the execute handler returns without calling `succeed`/`abort`/`canceled`, the
+goal is completed as **Aborted**. A `HorusActionGoalHandle*` is valid only for
+the duration of the execute call — never stash it and use it later.
 
 ## Cross-Process Services
 

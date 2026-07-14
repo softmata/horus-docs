@@ -34,6 +34,7 @@ HORUS provides two communication patterns beyond pub/sub topics: **services** fo
 |--------|---------|-------------|
 | `ServiceServer(name)` | -- | Construct a server for the named service |
 | `.set_handler(fn)` | `void` | Set the request handler callback |
+| `.process()` | `void` | Drive the server once; call in a loop on the constructing thread |
 | `operator bool()` | `bool` | Check if the server handle is valid |
 
 ## Quick Reference -- ActionClient
@@ -50,8 +51,9 @@ HORUS provides two communication patterns beyond pub/sub topics: **services** fo
 |--------|---------|-------------|
 | `ActionServer(name)` | -- | Construct a server for the named action |
 | `.set_accept_handler(fn)` | `void` | Set the goal acceptance callback |
-| `.set_execute_handler(fn)` | `void` | Set the goal execution callback |
+| `.set_execute_handler(fn)` | `void` | Set the goal execution callback (runs per-goal on its own thread) |
 | `.is_ready()` | `bool` | Check if both handlers are set |
+| `.process()` | `void` | Drive the server once; call in a loop on the constructing thread |
 | `operator bool()` | `bool` | Check if the server handle is valid |
 
 ## Quick Reference -- GoalHandle
@@ -144,6 +146,13 @@ server.set_handler([](const uint8_t* req, size_t req_len,
     *res_len = static_cast<size_t>(written);
     return true;  // true = success, false = error
 });
+
+// Drive the server so it answers requests. Call in a loop on the constructing
+// thread (or from a scheduled node tick).
+while (running) {
+    server.process();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
 ```
 
 The handler signature is:
@@ -226,25 +235,39 @@ server.set_accept_handler([](const uint8_t* goal_data, size_t len) -> uint8_t {
     return 0;  // accept all goals
 });
 
-// Execute handler: receives goal_id and goal data, runs the task
-server.set_execute_handler([](uint64_t goal_id,
+// Execute handler: runs on a dedicated thread per accepted goal. Wrap the raw
+// handle, poll for cancellation, publish feedback, and finish the goal.
+server.set_execute_handler([](HorusActionGoalHandle* h,
                               const uint8_t* goal_data, size_t len) {
-    printf("Executing goal %lu\n", goal_id);
-    // Parse goal, execute navigation...
-    // When done, the goal transitions to Succeeded/Aborted automatically
+    horus::ActionGoalHandle g(h);
+    while (!g.is_cancel_requested()) {
+        g.publish_feedback(R"({"progress": 0.5})");
+        // ... do work; break when done ...
+        g.succeed(R"({"arrived": true})");
+        return;
+    }
+    g.canceled(R"({"arrived": false})");
 });
 
-// Verify both handlers are set
+// Verify both handlers are set.
 if (server.is_ready()) {
     printf("Action server ready\n");
 }
+
+// Drive the server on the thread that created it.
+while (running) {
+    server.process();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
 ```
 
-The handler signatures are:
+Each goal runs on its own thread, so cancellation is delivered while a goal is
+executing. If the handler returns without calling `succeed`/`abort`/`canceled`,
+the goal completes as **Aborted**. The handler signatures are:
 
 ```cpp
 using AcceptHandler  = uint8_t(*)(const uint8_t* goal, size_t len);
-using ExecuteHandler = void(*)(uint64_t goal_id, const uint8_t* goal, size_t len);
+using ExecuteHandler = void(*)(HorusActionGoalHandle* handle, const uint8_t* goal, size_t len);
 ```
 
 ---
@@ -267,12 +290,14 @@ Each service creates two internal topics:
 {name}.response.{client_pid}      -- server sends response here (per-client)
 ```
 
-Each action creates three internal topics:
+Each action creates five internal topics:
 
 ```
 {name}.goal                       -- client sends goals here
+{name}.cancel                     -- client requests cancellation here
 {name}.feedback                   -- server publishes progress here
 {name}.result                     -- server publishes final result here
+{name}.status                     -- server publishes lifecycle status here
 ```
 
 These are standard HORUS topics -- you can monitor them with `horus topic list` and `horus monitor`.
@@ -344,6 +369,10 @@ server.set_handler([](const uint8_t*, size_t,
     *res_len = strlen(s);
     return true;
 });
+while (running) {          // drive the server to answer requests
+    server.process();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
 ```
 
 ```cpp
@@ -358,29 +387,49 @@ if (resp) printf("Robot status: %s\n", resp->c_str());
 Run an action server inside a scheduled node for navigation:
 
 ```cpp
-horus::ActionServer nav_server("navigate");
-bool nav_active = false;
+// Accept/execute handlers are function pointers, so shared state is file-scope.
+static std::atomic<bool> nav_active{false};
+static std::atomic<bool> nav_done{false};
 
-nav_server.set_accept_handler([&](const uint8_t*, size_t) -> uint8_t {
-    return nav_active ? 1 : 0;  // reject if already navigating
+horus::ActionServer nav_server("navigate");
+
+nav_server.set_accept_handler([](const uint8_t*, size_t) -> uint8_t {
+    return nav_active.load() ? 1 : 0;  // reject if already navigating
 });
-nav_server.set_execute_handler([&](uint64_t id, const uint8_t* data, size_t len) {
+
+// The goal runs on its own thread. Keep sensor/motor topic I/O OFF this thread
+// (topics are single-producer): hand control to the scheduled node via a flag
+// and just wait here for completion or cancellation.
+nav_server.set_execute_handler([](HorusActionGoalHandle* h, const uint8_t* /*data*/, size_t) {
+    horus::ActionGoalHandle g(h);
+    nav_done = false;
     nav_active = true;
-    // parse target from data...
+    while (!nav_done.load()) {
+        if (g.is_cancel_requested()) {
+            nav_active = false;
+            g.canceled(R"({"arrived": false})");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    g.succeed(R"({"arrived": true})");
 });
 
 auto odom_sub = sched.subscribe<horus::msg::Odometry>("odom");
 auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("motor.cmd");
 
+// This node pumps the action server AND runs the sensor->motor control loop, so
+// all topic I/O stays on one thread.
 sched.add("nav_executor").rate(50_hz)
     .tick([&] {
-        if (!nav_active) return;
+        nav_server.process();  // deliver goals/cancels, publish feedback/results
+        if (!nav_active.load()) return;
         auto odom = odom_sub.recv();
         if (!odom) return;
         double dist = std::sqrt(/* dx^2 + dy^2 */);
         if (dist < 0.1) {
-            nav_active = false;
             cmd_pub.send(horus::msg::CmdVel{0, 0.0f, 0.0f});
+            nav_done = true;  // signals the goal thread to succeed
         } else {
             cmd_pub.send(horus::msg::CmdVel{0, 0.3f, 0.0f});
         }
