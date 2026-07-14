@@ -30,7 +30,7 @@ use horus::prelude::*;
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `send(msg)` | `()` | Publishes a message. Non-blocking. Drops oldest if full. |
+| `send(msg)` | `()` | Publishes a message. Non-blocking. After a brief spin+yield retry, drops the newly-sent message if still full. |
 | `try_send(msg)` | `Result<(), T>` | Publishes if space available. Returns message back on failure. |
 | `send_blocking(msg, timeout)` | `Result<(), SendBlockingError>` | Blocks until space available or timeout. |
 
@@ -39,7 +39,7 @@ use horus::prelude::*;
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `recv()` | `Option<T>` | Takes the next unread message (FIFO). Consumes it. |
-| `try_recv()` | `Option<T>` | Same as `recv()`. Provided for API symmetry with `try_send()`. |
+| `try_recv()` | `Option<T>` | Low-level receive (internal; skips the fast-path/logging hooks of `recv()`). Prefer `recv()`. |
 | `read_latest()` | `Option<T>` | Reads the newest message, skipping older ones. Requires `T: Copy`. |
 
 ## Quick Reference — State & Metrics
@@ -164,7 +164,7 @@ let imu = Topic::<Imu>::with_capacity("imu", 16, None)?;
 
 ### `send(msg)`
 
-Publishes a message. Non-blocking. Overwrites the oldest unread message if the buffer is full.
+Publishes a message. Non-blocking. If the buffer is still full after a brief spin+yield retry, the newly-sent message is dropped (a slow consumer keeps the older, stale data).
 
 **Signature**
 
@@ -181,11 +181,11 @@ pub fn send(&self, msg: T)
 
 **Returns**
 
-Nothing (`()`). Always succeeds — never blocks, never returns an error.
+Nothing (`()`). Never returns an error, but the message may be dropped if the buffer stays full (see Behavior). For guaranteed delivery use `send_blocking()`.
 
 **Behavior**
 
-- If all slots are occupied, the oldest unread message is silently overwritten
+- If all slots stay occupied through a brief spin+yield retry, the newly-sent message is silently dropped (the older, unread data is kept)
 - Use `dropped_count()` to detect overwrites
 - Notifies any event-driven nodes (`.on("topic")`) that new data arrived
 - Fast path: ~3ns for same-thread publisher+subscriber (inlined ring write, no pointer chase)
@@ -392,7 +392,7 @@ while let Some(msg) = topic.recv() {
 
 ### `try_recv()`
 
-Non-blocking receive. Functionally identical to `recv()`.
+Low-level non-blocking receive. Marked `#[doc(hidden)]` in the source — it is an internal/test entry point.
 
 **Signature**
 
@@ -403,7 +403,7 @@ pub fn try_recv(&self) -> Option<T>
 
 **Returns**
 
-Same as `recv()`. Provided for API symmetry with `try_send()`.
+`Option<T>` — same values as `recv()`, but `try_recv()` skips the DirectChannel fast path plus the logging/recording hooks that `recv()` runs. Prefer `recv()` in application code.
 
 ---
 
@@ -528,7 +528,7 @@ pub fn dropped_count(&self) -> u64
 
 **Returns**
 
-`u64` — cumulative count since topic creation. Incremented by `send()` when it overwrites the oldest slot.
+`u64` — cumulative count since topic creation. Incremented by `send()` each time it drops the newly-sent message after the buffer stays full (it is the topic's `send_failures` counter).
 
 **When to use**
 
