@@ -178,15 +178,21 @@ Failures are completely ignored. The node keeps ticking every cycle regardless o
 
 ## Severity-Aware Handling
 
-HORUS errors carry severity levels that can **override** the configured policy:
+HORUS errors carry severity levels (`Fatal`, `Transient`, `Permanent`) — but note **where** they apply. Severity governs node **initialization** and **service calls**; it does **not** override the per-tick failure policy above. A node whose `tick()` panics follows its configured `FailurePolicy` directly, regardless of any error severity.
 
-| Severity | Effect |
-|----------|--------|
-| **Fatal** (e.g., shared memory corruption) | Always stops the scheduler, even with `Ignore` policy |
-| **Transient** (e.g., topic full, network timeout) | De-escalates `Fatal` policy to `Restart` (transient errors are recoverable) |
-| **Permanent** (e.g., invalid configuration) | Follows the configured policy |
+At node **init / re-init**, severity decides whether a failure stops the scheduler or is retried:
 
-This means a safety-critical node with `Fatal` policy won't kill the system on a transient network glitch — it'll restart instead. But a shared-memory corruption always stops, even on an `Ignore` node.
+| Severity | Effect at init / re-init |
+|----------|--------------------------|
+| **Fatal** (e.g., shared-memory corruption) | Stops the scheduler immediately |
+| **Transient** (e.g., topic full, device busy) | Marks the node errored and retries on the next control cycle |
+| **Permanent** (e.g., invalid configuration) | Marks the node errored (no retry) |
+
+For **service calls**, `retry_transient` and `ServiceClient::call_resilient` use the same classification — transient failures are retried, permanent ones surfaced.
+
+<Callout type="info" title="Choosing a per-tick policy">
+Because the per-tick failure policy does not consult severity, pick the policy that matches the node's recoverability: `Restart` for nodes that can re-initialize (e.g., a driver after a USB glitch), `Fatal` for nodes whose failure means the system is unsafe, `Skip`/`Ignore` for best-effort work.
+</Callout>
 
 ## Complete Robot Example
 
@@ -362,16 +368,16 @@ A sensor driver that fails once probably has a transient issue (USB reset). A se
 | One crashing node does not kill the system | Must think about failure contracts per node |
 | Restart with backoff handles transient hardware issues | Backoff adds latency during recovery |
 | Skip prevents non-critical failures from cascading | Skipped nodes produce no output during cooldown |
-| Severity overrides prevent both over- and under-reaction | Behavior depends on error severity, not just configured policy |
+| Transient init and service faults are retried automatically by severity | The per-tick policy is explicit — you choose it per node; it does not self-adjust to error severity |
 
 ## Common Errors
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| System stops on a transient network error | `Fatal` policy on a node with transient failures | Use `Restart` for nodes that can recover, or rely on severity-aware de-escalation |
+| System stops when a node's `tick()` fails | `Fatal` policy on a node that could recover | Use `Restart` for nodes that can re-initialize after a `tick()` failure |
 | Node restarts endlessly | `max_restarts` set too high, or the failure is permanent | Lower `max_restarts` and check logs for the root cause |
 | Non-critical node drags down performance | `Skip` cooldown too short, node fails immediately after cooldown | Increase cooldown duration or investigate the root cause |
-| `Fatal` node did not stop the system | Error was classified as `Transient` severity, de-escalated to Restart | Expected behavior. Truly fatal errors (e.g., SHM corruption) always stop regardless |
+| Node keeps retrying init instead of stopping | Its init error is classified as `Transient` severity | Expected — transient init faults retry each control cycle; return a `Fatal`-severity error to stop immediately |
 | Cannot find failure events after crash | No BlackBox configured | Add `.blackbox(64)` to the scheduler for crash forensics |
 
 ## See Also

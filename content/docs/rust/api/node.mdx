@@ -216,11 +216,15 @@ impl Node for MotorController {
 fn is_safe_state(&self) -> bool
 ```
 
-Called by the safety monitor each tick for nodes in `Isolated` health state. If this returns `true`, the node transitions back to `Healthy` and resumes normal ticking.
+A node-implemented hook that reports whether the node currently considers itself in a safe/recovered state.
 
-**Default**: Returns `true` (node is always considered safe).
+<Callout type="warn" title="Not polled for automatic recovery">
+The scheduler does **not** currently call `is_safe_state()` to return an `Isolated` node to service. A node that reaches `Isolated` (3× watchdog timeout) has `enter_safe_state()` called once and is then skipped for the rest of the run — see [NodeHealthState](#nodehealthstate). Override this hook to expose recovery-readiness to your own supervisory logic; scheduler-driven auto-recovery is not wired.
+</Callout>
 
-**When to override**: Implement for nodes that need recovery verification — check that sensors are reading valid data, that actuators are in a known position, or that communication is restored.
+**Default**: Returns `true` (node reports itself safe).
+
+**When to override**: Implement for nodes whose recovery you supervise externally — check that sensors are reading valid data, that actuators are in a known position, or that communication is restored.
 
 ```rust
 // simplified
@@ -229,7 +233,7 @@ impl Node for ArmController {
     fn tick(&mut self) { /* ... */ }
 
     fn is_safe_state(&self) -> bool {
-        // Only resume if all joints are within limits
+        // Report safe once all joints are within limits
         self.joints.iter().all(|j| j.position.abs() < j.limit)
     }
 
@@ -243,9 +247,9 @@ impl Node for ArmController {
 ```
 
 **Rules**:
-- Called every tick while the node is `Isolated` — keep it fast (no I/O)
-- Returning `false` indefinitely keeps the node isolated forever
-- The scheduler never calls `tick()` on an Isolated node until `is_safe_state()` returns `true`
+- Keep it fast (no I/O) if you poll it from your own supervisory loop
+- The scheduler **does not** call `is_safe_state()` — implementing it does not, on its own, bring an `Isolated` node back to `Healthy`
+- An `Isolated` node is skipped for the rest of the run; to put it back in service, restart the scheduler
 
 ---
 
@@ -273,9 +277,8 @@ fn enter_safe_state(&mut self) {
 
 **Rules**:
 - Must be fast — called from the watchdog path, not the normal tick path
-- After this is called, the node's health transitions to `Isolated`
-- The scheduler calls `is_safe_state()` each tick to check for recovery
-- If you set `on_miss(Miss::SafeMode)`, this is called on every deadline miss
+- When the watchdog `Critical` (3× timeout) path calls this, the node's health transitions to `Isolated` and it is skipped for the rest of the run (no automatic recovery)
+- If you set `on_miss(Miss::SafeMode)`, this is called on every deadline miss and the node keeps ticking (it is not isolated)
 
 ---
 
@@ -347,7 +350,9 @@ Watchdog health, stored as `AtomicU8` for lock-free per-node tracking.
 | `Healthy` | 0 | Normal operation | Node is ticked every cycle |
 | `Warning` | 1 | 1x watchdog timeout | Node still ticks, warning logged |
 | `Unhealthy` | 2 | 2x watchdog timeout | Node skipped in tick loop |
-| `Isolated` | 3 | 3x timeout on critical node | `enter_safe_state()` called, node skipped until `is_safe_state()` returns `true` |
+| `Isolated` | 3 | 3x timeout on critical node | `enter_safe_state()` called once, node skipped for the rest of the run |
+
+**Recovery**: a `Warning` node returns to `Healthy` after a successful tick. `Unhealthy` and `Isolated` nodes are skipped — because they no longer tick, they do **not** recover automatically (the scheduler does not poll `is_safe_state()`); returning them to service requires a restart.
 
 ### NodeMetrics
 
