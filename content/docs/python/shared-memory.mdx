@@ -38,7 +38,7 @@ Key properties:
 
 - **Lock-free**: No mutexes. Publisher and subscriber use atomic operations, so neither blocks the other.
 - **Single-producer / single-consumer (SPSC)**: The fastest path. HORUS auto-detects when multiple publishers or subscribers exist and upgrades the backend.
-- **Overflow drops the oldest**: If the subscriber cannot keep up, the publisher overwrites the oldest unread slot. The subscriber sees the freshest data, not stale data. This is intentional — a robot controller needs the latest sensor reading, not one from 100 ms ago.
+- **Overflow never blocks**: If a 1:1 subscriber cannot keep up, a full ring **rejects new sends** — `send()` retries briefly, then drops the new message; the queued messages are kept in publish order. Broadcast (multi-subscriber) topics instead overwrite the oldest (newest-wins). To always read the freshest 1:1 sample, drain with `recv_all()[-1]` or use a small capacity.
 - **Capacity is a power of two**: Slot lookup uses a bitmask instead of division — a single CPU instruction. The default capacity is auto-sized from the message type (16-1024 slots).
 
 From Python, you never interact with the ring buffer directly. `node.send()` writes into it; `node.recv()` reads from it.
@@ -353,9 +353,9 @@ Most Python users never need to think about shared memory. HORUS handles it. Her
 
 **Why shared memory instead of sockets or pipes?** Sockets and pipes require kernel transitions (`write()` + `read()` system calls) for every message — 1-5 us of overhead per message. Shared memory is just regular memory access: the CPU reads and writes at RAM speed without entering the kernel. For a robot running control loops at 1 kHz, that 1-5 us saving per message adds up to keeping the control cycle under budget.
 
-**Why ring buffers instead of queues?** Ring buffers have a fixed memory footprint (allocated once at topic creation) and predictable access patterns. A growable queue would require dynamic allocation, which is unpredictable in real-time contexts. The fixed size also means overflow behavior is explicit: the oldest message is dropped, and the subscriber always gets the freshest data.
+**Why ring buffers instead of queues?** Ring buffers have a fixed memory footprint (allocated once at topic creation) and predictable access patterns. A growable queue would require dynamic allocation, which is unpredictable in real-time contexts. The fixed size also means overflow behavior is explicit: a full point-to-point ring rejects new sends (keeping the queued messages in order); a broadcast ring overwrites the oldest.
 
-**Why drop oldest on overflow instead of blocking?** A robot controller that blocks waiting for a full buffer to drain is a robot controller that crashes into a wall. Dropping stale data and keeping fresh data is the safer default for robotics. If you need guaranteed delivery (log collection, recording), increase the ring buffer capacity.
+**Why never block on overflow?** A robot controller that blocks waiting for a full buffer to drain is a robot controller that crashes into a wall. So `send()` never blocks: on a full point-to-point buffer it drops the new message (the queued messages stay, in order); on a broadcast buffer it overwrites the oldest. If you need every message (log collection, recording), increase the capacity or use `send_blocking()`. If you need the freshest 1:1 sample, drain with `recv_all()[-1]`.
 
 **Why typed messages are faster than dicts:** A `CmdVel` struct is 24 bytes with a fixed layout known at compile time. A dict `{"linear_x": 0.5, "angular_z": 0.1}` must be serialized to bytes (encoding field names, types, values), copied into the buffer, then deserialized on the other side. The typed path skips all of that — it writes the 24 bytes directly.
 
@@ -370,7 +370,7 @@ Most Python users never need to think about shared memory. HORUS handles it. Her
 | Dict messages via MessagePack | Any Python object, no schema needed | 3-30x slower than typed messages |
 | Pool-backed large types | Zero-copy views for images and clouds | One copy on publish (`from_numpy()`) |
 | Atomic refcounting for pool slots | Multiple subscribers share one copy | Slots reclaimed only when all refs dropped |
-| Overflow drops oldest | Controller always gets fresh data | Subscribers that fall behind lose messages |
+| Overflow never blocks (1:1 rejects newest; broadcast drops oldest) | Publisher runs at full speed | Subscribers that fall behind lose messages |
 
 ---
 

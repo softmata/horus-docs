@@ -6,9 +6,13 @@ order: 17
 
 # Ring Buffer Semantics (Python)
 
-You have a LiDAR node publishing scans at 40 Hz and a path planner consuming them at 10 Hz. Four scans arrive between each planner tick. Where do the extra three go? They sit in the ring buffer. When the planner calls `node.recv("scan")`, it gets the oldest unread scan -- not the latest. If the planner falls further behind and 1024 scans pile up, the buffer is full. The next scan overwrites the oldest one. No error. No exception. No backpressure. The publisher keeps publishing at full speed.
+You have a LiDAR node publishing scans at 40 Hz and a path planner consuming them at 10 Hz. Four scans arrive between each planner tick. Where do the extra three go? They sit in the ring buffer. When the planner calls `node.recv("scan")`, it gets the oldest unread scan -- not the latest. If the planner falls further behind and 1024 scans pile up, the buffer is full. The next scan is **rejected**: `send()` retries briefly, then drops the *new* scan, and the 1024 already queued stay put. No error. No exception. No backpressure. The publisher keeps running at full speed.
 
-This is the fundamental contract of HORUS topic communication: **publishers never block, subscribers never stall, and when the buffer fills, the oldest message is silently dropped.**
+This is the fundamental contract of a HORUS **point-to-point** topic (one publisher, one subscriber): **publishers never block, subscribers never stall, and when the buffer fills, the newest message is dropped -- the queue keeps its oldest messages, in publish order.**
+
+<Callout type="warning" title="This is reject-newest, not ROS 2 KEEP_LAST">
+Coming from ROS 2, you may expect `KEEP_LAST` semantics, where a full queue evicts the *oldest* sample so the subscriber always sees the freshest data. HORUS point-to-point topics do the opposite: a full queue **rejects the newest** send and preserves the oldest, in order -- this keeps delivery in-order and the shared-memory write safe (see [Design Decisions](#design-decisions)). If you want freshest-wins for a 1:1 stream, drain with `recv_all()[-1]`, use a small capacity, or use a broadcast (multi-subscriber) topic (see [When Drops Are OK](#when-drops-are-ok-vs-when-they-are-not)). Broadcast topics *do* keep-newest / drop-oldest.
+</Callout>
 
 Understanding this contract is the difference between a system that works reliably and one where "my subscriber misses messages" becomes a recurring mystery.
 
@@ -35,10 +39,10 @@ Buffer full (8 publishes, 0 reads):
   [msg1] [msg2] [msg3] [msg4] [msg5] [msg6] [msg7] [msg8]
    tail                                               head
 
-9th publish — msg1 is dropped, msg9 takes its slot:
-  [msg9] [msg2] [msg3] [msg4] [msg5] [msg6] [msg7] [msg8]
-          tail                                       head
-          ^ recv() returns msg2 (msg1 is gone)
+9th publish — REJECTED. msg9 is dropped; the buffer is unchanged:
+  [msg1] [msg2] [msg3] [msg4] [msg5] [msg6] [msg7] [msg8]
+   tail                                               head
+   ^ recv() still returns msg1 (the oldest); msg9 never entered
 ```
 
 ### Key Properties
@@ -46,12 +50,12 @@ Buffer full (8 publishes, 0 reads):
 | Property | Behavior |
 |----------|----------|
 | Default capacity | 1024 messages per topic |
-| Overflow policy | Oldest message dropped (no backpressure) |
+| Overflow policy | Newest message rejected/dropped, oldest kept (no backpressure) |
 | `recv()` when empty | Returns `None` |
 | `recv()` when available | Returns oldest unread message (FIFO) |
 | `recv_all()` | Returns all buffered messages as a list, drains the buffer |
 | `has_msg()` | Returns `True` if at least one message is available, does not consume it |
-| Publisher behavior on full buffer | Overwrites oldest, continues at full speed |
+| Publisher behavior on full buffer | Rejects the new message (drop-newest), continues at full speed |
 | Subscriber behavior on empty buffer | Returns immediately with `None` |
 
 ---
@@ -112,9 +116,9 @@ A camera node publishes images at 30 Hz. A detection node subscribes and process
 - Detection processes 30 images (one per tick at 10 Hz)
 - 60 images sit in the buffer (90 - 30 = 60)
 
-If this continues indefinitely, the buffer fills to 1024. After that, every new publish drops the oldest unread image.
+If this continues indefinitely, the buffer fills to 1024. After that, every new publish is **rejected** -- the buffer keeps the 1024 images already queued, and newer frames are dropped until the subscriber drains some.
 
-**This is not a bug.** The detection node is processing images slower than they arrive. The ring buffer absorbs the burst, and when full, it keeps only the most recent 1024 images.
+**This is not a bug.** The detection node is processing images slower than they arrive. The ring buffer absorbs the burst; once full it holds the *oldest* 1024 images (in publish order) and rejects newer ones. For perception you usually want the *newest* frame instead -- drain with `recv_all()[-1]` every tick so the queue never saturates (see [When Drops Are OK](#when-drops-are-ok-vs-when-they-are-not)).
 
 ### When `recv()` Returns `None`
 
@@ -256,7 +260,7 @@ For large messages like images, **reduce the buffer capacity**. A 1024-slot buff
 
 **Redundant readings**: If a temperature sensor publishes at 100 Hz but the value changes every few seconds, dropping 99% of the readings loses no information.
 
-For these cases, use `recv()` to get one message per tick, and accept that earlier messages were overwritten. Or even better, drain with `recv_all()` and only use the last one:
+For these cases, **drain** with `recv_all()` and use only the last message -- this empties the queue every tick so it never saturates and you always process the freshest frame. (A plain `recv()` one-per-tick would instead hand you the *oldest* queued message and reject newer ones once the buffer fills.)
 
 ```python
 # simplified
@@ -480,7 +484,7 @@ If you see the publish rate is much higher than your subscriber's tick rate and 
 
 **Why a fixed-size ring buffer instead of an unbounded queue?** Unbounded queues leak memory. A LiDAR publishing at 40 Hz on a 1 Hz subscriber would accumulate 40 messages per second indefinitely. After an hour, that is 144,000 messages consuming memory that will never be reclaimed because the subscriber will never catch up. A fixed-size ring buffer caps memory at `capacity * message_size`, and the publisher keeps running at full speed regardless of subscriber behavior. In robotics, predictable memory usage is a requirement, not a luxury.
 
-**Why drop the oldest message instead of the newest?** When the buffer is full and a new message arrives, the system has two choices: drop the new message (keep old data) or drop the oldest message (keep new data). In robotics, newer data is almost always more valuable -- the robot has moved since the old reading was taken. Keeping old data at the expense of new data means the subscriber is working with increasingly stale information. Dropping the oldest keeps the buffer as fresh as possible.
+**Why reject the newest message instead of dropping the oldest (point-to-point)?** When a 1:1 buffer is full and a new message arrives, HORUS **rejects the new one** and keeps the queued messages, in order. This is deliberate, for two reasons. **Safety:** a point-to-point topic is a lock-free in-order queue; a producer that overwrote the oldest slot could clobber a slot a consumer is mid-read on and stall the in-order consumer forever, so the producer never overwrites an unconsumed slot. **Ordering:** rejecting on full preserves gap-free FIFO delivery of everything already queued (see "Why `recv()` returns the oldest" below). The cost is that a *saturated* queue serves the oldest data -- if you need freshest-wins, drain with `recv_all()[-1]`, use a smaller capacity so it never saturates, or use a **broadcast** (multi-subscriber) topic. Broadcast rings use a latest-wins protocol with supersession detection, so they *can* safely overwrite the oldest (newest-wins) -- the right default for sensor fan-out to several consumers.
 
 **Why no backpressure?** Backpressure means the publisher slows down or blocks when the subscriber cannot keep up. In robotics, publishers are often tied to physical sensors (a camera produces frames at 30 Hz regardless of what the subscriber does). Blocking the sensor read thread causes hardware buffer overflows, dropped interrupts, or device resets. Even for software publishers, backpressure from a slow logger should never cause a motor controller to miss its deadline. The ring buffer decouples publisher and subscriber timing completely.
 
