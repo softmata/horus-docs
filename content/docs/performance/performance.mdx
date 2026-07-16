@@ -85,15 +85,15 @@ recv()
 ```
 
 **Where time is spent:**
-- **POD path** (fixed-size `Copy` types): ~11ns for the memcpy, ~3ns for the atomic — total **14ns** same-thread (measured via RDTSC on i9-14900K)
+- **POD path** (fixed-size `Copy` types): a memcpy plus an atomic index update — **~12 ns** one-way when producer and consumer share an executor thread (self-loop), **~19 ns** for a real pub+sub on one thread (i9-14900K, release)
 - **Serde path** (types with `Vec`, `String`, etc.): serialization dominates, typically 50-500ns depending on size
-- **Cross-thread overhead**: cache-line transfer adds ~68ns for SPSC, ~164ns for contended MPMC
+- **Cross-core overhead**: the moment producer and consumer run on different cores — whether different threads or different processes — cache-coherence traffic sets the floor at **~220 ns** one-way. This is core-locality physics, not a backend difference.
 
 This is why fixed-size types matter: they skip serialization entirely.
 
 ### Optimized Data Structures
 
-HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — same-thread paths achieve **14ns**, cross-thread SPSC achieves **82ns**, and cross-process achieves **162ns** with only 99ns overhead over the 63ns hardware floor.
+HORUS uses carefully optimized memory layouts to minimize latency. Latency is governed by **core locality**, not by which backend is chosen or whether the consumer is in-process — every topic is shared-memory-backed from creation. Co-located on one executor thread, a round trip is **~24 ns** (send+recv) for a self-loop and **~39 ns** for a real pub+sub (**~12–19 ns** one-way, L1-hot). The moment the consumer runs on a different core — thread or process — cache-coherence physics sets a floor of **~220 ns** one-way.
 
 ## Benchmark Results
 
@@ -101,21 +101,28 @@ Measured on **Intel i9-14900K (32 cores), WSL2, release mode, RDTSC timing**. Ru
 
 For detailed methodology and raw data, see the dedicated **[Benchmarks](/performance/benchmarks)** page.
 
-### IPC Latency (All Backend Paths)
+### IPC Latency (by core locality)
 
-| Scenario | Backend | p50 | p99 | p99.9 | max |
-|----------|---------|-----|-----|-------|-----|
-| Same thread | DirectChannel | **12ns** | 13ns | 13ns | 13ns |
-| Cross-thread 1:1 | SpscIntra | **91ns** | 107ns | 125ns | 125ns |
-| Cross-thread 1:N | SpmcIntra | **80ns** | 92ns | 94ns | 94ns |
-| Cross-thread N:1 | MpscIntra | **187ns** | 372ns | 458ns | 464ns |
-| Cross-thread N:N | FanoutIntra | **150ns** | 307ns | 322ns | 322ns |
-| Cross-process 1:1 | SpscShm | **171ns** | 192ns | 195ns | 195ns |
-| Cross-process MPMC | FanoutShm | **91ns** | 230ns | — | — |
-| Cross-process broadcast | PodShm | **152ns** | 227ns | 254ns | 254ns |
-| Hardware floor (raw SHM atomic) | — | **57ns** | — | — | — |
+Latency depends on **where the peers run**, not on which backend HORUS picks. All topics are shared-memory-backed from creation, so the only cliff is same-core vs. different-core:
 
-Framework overhead: ~99ns over the 63ns hardware floor for cross-process 1:1.
+| Route | One-way | Round trip (send+recv) |
+|-------|---------|------------------------|
+| Same-thread, self-loop (1 handle) | **~12 ns** | ~24 ns |
+| Same-thread, real pub+sub (one executor thread) | **~19 ns** | ~39 ns |
+| Cross-thread **or** cross-process (different core) | **~220 ns** | — |
+
+The jump to ~220 ns is cache-coherence physics on a different core — no backend or layout choice moves it. An in-process heap ring would not beat shared memory across cores, so the fastest realistic route is to co-locate the producer and consumer on one executor thread.
+
+HORUS ships four shared-memory backends, selected automatically from topology and message type:
+
+| Backend | Topology |
+|---------|----------|
+| `SpscShm` | 1 producer : 1 consumer |
+| `MpscShm` | N producers : 1 consumer |
+| `PodShm` | 1 producer : N consumers (POD broadcast) |
+| `FanoutShm` | N producers : M consumers (non-POD broadcast) |
+
+Because all four are shared-memory-backed from topic creation (the creator's PID is stamped at init), a cross-process consumer can join an existing topic with no migration — which is why there is no separate in-process path.
 
 ### Robotics Message Types
 
@@ -523,10 +530,10 @@ HORUS provides optional kernel bypass networking for sub-microsecond latency req
 
 ### Transport Options
 
-| Transport | Latency (send+recv) | Throughput | Requirements |
+| Transport | Latency | Throughput | Requirements |
 |-----------|---------|------------|--------------|
-| Shared Memory (same thread) | **14ns** | 100M+ msg/s | Local only |
-| Shared Memory (cross thread, 1:1) | **82ns** | 13M+ msg/s | Local only |
+| Shared Memory (same core) | **~24ns** (send+recv) | 100M+ msg/s | Local only |
+| Shared Memory (different core) | **~220ns** (one-way) | — | Local only |
 | io_uring | 2-3us | 500K+ msg/s | Linux 5.1+ |
 | Batch UDP | 3-5us | 300K+ msg/s | Linux 3.0+ |
 | Standard UDP | 5-10us | 200K+ msg/s | Cross-platform |

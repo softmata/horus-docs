@@ -7,7 +7,7 @@ sidebar_group: "Communication & Data"
 
 # Shared Memory
 
-Your robot's camera publishes 30 frames/sec at 2MB each. Copying through kernel pipes would consume 60MB/s of bandwidth and add milliseconds of latency. HORUS puts the data in shared memory — zero copies, sub-200ns latency, no kernel involvement.
+Your robot's camera publishes 30 frames/sec at 2MB each. Copying through kernel pipes would consume 60MB/s of bandwidth and add milliseconds of latency. HORUS puts the data in shared memory — zero copies, sub-microsecond latency, no kernel involvement.
 
 This page explains **how it works underneath**. You never interact with SHM directly — `Topic::new()` handles everything. But understanding the architecture helps you debug performance issues, choose the right message types, and work with multi-process systems.
 
@@ -67,7 +67,7 @@ Cache Line 3 (bytes 128-191): tail
                                ↑ ONLY the consumer writes here
 ```
 
-This separation is the single most important optimization for achieving sub-20ns intra-process latency. Without it, every `send()` would invalidate the consumer's cache line and vice versa.
+This separation is the single most important optimization for achieving sub-20ns same-thread (same-core) latency. Without it, every `send()` would invalidate the consumer's cache line and vice versa.
 
 The remaining cache lines hold: publisher/subscriber counts, participant tracking (up to 16 participants with PID, thread ID, role, and lease expiry), and the type name for runtime validation.
 
@@ -83,7 +83,7 @@ The remaining cache lines hold: publisher/subscriber counts, participant trackin
 
 When you call `topic.send(msg)`, one of three paths executes depending on the message type:
 
-### 1. POD Zero-Copy (~3-150ns)
+### 1. POD Zero-Copy (~12-150ns)
 
 For types with only primitive fields and no heap pointers (`CmdVel`, `Imu`, `Pose2D`, any `#[repr(C)]` struct without `String`, `Vec`, or `Box`):
 
@@ -184,7 +184,7 @@ For large data types (`Image`, `PointCloud`, `DepthImage`):
 
 | Transport | Latency (same process) | Latency (cross process) | Suitable for |
 |-----------|----------------------|------------------------|-------------|
-| POD zero-copy | ~3-36ns | ~50-167ns | Fixed-size sensor data, commands |
+| POD zero-copy | ~12-36ns | ~50-167ns | Fixed-size sensor data, commands |
 | Serde | ~50ns | ~167ns+ | Variable-length strings, logs |
 | Pool-backed | ~50ns (descriptor) | ~50ns (descriptor) | Images, point clouds, depth maps |
 
@@ -194,22 +194,24 @@ For large data types (`Image`, `PointCloud`, `DepthImage`):
 
 HORUS automatically selects the optimal ring buffer backend based on the runtime topology. You never choose a backend — it's detected from how many publishers and subscribers exist.
 
-| Backend | Latency | When Used |
-|---------|---------|-----------|
-| DirectChannel | ~3ns | Same thread, POD type |
-| SpscIntra | ~18ns | Same process, 1 pub, 1 sub |
-| SpmcIntra | ~24ns | Same process, 1 pub, N subs |
-| MpscIntra | ~26ns | Same process, N pubs, 1 sub |
-| FanoutIntra | ~36ns | Same process, N pubs, N subs |
-| FanoutShm | ~40ns | Cross-process, N pubs, N subs |
-| PodShm | ~50ns | Cross-process, POD type |
-| MpscShm | ~65ns | Cross-process, N pubs, 1 sub |
-| SpmcShm | ~70ns | Cross-process, 1 pub, N subs |
-| SpscShm | ~85ns | Cross-process, 1 pub, 1 sub, non-POD |
+| Backend | Topology | When selected |
+|---------|----------|---------------|
+| `SpscShm` | 1 producer : 1 consumer | ≤1 publisher and ≤1 subscriber |
+| `MpscShm` | N producers : 1 consumer | More than one publisher, a single subscriber |
+| `PodShm` | 1 producer : N consumers | POD type broadcast to many subscribers — every subscriber gets every message |
+| `FanoutShm` | N : M | Non-POD broadcast or many-to-many, via a contention-free per-pair SHM SPSC matrix |
 
-**Intra-process backends** use heap memory (`Box<[UnsafeCell<MaybeUninit<T>>]>`) — no mmap overhead. The SHM file still exists for the control plane (header for cross-process discovery) but the data plane is heap-backed.
+**All four backends are SHM-backed** and share the same lock-free ring; the backend is chosen purely from the publisher/subscriber counts and whether the message type is POD. Latency is *not* a property of the backend — it is set by **core locality**:
 
-**Live migration**: When a second process joins a topic, the backend migrates from intra-process to cross-process automatically. The migration uses a CAS-based lock, drains in-flight messages, increments an epoch counter, and updates the backend mode atomically. Existing publishers and subscribers adapt within 32 messages (~1-10μs).
+| Route | One-way latency |
+|-------|-----------------|
+| Same thread, self-loop (single handle, `Both` fast path) | ~12 ns (~24 ns per send + recv) |
+| Same thread, real publisher + subscriber (one executor thread) | ~19 ns (~39 ns per send + recv) |
+| Cross-thread **or** cross-process | ~220 ns |
+
+The jump from ~19 ns to ~220 ns is cache-coherence physics, not a backend choice: once the producer and consumer sit on different cores, the ring's cache line bounces between them — whether the peer is another thread in the same process or a separate process makes no difference. An in-process heap ring would *not* beat SHM here. The fastest realistic route is to co-locate producer and consumer on one executor thread.
+
+**No migration when a process joins.** Every topic is SHM-backed from creation — the creator's PID is stamped into the header at init — so a second *process* can join an existing topic with no data-plane migration and no producer/consumer relocation; it simply mmaps the same region. Migration happens only when the *topology* changes (for example, a second subscriber turns a 1:1 topic into a broadcast, switching `SpscShm` → `PodShm` or `FanoutShm`). That transition takes a CAS-based lock, drains in-flight messages, increments an epoch counter, and updates the backend mode atomically; existing publishers and subscribers adapt within 32 messages (~1-10μs).
 
 See [Topics](/concepts/core-concepts-topic) for the full backend selection details and communication patterns.
 
@@ -343,7 +345,7 @@ Epoch checking is amortized: a process-local `AtomicU64` is checked every messag
 
 | Choice | Benefit | Cost |
 |--------|---------|------|
-| SHM ring buffers | Zero-copy, sub-200ns, no kernel | Complex synchronization, platform-specific code |
+| SHM ring buffers | Zero-copy, sub-microsecond, no kernel | Complex synchronization, platform-specific code |
 | Automatic backend selection | User doesn't think about topology | Migration latency on topology change (~10μs) |
 | flock-based stale detection | Kernel-reliable, no race conditions | Linux/fallback only — macOS uses PID-based |
 | Cache-line-aligned header | Eliminates false sharing (~40-80ns saved) | 640 bytes per topic (mostly unused padding) |

@@ -1187,7 +1187,7 @@ router_topic = Topic(CmdVel, endpoint="cmdvel@router")
 | `topic.send(msg, node=None)` | Send a message. Pass optional `node` for automatic IPC logging. Returns `True`. |
 | `topic.recv(node=None)` | Receive one message. Returns the message or `None` if empty. |
 | `topic.name` | Property: the topic name string |
-| `topic.backend_type` | Property: the active backend name (e.g., `"direct"`, `"spsc_shm"`) |
+| `topic.backend_type` | Property: the active SHM backend name (e.g., `"spsc_shm"`, `"pod_shm"`) |
 | `topic.is_network_topic` | Property: `True` if this topic uses network transport |
 | `topic.endpoint` | Property: the endpoint string, or `None` for local topics |
 | `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `is_network`, `backend` |
@@ -1209,7 +1209,7 @@ if msg:
 
 # Check topic properties
 print(f"Name: {topic.name}")           # "cmd_vel"
-print(f"Backend: {topic.backend_type}") # e.g. "mpmc_shm"
+print(f"Backend: {topic.backend_type}") # e.g. "spsc_shm"
 print(f"Stats: {topic.stats()}")
 ```
 
@@ -1255,31 +1255,40 @@ print(topic.is_generic())  # True
 | Typed (`Topic(CmdVel)`) | Direct field extraction (no serde) | Production, cross-language, high-frequency |
 | Generic (`Topic("name")`) | Python → JSON → MessagePack | Dynamic schemas, prototyping, Python-only |
 
-### Automatic Transport Selection
+### Automatic Backend Selection
 
-HORUS automatically selects the fastest communication path based on where publishers and subscribers are located. You never need to configure this manually:
+Every topic is shared-memory-backed from the moment it is created, so a cross-process consumer can join later with no migration. HORUS picks one of four SHM backends automatically from the publisher/subscriber topology — you never configure this manually:
 
 ```python
 # simplified
 from horus import Topic, CmdVel
 
-# Just create a topic — HORUS picks the fastest path automatically:
-# Same-thread:     ~3ns  (when pub+sub are in the same node)
-# Same-process:    ~18-36ns  (when pub+sub are in different nodes, same process)
-# Cross-process:   ~85-171ns  (when pub+sub are in different processes)
+# Just create a topic — HORUS picks the right SHM backend automatically:
+#   SpscShm   — 1 publisher : 1 subscriber
+#   MpscShm   — N publishers : 1 subscriber
+#   PodShm    — 1 publisher : N subscribers (POD broadcast)
+#   FanoutShm — N : M (non-POD broadcast)
 topic = Topic("cmd_vel", CmdVel)
 ```
 
-**Automatic Transport Tiers:**
+**SHM backends:**
 
-| Scenario | Latency | When it applies |
-|----------|---------|-----------------|
-| Same thread | ~3ns | Publisher and subscriber are in the same node |
-| Same process (1:1) | ~18ns | One publisher, one subscriber, same process |
-| Same process (many:1) | ~26ns | Multiple publishers, one subscriber, same process |
-| Same process (many:many) | ~36ns | Multiple publishers and subscribers, same process |
-| Cross-process (1:1) | ~85ns | One publisher, one subscriber, different processes |
-| Cross-process (many:many) | ~91ns | Multiple publishers and subscribers, different processes |
+| Backend | Topology | Use |
+|---------|----------|-----|
+| `SpscShm` | 1 : 1 | One publisher, one subscriber |
+| `MpscShm` | N : 1 | Many publishers, one subscriber |
+| `PodShm` | 1 : N | One publisher fanning out to many (POD broadcast) |
+| `FanoutShm` | N : M | Many publishers and subscribers (non-POD broadcast) |
+
+**Latency is set by core locality, not by which backend or by the process boundary.** All four backends are shared-memory; what moves the latency cliff is whether the producer and consumer run on the same CPU core:
+
+| Route | Latency (one-way) | Why |
+|-------|-------------------|-----|
+| Same thread, self-loop (pub+sub in one node) | ~12 ns | L1-cache-hot |
+| Same thread, separate pub + sub node (one executor thread) | ~19 ns | L1-cache-hot |
+| Cross-thread **or** cross-process | ~220 ns | cache-coherence physics — no backend choice moves it |
+
+An intra-process heap ring would not beat SHM across cores: the ~220 ns is hardware cache-coherence, not transport overhead. The fastest realistic route is co-locating the producer and consumer on one executor thread.
 
 ### Router Client (WAN/NAT Traversal)
 
@@ -1322,11 +1331,10 @@ server.start()
 
 ### When to Use What
 
-| Transport | Latency | Use Case |
-|-----------|---------|----------|
-| Same-process (`Topic(CmdVel)`) | ~18-36ns | In-process communication (automatic) |
-| Cross-process, 1:1 (`Topic(CmdVel)`) | ~85ns | Same machine, one publisher and one subscriber |
-| Cross-process, many:many (`Topic(CmdVel)`) | ~91ns | Same machine, multiple publishers and subscribers |
+| Transport | Latency (one-way) | Use Case |
+|-----------|-------------------|----------|
+| Same-thread (`Topic(CmdVel)`, pub+sub co-located) | ~12-19ns | Pub and sub on one executor thread (fastest, SHM) |
+| Cross-thread or cross-process (`Topic(CmdVel)`) | ~220ns | Same machine, different core (automatic, SHM) |
 | Network (`endpoint="topic@host:port"`) | &lt;50μs | Multi-machine on LAN (direct UDP) |
 | Router (`endpoint="topic@router"`) | 10-50ms | WAN, NAT traversal, cloud deployments |
 
@@ -1338,7 +1346,7 @@ server.start()
 from horus import Topic, CmdVel, Imu, Odometry
 
 # Local: Critical flight control (ultra-fast)
-imu_topic = Topic(Imu)  # ~85ns local shared memory
+imu_topic = Topic(Imu)  # local shared memory (~12ns same-thread, ~220ns cross-core)
 
 # Network: Telemetry to ground station
 telemetry = Topic(Odometry, endpoint="telem@192.168.1.100:8000")

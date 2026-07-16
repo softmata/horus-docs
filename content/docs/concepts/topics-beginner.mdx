@@ -168,7 +168,7 @@ self.publisher.send(CmdVel::new(1.0, 0.0));
 **Why this is the default for robotics**: A motor controller runs at 1000 Hz — it expects a new velocity command every millisecond. If it falls 3 messages behind, you don't want it processing stale commands from 3 ms ago. You want it to skip ahead to the latest command. Overwriting old data is the correct behavior.
 
 <Callout type="tip">
-Use `send()` for almost everything: sensor data, velocity commands, state updates, telemetry. It's the fastest option (~3 ns same-thread) and the simplest to reason about.
+Use `send()` for almost everything: sensor data, velocity commands, state updates, telemetry. It's the fastest option (~12 ns one-way when publisher and subscriber share a thread) and the simplest to reason about.
 </Callout>
 
 ### `try_send()` — Send With Feedback
@@ -328,17 +328,18 @@ Numbers without context are meaningless. Here's what topic latency means for a r
 
 A motor controller running at **1000 Hz** has a **1 millisecond** (1,000,000 nanoseconds) budget per cycle. The time spent delivering a velocity command via a topic:
 
-| Scenario | Latency | % of 1 ms budget |
-|----------|---------|-------------------|
-| Same thread | ~3 ns | 0.0003% |
-| Same process, 1 publisher + 1 subscriber | ~18 ns | 0.002% |
-| Same process, many-to-many | ~36 ns | 0.004% |
-| Cross-process (shared memory) | ~50–167 ns | 0.005–0.017% |
+| Scenario | Latency (one-way) | % of 1 ms budget |
+|----------|-------------------|-------------------|
+| Same thread, self-loop (a node reading its own topic) | ~12 ns | 0.0012% |
+| Same thread, publisher + subscriber on one executor | ~19 ns | 0.0019% |
+| Different core — cross-thread **or** cross-process | ~220 ns | 0.022% |
+
+Notice the jump from ~19 ns to ~220 ns. It appears the moment the publisher and subscriber sit on **different CPU cores** — whether that's two threads or two separate processes — because the data now has to travel through the cache-coherence fabric between cores. That's physics, not a HORUS overhead, and no backend or layout choice avoids it. The fastest arrangement is to keep a producer and its consumer on the same executor thread (same core, L1-cache-hot). And because every topic is shared-memory backed from the moment it's created, moving a subscriber into a separate process for fault isolation costs the same ~220 ns — the topic is never re-created or migrated.
 
 For comparison, a traditional message-passing system using sockets or pipes adds **50,000–100,000 ns** per message — eating 5–10% of the motor controller's budget. Topics use shared memory to eliminate serialization and kernel transitions, keeping overhead negligible even at kilohertz control rates.
 
 <Callout type="info">
-**What's a nanosecond?** Light travels about 30 centimeters (1 foot) in one nanosecond. HORUS can deliver a message between two nodes in the time it takes light to travel one meter. This matters because robots have strict timing budgets — every nanosecond spent on communication is a nanosecond not spent on control computation. A motor controller that misses its deadline can cause a robot arm to overshoot its target.
+**What's a nanosecond?** Light travels about 30 centimeters (1 foot) in one nanosecond. HORUS can deliver a message between two nodes on the same core in the time it takes light to travel a few meters. This matters because robots have strict timing budgets — every nanosecond spent on communication is a nanosecond not spent on control computation. A motor controller that misses its deadline can cause a robot arm to overshoot its target.
 </Callout>
 
 ## A Complete Example
@@ -448,7 +449,7 @@ Sockets and pipes require the operating system's kernel to copy data between pro
 A robot's control loop cares about what's happening *now*, not what happened 10 milliseconds ago. If the motor controller falls behind, you want it to skip ahead to the latest velocity command, not process 10 stale commands in sequence. A ring buffer with overwrite semantics guarantees this: the latest data is always available, memory usage is bounded (no unbounded queues that eat all your RAM), and the publisher never blocks waiting for a slow subscriber. If you need guaranteed delivery (no overwrites), use `try_send()` to detect drops or `send_blocking()` to wait.
 
 **Why automatic backend selection?**
-During development, all your nodes typically run in one process — the fastest communication path. In production, you might split the camera and controller into separate processes for fault isolation. If you had to manually choose the communication backend (in-process ring buffer vs cross-process shared memory), you'd need to reconfigure every time you changed the deployment topology. HORUS detects whether publisher and subscriber are in the same thread, same process, or different processes, and automatically selects the fastest available path. Your code stays identical across all deployment configurations.
+During development, all your nodes typically run in one process — often on one executor thread, the fastest path (same core, L1-cache-hot). In production, you might split the camera and controller into separate processes for fault isolation. Every HORUS topic is shared-memory backed from the moment it's created, so splitting nodes across processes needs no reconfiguration — a subscriber in another process simply joins the same shared-memory region, no migration required. On top of that, HORUS picks the right delivery backend automatically from the communication pattern — one-to-one, many-to-one, or one-to-many broadcast — so your code stays identical across every deployment configuration.
 
 ## Trade-offs
 
