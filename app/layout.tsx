@@ -91,7 +91,7 @@ export default function RootLayout({
     applicationSubCategory: 'Robotics Framework',
     operatingSystem: ['Linux', 'macOS', 'Windows'],
     description: 'HORUS is an open-source robotics framework with sub-microsecond IPC latency, zero-copy shared memory messaging, and multi-language support (Rust, Python).',
-    softwareVersion: '0.1.7',
+    softwareVersion: '0.2.0',
     url: 'https://docs.horusrobotics.dev',
     downloadUrl: 'https://github.com/softmata/horus',
     installUrl: 'https://docs.horusrobotics.dev/getting-started/installation',
