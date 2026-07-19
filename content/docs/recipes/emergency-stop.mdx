@@ -41,28 +41,35 @@ description = "E-stop monitor with safety state handling"
     ```rust
 // simplified
     use horus::prelude::*;
-    use horus_robotics::prelude::*;
 
-    /// E-stop trigger from hardware or software
-    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-    #[repr(C)]
-    struct EStopSignal {
-        triggered: u8,   // 0 = clear, 1 = triggered (u8 for repr(C) compat)
-        source: u8,      // 0 = hardware, 1 = software, 2 = remote
+    // Custom messages use the `message!` macro. `#[fixed]` generates a zero-copy
+    // POD type: repr(C) + Copy + Default + Serialize/Deserialize + LogSummary.
+    // (The prelude does not re-export serde, so a hand-written
+    // `#[derive(Serialize, Deserialize)]` on a plain struct would not compile.)
+    // `Twist` is the prelude-native velocity command; CmdVel/Imu/LaserScan live
+    // in the separate `horus_robotics` crate and are not auto-injected.
+    message! {
+        #[fixed]
+        /// E-stop trigger from hardware or software
+        EStopSignal {
+            triggered: u8,   // 0 = clear, 1 = triggered (u8 for repr(C) compat)
+            source: u8,      // 0 = hardware, 1 = software, 2 = remote
+        }
     }
 
-    /// Status published by the E-stop monitor
-    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-    #[repr(C)]
-    struct SafetyStatus {
-        estop_active: u8,
-        consecutive_clears: u32,
-        uptime_ticks: u64,
+    message! {
+        #[fixed]
+        /// Status published by the E-stop monitor
+        SafetyStatus {
+            estop_active: u8,
+            consecutive_clears: u32,
+            uptime_ticks: u64,
+        }
     }
 
     struct EStopNode {
         estop_sub: Topic<EStopSignal>,
-        cmd_pub: Topic<CmdVel>,
+        cmd_pub: Topic<Twist>,
         status_pub: Topic<SafetyStatus>,
         estop_active: bool,
         consecutive_clears: u32,
@@ -109,7 +116,7 @@ description = "E-stop monitor with safety state handling"
 
             if self.estop_active {
                 // SAFETY: override cmd_vel with zero — stops all motion
-                self.cmd_pub.send(CmdVel::zero());
+                self.cmd_pub.send(Twist::stop());
             }
 
             self.status_pub.send(SafetyStatus {
@@ -121,14 +128,14 @@ description = "E-stop monitor with safety state handling"
 
         fn shutdown(&mut self) -> Result<()> {
             // SAFETY: zero velocity on shutdown
-            self.cmd_pub.send(CmdVel::zero());
+            self.cmd_pub.send(Twist::stop());
             Ok(())
         }
 
         fn enter_safe_state(&mut self) {
             // SAFETY: called by scheduler if this node misses its deadline
             self.estop_active = true;
-            self.cmd_pub.send(CmdVel::zero());
+            self.cmd_pub.send(Twist::stop());
         }
 
         fn is_safe_state(&self) -> bool {
@@ -393,36 +400,41 @@ A real robot does not run the E-stop node alone. Below is a complete scheduler w
 ```rust
 // simplified
 use horus::prelude::*;
-use horus_robotics::prelude::*;
 
 // --- Messages (same EStopSignal and SafetyStatus as above) ---
+// Custom messages use the `message!` macro; `#[fixed]` = zero-copy POD.
+// `Twist` (prelude-native velocity command) replaces CmdVel, which lives in
+// the separate `horus_robotics` crate.
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct EStopSignal {
-    triggered: u8,
-    source: u8,
+message! {
+    #[fixed]
+    EStopSignal {
+        triggered: u8,
+        source: u8,
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct SafetyStatus {
-    estop_active: u8,
-    consecutive_clears: u32,
-    uptime_ticks: u64,
+message! {
+    #[fixed]
+    SafetyStatus {
+        estop_active: u8,
+        consecutive_clears: u32,
+        uptime_ticks: u64,
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct WheelCmd {
-    left_rpm: f32,
-    right_rpm: f32,
+message! {
+    #[fixed]
+    WheelCmd {
+        left_rpm: f32,
+        right_rpm: f32,
+    }
 }
 
 // --- DriveNode: converts cmd_vel to wheel commands ---
 
 struct DriveNode {
-    cmd_sub: Topic<CmdVel>,
+    cmd_sub: Topic<Twist>,
     wheel_pub: Topic<WheelCmd>,
 }
 
@@ -440,14 +452,15 @@ impl Node for DriveNode {
 
     fn tick(&mut self) {
         if let Some(cmd) = self.cmd_sub.recv() {
-            let wheel_base = 0.3_f32;
-            let radius = 0.05_f32;
-            let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
-            let left = ((cmd.linear - cmd.angular * wheel_base / 2.0) / radius) * to_rpm;
-            let right = ((cmd.linear + cmd.angular * wheel_base / 2.0) / radius) * to_rpm;
+            // Twist stores linear/angular as [f64; 3]; use forward (x) and yaw (z).
+            let wheel_base = 0.3_f64;
+            let radius = 0.05_f64;
+            let to_rpm = 60.0 / (2.0 * std::f64::consts::PI);
+            let left = ((cmd.linear[0] - cmd.angular[2] * wheel_base / 2.0) / radius) * to_rpm;
+            let right = ((cmd.linear[0] + cmd.angular[2] * wheel_base / 2.0) / radius) * to_rpm;
             self.wheel_pub.send(WheelCmd {
-                left_rpm: left.clamp(-200.0, 200.0),
-                right_rpm: right.clamp(-200.0, 200.0),
+                left_rpm: left.clamp(-200.0, 200.0) as f32,
+                right_rpm: right.clamp(-200.0, 200.0) as f32,
             });
         }
     }
@@ -466,7 +479,7 @@ impl Node for DriveNode {
 // --- PlannerNode: publishes cmd_vel, checks path safety ---
 
 struct PlannerNode {
-    cmd_pub: Topic<CmdVel>,
+    cmd_pub: Topic<Twist>,
     path_clear: bool,
 }
 
@@ -485,9 +498,9 @@ impl Node for PlannerNode {
     fn tick(&mut self) {
         // In production, check lidar/camera for obstacles
         if self.path_clear {
-            self.cmd_pub.send(CmdVel::new(0.5, 0.0));
+            self.cmd_pub.send(Twist::new_2d(0.5, 0.0));
         } else {
-            self.cmd_pub.send(CmdVel::zero());
+            self.cmd_pub.send(Twist::stop());
         }
     }
 
@@ -498,7 +511,7 @@ impl Node for PlannerNode {
 
     fn enter_safe_state(&mut self) {
         self.path_clear = false;
-        self.cmd_pub.send(CmdVel::zero());
+        self.cmd_pub.send(Twist::stop());
     }
 }
 
@@ -679,8 +692,8 @@ mod tests {
         estop_pub.send(EStopSignal { triggered: 0, source: 0 });
 
         // Publish a velocity command
-        let cmd_pub: Topic<CmdVel> = Topic::new("cmd_vel").unwrap();
-        cmd_pub.send(CmdVel::new(1.0, 0.0));
+        let cmd_pub: Topic<Twist> = Topic::new("cmd_vel").unwrap();
+        cmd_pub.send(Twist::new_2d(1.0, 0.0));
 
         // Tick once — Drive should produce non-zero wheel output
         scheduler.tick_once();
@@ -708,8 +721,8 @@ mod tests {
         estop_pub.send(EStopSignal { triggered: 1, source: 1 });
 
         // Publish a velocity command — E-stop should override it
-        let cmd_pub: Topic<CmdVel> = Topic::new("cmd_vel").unwrap();
-        cmd_pub.send(CmdVel::new(1.0, 0.0));
+        let cmd_pub: Topic<Twist> = Topic::new("cmd_vel").unwrap();
+        cmd_pub.send(Twist::new_2d(1.0, 0.0));
 
         // Tick once — EStopNode overwrites cmd_vel with zero
         scheduler.tick_once();
@@ -831,8 +844,8 @@ Separate E-stop nodes per actuator group (arms, wheels, gripper). Each publishes
 
 ```rust
 // simplified
-let arm_cmd: Topic<CmdVel> = Topic::new("arm.cmd_vel")?;
-let wheel_cmd: Topic<CmdVel> = Topic::new("wheel.cmd_vel")?;
+let arm_cmd: Topic<Twist> = Topic::new("arm.cmd_vel")?;
+let wheel_cmd: Topic<Twist> = Topic::new("wheel.cmd_vel")?;
 ```
 
 </Details>
@@ -858,7 +871,7 @@ Trades guaranteed periodic checking for lower latency on the signal path.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | E-stop doesn't override motors | E-stop `.order()` lower than motor node | Set E-stop `.order()` HIGHER than motor node |
-| Motors resume after E-stop | Only sending zero once | Send `CmdVel::zero()` every tick while active |
+| Motors resume after E-stop | Only sending zero once | Send `Twist::stop()` every tick while active |
 | E-stop flickers on/off | No debounce on clear signal | Use `CLEAR_THRESHOLD` consecutive clears |
 | System continues after deadline miss | Using `Miss::Warn` instead of `Miss::SafeMode` | Set `.on_miss(Miss::SafeMode)` |
 | E-stop never releases | `CLEAR_THRESHOLD` too high or no clear signals | Verify upstream publishes clear signals |

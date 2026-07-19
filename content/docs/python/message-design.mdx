@@ -53,12 +53,12 @@ horus.run(sensor, logger)
 
 - Primitive types: `int`, `float`, `str`, `bool`, `None`
 - Collections: `list`, `dict` (nested)
-- Bytes: `bytes`, `bytearray`
 
 ### What dict topics do not support
 
 - Custom class instances (unless you convert to dict first)
 - NumPy arrays (convert with `.tolist()` first)
+- Raw `bytes` / `bytearray` (encode as a list of ints or a base64 string first)
 - Payloads larger than 4KB (use pool-backed types instead)
 
 ### When to use dict topics
@@ -148,7 +148,6 @@ node.send("my_velocity", horus.CmdVel(linear=1.0, angular=0.0))
 | **Typed (Pod)** | ~1.5us | ~650K msgs/sec | Fixed-size struct | None (zero-copy) |
 | **Dict (GenericMessage)** | ~5-50us | ~20-200K msgs/sec | 4KB | MessagePack |
 | **Pool-backed (Image, Tensor)** | ~3-5us | ~300K descriptors/sec | Unlimited (pool) | Descriptor only (64-168B) |
-| **Custom Runtime** | ~20-40us | ~25K msgs/sec | Fixed-size struct | Python `struct` module |
 | **Custom Compiled** | ~3-5us | ~200K msgs/sec | Fixed-size struct | None (zero-copy) |
 
 Dict latency varies with payload size: a 50-byte dict serializes in ~5us; a 3KB dict takes ~50us.
@@ -333,33 +332,26 @@ node.send("state", {
 
 When built-in types don't fit your data model, create custom messages.
 
-### Runtime messages (no build step)
+### Without a build step: dict topics
 
-Use `horus.msggen` to define custom binary-serialized messages at runtime:
+HORUS has no runtime custom-message compiler -- there is no way to mint a new binary Pod type without a build. When you need custom fields and want to skip the build entirely, send a plain dict over a dict topic (see the **Dict Topics (GenericMessage)** section above). No code generation, no registration, instant iteration:
 
 ```python
 # simplified
-from horus.msggen import define_message
+# Custom fields as a dict — no build step, no type registration
+node.send("robot.status", {
+    "battery_level": 85.0,
+    "error_code": 0,
+    "is_active": True,
+    "motor_temp": 42.3,
+})
 
-# Define a custom message type
-RobotStatus = define_message('RobotStatus', 'robot.status', [
-    ('battery_level', 'f32'),
-    ('error_code', 'i32'),
-    ('is_active', 'bool'),
-    ('motor_temp', 'f32'),
-])
-
-# Create, serialize, send
-status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, motor_temp=42.3)
-node.send("robot.status", status.to_bytes())
-
-# Receive, deserialize
-raw = node.recv("robot.status")
-status = RobotStatus.from_bytes(raw)
-print(status.battery_level)  # 85.0
+# Receive — comes back as a dict
+status = node.recv("robot.status")
+print(status["battery_level"])  # 85.0
 ```
 
-Runtime messages use Python's `struct` module for fixed-layout binary serialization. They support only primitive types (`f32`, `f64`, `i32`, `u64`, `bool`, etc.) -- no nested objects or variable-length arrays.
+Dict topics accept only MessagePack-serializable values -- primitives, lists, and nested dicts, with a 4KB payload cap. For a fixed schema with zero-copy performance, compile a Pod message instead (below).
 
 ### Compiled messages (production)
 
@@ -470,8 +462,11 @@ def robot_tick(node):
 
 robot = horus.Node(
     name="robot_brain",
-    subs=[horus.Imu, horus.Image, "config"],
-    pubs=[horus.CmdVel, "detections", "nav.costmap"],
+    # Imu auto-derives the "imu" topic; bind Image to "camera.rgb" and the
+    # Tensor costmap to "nav.costmap" so the typed topics match the tick's
+    # recv/send names. "config" is a bare-string (dict) topic.
+    subs=[horus.Imu, horus.Sub("camera.rgb", horus.Image), "config"],
+    pubs=[horus.CmdVel, "detections", horus.Pub("nav.costmap", horus.Tensor)],
     tick=robot_tick,
     rate=30,
 )
@@ -499,7 +494,6 @@ horus.run(robot)
 | **Dict topics** | Any Python dict; no schema; evolve freely | Serialization overhead (~5-50us); no type checking; 4KB limit |
 | **Typed topics** | Zero-copy (~1.5us); type safety; cross-language compatible | Fixed schema; only primitive fields; must use built-in or compiled types |
 | **Pool-backed types** | Zero-copy for megabytes of data; NumPy/PyTorch interop | One copy on `from_numpy()`; pool slot management; descriptors add indirection |
-| **Custom runtime messages** | No build step; instant iteration | Slower (~20-40us); primitive types only; manual `to_bytes()`/`from_bytes()` |
 | **Custom compiled messages** | Same performance as built-in types; cross-language | Requires `maturin develop` build step; primitive types only |
 | **GenericMessage inline buffer** | No heap allocation for small messages (256B or less) | 4KB maximum; overflow to heap above 256B |
 

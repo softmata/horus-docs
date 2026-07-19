@@ -33,6 +33,8 @@ language = "rust"
 
 [dependencies]
 horus = "0.1"
+# TransformFrame + Transform live in horus-tf (not auto-injected)
+horus-tf = "0.2"
 ```
 
 ### Complete Code
@@ -42,7 +44,6 @@ horus = "0.1"
     ```rust
 // simplified
     use horus::prelude::*;
-    use horus_robotics::prelude::*;
     use horus_tf::prelude::*;
     use std::sync::Arc;
 
@@ -154,7 +155,7 @@ horus = "0.1"
         fn shutdown(&mut self) -> Result<()> {
             // SAFETY: Log final frame tree statistics for post-run diagnostics.
             let stats = self.tf.stats();
-            hlog!(info, "Frame publisher shutdown — {}", stats.summary());
+            hlog!(info, "Frame publisher shutdown — {}", stats);
             Ok(())
         }
     }
@@ -272,7 +273,7 @@ horus = "0.1"
             .build()?;
 
         hlog!(info, "Transform frame system running — Ctrl+C to stop");
-        scheduler.build()?.run()?;
+        scheduler.run()?;
 
         Ok(())
     }
@@ -281,7 +282,7 @@ horus = "0.1"
   <LangTab language="Python">
     ```python
     import horus
-    from horus import Node, TransformFrame, run
+    from horus import Node, TransformFrame, Transform, run
     import math
 
     # Create a shared TransformFrame — both nodes use the same tree
@@ -289,15 +290,21 @@ horus = "0.1"
 
     def publisher_init(node):
         """Register the frame hierarchy."""
-        tf.add_frame("world")
-        tf.add_frame("base_link", parent="world")
-        tf.add_frame("camera_link", parent="base_link",
-                      static_transform={"xyz": [0.1, 0.0, 0.3], "rpy": [0.0, 0.26, 0.0]})
-        tf.add_frame("lidar_link", parent="base_link",
-                      static_transform={"xyz": [0.0, 0.0, 0.4]})
-        tf.add_frame("arm_link", parent="base_link")
-        tf.add_frame("end_effector", parent="arm_link")
-        tf.print_tree()
+        # Register the root first — there is no implicit root frame
+        tf.register_frame("world")
+        tf.register_frame("base_link", "world")
+        # Static mounts take a Transform (translation + rpy)
+        tf.register_static_frame(
+            "camera_link",
+            Transform.from_euler([0.1, 0.0, 0.3], [0.0, 0.26, 0.0]),
+            parent="base_link")
+        tf.register_static_frame(
+            "lidar_link",
+            Transform.from_translation([0.0, 0.0, 0.4]),
+            parent="base_link")
+        tf.register_frame("arm_link", "base_link")
+        tf.register_frame("end_effector", "arm_link")
+        node.log_info(f"Frame tree registered: {tf.all_frames()}")
         node.state = {"tick_count": 0}
 
     def publisher_tick(node):
@@ -312,14 +319,18 @@ horus = "0.1"
         base_y = radius * math.sin(speed * t)
         base_yaw = speed * t + math.pi / 2
 
-        tf.update_transform("base_link", xyz=[base_x, base_y, 0.0], yaw=base_yaw)
+        # update_transform takes a Transform (yaw = rotation about Z, so rpy=[0,0,yaw])
+        tf.update_transform("base_link",
+                            Transform.from_euler([base_x, base_y, 0.0], [0.0, 0.0, base_yaw]))
 
         # Update arm_link: joint sweeps back and forth
         arm_angle = 0.8 * math.sin(t * 0.5)
-        tf.update_transform("arm_link", xyz=[0.15, 0.0, 0.2], yaw=arm_angle)
+        tf.update_transform("arm_link",
+                            Transform.from_euler([0.15, 0.0, 0.2], [0.0, 0.0, arm_angle]))
 
         # Update end_effector: extends from arm tip
-        tf.update_transform("end_effector", xyz=[0.3, 0.0, 0.0])
+        tf.update_transform("end_effector",
+                            Transform.from_translation([0.3, 0.0, 0.0]))
 
     def user_init(node):
         node.state = {"tick_count": 0}
@@ -329,16 +340,17 @@ horus = "0.1"
         s["tick_count"] += 1
 
         # Transform detection from camera_link to world frame
+        # (transform_point raises if the frames aren't connected yet — guard with can_transform)
         detection_in_camera = [1.5, 0.2, 0.0]
-        world_point = tf.transform_point("camera_link", "world", detection_in_camera)
-        if world_point is not None:
+        if tf.can_transform("camera_link", "world"):
+            world_point = tf.transform_point("camera_link", "world", detection_in_camera)
             node.send("detection_world", world_point)
 
         # Query end effector position in world frame
-        if s["tick_count"] % 100 == 0:
-            ee = tf.lookup("end_effector", "world")
-            if ee is not None:
-                node.log_info(f"End effector in world: ({ee[0]:.2f}, {ee[1]:.2f}, {ee[2]:.2f})")
+        if s["tick_count"] % 100 == 0 and tf.can_transform("end_effector", "world"):
+            # tf() returns a Transform; .translation is its [x, y, z]
+            ee = tf.tf("end_effector", "world").translation
+            node.log_info(f"End effector in world: ({ee[0]:.2f}, {ee[1]:.2f}, {ee[2]:.2f})")
 
     publisher = Node(
         name="frame_publisher",
@@ -530,7 +542,7 @@ world
 [INFO] [USER] End effector in world: (2.18, 0.57, 0.20)
 [INFO] [USER] Frame chain: end_effector -> arm_link -> base_link -> world
 ^C
-[INFO] Frame publisher shutdown — 6 total, 2 static, 4 dynamic, depth 4
+[INFO] Frame publisher shutdown — TransformFrame: 6/256 frames (2 static, 4 dynamic), 32 history entries, depth 4, 1 root(s)
 [INFO] Frame user shutdown after 500 ticks
 world
   └── base_link

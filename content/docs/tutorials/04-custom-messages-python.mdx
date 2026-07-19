@@ -46,10 +46,10 @@ import horus
 # --- Node tick functions ---
 
 def imu_sensor_tick(node):
-    """Simulate an IMU sensor publishing orientation and acceleration."""
-    imu = horus.Imu()
-    # Imu fields: orientation[4], angular_velocity[3], linear_acceleration[3]
-    # All fields default to 0.0 — set what you need
+    """Simulate an IMU sensor publishing acceleration and angular velocity."""
+    # Imu(accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, timestamp_ns=0)
+    # Fields are flat scalars — there is no zero-argument constructor.
+    imu = horus.Imu(0.0, 0.0, 9.81, 0.0, 0.0, 0.0)
     node.send("imu", imu)
 
 def motor_driver_tick(node):
@@ -63,7 +63,9 @@ def controller_tick(node):
     imu = node.recv("imu")
     if imu is not None:
         # Simple proportional controller: slow down if tilting
-        tilt = abs(imu.linear_acceleration[0])
+        # Read acceleration via flat scalars (.accel_x/.accel_y/.accel_z) or
+        # the vector accessor imu.linear_acceleration_vec().
+        tilt = abs(imu.accel_x)
         speed = max(0.1, 1.0 - tilt * 0.5)
         cmd = horus.CmdVel(linear=speed, angular=0.0)
         node.send("cmd_vel", cmd)
@@ -104,17 +106,18 @@ horus.run(sensor, controller, motor, duration=5.0)
 Create `horus.toml` in the same directory:
 
 ```toml
-[project]
+[package]
 name = "typed-demo"
 version = "0.1.0"
 language = "python"
-entry = "typed_demo.py"
 ```
+
+<Callout type="info">`horus.toml` uses `[package]` (not `[project]`), and there is no `entry` field — the file to run is auto-detected (`main.py`) or passed to `horus run` positionally.</Callout>
 
 Run it:
 
 ```bash
-horus run
+horus run typed_demo.py
 ```
 
 **Expected output:**
@@ -232,17 +235,16 @@ horus.run(sensor, logger, alerter, duration=10.0)
 Create `horus.toml`:
 
 ```toml
-[project]
+[package]
 name = "dict-demo"
 version = "0.1.0"
 language = "python"
-entry = "dict_demo.py"
 ```
 
 Run it:
 
 ```bash
-horus run
+horus run dict_demo.py
 ```
 
 **Expected output:**
@@ -426,17 +428,16 @@ horus.run(battery, monitor, dashboard, duration=20.0)
 Create `horus.toml`:
 
 ```toml
-[project]
+[package]
 name = "dataclass-demo"
 version = "0.1.0"
 language = "python"
-entry = "dataclass_demo.py"
 ```
 
 Run it:
 
 ```bash
-horus run
+horus run dataclass_demo.py
 ```
 
 **Expected output:**
@@ -480,7 +481,7 @@ class BatteryReading:
 
 ## Approach 4: Compiled Messages with maturin (Production)
 
-For Python-only custom messages at high frequency, use `horus.msggen` to define a message schema, then compile it with `maturin` for near-native performance (~3-5us). This approach requires a build step but gives you a typed, binary-serialized message without writing any Rust yourself.
+For Python-only custom messages at high frequency, use `horus.msggen` to register a message schema, then compile it with `build_messages()` (which runs `maturin`) for near-native performance (~3-5us). This approach requires a one-time build step but gives you a typed, binary-serialized message without writing any Rust yourself.
 
 ### When to use compiled messages
 
@@ -491,18 +492,15 @@ For Python-only custom messages at high frequency, use `horus.msggen` to define 
 
 ### Complete example
 
-Create `compiled_demo.py`:
+First, register the message schemas and compile them. Create `gen_messages.py`:
 
 ```python
-from horus.msggen import define_message
-import horus
+# gen_messages.py — run ONCE to generate and compile the custom message types.
+from horus.msggen import register_message, build_messages
 
-# --- Define a custom message type ---
-# This creates a Python class backed by fixed-layout binary serialization.
-# At runtime (no maturin), latency is ~20-40us.
-# After `maturin develop`, latency drops to ~3-5us.
-
-RobotStatus = define_message("RobotStatus", "robot.status", [
+# register_message(name, topic, fields) records a schema. It returns None —
+# the usable class is produced by the build step below, not by this call.
+register_message("RobotStatus", "robot.status", [
     ("battery_level", "f32"),
     ("motor_rpm", "f32"),
     ("error_code", "i32"),
@@ -510,11 +508,30 @@ RobotStatus = define_message("RobotStatus", "robot.status", [
     ("tick_count", "u64"),
 ])
 
-WheelSpeed = define_message("WheelSpeed", "wheel.speed", [
+register_message("WheelSpeed", "wheel.speed", [
     ("left_rpm", "f32"),
     ("right_rpm", "f32"),
     ("timestamp_ns", "u64"),
 ])
+
+# Generates Rust PyO3 code for each schema and runs `maturin develop --release`.
+# Requires maturin (`pip install maturin`). Afterwards the compiled classes are
+# importable as `from horus import RobotStatus, WheelSpeed`.
+build_messages()
+```
+
+Run the generator once — this is the required build step (there is no interpreted fallback):
+
+```bash
+pip install maturin
+python gen_messages.py
+```
+
+Then use the generated types in your application. Create `compiled_demo.py`:
+
+```python
+import horus
+from horus import RobotStatus, WheelSpeed  # compiled by gen_messages.py
 
 # --- Node tick functions ---
 
@@ -553,13 +570,16 @@ def dashboard_tick(node):
         )
 
 # --- Node definitions ---
+# The generated classes carry their own topic name, so register them as TYPED
+# topics — a compiled message cannot be sent over a bare-string topic. Send/recv
+# still address the topic by name ("robot.status", "wheel.speed").
 
 status_pub = horus.Node(
     name="StatusPub",
     tick=status_publisher_tick,
     rate=50,
     order=0,
-    pubs=["robot.status"],
+    pubs=[RobotStatus],
 )
 
 wheel_pub = horus.Node(
@@ -567,7 +587,7 @@ wheel_pub = horus.Node(
     tick=wheel_publisher_tick,
     rate=50,
     order=1,
-    pubs=["wheel.speed"],
+    pubs=[WheelSpeed],
 )
 
 dash = horus.Node(
@@ -575,7 +595,7 @@ dash = horus.Node(
     tick=dashboard_tick,
     rate=50,
     order=2,
-    subs=["robot.status", "wheel.speed"],
+    subs=[RobotStatus, WheelSpeed],
 )
 
 # --- Run ---
@@ -586,26 +606,21 @@ horus.run(status_pub, wheel_pub, dash, duration=5.0)
 Create `horus.toml`:
 
 ```toml
-[project]
+[package]
 name = "compiled-demo"
 version = "0.1.0"
 language = "python"
-entry = "compiled_demo.py"
 ```
 
-This example runs without any build step (runtime mode, ~20-40us). To get compiled performance (~3-5us), run:
+Run the app (after `gen_messages.py` has compiled the types):
 
 ```bash
-# One-time setup: install maturin
-pip install maturin
-
-# Compile the message definitions
-maturin develop
+horus run compiled_demo.py
 ```
 
-After compilation, the same code runs with binary serialization instead of Python's `struct` module.
+The compiled classes use binary serialization instead of Python's `struct` module, giving ~3-5us latency.
 
-**Expected output (both runtime and compiled):**
+**Expected output:**
 
 ```text
 [Dash] battery=85% rpm=3201 wheels=(150, 148)
@@ -621,7 +636,7 @@ After compilation, the same code runs with binary serialization instead of Pytho
 | Approach | Latency | Cross-language? | Build step? | Best for |
 |----------|---------|-----------------|-------------|----------|
 | **Typed** (`horus.CmdVel`) | ~1.7us | Yes (Rust + Python) | No | Control loops, typed sensor data |
-| **Dict** (GenericMessage) | ~6-50us | No (Python only) | No | Prototyping, flexible schemas |
+| **Dict** (plain dict) | ~6-50us | No (Python only) | No | Prototyping, flexible schemas |
 | **Dataclass** (runtime) | ~20-40us | No (Python only) | No | Structured Python-only data |
 | **Compiled** (maturin) | ~3-5us | No (Python only) | Yes (`maturin develop`) | Production, high-frequency custom types |
 
@@ -637,7 +652,7 @@ Follow this decision process:
 
 **Do you need structure but stay Python-only?** Use dataclasses (Approach 3). You get IDE autocompletion, type hints, and constructor validation. The transport cost is the same as dicts (they serialize as dicts), but your code is cleaner and more maintainable.
 
-**Do you need a custom type at high frequency?** Use compiled messages (Approach 4). Define the schema once with `define_message()`, compile with `maturin`, and get ~3-5us latency with binary serialization. This is the right choice for production Python nodes running at 50Hz or above with custom data.
+**Do you need a custom type at high frequency?** Use compiled messages (Approach 4). Register the schema with `register_message()`, compile it with `build_messages()` (which runs `maturin`), and get ~3-5us latency with binary serialization. This is the right choice for production Python nodes running at 50Hz or above with custom data.
 
 **Do you need cross-language custom types?** Define the message in Rust with `message!` and expose it to Python via PyO3. See [Tutorial 4 (Rust)](/tutorials/04-custom-messages) for the Rust side and [Python API: Custom Messages](/python/api/custom-messages) for binding patterns.
 
@@ -673,7 +688,7 @@ if data is not None:
 - [Tutorial 5: Hardware Drivers (Python)](/tutorials/05-hardware-and-rt-python) -- connect to real hardware
 - [Tutorial 4 (Rust)](/tutorials/04-custom-messages) -- same tutorial in Rust with `message!` macro
 - [Message Types](/concepts/message-types) -- full list of 70+ built-in types
-- [Python API: Custom Messages](/python/api/custom-messages) -- `define_message()`, `define_numpy_message()`, and compiled workflows
+- [Python API: Custom Messages](/python/api/custom-messages) -- `register_message()`, `build_messages()`, and compiled workflows
 
 ---
 

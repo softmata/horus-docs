@@ -1,6 +1,6 @@
 # HORUS Documentation (Full)
 
-Generated: 2026-07-18T22:15:15.061Z
+Generated: 2026-07-19T07:59:10.662Z
 Pages: 278
 Source: https://docs.horusrobotics.dev
 Condensed overview: https://docs.horusrobotics.dev/llms.txt
@@ -9931,6 +9931,7 @@ The scheduler selects the execution class based on **which builder methods you c
 
 **Key rule**: `.rate()` only auto-enables RT when no explicit execution class (`.compute()`, `.on()`, `.async_io()`) is set. When combined with an explicit class, `.rate()` just limits tick frequency.
 
+
 ### Deferred Finalization
 
 Class selection happens at `.build()` time, not when individual methods are called. This means:
@@ -18524,10 +18525,10 @@ import horus
 # --- Node tick functions ---
 
 def imu_sensor_tick(node):
-    """Simulate an IMU sensor publishing orientation and acceleration."""
-    imu = horus.Imu()
-    # Imu fields: orientation[4], angular_velocity[3], linear_acceleration[3]
-    # All fields default to 0.0 — set what you need
+    """Simulate an IMU sensor publishing acceleration and angular velocity."""
+    # Imu(accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, timestamp_ns=0)
+    # Fields are flat scalars — there is no zero-argument constructor.
+    imu = horus.Imu(0.0, 0.0, 9.81, 0.0, 0.0, 0.0)
     node.send("imu", imu)
 
 def motor_driver_tick(node):
@@ -18541,7 +18542,9 @@ def controller_tick(node):
     imu = node.recv("imu")
     if imu is not None:
         # Simple proportional controller: slow down if tilting
-        tilt = abs(imu.linear_acceleration[0])
+        # Read acceleration via flat scalars (.accel_x/.accel_y/.accel_z) or
+        # the vector accessor imu.linear_acceleration_vec().
+        tilt = abs(imu.accel_x)
         speed = max(0.1, 1.0 - tilt * 0.5)
         cmd = horus.CmdVel(linear=speed, angular=0.0)
         node.send("cmd_vel", cmd)
@@ -18582,17 +18585,17 @@ horus.run(sensor, controller, motor, duration=5.0)
 Create `horus.toml` in the same directory:
 
 ```toml
-[project]
+[package]
 name = "typed-demo"
 version = "0.1.0"
 language = "python"
-entry = "typed_demo.py"
 ```
+
 
 Run it:
 
 ```bash
-horus run
+horus run typed_demo.py
 ```
 
 **Expected output:**
@@ -18710,17 +18713,16 @@ horus.run(sensor, logger, alerter, duration=10.0)
 Create `horus.toml`:
 
 ```toml
-[project]
+[package]
 name = "dict-demo"
 version = "0.1.0"
 language = "python"
-entry = "dict_demo.py"
 ```
 
 Run it:
 
 ```bash
-horus run
+horus run dict_demo.py
 ```
 
 **Expected output:**
@@ -18904,17 +18906,16 @@ horus.run(battery, monitor, dashboard, duration=20.0)
 Create `horus.toml`:
 
 ```toml
-[project]
+[package]
 name = "dataclass-demo"
 version = "0.1.0"
 language = "python"
-entry = "dataclass_demo.py"
 ```
 
 Run it:
 
 ```bash
-horus run
+horus run dataclass_demo.py
 ```
 
 **Expected output:**
@@ -18958,7 +18959,7 @@ class BatteryReading:
 
 ## Approach 4: Compiled Messages with maturin (Production)
 
-For Python-only custom messages at high frequency, use `horus.msggen` to define a message schema, then compile it with `maturin` for near-native performance (~3-5us). This approach requires a build step but gives you a typed, binary-serialized message without writing any Rust yourself.
+For Python-only custom messages at high frequency, use `horus.msggen` to register a message schema, then compile it with `build_messages()` (which runs `maturin`) for near-native performance (~3-5us). This approach requires a one-time build step but gives you a typed, binary-serialized message without writing any Rust yourself.
 
 ### When to use compiled messages
 
@@ -18969,18 +18970,15 @@ For Python-only custom messages at high frequency, use `horus.msggen` to define 
 
 ### Complete example
 
-Create `compiled_demo.py`:
+First, register the message schemas and compile them. Create `gen_messages.py`:
 
 ```python
-from horus.msggen import define_message
-import horus
+# gen_messages.py — run ONCE to generate and compile the custom message types.
+from horus.msggen import register_message, build_messages
 
-# --- Define a custom message type ---
-# This creates a Python class backed by fixed-layout binary serialization.
-# At runtime (no maturin), latency is ~20-40us.
-# After `maturin develop`, latency drops to ~3-5us.
-
-RobotStatus = define_message("RobotStatus", "robot.status", [
+# register_message(name, topic, fields) records a schema. It returns None —
+# the usable class is produced by the build step below, not by this call.
+register_message("RobotStatus", "robot.status", [
     ("battery_level", "f32"),
     ("motor_rpm", "f32"),
     ("error_code", "i32"),
@@ -18988,11 +18986,30 @@ RobotStatus = define_message("RobotStatus", "robot.status", [
     ("tick_count", "u64"),
 ])
 
-WheelSpeed = define_message("WheelSpeed", "wheel.speed", [
+register_message("WheelSpeed", "wheel.speed", [
     ("left_rpm", "f32"),
     ("right_rpm", "f32"),
     ("timestamp_ns", "u64"),
 ])
+
+# Generates Rust PyO3 code for each schema and runs `maturin develop --release`.
+# Requires maturin (`pip install maturin`). Afterwards the compiled classes are
+# importable as `from horus import RobotStatus, WheelSpeed`.
+build_messages()
+```
+
+Run the generator once — this is the required build step (there is no interpreted fallback):
+
+```bash
+pip install maturin
+python gen_messages.py
+```
+
+Then use the generated types in your application. Create `compiled_demo.py`:
+
+```python
+import horus
+from horus import RobotStatus, WheelSpeed  # compiled by gen_messages.py
 
 # --- Node tick functions ---
 
@@ -19031,13 +19048,16 @@ def dashboard_tick(node):
         )
 
 # --- Node definitions ---
+# The generated classes carry their own topic name, so register them as TYPED
+# topics — a compiled message cannot be sent over a bare-string topic. Send/recv
+# still address the topic by name ("robot.status", "wheel.speed").
 
 status_pub = horus.Node(
     name="StatusPub",
     tick=status_publisher_tick,
     rate=50,
     order=0,
-    pubs=["robot.status"],
+    pubs=[RobotStatus],
 )
 
 wheel_pub = horus.Node(
@@ -19045,7 +19065,7 @@ wheel_pub = horus.Node(
     tick=wheel_publisher_tick,
     rate=50,
     order=1,
-    pubs=["wheel.speed"],
+    pubs=[WheelSpeed],
 )
 
 dash = horus.Node(
@@ -19053,7 +19073,7 @@ dash = horus.Node(
     tick=dashboard_tick,
     rate=50,
     order=2,
-    subs=["robot.status", "wheel.speed"],
+    subs=[RobotStatus, WheelSpeed],
 )
 
 # --- Run ---
@@ -19064,26 +19084,21 @@ horus.run(status_pub, wheel_pub, dash, duration=5.0)
 Create `horus.toml`:
 
 ```toml
-[project]
+[package]
 name = "compiled-demo"
 version = "0.1.0"
 language = "python"
-entry = "compiled_demo.py"
 ```
 
-This example runs without any build step (runtime mode, ~20-40us). To get compiled performance (~3-5us), run:
+Run the app (after `gen_messages.py` has compiled the types):
 
 ```bash
-# One-time setup: install maturin
-pip install maturin
-
-# Compile the message definitions
-maturin develop
+horus run compiled_demo.py
 ```
 
-After compilation, the same code runs with binary serialization instead of Python's `struct` module.
+The compiled classes use binary serialization instead of Python's `struct` module, giving ~3-5us latency.
 
-**Expected output (both runtime and compiled):**
+**Expected output:**
 
 ```text
 [Dash] battery=85% rpm=3201 wheels=(150, 148)
@@ -19099,7 +19114,7 @@ After compilation, the same code runs with binary serialization instead of Pytho
 | Approach | Latency | Cross-language? | Build step? | Best for |
 |----------|---------|-----------------|-------------|----------|
 | **Typed** (`horus.CmdVel`) | ~1.7us | Yes (Rust + Python) | No | Control loops, typed sensor data |
-| **Dict** (GenericMessage) | ~6-50us | No (Python only) | No | Prototyping, flexible schemas |
+| **Dict** (plain dict) | ~6-50us | No (Python only) | No | Prototyping, flexible schemas |
 | **Dataclass** (runtime) | ~20-40us | No (Python only) | No | Structured Python-only data |
 | **Compiled** (maturin) | ~3-5us | No (Python only) | Yes (`maturin develop`) | Production, high-frequency custom types |
 
@@ -19115,7 +19130,7 @@ Follow this decision process:
 
 **Do you need structure but stay Python-only?** Use dataclasses (Approach 3). You get IDE autocompletion, type hints, and constructor validation. The transport cost is the same as dicts (they serialize as dicts), but your code is cleaner and more maintainable.
 
-**Do you need a custom type at high frequency?** Use compiled messages (Approach 4). Define the schema once with `define_message()`, compile with `maturin`, and get ~3-5us latency with binary serialization. This is the right choice for production Python nodes running at 50Hz or above with custom data.
+**Do you need a custom type at high frequency?** Use compiled messages (Approach 4). Register the schema with `register_message()`, compile it with `build_messages()` (which runs `maturin`), and get ~3-5us latency with binary serialization. This is the right choice for production Python nodes running at 50Hz or above with custom data.
 
 **Do you need cross-language custom types?** Define the message in Rust with `message!` and expose it to Python via PyO3. See [Tutorial 4 (Rust)](/tutorials/04-custom-messages) for the Rust side and [Python API: Custom Messages](/python/api/custom-messages) for binding patterns.
 
@@ -19151,7 +19166,7 @@ if data is not None:
 - [Tutorial 5: Hardware Drivers (Python)](/tutorials/05-hardware-and-rt-python) -- connect to real hardware
 - [Tutorial 4 (Rust)](/tutorials/04-custom-messages) -- same tutorial in Rust with `message!` macro
 - [Message Types](/concepts/message-types) -- full list of 70+ built-in types
-- [Python API: Custom Messages](/python/api/custom-messages) -- `define_message()`, `define_numpy_message()`, and compiled workflows
+- [Python API: Custom Messages](/python/api/custom-messages) -- `register_message()`, `build_messages()`, and compiled workflows
 
 ---
 
@@ -19442,7 +19457,8 @@ fn main() -> Result<()> {
 }
 ```
 
-That is a complete hardware-loading program. Twelve lines.
+That is a complete hardware-loading program in twelve lines.
+
 
 ---
 
@@ -21572,7 +21588,7 @@ def make_imu():
         tick=tick,
         rate=100,
         order=0,
-        pubs=[horus.Imu],
+        pubs=[horus.Pub("imu.data", horus.Imu)],
     )
 
 
@@ -21599,7 +21615,7 @@ def make_controller():
         tick=tick,
         rate=50,
         order=10,
-        subs=[horus.Imu],
+        subs=[horus.Sub("imu.data", horus.Imu)],
         pubs=[horus.CmdVel],
     )
 
@@ -21726,7 +21742,7 @@ imu = horus.Node(
     rate=100,
     order=0,
     on_miss="skip",
-    pubs=[horus.Imu],
+    pubs=[horus.Pub("imu.data", horus.Imu)],
 )
 
 # PID controller: enter safe state on deadline miss
@@ -21738,7 +21754,7 @@ controller = horus.Node(
     budget=10 * ms,
     deadline=18 * ms,
     on_miss="safe_mode",
-    subs=[horus.Imu],
+    subs=[horus.Sub("imu.data", horus.Imu)],
     pubs=[horus.CmdVel],
 )
 
@@ -21828,7 +21844,7 @@ def make_imu():
         rate=100,
         order=0,
         on_miss="skip",       # one stale reading is acceptable
-        pubs=[horus.Imu],
+        pubs=[horus.Pub("imu.data", horus.Imu)],
     )
 
 
@@ -21870,7 +21886,7 @@ def make_controller():
         budget=10 * ms,
         deadline=18 * ms,
         on_miss="safe_mode",  # zero velocity on deadline miss
-        subs=[horus.Imu],
+        subs=[horus.Sub("imu.data", horus.Imu)],
         pubs=[horus.CmdVel],
     )
 
@@ -22275,20 +22291,27 @@ Replace `src/main.rs` with a 3-node system: a simulated sensor, a controller wit
 use horus::prelude::*;
 
 // ── Messages ──────────────────────────────────────────────────
+// The `message!` macro is the canonical way to declare messages. The
+// `#[fixed]` variant produces a `#[repr(C)]` POD struct and auto-derives
+// Clone, Copy, Default, Debug, Serialize, Deserialize, and LogSummary.
+// (The bare `prelude` does not re-export serde, so `#[derive(Serialize)]`
+// on a plain struct would fail to compile.)
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct SensorReading {
-    value: f32,
-    timestamp_ns: u64,
+message! {
+    #[fixed]
+    SensorReading {
+        value: f32,
+        timestamp_ns: u64,
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct ControlOutput {
-    command: f32,
-    error: f32,
-    integral: f32,
+message! {
+    #[fixed]
+    ControlOutput {
+        command: f32,
+        error: f32,
+        integral: f32,
+    }
 }
 
 // ── Sensor Node ───────────────────────────────────────────────
@@ -22812,8 +22835,8 @@ def detector_tick(node):
 horus.run(
     horus.Node(
         name="ai_detector",
-        subs=["sensor.data"],
-        pubs=["ai.decision"],
+        subs=[horus.Sub("sensor.data", horus.CmdVel)],
+        pubs=[horus.Pub("ai.decision", horus.CmdVel)],
         tick=detector_tick,
         rate=10
     )
@@ -22850,13 +22873,13 @@ fn main() -> Result<()> {
 
 ```bash
 # Terminal 1: C++ sensor
-horus run --project cpp_sensor/
+horus run cpp_sensor/
 
 # Terminal 2: Python AI
-horus run --project py_detector/
+horus run py_detector/
 
 # Terminal 3: Rust controller
-horus run --project rust_ctrl/
+horus run rust_ctrl/
 ```
 
 All three share topics over SHM. Use `horus topic list` to see all active topics from any terminal.
@@ -24589,6 +24612,7 @@ Register a hardware driver so the `[hardware]` section of `horus.toml` can insta
 // simplified
 use horus::prelude::*;
 use horus::hardware::NodeParams;
+use horus::register_driver;  // not in the prelude — import it explicitly
 
 register_driver!(MyDriver, MyDriver::from_params);
 ```
@@ -24601,6 +24625,7 @@ The first argument is the driver type. The second is a factory function with sig
 // simplified
 use horus::prelude::*;
 use horus::hardware::NodeParams;
+use horus::register_driver;  // not in the prelude — import it explicitly
 
 struct LidarDriver {
     port: String,
@@ -24641,9 +24666,10 @@ And in `main.rs`:
 ```rust
 // simplified
 fn main() -> Result<()> {
+    // hardware::load() returns Vec<(String, Box<dyn Node>)> — destructure the tuple.
     let nodes = hardware::load()?;
     let mut sched = Scheduler::new().tick_rate(100_u64.hz());
-    for node in nodes {
+    for (_name, node) in nodes {
         sched.add(node).build()?;
     }
     sched.run()?;
@@ -27194,21 +27220,23 @@ import horus
 import numpy as np
 
 # Subscribe to camera images
-topic = horus.Topic("camera.rgb", horus.Image)
+# Topic(msg_type, capacity=None, endpoint=None) — the type comes first; the
+# channel name is passed as endpoint (the 2nd positional is an int capacity).
+topic = horus.Topic(horus.Image, endpoint="camera.rgb")
 img = topic.recv()
 if img is not None:
     print(f"{img.width}x{img.height}, encoding: {img.encoding}")
     arr = img.to_numpy()  # Zero-copy NumPy view
 
 # Subscribe to point clouds
-pc_topic = horus.Topic("lidar.points", horus.PointCloud)
+pc_topic = horus.Topic(horus.PointCloud, endpoint="lidar.points")
 pc = pc_topic.recv()
 if pc is not None:
     points = pc.to_numpy()  # (N, fields) NumPy array
-    print(f"{pc.num_points} points")
+    print(f"{pc.point_count} points")
 
 # Subscribe to depth images
-depth_topic = horus.Topic("camera.depth", horus.DepthImage)
+depth_topic = horus.Topic(horus.DepthImage, endpoint="camera.depth")
 depth = depth_topic.recv()
 if depth is not None:
     depth_arr = depth.to_numpy()  # (H, W) NumPy array
@@ -35514,9 +35542,9 @@ topic.send(msg);
 
 ```python
 # Python side: receive and parse
-topic = Topic(GenericMessage, "external.detections")
-msg = topic.recv()
-data = msg.to_dict()  # {"class": "box", "confidence": 0.95, ...}
+# A bare-string topic carries a generic MessagePack dict.
+topic = Topic("external.detections")
+data = topic.recv()  # plain dict (already deserialized) or None: {"class": "box", ...}
 ```
 
 ## When to Use
@@ -35633,16 +35661,20 @@ topic.send(msg);
 # Python receiver
 import horus
 
-topic = horus.Topic(horus.GenericMessage, endpoint="controller.params")
+# A bare-string topic carries a generic MessagePack dict. On the Python side
+# recv() returns a plain dict directly (already deserialized) — there is no
+# GenericMessage wrapper class and no .to_dict() call.
+topic = horus.Topic("controller.params")
 
-msg = topic.recv()
-if msg is not None:
-    params = msg.to_dict()  # Deserializes MessagePack
+params = topic.recv()
+if params is not None:
     print(f"PID gains: kp={params['kp']}, ki={params['ki']}, kd={params['kd']}")
-
-    if msg.metadata == "pid_gains":
-        controller.update_gains(**params)
+    controller.update_gains(**params)
 ```
+
+The Rust sender's `metadata` label is not surfaced on the Python side — a generic
+topic yields only the payload dict. Put any dispatch key (e.g. `"kind": "pid_gains"`)
+inside the dict itself if the Python receiver needs to branch on it.
 
 ### With Metadata Tagging
 
@@ -45869,15 +45901,17 @@ plan.add_waypoint(3.0, 0.0, 0.0)
 plan.add_waypoint(3.0, 4.0, 1.57)
 ```
 
-### `.from_waypoints(waypoints, goal)` — Build from Array
+### `.from_waypoints(waypoints, goal_x, goal_y, goal_theta)` — Build from Array
 
 ```python
 # simplified
 plan = PathPlan.from_waypoints(
     waypoints=[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [3.0, 4.0, 1.57]],
-    goal=[3.0, 4.0, 1.57],
+    goal_x=3.0, goal_y=4.0, goal_theta=1.57,
 )
 ```
+
+The goal pose is passed as three scalars (`goal_x`, `goal_y`, `goal_theta`), not a list.
 
 ### `.is_empty()` — Check if Empty
 
@@ -45967,7 +46001,7 @@ def detect_tick(node):
 
 detector = horus.Node(
     name="yolo",
-    subs=[horus.Image],
+    subs={"camera.rgb": horus.Image},
     pubs=["detections"],
     tick=detect_tick,
     rate=30,
@@ -46085,7 +46119,7 @@ def inference_tick(node):
 
 node = horus.Node(
     name="onnx_detector",
-    subs=[horus.Image],
+    subs={"camera.rgb": horus.Image},
     pubs=["detections"],
     tick=inference_tick,
     rate=30,
@@ -46121,7 +46155,7 @@ def classify_tick(node):
 
 node = horus.Node(
     name="hf_classifier",
-    subs=[horus.Image],
+    subs={"camera.rgb": horus.Image},
     pubs=["classification"],
     tick=classify_tick,
     rate=10,
@@ -46206,8 +46240,11 @@ T = horus.Tensor.from_numpy(np.array([
 # 6x6 Jacobian
 J = horus.Tensor.from_numpy(np.zeros((6, 6), dtype=np.float64))
 
-# Share matrices between nodes via topics
-topic = horus.Topic("jacobian")
+# Share matrices between nodes via topics.
+# A Tensor must travel on a TYPED topic — a bare-string ("jacobian") topic is a
+# generic dict channel and cannot serialize a Tensor. Pass the type and route it
+# with endpoint=; both nodes using the same endpoint share the "jacobian" channel.
+topic = horus.Topic(horus.Tensor, endpoint="jacobian")
 topic.send(J)
 
 # Receive and use
@@ -46247,7 +46284,8 @@ roi = t[100:200, 200:400, :]
 
 # Arithmetic
 scaled = t * 0.5
-normalized = (t - t.mean()) / t.std()
+# Tensor has .mean() but no .std() — take std via the NumPy view
+normalized = (t - t.mean()) / float(t.numpy().std())
 ```
 
 ---
@@ -46264,15 +46302,16 @@ import numpy as np
 
 model = torch.jit.load("policy.pt").cuda().eval()
 
-# Collect observations from N environments
-env_topics = [horus.Topic(f"env.{i}.obs") for i in range(16)]
+# Collect observations from N environments.
+# Tensors need typed topics — route each with a distinct endpoint.
+env_topics = [horus.Topic(horus.Tensor, endpoint=f"env.{i}.obs") for i in range(16)]
 
 def batch_tick(node):
     observations = []
     for topic in env_topics:
         obs = topic.recv()
         if obs is not None:
-            observations.append(obs.to_numpy())
+            observations.append(obs.numpy())
 
     if len(observations) < 16:
         return  # wait for all envs
@@ -46284,9 +46323,9 @@ def batch_tick(node):
     with torch.no_grad():
         actions = model(batch_tensor).cpu().numpy()
 
-    # Send actions back to each environment
+    # Send actions back to each environment (typed Tensor topics)
     for i, action in enumerate(actions):
-        action_topic = horus.Topic(f"env.{i}.action")
+        action_topic = horus.Topic(horus.Tensor, endpoint=f"env.{i}.action")
         action_topic.send(horus.Tensor.from_numpy(action))
 
 node = horus.Node(
@@ -46399,7 +46438,7 @@ def detect_tick(node):
 
 node = horus.Node(
     name="jetson_detector",
-    subs=[horus.Image],
+    subs={"camera.rgb": horus.Image},
     pubs=["detections"],
     tick=detect_tick,
     init=init_model,
@@ -47553,7 +47592,7 @@ controller = horus.Node(
     tick=controller_tick,
     rate=30
 )
-logger = horus.Node(name="logger", subs=["cmd_vel"], tick=logger_tick, rate=10)
+logger = horus.Node(name="logger", subs={"cmd_vel": {"type": horus.CmdVel}}, tick=logger_tick, rate=10)
 
 # Quick run — no scheduler needed
 horus.run(sensor, controller, logger, duration=10.0)
@@ -50231,9 +50270,12 @@ Raised when looking up a topic, node, or transform frame that doesn't exist.
 # simplified
 import horus
 
+tf = horus.TransformFrame()
+tf.register_frame("base_link")  # register the root frame first — HORUS has no auto-root
+
 try:
-    tf = horus.TransformFrame()
-    result = tf.lookup("base_link", "nonexistent_frame")
+    # "nonexistent_frame" was never registered
+    result = tf.tf("base_link", "nonexistent_frame")
 except horus.HorusNotFoundError as e:
     print(f"Frame not found: {e}")
 ```
@@ -50251,9 +50293,16 @@ Raised when a transform lookup fails due to stale data, extrapolation, or discon
 # simplified
 import horus
 
+tf = horus.TransformFrame()
+tf.register_frame("world")
+tf.register_frame("base_link", "world")
+tf.register_frame("camera", "base_link")
+tf.update_transform("camera", horus.Transform())  # broadcast at 'now'
+
 try:
-    tf = horus.TransformFrame()
-    result = tf.lookup("base_link", "camera", timestamp=horus.timestamp_ns())
+    # Strict lookup 5s in the past — outside the buffer window, so it extrapolates
+    stale_ts = horus.timestamp_ns() - 5_000_000_000
+    result = tf.tf_at_strict("base_link", "camera", stale_ts)
 except horus.HorusTransformError as e:
     print(f"Transform error: {e}")
     # Fall back to last known transform or skip this tick
@@ -50270,10 +50319,15 @@ Raised when a blocking operation exceeds its timeout.
 
 ```python
 # simplified
+import horus
+
+tf = horus.TransformFrame()
+tf.register_frame("world")
+tf.register_frame("base_link", "world")
+
 try:
-    tf = horus.TransformFrame()
-    # Wait up to 1 second for transform to become available
-    result = tf.lookup_with_timeout("base_link", "gripper", timeout_ms=1000)
+    # 'gripper' is never broadcast — wait up to 1 second, then time out
+    result = tf.wait_for_transform("base_link", "gripper", timeout_sec=1.0)
 except horus.HorusTimeoutError:
     print("Transform not available within 1 second")
 ```
@@ -50319,7 +50373,7 @@ for name, obj in entries:
 # simplified
 def tick(node):
     try:
-        transform = tf.lookup("base_link", "camera")
+        transform = tf.tf("base_link", "camera")
         process_with_transform(transform)
     except horus.HorusTransformError:
         # Use identity transform as fallback
@@ -50789,23 +50843,30 @@ Stereo camera pair calibration with depth-to-disparity conversion.
 
 ```python
 # simplified
-stereo = StereoInfo(baseline=0.12, fx=525.0)
+from horus import CameraInfo, StereoInfo
+
+# Both cameras share intrinsics here; the LEFT camera's fx drives the depth math.
+cam = CameraInfo(width=640, height=480, fx=525.0, fy=525.0, cx=320.0, cy=240.0)
+stereo = StereoInfo(left_camera=cam, right_camera=cam, baseline=0.12)  # 12cm baseline
 ```
 
 ### Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `left_camera` | `CameraInfo` | Left camera intrinsics — its `fx` is used for depth/disparity conversion |
+| `right_camera` | `CameraInfo` | Right camera intrinsics |
 | `baseline` | `float` | Distance between camera centers in meters |
-| `fx` | `float` | Horizontal focal length in pixels |
+| `depth_scale` | `float` | Scale factor applied to computed depth (default `1.0`) |
 
 ### `.depth_from_disparity(disparity)` — Convert Disparity to Depth
 
 ```python
 # simplified
-stereo = StereoInfo(baseline=0.12, fx=525.0)  # 12cm between cameras
-depth = stereo.depth_from_disparity(disparity=30.0)
-# depth = baseline * fx / disparity
+cam = CameraInfo(width=640, height=480, fx=525.0, fy=525.0, cx=320.0, cy=240.0)
+stereo = StereoInfo(left_camera=cam, right_camera=cam, baseline=0.12)  # 12cm between cameras
+depth = stereo.depth_from_disparity(disparity=30.0)  # 0.12 * 525 / 30 = 2.1 m
+# depth = baseline * fx / disparity  (fx taken from the left camera)
 ```
 
 The fundamental stereo vision equation: Z = B * f / d. Given disparity (pixel offset between left and right images), compute real-world depth. Larger baseline = better depth accuracy at long range.
@@ -50824,9 +50885,10 @@ The inverse — useful for setting depth range limits in stereo matching algorit
 
 ```python
 # simplified
-from horus import StereoInfo
+from horus import CameraInfo, StereoInfo
 
-stereo = StereoInfo(baseline=0.12, fx=525.0)
+cam = CameraInfo(width=640, height=480, fx=525.0, fy=525.0, cx=320.0, cy=240.0)
+stereo = StereoInfo(left_camera=cam, right_camera=cam, baseline=0.12)
 
 # What disparity range corresponds to 0.5m - 10m depth?
 near_disp = stereo.disparity_from_depth(0.5)   # ~126 pixels
@@ -50846,7 +50908,7 @@ print(f"Search range: {far_disp:.0f} - {near_disp:.0f} pixels")
 
 **Why does `CameraInfo` store focal length in pixels, not millimeters?** Pixel-based focal lengths are what you need for the pinhole camera model: `pixel_x = fx * X/Z + cx`. Millimeter focal lengths require an additional conversion using sensor pixel size. Since calibration tools (OpenCV, ROS camera_calibration) output pixel-based values, storing them directly avoids a conversion step and a potential source of error.
 
-**Why does `StereoInfo` take `baseline` in meters?** The stereo depth equation is `Z = baseline * fx / disparity`. Baseline must be in the same units as the desired depth output. Since horus uses meters for all spatial measurements, baseline is in meters. If your stereo camera spec lists baseline in centimeters or millimeters, convert before construction.
+**Why does `StereoInfo` take `baseline` in meters?** The stereo depth equation is `Z = baseline * fx / disparity`, where `fx` comes from the `left_camera` intrinsics you pass in. Baseline must be in the same units as the desired depth output. Since horus uses meters for all spatial measurements, baseline is in meters. If your stereo camera spec lists baseline in centimeters or millimeters, convert before construction.
 
 ---
 
@@ -53888,12 +53950,12 @@ horus.run(sensor, logger)
 
 - Primitive types: `int`, `float`, `str`, `bool`, `None`
 - Collections: `list`, `dict` (nested)
-- Bytes: `bytes`, `bytearray`
 
 ### What dict topics do not support
 
 - Custom class instances (unless you convert to dict first)
 - NumPy arrays (convert with `.tolist()` first)
+- Raw `bytes` / `bytearray` (encode as a list of ints or a base64 string first)
 - Payloads larger than 4KB (use pool-backed types instead)
 
 ### When to use dict topics
@@ -53983,7 +54045,6 @@ node.send("my_velocity", horus.CmdVel(linear=1.0, angular=0.0))
 | **Typed (Pod)** | ~1.5us | ~650K msgs/sec | Fixed-size struct | None (zero-copy) |
 | **Dict (GenericMessage)** | ~5-50us | ~20-200K msgs/sec | 4KB | MessagePack |
 | **Pool-backed (Image, Tensor)** | ~3-5us | ~300K descriptors/sec | Unlimited (pool) | Descriptor only (64-168B) |
-| **Custom Runtime** | ~20-40us | ~25K msgs/sec | Fixed-size struct | Python `struct` module |
 | **Custom Compiled** | ~3-5us | ~200K msgs/sec | Fixed-size struct | None (zero-copy) |
 
 Dict latency varies with payload size: a 50-byte dict serializes in ~5us; a 3KB dict takes ~50us.
@@ -54168,33 +54229,26 @@ node.send("state", {
 
 When built-in types don't fit your data model, create custom messages.
 
-### Runtime messages (no build step)
+### Without a build step: dict topics
 
-Use `horus.msggen` to define custom binary-serialized messages at runtime:
+HORUS has no runtime custom-message compiler -- there is no way to mint a new binary Pod type without a build. When you need custom fields and want to skip the build entirely, send a plain dict over a dict topic (see the **Dict Topics (GenericMessage)** section above). No code generation, no registration, instant iteration:
 
 ```python
 # simplified
-from horus.msggen import define_message
+# Custom fields as a dict — no build step, no type registration
+node.send("robot.status", {
+    "battery_level": 85.0,
+    "error_code": 0,
+    "is_active": True,
+    "motor_temp": 42.3,
+})
 
-# Define a custom message type
-RobotStatus = define_message('RobotStatus', 'robot.status', [
-    ('battery_level', 'f32'),
-    ('error_code', 'i32'),
-    ('is_active', 'bool'),
-    ('motor_temp', 'f32'),
-])
-
-# Create, serialize, send
-status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, motor_temp=42.3)
-node.send("robot.status", status.to_bytes())
-
-# Receive, deserialize
-raw = node.recv("robot.status")
-status = RobotStatus.from_bytes(raw)
-print(status.battery_level)  # 85.0
+# Receive — comes back as a dict
+status = node.recv("robot.status")
+print(status["battery_level"])  # 85.0
 ```
 
-Runtime messages use Python's `struct` module for fixed-layout binary serialization. They support only primitive types (`f32`, `f64`, `i32`, `u64`, `bool`, etc.) -- no nested objects or variable-length arrays.
+Dict topics accept only MessagePack-serializable values -- primitives, lists, and nested dicts, with a 4KB payload cap. For a fixed schema with zero-copy performance, compile a Pod message instead (below).
 
 ### Compiled messages (production)
 
@@ -54305,8 +54359,11 @@ def robot_tick(node):
 
 robot = horus.Node(
     name="robot_brain",
-    subs=[horus.Imu, horus.Image, "config"],
-    pubs=[horus.CmdVel, "detections", "nav.costmap"],
+    # Imu auto-derives the "imu" topic; bind Image to "camera.rgb" and the
+    # Tensor costmap to "nav.costmap" so the typed topics match the tick's
+    # recv/send names. "config" is a bare-string (dict) topic.
+    subs=[horus.Imu, horus.Sub("camera.rgb", horus.Image), "config"],
+    pubs=[horus.CmdVel, "detections", horus.Pub("nav.costmap", horus.Tensor)],
     tick=robot_tick,
     rate=30,
 )
@@ -54334,7 +54391,6 @@ horus.run(robot)
 | **Dict topics** | Any Python dict; no schema; evolve freely | Serialization overhead (~5-50us); no type checking; 4KB limit |
 | **Typed topics** | Zero-copy (~1.5us); type safety; cross-language compatible | Fixed schema; only primitive fields; must use built-in or compiled types |
 | **Pool-backed types** | Zero-copy for megabytes of data; NumPy/PyTorch interop | One copy on `from_numpy()`; pool slot management; descriptors add indirection |
-| **Custom runtime messages** | No build step; instant iteration | Slower (~20-40us); primitive types only; manual `to_bytes()`/`from_bytes()` |
 | **Custom compiled messages** | Same performance as built-in types; cross-language | Requires `maturin develop` build step; primitive types only |
 | **GenericMessage inline buffer** | No heap allocation for small messages (256B or less) | 4KB maximum; overflow to heap above 256B |
 
@@ -54829,12 +54885,17 @@ Raised when a blocking operation exceeds its deadline. The error message include
 
 ```python
 # simplified
-from horus import HorusTimeoutError
+from horus import TransformFrame, HorusTimeoutError
+
+tf = TransformFrame()
 
 try:
-    data = node.recv("lidar.scan", timeout=0.5)
+    # A blocking wait with a deadline — raises HorusTimeoutError if it expires.
+    # (node.recv() is non-blocking: it returns None when no message is ready,
+    # so it never raises a timeout.)
+    transform = tf.wait_for_transform("base_link", "lidar_link", timeout_sec=0.5)
 except HorusTimeoutError:
-    node.log_warning("LiDAR scan not received within 500ms")
+    node.log_warning("Transform base_link->lidar_link not available within 500ms")
 ```
 
 ### Standard Python Exceptions
@@ -57487,30 +57548,36 @@ def diagnostics_tick(node):
 - **Unsupported:** Custom classes, lambdas, sockets, file handles
 - **Cross-language:** GenericMessage does NOT cross to Rust nodes
 
-For structured data that crosses to Rust, use typed messages or custom messages:
+For structured data that crosses to Rust, define a custom message and build it once, then send instances over a typed topic:
 
 ```python
 # simplified
-from horus.msggen import define_message
+import horus
+from horus.msggen import register_message, build_messages
 
-RobotDiagnostics = define_message("RobotDiagnostics", "diagnostics", [
+register_message("RobotDiagnostics", "diagnostics", [
     ("cpu_temp", "f32"),
     ("battery_pct", "f32"),
     ("error_code", "i32"),
     ("uptime_sec", "f64"),
 ])
+build_messages()  # one-time compile
+
+from horus import RobotDiagnostics
 
 def diagnostics_tick(node):
-    diag = RobotDiagnostics(
+    node.send("diagnostics", RobotDiagnostics(
         cpu_temp=65.0,
         battery_pct=85.0,
         error_code=0,
         uptime_sec=horus.elapsed(),
-    )
-    node.send("diagnostics", diag.to_bytes())
+    ))
+
+# Declare the typed message on the node so the topic is typed end-to-end
+node = horus.Node("diag", pubs={"diagnostics": RobotDiagnostics}, tick=diagnostics_tick, rate=1)
 ```
 
-See [Custom Messages](/python/api/custom-messages) for runtime vs compiled message details.
+See [Custom Messages](/python/api/custom-messages) for the full define → build → use workflow.
 
 ---
 
@@ -61548,19 +61615,26 @@ How to get your Python HORUS nodes running on a real robot.
 
 ---
 
-## Virtual Environments
+## Dependencies & Environments
 
-`horus run` manages Python virtual environments automatically via `.horus/`:
+`horus run` resolves your Python dependencies automatically. It does **not** create a virtualenv — instead it generates `.horus/pyproject.toml` from your `horus.toml` and installs any declared PyPI dependencies with `pip`:
 
 ```bash
-# First run creates .horus/venv and installs dependencies from horus.toml
+# Generates .horus/pyproject.toml and resolves declared PyPI deps via pip,
+# then launches your node. No .horus/venv is created.
 horus run src/main.py
-
-# Dependencies declared in horus.toml [dependencies] with source = "pypi"
-# are installed into .horus/venv automatically
 ```
 
-For manual venv management:
+```toml
+# horus.toml — declare Python deps under [dependencies] with source = "pypi"
+[dependencies]
+numpy    = { version = ">=1.24", source = "pypi" }
+pyserial = { version = ">=3.5",  source = "pypi" }
+```
+
+> `.horus/` holds generated build artifacts (including `pyproject.toml`) — never edit it by hand.
+
+If you want an isolated interpreter, manage a virtualenv yourself and run the entry file directly:
 
 ```bash
 python3 -m venv .venv
@@ -62895,7 +62969,7 @@ print(f"Sensor: {stats['total_ticks']} ticks in 5 seconds")
 
 ## Network Communication
 
-HORUS Python supports network communication for distributed multi-machine systems. Topic, and Router all work transparently over the network.
+HORUS Python supports network communication for distributed multi-machine systems. Typed topics work transparently over the network via direct UDP endpoints.
 
 ### Topic Network Endpoints
 
@@ -62910,16 +62984,11 @@ local_topic = Topic(CmdVel)
 
 # Network (UDP direct)
 network_topic = Topic(CmdVel, endpoint="cmdvel@192.168.1.100:8000")
-
-# Router (TCP broker for WAN/NAT traversal)
-router_topic = Topic(CmdVel, endpoint="cmdvel@router")
 ```
 
 **Endpoint Syntax:**
 - `"topic"` - Local shared memory (~500ns latency)
 - `"topic@host:port"` - Direct UDP (&lt;50μs latency)
-- `"topic@router"` - Router broker (auto-discovery on localhost:7777)
-- `"topic@192.168.1.100:7777"` - Router broker at specific address
 
 ### Topic Methods
 
@@ -63031,45 +63100,6 @@ topic = Topic("cmd_vel", CmdVel)
 
 An intra-process heap ring would not beat SHM across cores: the ~220 ns is hardware cache-coherence, not transport overhead. The fastest realistic route is co-locating the producer and consumer on one executor thread.
 
-### Router Client (WAN/NAT Traversal)
-
-For communication across networks, through NAT, or for large-scale deployments, use the Router:
-
-```python
-# simplified
-from horus import RouterClient, Topic, CmdVel
-
-# Create router client for explicit connection management
-router = RouterClient("192.168.1.100", 7777)
-
-# Build endpoints through the router
-cmd_endpoint = router.endpoint("cmdvel")  # Returns "cmdvel@192.168.1.100:7777"
-pose_endpoint = router.endpoint("pose")
-
-# Use endpoints with Topic
-topic = Topic(CmdVel, endpoint=cmd_endpoint)
-
-# Router properties
-print(f"Address: {router.address}")        # "192.168.1.100:7777"
-print(f"Connected: {router.is_connected}") # True
-print(f"Topics: {router.topics}")          # ["cmdvel", "pose"]
-print(f"Uptime: {router.uptime_seconds}s")
-```
-
-**Router Server (for testing):**
-
-```python
-# simplified
-from horus import RouterServer
-
-# Start a local router (for development/testing)
-server = RouterServer(port=7777)
-server.start()
-
-# For production, use CLI instead:
-# $ horus router start --port 7777
-```
-
 ### When to Use What
 
 | Transport | Latency (one-way) | Use Case |
@@ -63077,7 +63107,6 @@ server.start()
 | Same-thread (`Topic(CmdVel)`, pub+sub co-located) | ~12-19ns | Pub and sub on one executor thread (fastest, SHM) |
 | Cross-thread or cross-process (`Topic(CmdVel)`) | ~220ns | Same machine, different core (automatic, SHM) |
 | Network (`endpoint="topic@host:port"`) | &lt;50μs | Multi-machine on LAN (direct UDP) |
-| Router (`endpoint="topic@router"`) | 10-50ms | WAN, NAT traversal, cloud deployments |
 
 ### Multi-Machine Example
 
@@ -63418,15 +63447,15 @@ pip install pytest
 pytest tests/
 
 # Run specific feature tests
-horus run tests/test_rate_control.py    # Phase 1: Per-node rates
-horus run tests/test_timestamps.py      # Phase 2: Timestamps
-horus run tests/test_typed_messages.py  # Phase 3: Typed messages
+pytest tests/test_rate_control.py       # Per-node rate control
+pytest tests/test_timestamps.py         # Message timestamps
+pytest tests/test_topic_resolution.py   # Typed message routing
 
 # With coverage
 pytest --cov=horus tests/
 
-# Test multiprocess execution (Phase 4)
-horus run tests/multiprocess_publisher.py tests/multiprocess_subscriber.py
+# End-to-end multiprocess workflow
+pytest tests/test_e2e_workflow.py
 ```
 
 ### Mock Mode
@@ -64464,45 +64493,44 @@ Description: Create your own typed messages in Python without writing Rust
 
 # Custom Messages (horus.msggen)
 
-The `horus.msggen` module lets you define **custom typed messages** directly in Python. Two approaches are available:
+The `horus.msggen` module lets you define **custom typed messages** directly in Python — no hand-written Rust required. You describe the fields in Python, run a one-time build step, and the messages become native zero-copy types (~3-5μs) importable from `horus` exactly like the built-in messages.
 
-| Approach | Build Step | Latency | Best For |
-|----------|-----------|---------|----------|
-| **Runtime Messages** | None | ~20-40μs | Prototyping, quick iteration |
-| **Compiled Messages** | `maturin develop` | ~3-5μs | Production, high-frequency |
+The workflow is always the same:
+
+1. **Define** the message with `register_message(name, topic, fields)`
+2. **Build** it once with `build_messages()` — this generates Rust code and runs `maturin develop`
+3. **Use** it — `from horus import YourMessage`, then send it over a typed `Topic`
 
 ---
 
-## Runtime Messages (No Build Step)
+## Defining a Message
 
-Create custom messages instantly without any compilation. Uses Python's `struct` module for fixed-layout binary serialization.
-
-### Basic Usage
+Describe the message name, its topic, and a list of `(field_name, type)` tuples. Fixed-size scalar fields keep the message a zero-copy Pod.
 
 ```python
 # simplified
-from horus.msggen import define_message
+from horus.msggen import register_message
 
-# Define a custom message type
-RobotStatus = define_message('RobotStatus', 'robot.status', [
+# Register a custom message type
+register_message('RobotStatus', 'robot.status', [
     ('battery_level', 'f32'),
     ('error_code', 'i32'),
     ('is_active', 'bool'),
     ('timestamp', 'u64'),
 ])
+```
 
-# Create instances
+`register_message` records the definition — it does not create a usable class by itself. Run
+`build_messages()` (shown in the next sections) to compile every registered message, then import
+the generated class from `horus` and construct instances:
+
+```python
+# simplified — after build_messages() has run
+from horus import RobotStatus
+
 status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, timestamp=0)
-
-# Access fields
 print(status.battery_level)  # 85.0
 status.error_code = 5
-
-# Serialize for IPC
-raw_bytes = status.to_bytes()  # 17 bytes
-
-# Reconstruct from bytes
-status2 = RobotStatus.from_bytes(raw_bytes)
 ```
 
 ### Supported Types
@@ -64521,96 +64549,70 @@ status2 = RobotStatus.from_bytes(raw_bytes)
 | `u64` | 8 bytes | Unsigned 64-bit int |
 | `bool` | 1 byte | Boolean |
 
-### NumPy Messages (Better Performance)
+### Sending and Receiving
 
-If NumPy is available, use `define_numpy_message` for better performance:
-
-```python
-# simplified
-from horus.msggen import define_numpy_message
-import numpy as np
-
-# NumPy-based message (uses structured arrays internally)
-SensorData = define_numpy_message('SensorData', 'sensor.data', [
-    ('x', np.float32),
-    ('y', np.float32),
-    ('z', np.float32),
-    ('temperature', np.float32),
-    ('timestamp', np.uint64),
-])
-
-# Create instance
-data = SensorData(x=1.0, y=2.0, z=3.0, temperature=25.5, timestamp=0)
-
-# Get underlying numpy structured array
-arr = data.to_numpy()
-
-# Zero-copy bytes access
-raw = data.to_bytes()
-```
-
-### With Topic (IPC)
-
-Runtime messages work with Topic for inter-process communication. Use `to_bytes()` / `from_bytes()` for serialization over generic topics:
-
-```python
-# simplified
-from horus import Topic
-from horus.msggen import define_message
-
-# Define message
-RobotStatus = define_message('RobotStatus', 'robot.status', [
-    ('battery_level', 'f32'),
-    ('error_code', 'i32'),
-])
-
-# Publisher — use generic topic with manual serialization
-pub_topic = Topic("robot.status")
-status = RobotStatus(battery_level=85.0, error_code=0)
-pub_topic.send(status.to_bytes())
-
-# Subscriber (different process)
-sub_topic = Topic("robot.status")
-raw = sub_topic.recv()
-if raw:
-    received = RobotStatus.from_bytes(raw)
-    print(received.battery_level)  # 85.0
-```
-
-Or use the Node convenience API (handles serialization automatically):
+Once built, a custom message is a typed message like any built-in type. Create a typed `Topic` for it and pass instances directly — no manual serialization:
 
 ```python
 # simplified
 import horus
-from horus.msggen import define_message
+from horus.msggen import register_message, build_messages
 
-RobotStatus = define_message('RobotStatus', 'robot.status', [
+register_message('RobotStatus', 'robot.status', [
     ('battery_level', 'f32'),
     ('error_code', 'i32'),
 ])
+build_messages()  # one-time compile; a no-op if nothing changed
+
+from horus import RobotStatus, Topic
+
+# Publisher — a typed topic carries RobotStatus instances directly
+pub_topic = Topic(RobotStatus)
+pub_topic.send(RobotStatus(battery_level=85.0, error_code=0))
+
+# Subscriber (different process) — recv() returns a typed RobotStatus (or None)
+sub_topic = Topic(RobotStatus)
+received = sub_topic.recv()
+if received:
+    print(received.battery_level)  # 85.0
+```
+
+Or use the Node convenience API:
+
+```python
+# simplified
+import horus
+from horus.msggen import register_message, build_messages
+
+register_message('RobotStatus', 'robot.status', [
+    ('battery_level', 'f32'),
+    ('error_code', 'i32'),
+])
+build_messages()  # one-time compile
+
+from horus import RobotStatus
 
 def publisher_tick(node):
-    status = RobotStatus(battery_level=85.0, error_code=0)
-    node.send("robot.status", status.to_bytes())
+    node.send("robot.status", RobotStatus(battery_level=85.0, error_code=0))
 
 def subscriber_tick(node):
     if node.has_msg("robot.status"):
-        raw = node.recv("robot.status")
-        status = RobotStatus.from_bytes(raw)
+        status = node.recv("robot.status")
         print(status.battery_level)  # 85.0
 
-pub = horus.Node("publisher", pubs="robot.status", tick=publisher_tick)
-sub = horus.Node("subscriber", subs="robot.status", tick=subscriber_tick)
+# Declare the typed message on pubs/subs so the topic is typed end-to-end
+pub = horus.Node("publisher", pubs={"robot.status": RobotStatus}, tick=publisher_tick)
+sub = horus.Node("subscriber", subs={"robot.status": RobotStatus}, tick=subscriber_tick)
 horus.run(pub, sub, duration=3)
 ```
 
 ---
 
-## Compiled Messages (Production)
+## Registering Multiple Messages
 
-For maximum performance (~3-5μs), compile your messages to Rust. This generates PyO3 bindings with the same zero-copy performance as built-in types.
+You can register several messages before building — `build_messages()` compiles them all in one pass. Here is the full register → build → use cycle end to end. Generated messages are PyO3 types with the same zero-copy performance (~3-5μs) as the built-in messages.
 
-### Step 1: Define Messages
+### Step 1: Register Messages
 
 ```python
 # simplified
@@ -64727,56 +64729,13 @@ build_messages(force=True)
 | Approach | Latency | Throughput | Use Case |
 |----------|---------|------------|----------|
 | **Built-in (Rust)** | ~3μs | 300K msgs/sec | CmdVel, Pose2D, etc. |
-| **Compiled Custom** | ~3-5μs | 200K msgs/sec | Production custom types |
-| **Runtime** | ~20-40μs | 25K msgs/sec | Prototyping |
-| **Runtime (NumPy)** | ~15-30μs | 35K msgs/sec | NumPy integration |
-| **Pickle** | ~50-100μs | 10K msgs/sec | Legacy/dynamic types |
+| **Compiled Custom** | ~3-5μs | 200K msgs/sec | Custom typed messages |
 
-**Recommendation**: Start with runtime messages for fast iteration, then compile for production.
+**Recommendation**: For a quick, schema-free prototype, send a plain `dict` over a generic topic. When you need a stable typed contract — especially one shared with Rust nodes — define a custom message and build it.
 
 ---
 
 ## API Reference
-
-### define_message
-
-```python
-# simplified
-def define_message(
-    name: str,
-    topic: str,
-    fields: List[Tuple[str, str]]
-) -> Type[RuntimeMessage]
-```
-
-Create a runtime message class.
-
-**Parameters:**
-- `name`: Class name (e.g., `"RobotStatus"`)
-- `topic`: Topic name (e.g., `"robot.status"`)
-- `fields`: List of `(field_name, type_string)` tuples
-
-**Returns:** New message class
-
-### define_numpy_message
-
-```python
-# simplified
-def define_numpy_message(
-    name: str,
-    topic: str,
-    fields: List[Tuple[str, Any]]
-) -> Type[NumpyMessage]
-```
-
-Create a NumPy-based message class.
-
-**Parameters:**
-- `name`: Class name
-- `topic`: Topic name
-- `fields`: List of `(field_name, numpy_dtype)` tuples
-
-**Returns:** New NumPy message class
 
 ### register_message
 
@@ -64785,11 +64744,19 @@ Create a NumPy-based message class.
 def register_message(
     name: str,
     topic: str,
-    fields: List[Tuple[str, str]]
+    fields: List[Tuple[str, str]],
+    doc: Optional[str] = None,
 ) -> None
 ```
 
-Register a message for compiled generation.
+Register a message for generation. Call `build_messages()` afterwards to compile every registered
+message.
+
+**Parameters:**
+- `name`: Class name (e.g., `"RobotStatus"`)
+- `topic`: Topic name (e.g., `"robot.status"`)
+- `fields`: List of `(field_name, type_string)` tuples
+- `doc`: Optional docstring for the generated type
 
 ### build_messages
 
@@ -64825,18 +64792,21 @@ Check if registered messages differ from last build.
 ```python
 # simplified
 #!/usr/bin/env python3
-"""Custom message example with runtime messages."""
+"""Custom message example."""
 
 import horus
-from horus.msggen import define_message
+from horus.msggen import register_message, build_messages
 
-# Define custom sensor message
-MySensor = define_message('MySensor', 'my.sensor', [
+# Define and build a custom sensor message (build is a no-op once compiled)
+register_message('MySensor', 'my.sensor', [
     ('distance', 'f32'),
     ('angle', 'f32'),
     ('confidence', 'f32'),
     ('object_id', 'u32'),
 ])
+build_messages()
+
+from horus import MySensor
 
 def sensor_tick(node):
     """Publish sensor readings."""
@@ -64844,20 +64814,19 @@ def sensor_tick(node):
         distance=2.5,
         angle=0.785,
         confidence=0.95,
-        object_id=42
+        object_id=42,
     )
-    node.send("my.sensor", reading.to_bytes())
+    node.send("my.sensor", reading)
 
 def processor_tick(node):
     """Process sensor readings."""
     if node.has_msg("my.sensor"):
-        raw = node.recv("my.sensor")
-        reading = MySensor.from_bytes(raw)
+        reading = node.recv("my.sensor")
         print(f"Object {reading.object_id}: {reading.distance}m at {reading.angle}rad")
 
-# Create nodes
-sensor = horus.Node("sensor", pubs="my.sensor", tick=sensor_tick, rate=10)
-processor = horus.Node("processor", subs="my.sensor", tick=processor_tick)
+# Create nodes — declare the typed message so the topic is typed end-to-end
+sensor = horus.Node("sensor", pubs={"my.sensor": MySensor}, tick=sensor_tick, rate=10)
+processor = horus.Node("processor", subs={"my.sensor": MySensor}, tick=processor_tick)
 
 # Run
 horus.run(sensor, processor, duration=3)
@@ -64867,17 +64836,16 @@ horus.run(sensor, processor, duration=3)
 
 ## When to Use Each Approach
 
-### Use Runtime Messages When:
-- Prototyping new message types
-- Message schema changes frequently
-- You don't want to wait for compilation
-- Performance requirements are moderate (&lt;50Hz)
+### Use Custom Messages When:
+- You need a stable, typed contract for your own data
+- Cross-language compatibility with Rust nodes is required
+- Type safety and zero-copy performance (~3-5μs) matter
+- The schema is stable enough to compile once
 
-### Use Compiled Messages When:
-- Deploying to production
-- High-frequency data (>100Hz)
-- Cross-language compatibility required
-- Type safety is critical
+### Use a Generic dict When:
+- Prototyping and the schema changes frequently
+- The data stays inside Python (does not cross to Rust)
+- You want to skip the build step entirely
 
 ### Use Built-in Messages When:
 - Standard robotics types (CmdVel, Pose2D, LaserScan)
@@ -64886,11 +64854,9 @@ horus.run(sensor, processor, duration=3)
 
 ## Design Decisions
 
-**Why two approaches (runtime vs compiled) instead of one?** Development speed and runtime speed are inversely correlated. Runtime messages need no build step and let you iterate on message schemas in seconds -- ideal for prototyping. Compiled messages take longer to build but achieve near-native performance -- essential for production. The two-path design matches the typical robotics workflow: prototype fast, then optimize for deployment.
+**Why require a build step at all?** Zero-copy IPC needs a fixed-size Pod layout known at compile time. Generating and compiling native PyO3 types is what lets a custom message be sent with the same performance and cross-language compatibility as a built-in type. For schema-free data that never leaves Python, send a plain `dict` over a generic topic instead — no build required.
 
-**Why `struct` module for runtime messages instead of pickle?** `struct` produces a fixed-size binary layout that is deterministic and cross-process compatible. Pickle produces variable-length output, is version-sensitive, and has security implications (arbitrary code execution on deserialization). The tradeoff is that `struct` only supports primitive types (no nested objects), but this matches the fixed-size Pod constraint of zero-copy IPC.
-
-**Why YAML schema support?** Teams need a shared source of truth for message definitions that is language-agnostic and version-controllable. YAML schemas serve as the canonical definition that generates both Python runtime classes and Rust compiled types, ensuring cross-language compatibility.
+**Why YAML schema support?** Teams need a shared source of truth for message definitions that is language-agnostic and version-controllable. YAML schemas serve as the canonical definition that generates the message types used from both Python and Rust nodes, ensuring cross-language compatibility.
 
 **Why generate Rust code for compiled messages instead of a Python-only binary format?** Generated Rust code produces the same Pod types used by the standard library, so compiled custom messages get identical zero-copy IPC performance and are binary-compatible with Rust nodes. A Python-only approach would sacrifice cross-language support.
 
@@ -65372,8 +65338,8 @@ import horus
 from horus import Image, Detection, DetectionList, BoundingBox2D, Topic
 
 model = load_yolo("model.pt")
-sub_image = Topic(Image, "camera.rgb")
-pub_detections = Topic(DetectionList, "detections")
+sub_image = Topic(Image, endpoint="camera.rgb")
+pub_detections = Topic(DetectionList, endpoint="detections")
 
 def detector_tick(node):
     img = sub_image.recv()
@@ -65383,14 +65349,12 @@ def detector_tick(node):
         detections = DetectionList()
         for r in results:
             det = Detection(
-                label=r.class_name,
+                class_name=r.class_name,
                 confidence=r.score,
-                bbox=BoundingBox2D(
-                    x=r.x, y=r.y,
-                    width=r.w, height=r.h,
-                ),
+                x=r.x, y=r.y,
+                width=r.w, height=r.h,
             )
-            detections.add(det)
+            detections.append(det)
 
         pub_detections.send(detections)
 
@@ -77554,7 +77518,9 @@ scheduler.run()?;
 import horus
 
 def sensor_tick(node):
-    node.send("imu", horus.Imu(accel_x=0.0, accel_y=0.0, accel_z=9.81))
+    # Imu requires all six components (gyro_* have no default).
+    node.send("imu", horus.Imu(accel_x=0.0, accel_y=0.0, accel_z=9.81,
+                               gyro_x=0.0, gyro_y=0.0, gyro_z=0.0))
 
 sensor = horus.Node(name="imu", pubs=[horus.Imu], tick=sensor_tick, rate=100)
 
@@ -88929,6 +88895,10 @@ Where `v_left` and `v_right` are the linear velocities at each wheel (m/s). To g
 name = "differential-drive"
 version = "0.1.0"
 description = "2-wheel differential drive with safe shutdown"
+
+[dependencies]
+# CmdVel, Odometry, and Pose2D live in horus-robotics (not auto-injected)
+horus-robotics = "0.2"
 ```
 
 ### src/main.rs (or src/main.py)
@@ -88969,12 +88939,13 @@ const TICKS_PER_REV: f32 = 1440.0;      // encoder resolution
 const WHEEL_CIRCUMFERENCE: f32 = 0.314;  // 2 * π * 0.05m radius
 const METERS_PER_TICK: f32 = WHEEL_CIRCUMFERENCE / TICKS_PER_REV;
 
-/// Raw encoder readings from motor driver
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct WheelEncoder {
-    left_ticks: i64,
-    right_ticks: i64,
+message! {
+    #[fixed]
+    /// Raw encoder readings from motor driver
+    WheelEncoder {
+        left_ticks: i64,
+        right_ticks: i64,
+    }
 }
 
 struct OdometryNode {
@@ -89187,36 +89158,41 @@ A real robot does not run the E-stop node alone. Below is a complete scheduler w
 ```rust
 // simplified
 use horus::prelude::*;
-use horus_robotics::prelude::*;
 
 // --- Messages (same EStopSignal and SafetyStatus as above) ---
+// Custom messages use the `message!` macro; `#[fixed]` = zero-copy POD.
+// `Twist` (prelude-native velocity command) replaces CmdVel, which lives in
+// the separate `horus_robotics` crate.
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct EStopSignal {
-    triggered: u8,
-    source: u8,
+message! {
+    #[fixed]
+    EStopSignal {
+        triggered: u8,
+        source: u8,
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct SafetyStatus {
-    estop_active: u8,
-    consecutive_clears: u32,
-    uptime_ticks: u64,
+message! {
+    #[fixed]
+    SafetyStatus {
+        estop_active: u8,
+        consecutive_clears: u32,
+        uptime_ticks: u64,
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, LogSummary)]
-#[repr(C)]
-struct WheelCmd {
-    left_rpm: f32,
-    right_rpm: f32,
+message! {
+    #[fixed]
+    WheelCmd {
+        left_rpm: f32,
+        right_rpm: f32,
+    }
 }
 
 // --- DriveNode: converts cmd_vel to wheel commands ---
 
 struct DriveNode {
-    cmd_sub: Topic<CmdVel>,
+    cmd_sub: Topic<Twist>,
     wheel_pub: Topic<WheelCmd>,
 }
 
@@ -89234,14 +89210,15 @@ impl Node for DriveNode {
 
     fn tick(&mut self) {
         if let Some(cmd) = self.cmd_sub.recv() {
-            let wheel_base = 0.3_f32;
-            let radius = 0.05_f32;
-            let to_rpm = 60.0 / (2.0 * std::f32::consts::PI);
-            let left = ((cmd.linear - cmd.angular * wheel_base / 2.0) / radius) * to_rpm;
-            let right = ((cmd.linear + cmd.angular * wheel_base / 2.0) / radius) * to_rpm;
+            // Twist stores linear/angular as [f64; 3]; use forward (x) and yaw (z).
+            let wheel_base = 0.3_f64;
+            let radius = 0.05_f64;
+            let to_rpm = 60.0 / (2.0 * std::f64::consts::PI);
+            let left = ((cmd.linear[0] - cmd.angular[2] * wheel_base / 2.0) / radius) * to_rpm;
+            let right = ((cmd.linear[0] + cmd.angular[2] * wheel_base / 2.0) / radius) * to_rpm;
             self.wheel_pub.send(WheelCmd {
-                left_rpm: left.clamp(-200.0, 200.0),
-                right_rpm: right.clamp(-200.0, 200.0),
+                left_rpm: left.clamp(-200.0, 200.0) as f32,
+                right_rpm: right.clamp(-200.0, 200.0) as f32,
             });
         }
     }
@@ -89260,7 +89237,7 @@ impl Node for DriveNode {
 // --- PlannerNode: publishes cmd_vel, checks path safety ---
 
 struct PlannerNode {
-    cmd_pub: Topic<CmdVel>,
+    cmd_pub: Topic<Twist>,
     path_clear: bool,
 }
 
@@ -89279,9 +89256,9 @@ impl Node for PlannerNode {
     fn tick(&mut self) {
         // In production, check lidar/camera for obstacles
         if self.path_clear {
-            self.cmd_pub.send(CmdVel::new(0.5, 0.0));
+            self.cmd_pub.send(Twist::new_2d(0.5, 0.0));
         } else {
-            self.cmd_pub.send(CmdVel::zero());
+            self.cmd_pub.send(Twist::stop());
         }
     }
 
@@ -89292,7 +89269,7 @@ impl Node for PlannerNode {
 
     fn enter_safe_state(&mut self) {
         self.path_clear = false;
-        self.cmd_pub.send(CmdVel::zero());
+        self.cmd_pub.send(Twist::stop());
     }
 }
 
@@ -89467,8 +89444,8 @@ mod tests {
         estop_pub.send(EStopSignal { triggered: 0, source: 0 });
 
         // Publish a velocity command
-        let cmd_pub: Topic<CmdVel> = Topic::new("cmd_vel").unwrap();
-        cmd_pub.send(CmdVel::new(1.0, 0.0));
+        let cmd_pub: Topic<Twist> = Topic::new("cmd_vel").unwrap();
+        cmd_pub.send(Twist::new_2d(1.0, 0.0));
 
         // Tick once — Drive should produce non-zero wheel output
         scheduler.tick_once();
@@ -89496,8 +89473,8 @@ mod tests {
         estop_pub.send(EStopSignal { triggered: 1, source: 1 });
 
         // Publish a velocity command — E-stop should override it
-        let cmd_pub: Topic<CmdVel> = Topic::new("cmd_vel").unwrap();
-        cmd_pub.send(CmdVel::new(1.0, 0.0));
+        let cmd_pub: Topic<Twist> = Topic::new("cmd_vel").unwrap();
+        cmd_pub.send(Twist::new_2d(1.0, 0.0));
 
         // Tick once — EStopNode overwrites cmd_vel with zero
         scheduler.tick_once();
@@ -89602,7 +89579,7 @@ The layered approach: hardware relay catches catastrophic failures (software cra
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | E-stop doesn't override motors | E-stop `.order()` lower than motor node | Set E-stop `.order()` HIGHER than motor node |
-| Motors resume after E-stop | Only sending zero once | Send `CmdVel::zero()` every tick while active |
+| Motors resume after E-stop | Only sending zero once | Send `Twist::stop()` every tick while active |
 | E-stop flickers on/off | No debounce on clear signal | Use `CLEAR_THRESHOLD` consecutive clears |
 | System continues after deadline miss | Using `Miss::Warn` instead of `Miss::SafeMode` | Set `.on_miss(Miss::SafeMode)` |
 | E-stop never releases | `CLEAR_THRESHOLD` too high or no clear signals | Verify upstream publishes clear signals |
@@ -89648,6 +89625,10 @@ You need to read an IMU sensor (accelerometer + gyroscope) at a fixed rate and p
 name = "imu-reader"
 version = "0.1.0"
 description = "100 Hz IMU sensor with orientation publishing"
+
+[dependencies]
+# The Imu message type lives in horus-robotics (not auto-injected)
+horus-robotics = "0.2"
 ```
 
 ### src/main.rs (or src/main.py)
@@ -89946,6 +89927,10 @@ You need a robot to avoid obstacles in real time using 2D LiDAR scan data withou
 name = "lidar-avoidance"
 version = "0.1.0"
 description = "Reactive obstacle avoidance from LaserScan"
+
+[dependencies]
+# LaserScan and CmdVel live in horus-robotics (not auto-injected)
+horus-robotics = "0.2"
 ```
 
 ### Complete Code
@@ -90427,6 +90412,11 @@ You need to log topic data to disk for post-run analysis without affecting the t
 name = "telemetry-logger"
 version = "0.1.0"
 description = "Non-blocking topic logger to CSV"
+
+# The Rust example defines messages with the `message!` macro, which derives
+# serde — required by typed `Topic<T>`. Not needed for the Python/C++ variants.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
 ```
 
 ### Complete Code
@@ -90518,6 +90508,8 @@ language = "rust"
 
 [dependencies]
 horus = "0.1"
+# TransformFrame + Transform live in horus-tf (not auto-injected)
+horus-tf = "0.2"
 ```
 
 ### Complete Code
@@ -90544,7 +90536,7 @@ world
 [INFO] [USER] End effector in world: (2.18, 0.57, 0.20)
 [INFO] [USER] Frame chain: end_effector -> arm_link -> base_link -> world
 ^C
-[INFO] Frame publisher shutdown — 6 total, 2 static, 4 dynamic, depth 4
+[INFO] Frame publisher shutdown — TransformFrame: 6/256 frames (2 static, 4 dynamic), 32 history entries, depth 4, 1 root(s)
 [INFO] Frame user shutdown after 500 ticks
 world
   └── base_link
@@ -95468,6 +95460,7 @@ Three separate binaries communicating over SHM.
 
 ```cpp
 #include <horus/horus.hpp>
+#include <cmath>   // std::sin
 using namespace horus::literals;
 
 class LidarDriver : public horus::Node {
