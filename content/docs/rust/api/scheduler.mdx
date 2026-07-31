@@ -406,6 +406,35 @@ pub fn max_deadline_misses(self, n: u64) -> Self
 - Requires `.watchdog()` to be enabled — without it, misses aren't tracked
 - After `n` consecutive misses, the node is isolated (stopped from ticking)
 - Lower values = more aggressive isolation, higher values = more tolerance
+- Counted for RT nodes on their executor as well as for main-loop nodes. `.rate()` is what makes a node RT, and until recently that guaranteed its misses were *not* counted, because the accounting only ran on the main loop after the class partition had moved the node away
+
+### Graduated degradation
+
+Separately from the `max_deadline_misses` ceiling, sustained deadline misses
+drive a graduated ladder with its own thresholds:
+
+| Consecutive misses | Action |
+|--------------------|--------|
+| 3 | `Warn` — logged, nothing changes |
+| 5 | `ReduceRate` — the node's rate is halved so it can keep up |
+| 10 | `Isolate` — `enter_safe_state()` is called on the node |
+| 20 | `Kill` — `shutdown()` is called and the node stops ticking |
+
+After `recovery_ticks` consecutive good ticks the ladder walks back down
+(`Deisolate`, then `RestoreRate`).
+
+<Callout type="warning">
+**This ladder was inert before and is live now.** The consecutive-miss counter
+was reset on every tick, including ticks that missed, so the 3-consecutive
+threshold could never be reached and `recovery_ticks` was unreachable
+configuration. A node that has been quietly missing its deadline will now
+actually be rate-reduced and isolated.
+
+If you see a node drop to half rate after upgrading, it was missing its
+deadline all along — check the value you passed to `.deadline()` (and note
+that `.budget()` implies one) against what the tick really costs, including
+framework overhead, on the build profile you are running.
+</Callout>
 
 **Example**
 
@@ -1099,6 +1128,19 @@ static ALLOC: horus_core::memory::rt_allocator::RtAwareAllocator
 ```
 
 Without this line, `.no_alloc()` is a no-op — safe for prototyping.
+
+**Also requires an RT node.** Allocation checking is performed by the RT
+executor, so `.no_alloc()` on a `.compute()`, `.event()`, `.async_io()` or
+best-effort node is a **`build()` error**, not a silently ignored flag — you
+cannot be told a tick was checked when it was not. Add `.rate()`, `.budget()`
+or `.deadline()`, or drop `.no_alloc()`.
+
+Enforcement starts on the node's **second** tick, so one-time lazy
+initialisation (a `Topic`'s shared-memory backend on first `recv`/`send`) may
+allocate. Allocation-freedom is a steady-state guarantee.
+
+In `.deterministic()` mode no executor threads are spawned and every node runs
+on the main loop — `.no_alloc()` is enforced there too.
 
 **Example**
 

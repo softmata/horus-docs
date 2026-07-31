@@ -1,6 +1,6 @@
 # HORUS Documentation (Full)
 
-Generated: 2026-07-19T08:16:30.648Z
+Generated: 2026-07-31T19:36:49.954Z
 Pages: 278
 Source: https://docs.horusrobotics.dev
 Condensed overview: https://docs.horusrobotics.dev/llms.txt
@@ -10256,7 +10256,7 @@ scheduler.add(motor_ctrl)
 **Interaction rules:**
 - `.deadline_scheduler()` requires `.rate()` and `.budget()` — these provide the kernel parameters (period = 1/rate, runtime = budget)
 - `.deadline_scheduler()` + `.priority()` — priority is used as SCHED_FIFO fallback if SCHED_DEADLINE fails
-- `.no_alloc()` works with any execution class but is most useful for RT nodes
+- `.no_alloc()` **requires an RT node** — `.rate()`, `.budget()` or `.deadline()`. Allocation checking is performed only by the RT executor, so `.compute().no_alloc()` is rejected at `build()` rather than silently ignored
 - `.core()` now automatically locks CPU governor to `performance` and moves IRQs off that core
 - Without root/CAP_SYS_NICE, `.deadline_scheduler()` and `.priority()` degrade silently to normal scheduling
 
@@ -14281,6 +14281,11 @@ static ALLOC: horus_core::memory::rt_allocator::RtAwareAllocator
 ```
 
 Without this line, `.no_alloc()` is a no-op — safe for prototyping.
+
+`.no_alloc()` also requires an RT node (`.rate()`, `.budget()` or
+`.deadline()`). On a `.compute()`/`.event()`/`.async_io()`/best-effort node it
+is a `build()` error rather than a silent no-op, so the flag never gives false
+assurance that a tick was checked.
 
 ### Automatic CPU Governor and IRQ Management
 
@@ -25692,6 +25697,23 @@ pub fn max_deadline_misses(self, n: u64) -> Self
 - Requires `.watchdog()` to be enabled — without it, misses aren't tracked
 - After `n` consecutive misses, the node is isolated (stopped from ticking)
 - Lower values = more aggressive isolation, higher values = more tolerance
+- Counted for RT nodes on their executor as well as for main-loop nodes. `.rate()` is what makes a node RT, and until recently that guaranteed its misses were *not* counted, because the accounting only ran on the main loop after the class partition had moved the node away
+
+### Graduated degradation
+
+Separately from the `max_deadline_misses` ceiling, sustained deadline misses
+drive a graduated ladder with its own thresholds:
+
+| Consecutive misses | Action |
+|--------------------|--------|
+| 3 | `Warn` — logged, nothing changes |
+| 5 | `ReduceRate` — the node's rate is halved so it can keep up |
+| 10 | `Isolate` — `enter_safe_state()` is called on the node |
+| 20 | `Kill` — `shutdown()` is called and the node stops ticking |
+
+After `recovery_ticks` consecutive good ticks the ladder walks back down
+(`Deisolate`, then `RestoreRate`).
+
 
 **Example**
 
@@ -26385,6 +26407,19 @@ static ALLOC: horus_core::memory::rt_allocator::RtAwareAllocator
 ```
 
 Without this line, `.no_alloc()` is a no-op — safe for prototyping.
+
+**Also requires an RT node.** Allocation checking is performed by the RT
+executor, so `.no_alloc()` on a `.compute()`, `.event()`, `.async_io()` or
+best-effort node is a **`build()` error**, not a silently ignored flag — you
+cannot be told a tick was checked when it was not. Add `.rate()`, `.budget()`
+or `.deadline()`, or drop `.no_alloc()`.
+
+Enforcement starts on the node's **second** tick, so one-time lazy
+initialisation (a `Topic`'s shared-memory backend on first `recv`/`send`) may
+allocate. Allocation-freedom is a steady-state guarantee.
+
+In `.deterministic()` mode no executor threads are spawned and every node runs
+on the main loop — `.no_alloc()` is enforced there too.
 
 **Example**
 
@@ -28398,7 +28433,7 @@ pub fn new(name: impl Into<String>) -> HorusResult<Self>
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `name` | `impl Into` | yes | Topic identifier. Case-sensitive. Use dot-delimited hierarchical names: `"sensors.imu"`, `"cmd_vel"`. Two Topic instances with the same name and type `T` connect automatically. **Note:** Dots are preferred over slashes for macOS compatibility (`shm_open` does not allow `/` in names). |
+| `name` | `impl Into` | yes | Topic identifier. Case-sensitive. Use dot-delimited hierarchical names: `"sensors.imu"`, `"cmd_vel"`. Two Topic instances with the same name and type `T` connect automatically. **Note:** Dots are preferred over slashes for macOS compatibility (`shm_open` does not allow `/` in names). Names that are absolute paths or contain `..` are **rejected** — the name becomes part of a shared-memory path, so a traversal there would place the region outside the HORUS namespace. |
 
 **Returns**
 
@@ -42443,8 +42478,9 @@ The watchdog uses graduated response:
 | Timeout | Health State | Action |
 |---------|-------------|--------|
 | 1x watchdog | Warning | Log warning |
-| 2x watchdog | Unhealthy | Skip tick, log error |
-| 3x watchdog (critical node) | Isolated | Remove from tick loop, call `enter_safe_state()` |
+| 2x watchdog | Unhealthy | Record and report |
+| 3x watchdog (critical node) | Isolated | Call `enter_safe_state()`, latch emergency stop |
+
 
 A single late tick might be a transient GC pause. The graduated response gives transient problems time to resolve while still catching truly frozen nodes.
 
@@ -47265,8 +47301,9 @@ The graduated response prevents a single transient spike from killing a node:
 | Timeout | Health state | Response |
 |---------|-------------|----------|
 | 1x watchdog (500 ms) | Warning | Log warning |
-| 2x watchdog (1000 ms) | Unhealthy | Skip tick, log error |
-| 3x watchdog (1500 ms, critical node) | Isolated | Remove from tick loop, call `enter_safe_state()` |
+| 2x watchdog (1000 ms) | Unhealthy | Record and report |
+| 3x watchdog (1500 ms, critical node) | Isolated | Call `enter_safe_state()`, latch emergency stop |
+
 
 ### Per-Node Watchdog
 
@@ -67818,10 +67855,12 @@ The `.telemetry(endpoint)` method accepts a string that determines the export ba
 | String Format | Endpoint | Behavior |
 |--------------|----------|----------|
 | `"http://host:port/path"` | HTTP POST | Non-blocking — background thread handles network I/O |
-| `"https://host:port/path"` | HTTPS POST | Same as HTTP with TLS |
+| `"https://host:port/path"` | **Rejected** | The exporter speaks cleartext HTTP only. Rather than silently downgrading your metrics to port 80, HORUS refuses the endpoint at startup — put a TLS-terminating reverse proxy in front and point HORUS at it over `http://` on the loopback interface |
 | `"udp://host:port"` | UDP datagram | Compact JSON, single packet per snapshot |
 | `"file:///path/to/metrics.json"` | Local file | Pretty-printed JSON, overwritten each export |
 | `"/path/to/metrics.json"` | Local file | Same as `file://` prefix |
+
+
 | `"stdout"` or `"local"` | Stdout | Pretty-printed to terminal (debugging) |
 | `"disabled"` or `""` | Disabled | No export (default) |
 
@@ -70159,6 +70198,19 @@ pid_kd: 0.05
 3. Call `params.reset()` to restore defaults
 4. Call `params.save_to_disk()` to persist changes
 
+### How the three layers merge
+
+Parameters are built up in a fixed order, **per key**:
+
+1. the built-in defaults above,
+2. any key present in `.horus/config/params.yaml`,
+3. any `HORUS_PARAM_*` environment variable.
+
+Each layer overrides only the keys it names. A `params.yaml` containing one
+tuning value does not remove `emergency_stop_distance`; nor does setting a
+single `HORUS_PARAM_TICK_RATE`.
+
+
 ## Managing Parameters
 
 ### Via Monitor
@@ -70949,7 +71001,7 @@ Provides the complete command-line interface for building, running, testing, mon
 | | `horus record <cmd>` | Record/replay for debugging and testing |
 | | `horus scripts [name]` | Run a script from `horus.toml` `[scripts]` |
 | **Plugins** | `horus plugin <cmd>` | Plugin management (enable, disable, verify) |
-| **Auth** | `horus auth <cmd>` | Authentication (login, api-key, signing-key, logout, whoami) |
+| **Auth** | `horus auth <cmd>` | Authentication (login, api-key, signing-key, trust-publisher, publishers, logout, whoami) |
 
 ---
 
@@ -71720,9 +71772,57 @@ horus auth signing-key
 ```bash
 horus auth signing-key
 # Generates Ed25519 key pair
-# Private key saved to ~/.horus/keys/
+# Keys saved under the platform data directory:
+#   Linux   ~/.local/share/horus/keys/
+#   macOS   ~/Library/Application Support/horus/keys/
+#   Windows %LOCALAPPDATA%\horus\keys\
 # Public key printed to stdout
 ```
+
+
+---
+
+## `horus auth trust-publisher` - Trust a Publisher's Key
+
+**What it does**: Records a publisher's Ed25519 public key so that packages
+they sign are verified on install.
+
+**Why it's useful**: A signature is only worth something if it is checked
+against the key of whoever was supposed to sign it. Package verification
+consults this store, keyed by the package owner (falling back to the package
+name).
+
+### Basic Usage
+
+```bash
+horus auth trust-publisher <name> <key-or-file>
+horus auth publishers            # list what you currently trust
+```
+
+### Examples
+
+```bash
+# From a file the publisher gave you
+horus auth trust-publisher acme ./acme-signing-key.pub
+
+# Or paste the hex key directly (the form `horus auth signing-key` prints)
+horus auth trust-publisher acme 3d4f...c1
+
+# Review your trust store
+horus auth publishers
+```
+
+Keys are stored one per file at `<data-dir>/keys/publishers/<name>.pub`.
+
+**What happens on install**
+
+| Situation | Result |
+|-----------|--------|
+| Package signed, matching publisher key on file | Verified, install proceeds |
+| Package signed, publisher key on file does not match | **Fatal** — install aborts, the package may have been tampered with |
+| Package signed, no publisher key on file | Warning: the signature cannot be checked. Install proceeds |
+| Package unsigned, publisher key on file | Warning: a signed package was expected |
+
 
 ---
 
@@ -71743,6 +71843,10 @@ horus auth api-key
 
 # Generate Ed25519 signing key pair (for package signing)
 horus auth signing-key
+
+# Trust a publisher's key, so their signed packages are verified on install
+horus auth trust-publisher <name> <key-or-file>
+horus auth publishers
 
 # Check who you are
 horus auth whoami
@@ -71777,7 +71881,13 @@ horus auth api-key --name github-actions --environment ci-cd
 **Generate signing key for package integrity**:
 ```bash
 horus auth signing-key
-# Ed25519 key pair saved to ~/.horus/keys/
+# Ed25519 key pair saved under the platform data directory
+```
+
+**Trust a publisher so their packages are verified**:
+```bash
+horus auth trust-publisher acme ./acme-signing-key.pub
+horus auth publishers
 ```
 
 **Logout**:
@@ -77138,6 +77248,7 @@ robotics  hard  memlock  unlimited
 ```
 
 **Log out and back in** for changes to take effect. Verify with `ulimit -r` — it should now return `99`.
+
 
 ## Install PREEMPT_RT Kernel
 
@@ -85592,6 +85703,7 @@ docker compose logs -f
 ```
 
 > **SHM sharing**: For nodes in separate containers to communicate via zero-copy shared memory, use `ipc: host` or mount `/dev/shm`. Without this, topics fall back to network transport.
+
 
 ---
 
@@ -94473,17 +94585,18 @@ All sensor types live in `horus::msg::` namespace. Include via `<horus/msg/senso
 
 | Type | Size | Key Fields | Use Case |
 |------|------|------------|----------|
-| `LaserScan` | 1472 B | `ranges[360]`, `angle_min/max` | 2D LiDAR |
+| `LaserScan` | 1480 B | `ranges[360]`, `angle_min/max` | 2D LiDAR |
 | `Imu` | 304 B | `orientation[4]`, `angular_velocity[3]`, `linear_acceleration[3]` | IMU |
-| `Odometry` | ~700 B | `pose` (Pose2D), `twist` (Twist), covariance matrices | Wheel encoders |
-| `JointState` | ~900 B | `names[16][32]`, `positions[16]`, `velocities[16]`, `efforts[16]` | Robot arms |
+| `Odometry` | 736 B | `pose` (Pose2D), `twist` (Twist), covariance matrices | Wheel encoders |
+| `JointState` | 912 B | `names[16][32]`, `positions[16]`, `velocities[16]`, `efforts[16]` | Robot arms |
 | `RangeSensor` | 32 B | `range`, `min/max_range`, `field_of_view` | Ultrasonic/IR |
-| `BatteryState` | 40 B | `voltage`, `current`, `percentage`, `health`, `status` | Battery monitor |
-| `NavSatFix` | 112 B | `latitude`, `longitude`, `altitude`, `satellites` | GPS |
+| `BatteryState` | 104 B | `voltage`, `current`, `percentage`, `health`, `power_supply_status` | Battery monitor |
+| `NavSatFix` | 128 B | `latitude`, `longitude`, `altitude`, `satellites_visible`, `status` | GPS |
 | `MagneticField` | 136 B | `magnetic_field[3]`, covariance | Magnetometer |
 | `Temperature` | 56 B | `temperature` (Celsius), `variance` | Thermometer |
 | `FluidPressure` | 56 B | `fluid_pressure` (Pascals) | Barometer |
 | `Illuminance` | 56 B | `illuminance` (Lux) | Light sensor |
+
 
 ## LaserScan
 
