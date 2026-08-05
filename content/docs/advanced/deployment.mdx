@@ -1,0 +1,244 @@
+---
+title: "Production Deployment"
+description: "Deploying HORUS applications to production robots with real-time features, safety monitoring, and performance tuning"
+weight: 50
+---
+
+# Production Deployment
+
+Guide to deploying HORUS applications on production robots with real-time constraints, safety monitoring, and optimal performance.
+
+## Deployment Checklist
+
+Five steps to go from development to production.
+
+### 1. Enable Safety Monitoring
+
+The `.watchdog(Duration)` method enables frozen node detection and creates the safety monitor. Budget enforcement is implicit when nodes have `.rate()` set:
+
+```rust
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .tick_rate(100_u64.hz());
+```
+
+This is the single most important setting for production. The watchdog detects hung nodes and triggers graduated degradation automatically.
+
+### 2. Configure Real-Time (Optional)
+
+HORUS provides two RT modes that enable OS-level `SCHED_FIFO` scheduling and `mlockall()` memory locking:
+
+```rust
+// Graceful: try RT, warn and continue if unavailable
+let mut scheduler = Scheduler::new()
+    .prefer_rt()
+    .watchdog(500_u64.ms())
+    .tick_rate(100_u64.hz());
+
+// Strict: panic if the system lacks RT capabilities
+let mut scheduler = Scheduler::new()
+    .require_rt()
+    .watchdog(500_u64.ms())
+    .tick_rate(1000_u64.hz());
+```
+
+**Use `.prefer_rt()` in most cases.** It tries to enable RT features and records any that failed as degradations rather than errors. Use `.require_rt()` only when you need a hard guarantee that RT is active -- it panics if neither `SCHED_FIFO` nor `mlockall` is available.
+
+Even without `.prefer_rt()`, the scheduler auto-enables `mlockall` when RT nodes are present and the system permits it. This prevents 10-100 ms page fault spikes under memory pressure.
+
+### 3. Set Node Budgets
+
+Assign tick budgets and deadlines to safety-critical nodes. Setting either `.budget()` or `.deadline()` automatically promotes the node to the RT execution class:
+
+```rust
+scheduler.add(motor_controller)
+    .rate(1000_u64.hz())
+    .budget(200_u64.us())       // Must finish within 200 us
+    .deadline(800_u64.us())     // Absolute latest: 800 us
+    .on_miss(Miss::SafeMode)    // Enter safe state on miss
+    .build()?;
+
+scheduler.add(lidar_processor)
+    .rate(20_u64.hz())
+    .budget(10_u64.ms())
+    .on_miss(Miss::Skip)        // Drop this tick, continue next
+    .build()?;
+```
+
+The `Miss` policy controls what happens on deadline miss:
+
+| Policy | Behavior |
+|--------|----------|
+| `Miss::Warn` | Log a warning and continue (default) |
+| `Miss::Skip` | Skip the current tick, resume next cycle |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node |
+| `Miss::Stop` | Stop the entire scheduler |
+
+### 4. Enable Flight Recorder
+
+The blackbox records scheduler events to a ring buffer on disk for post-mortem analysis:
+
+```rust
+let mut scheduler = Scheduler::new()
+    .watchdog(500_u64.ms())
+    .blackbox(64)             // 64 MB ring buffer
+    .tick_rate(100_u64.hz());
+```
+
+Data is written to `.horus/blackbox/` in the working directory. See the [Blackbox](/advanced/blackbox) page for analysis tools.
+
+### 5. Require Real-Time
+
+For hard real-time deployments, require RT capabilities:
+
+```rust
+let mut scheduler = Scheduler::new()
+    .require_rt()
+    .watchdog(500_u64.ms())
+    .blackbox(64)
+    .tick_rate(1000_u64.hz());
+```
+
+This panics if the system lacks `SCHED_FIFO` or `mlockall` capabilities, ensuring your safety-critical system never runs in degraded mode silently.
+
+## RT Kernel Setup (Linux)
+
+For hard real-time guarantees, you need a `PREEMPT_RT` kernel.
+
+### Installing the RT Kernel
+
+On Ubuntu/Debian:
+
+```bash
+sudo apt install linux-image-rt-amd64
+sudo reboot
+```
+
+Verify after reboot:
+
+```bash
+uname -a   # Should show "PREEMPT_RT" in the output
+```
+
+### Setting RT Permissions
+
+Add your robot user to the `realtime` group and raise the memlock limit in `/etc/security/limits.conf`:
+
+```
+@realtime   -   rtprio     99
+@realtime   -   memlock    unlimited
+@realtime   -   nice       -20
+```
+
+Then add the user:
+
+```bash
+sudo groupadd -f realtime
+sudo usermod -aG realtime robot_user
+```
+
+Log out and back in for the changes to take effect.
+
+### Verifying RT Capabilities
+
+HORUS prints its RT capability detection at startup. Look for these lines:
+
+```
+[SCHEDULER] Memory locked (mlockall)
+[SCHEDULER] RT scheduling enabled (SCHED_FIFO, priority 50)
+[SCHEDULER] CPU affinity set to cores [2, 3]
+```
+
+If any feature is unavailable with `.prefer_rt()`, it appears as a degradation warning instead of an error.
+
+## Example: Production Robot Configuration
+
+A complete production configuration combining all features:
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new()
+        .prefer_rt()
+        .watchdog(500_u64.ms())
+        .blackbox(64)
+        .max_deadline_misses(5)
+        .tick_rate(1000_u64.hz());
+
+    // Safety-critical: motor control at 1 kHz
+    scheduler.add(MotorController::new())
+        .order(0)
+        .rate(1000_u64.hz())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    // Important: state estimation at 200 Hz
+    scheduler.add(StateEstimator::new())
+        .order(10)
+        .rate(200_u64.hz())
+        .on_miss(Miss::Warn)
+        .build()?;
+
+    // Best-effort: telemetry at 10 Hz
+    scheduler.add(TelemetryPublisher::new())
+        .order(200)
+        .rate(10_u64.hz())
+        .async_io()
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+## Graceful Degradation
+
+When `.prefer_rt()` is used and a feature cannot be applied, it is recorded as a degradation, not an error. The four RT features that can degrade independently are:
+
+- **RT Priority** -- `SCHED_FIFO` scheduling
+- **Memory Locking** -- `mlockall()` to prevent page faults
+- **CPU Affinity** -- pinning to specific cores
+- **NUMA Pinning** -- memory locality on multi-socket systems
+
+The scheduler continues running with whichever features succeeded. This lets you develop on a laptop (no RT kernel) and deploy on a production system (full RT) without changing code.
+
+## Monitoring in Production
+
+### Safety Statistics
+
+Query the safety monitor for budget overruns and deadline misses:
+
+```rust
+if let Some(stats) = scheduler.safety_stats() {
+    println!("State: {:?}", stats.state());
+    println!("Budget overruns: {}", stats.budget_overruns());
+    println!("Deadline misses: {}", stats.deadline_misses());
+    println!("Watchdog expirations: {}", stats.watchdog_expirations());
+}
+```
+
+The safety monitor applies graduated degradation automatically: warn, then reduce rate, then isolate the node and call `enter_safe_state()`.
+
+### Node Metrics
+
+Get per-node performance data:
+
+```rust
+for m in scheduler.metrics() {
+    println!("{}: avg={:?}", m.name, m.avg_tick);
+}
+```
+
+### Blackbox for Post-Mortem
+
+After an incident, the blackbox contains a timestamped log of scheduler events including start/stop, budget violations, deadline misses, and watchdog expirations. See [Blackbox](/advanced/blackbox) for details.
+
+## See Also
+
+- [Safety Monitor](/advanced/safety-monitor) -- watchdog, budget enforcement, and deadline miss policies
+- [Scheduler Configuration](/advanced/scheduler-configuration) -- full builder API reference
+- [BlackBox Flight Recorder](/advanced/blackbox) -- flight recorder and post-mortem analysis

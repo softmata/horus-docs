@@ -6,78 +6,36 @@ weight: 30
 
 # BlackBox Flight Recorder
 
-Your robot crashed overnight and the logs are gone. You need a crash-safe, always-on event recorder that captures the sequence of events leading up to any failure. The BlackBox is that recorder.
+The BlackBox flight recorder provides continuous event logging for post-mortem analysis. Like an aircraft flight recorder, it captures all significant events leading up to failures in a circular buffer.
 
-## When To Use This
+## Overview
 
-| Situation | Use BlackBox? |
-|-----------|--------------|
-| Robot runs unattended (production, field tests) | **Yes** -- you need crash forensics |
-| Safety-critical system (motors, arms, drones) | **Yes** -- every deadline miss is recorded |
-| Development with debugger attached | Optional -- you can inspect directly |
-| Short test runs (under 5 minutes) | Optional -- logs are usually sufficient |
-| Overnight regression testing | **Yes** -- find intermittent failures |
-
-**Use [Record & Replay](/advanced/record-replay) instead** if you need full node state (inputs/outputs) for deterministic replay. The BlackBox captures lightweight events (what happened), not full data.
-
-## Prerequisites
-
-- Familiarity with [Scheduler Configuration](/advanced/scheduler-configuration) -- especially the `.blackbox()` builder method
-- Understanding of [Safety Monitor](/advanced/safety-monitor) for interpreting deadline misses and watchdog events
-
-## Understanding the BlackBox
-
-**BlackBox vs Logging:** Logs are text, grow forever, and require parsing. The BlackBox is structured events, fixed-size (never fills your disk), and queryable by type (show only anomalies).
-
-**BlackBox vs Record/Replay:** Record/Replay captures full node state (inputs/outputs) for deterministic replay -- great for debugging but storage-heavy. The BlackBox captures lightweight events (what happened, not the full data) -- always-on, zero overhead, crash-safe.
-
-## How It Works
-
-The BlackBox is a **circular buffer** — it keeps the last N events and discards the oldest when full. This means:
-- **Fixed memory** — never grows beyond the configured size
-- **Always-on** — no performance impact (events are tiny structs)
-- **Crash-safe** — data persists even if the process is killed
-- **No manual instrumentation** — the Scheduler records events automatically
+The BlackBox:
+- Records scheduler, node, and safety events automatically
+- Uses a fixed-size circular buffer (oldest events discarded when full)
+- Captures anomalies (errors, deadline misses, emergency stops)
+- Requires no manual instrumentation — the Scheduler records events automatically
 
 ## Enabling BlackBox
 
-Use the `.blackbox(size_mb)` builder method to enable the BlackBox:
+Use the `.with_blackbox(size_mb)` builder method to enable the BlackBox:
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
+```rust
+use horus::prelude::*;
 
-    // 16MB black box for general production
-    let mut scheduler = Scheduler::new()
-        .blackbox(16);
+// 16MB black box for general production
+let mut scheduler = Scheduler::new()
+    .with_blackbox(16);
 
-    // 1GB black box for safety-critical systems with watchdog
-    let mut scheduler = Scheduler::new()
-        .watchdog(500_u64.ms())
-        .blackbox(1024);
+// 1GB black box for safety-critical systems
+let mut scheduler = Scheduler::new()
+    .with_blackbox(1024)
+    .safety_monitor(true);
 
-    // 100MB black box for hard real-time systems
-    let mut scheduler = Scheduler::new()
-        .blackbox(100);
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
-
-    # 16MB black box for general production
-    scheduler = horus.Scheduler(blackbox_mb=16)
-
-    # 1GB black box for safety-critical systems with watchdog
-    scheduler = horus.Scheduler(watchdog_ms=500, blackbox_mb=1024)
-
-    # 100MB black box for hard real-time systems
-    scheduler = horus.Scheduler(blackbox_mb=100)
-    ```
-  </LangTab>
-</LanguageTabs>
+// 100MB black box for hard real-time or deterministic modes
+let mut scheduler = Scheduler::new()
+    .with_blackbox(100);
+```
 
 ## What Gets Recorded
 
@@ -86,69 +44,43 @@ The BlackBox automatically captures events during scheduler execution:
 | Event | Description |
 |-------|-------------|
 | Scheduler start/stop | When the scheduler begins and ends |
+| Node execution | Each node tick with duration and success/failure |
+| Node errors | Failed node executions |
 | Deadline misses | Nodes that missed their timing deadline |
-| Budget violations | Nodes that exceeded their execution time budget |
-| Emergency stops | Safety-system activations (e.g. the safety monitor tripping) |
-| Custom events | User-defined markers and internal safety notes |
-
-> **Note**: The BlackBox records anomalies and lifecycle events — **not** every node tick. Individual per-tick node execution and node error details are not captured here. Use [Record & Replay](/advanced/record-replay) for full per-tick node state, or `horus log` for node error messages.
+| WCET violations | Nodes that exceeded their execution time budget |
+| Circuit breaker changes | Fault tolerance state transitions |
+| Emergency stops | Safety system activations |
+| Custom events | User-defined markers |
 
 ## Post-Mortem Debugging
 
-After a failure, the BlackBox contains the sequence of events leading up to it. Inspect via the CLI (works for both Rust and Python projects) or programmatically in Rust:
-
-```bash
-# CLI — works for any HORUS project (Rust or Python)
-horus blackbox --anomalies
-horus blackbox --json
-horus blackbox
-horus blackbox --last 100
-```
-
-### Programmatic access
-
-<LanguageTabs>
-  <LangTab language="Rust">
+After a failure, the BlackBox contains the sequence of events leading up to it. Use the Scheduler's blackbox access to inspect:
 
 ```rust
-// simplified
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .blackbox(16);
+    .with_blackbox(16);
 
 // ... application runs ...
 
-// Programmatic access after scheduler.run() returns:
-if let Some(bb) = scheduler.get_blackbox() {
-    let anomalies = bb.lock().expect("blackbox lock").anomalies();
+// After a failure, inspect the blackbox
+if let Some(bb) = scheduler.blackbox() {
+    // Get all anomalies (errors, deadline misses, e-stops)
+    let anomalies = bb.anomalies();
     println!("=== ANOMALIES ({}) ===", anomalies.len());
     for record in &anomalies {
         println!("[tick {}] {:?}", record.tick, record.event);
     }
+
+    // Get all events (full history)
+    let all_events = bb.events();
+    println!("\n=== LAST 20 EVENTS ===");
+    for record in all_events.iter().rev().take(20) {
+        println!("[tick {}] {:?}", record.tick, record.event);
+    }
 }
 ```
-
-  </LangTab>
-  <LangTab language="Python">
-
-```python
-import horus
-
-# Enable blackbox in Python
-sched = horus.Scheduler(tick_rate=100, blackbox_mb=16)
-sched.add(my_node)
-sched.run()
-
-# After crash, use CLI to inspect:
-#   horus blackbox --anomalies
-#   horus blackbox --json
-```
-
-> **Note**: Programmatic blackbox access (`get_blackbox()`, `anomalies()`) is currently Rust-only. From Python projects, use the `horus blackbox` CLI commands to inspect post-mortem.
-
-  </LangTab>
-</LanguageTabs>
 
 ## Circular Buffer Behavior
 
@@ -170,104 +102,12 @@ This ensures bounded memory usage while keeping the most recent events for debug
 
 | Use Case | Configuration | Buffer Size |
 |----------|---------------|-------------|
-| Development | `.blackbox(16)` | 16 MB |
-| Long-running production | `.blackbox(100)` | 100 MB |
-| Safety-critical | `.blackbox(1024)` | 1 GB |
-
-## CLI Usage
-
-Inspect the BlackBox from the command line:
-
-```bash
-# View all events
-horus blackbox
-
-# View anomalies only (errors, deadline misses, e-stops)
-horus blackbox --anomalies
-
-# Follow in real-time (like tail -f)
-horus blackbox --follow
-
-# Filter by node
-horus blackbox --node motor_ctrl
-
-# Filter by event type
-horus blackbox --event DeadlineMiss
-
-# JSON output for scripts/dashboards
-horus blackbox --json
-```
-
-## Debugging Walkthrough: "My Robot Crashed Overnight"
-
-**Scenario:** Your mobile robot stopped moving during an overnight warehouse test. The process restarted but the original crash data is gone.
-
-**Step 1: Check the BlackBox**
-```bash
-horus blackbox --anomalies
-```
-
-**Step 2: Read the timeline**
-```
-[03:17:01.502] DeadlineMiss { name: "collision_checker", deadline_us: 1900, actual_us: 4200 }
-[03:17:01.503] DeadlineMiss { name: "collision_checker", deadline_us: 1900, actual_us: 5100 }
-[03:17:01.504] BudgetViolation { name: "collision_checker", budget_us: 1500, actual_us: 5100 }
-[03:17:01.504] EmergencyStop { reason: "deadline miss threshold exceeded" }
-```
-
-**Step 3: Diagnose**
-The collision checker started missing its 1.9ms deadline (taking 4-5ms instead) and blew its execution budget. Once the repeated misses crossed the safety threshold, the scheduler triggered an emergency stop — halting the robot before the late trajectory could be acted on. (Per-tick node execution is not recorded, so the timeline shows the anomalies that led to the stop, not every tick.)
-
-**Step 4: Fix**
-- Tighten the collision checker's budget: `.budget(1500_u64.us())`
-- Or add a safety interlock: hold trajectory execution until collision check completes
-- Or move collision checking to the same RT thread as the arm controller
-
-## BlackBox vs Other Debugging Tools
-
-| Tool | What it captures | Storage | When to use |
-|------|-----------------|---------|-------------|
-| **BlackBox** | Scheduler events (lightweight) | Fixed ring buffer (16-1024 MB) | Always-on crash forensics |
-| **Record/Replay** | Full node state (inputs/outputs) | Grows with time | Reproduce specific bugs |
-| **horus log** | Text log messages | Grows with time | Verbose debugging |
-| **horus monitor** | Live system state | None (real-time only) | Active debugging |
-
-## Design Decisions
-
-**Why a ring buffer instead of a log file?**
-
-A log file grows without bound and eventually fills the disk. A ring buffer has fixed, predictable memory usage. For a robot running 24/7 in a warehouse, you cannot afford to run out of disk space. The ring buffer keeps the most recent events and silently discards the oldest.
-
-**Why structured events instead of text logs?**
-
-Structured events can be filtered by type (`--event DeadlineMiss`), queried by node (`--node motor_ctrl`), and exported to JSON for dashboards. Text logs require regex parsing and are fragile. Structured events also have lower overhead -- no string formatting during the hot path.
-
-**Why automatic recording instead of manual instrumentation?**
-
-The scheduler knows when every node ticks, when deadlines are missed, and when failures occur. Requiring developers to manually add recording calls would lead to incomplete data. The BlackBox records the anomalies and lifecycle events the scheduler observes, with zero code changes.
-
-## Trade-offs
-
-| Gain | Cost |
-|------|------|
-| Fixed memory -- never fills disk | Oldest events are lost when buffer is full |
-| Always-on with zero overhead | Only captures scheduler events, not application-level data |
-| Crash-safe (survives process kill) | Requires post-mortem inspection (not real-time alerting) |
-| No code changes required | Cannot record custom application data (use Record/Replay for that) |
-
-## Common Errors
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `horus blackbox` shows no events | BlackBox not enabled | Add `.blackbox(16)` to the scheduler builder |
-| BlackBox missing events from crash | Buffer too small, events were overwritten | Increase buffer size: `.blackbox(100)` or `.blackbox(1024)` |
-| Cannot read BlackBox after process restart | BlackBox data is in-memory, not persisted to disk by default | Use `horus blackbox --follow` during the run, or configure filesystem persistence |
-| `horus blackbox --anomalies` shows nothing | No anomalies occurred (all nodes ran within budget) | This is normal. Use `horus blackbox` without filters to see all events |
-| High memory usage | Buffer size too large for the system | Reduce `.blackbox(size_mb)` to match available memory |
+| Development | `.with_blackbox(16)` | 16 MB |
+| Long-running production | `.with_blackbox(100)` | 100 MB |
+| Safety-critical | `.with_blackbox(1024)` | 1 GB |
 
 ## See Also
 
-- [Safety Monitor](/advanced/safety-monitor) — Deadline enforcement and watchdog events recorded by the BlackBox
-- [Fault Tolerance](/advanced/circuit-breaker) — Failure policies whose state transitions are recorded
-- [Record & Replay](/advanced/record-replay) — Full node state recording for deterministic replay
-- [Scheduler Configuration](/advanced/scheduler-configuration) — `.blackbox()` builder method
+- [Safety Monitor](/advanced/safety-monitor) - Real-time safety monitoring
+- [Circuit Breaker](/advanced/circuit-breaker) - Fault tolerance patterns
+- [Record & Replay](/advanced/record-replay) - Full recording and playback

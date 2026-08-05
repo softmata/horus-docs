@@ -1,92 +1,33 @@
 ---
-title: "Data Types & Encoding"
-description: "Image, PointCloud, and DepthImage types for robotics data"
+title: "Tensor Messages"
+description: "Zero-copy tensor types for ML workloads"
 weight: 15
 ---
 
-# Data Types & Encoding
+# Tensor Messages
 
-High-level types for camera images, 3D point clouds, and depth maps. These types use zero-copy shared memory transport internally but expose ergonomic, domain-specific APIs.
+Zero-copy tensor sharing between nodes for ML/AI workloads.
 
-```rust
-// simplified
-use horus::prelude::*; // Provides Image, PointCloud, DepthImage, TensorDtype, Device
-```
+## Tensor
 
-## Image
-
-Represents a camera frame with pixel-level access and encoding metadata.
+A 168-byte Pod descriptor pointing to data in shared memory:
 
 ```rust
-// simplified
-// Create a 1080p RGB image
-let image = Image::new(1920, 1080, ImageEncoding::Rgb8);
+use horus::prelude::*; // Provides Tensor, TensorDtype, Device from horus_types
 
-// Publish on a topic
-let topic: Topic<Image> = Topic::new("camera.rgb")?;
-topic.send(&image);
+// Send tensor descriptor through Topic
+let topic: Topic<Tensor> = Topic::new("camera.frames")?;
 
-// Receive and access pixels
-if let Some(img) = topic.recv() {
-    println!("{}x{}, encoding: {:?}", img.width(), img.height(), img.encoding());
-    let pixel = img.pixel(100, 200);
+if let Some(tensor) = topic.recv() {
+    println!("Shape: {:?}", tensor.shape());
+    println!("Dtype: {:?}", tensor.dtype);
+    println!("Device: {}", tensor.device());
 }
 ```
 
-### ImageEncoding
-
-| Encoding | Channels | Dtype | Description |
-|----------|----------|-------|-------------|
-| `Rgb8` | 3 | U8 | Standard RGB color |
-| `Rgba8` | 4 | U8 | RGB with alpha |
-| `Bgr8` | 3 | U8 | BGR (OpenCV default) |
-| `Bgra8` | 4 | U8 | BGR with alpha |
-| `Mono8` | 1 | U8 | Grayscale 8-bit |
-| `Mono16` | 1 | U16 | Grayscale 16-bit |
-
-## PointCloud
-
-Represents a 3D point cloud with per-point field access.
-
-```rust
-// simplified
-// Build a point cloud from XYZ points
-let points: Vec<[f32; 3]> = scan_points();   // your Vec<[f32; 3]>
-let cloud = PointCloud::from_xyz(&points)?;
-
-// Publish
-let topic: Topic<PointCloud> = Topic::new("lidar.points")?;
-topic.send(&cloud);
-
-// Receive and inspect
-if let Some(pc) = topic.recv() {
-    println!("{} points, {} fields/point", pc.point_count(), pc.fields_per_point());
-}
-```
-
-## DepthImage
-
-Represents a depth map, typically from an RGBD or stereo camera.
-
-```rust
-// simplified
-// Create a 640x480 depth image with millimeter-precision U16 values
-let depth = DepthImage::millimeters(640, 480);
-
-// Publish
-let topic: Topic<DepthImage> = Topic::new("camera.depth")?;
-topic.send(&depth);
-
-// Receive and query depth
-if let Some(d) = topic.recv() {
-    let depth_mm = d.get_depth(320, 240);
-    println!("Center depth: {} mm", depth_mm);
-}
-```
+All tensor types are available via `use horus::prelude::*`.
 
 ## TensorDtype
-
-Element data type used when constructing PointCloud, DepthImage, and other tensor-backed types.
 
 | Dtype | Size | Use Case |
 |-------|------|----------|
@@ -104,56 +45,117 @@ Element data type used when constructing PointCloud, DepthImage, and other tenso
 | I64 | 8 | Large signed values |
 | Bool | 1 | Masks |
 
-### TensorDtype Methods
+Helper methods:
 
 ```rust
-// simplified
 let dtype = TensorDtype::F32;
 assert_eq!(dtype.element_size(), 4);
-println!("{}", dtype);  // "float32"
+assert!(dtype.is_float());
+assert!(!dtype.is_signed_int());
+println!("{}", dtype);  // "f32"
+
+// DLPack interop
+let dl = dtype.to_dlpack();
+let back = TensorDtype::from_dlpack(dl.0, dl.1).unwrap();
 
 // Parse from string
 let parsed = TensorDtype::parse("float32").unwrap();
 ```
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `.element_size()` | `usize` | Bytes per element |
-| `TensorDtype::parse(s)` | `Option` | Parse from string ("float32", "uint8", "int16", etc.) |
+## Device
+
+The `Device` struct replaces the old `TensorDevice` enum. It's a Pod-safe `repr(C)` struct supporting **unlimited GPU indices**:
+
+```rust
+Device::cpu()      // CPU / shared memory
+Device::cuda(0)    // GPU 0
+Device::cuda(1)    // GPU 1
+Device::cuda(7)    // GPU 7 — no limit!
+
+// Parse from string
+let dev = Device::parse("cuda:2").unwrap();
+let cpu = Device::parse("cpu").unwrap();
+
+// Check device type
+assert!(Device::cpu().is_cpu());
+assert!(Device::cuda(0).is_cuda());
+println!("{}", Device::cuda(1));  // "cuda:1"
+```
+
+## Auto-Managed Tensor Pools
+
+`Topic<Tensor>` automatically manages a shared-memory `TensorPool` per topic. Users call `alloc_tensor()`, `send_handle()`, and `recv_handle()` instead of managing pools manually:
+
+```rust
+use horus::prelude::*;
+
+let topic: Topic<Tensor> = Topic::new("camera.rgb")?;
+
+// Allocate a 1080p RGB image from the topic's auto-managed pool
+let handle = topic.alloc_tensor(&[1080, 1920, 3], TensorDtype::U8, Device::cpu())?;
+
+// Write pixel data
+let pixels = handle.data_slice_mut()?;
+// ... fill pixels ...
+
+// Send — only the 168-byte descriptor flows through the ring buffer.
+// The actual tensor data stays in shared memory — true zero-copy.
+topic.send_handle(&handle);
+```
+
+On the receiver side:
+
+```rust
+let topic: Topic<Tensor> = Topic::new("camera.rgb")?;
+
+if let Some(recv_handle) = topic.recv_handle() {
+    let data = recv_handle.data_slice()?;  // Zero-copy access to shared memory
+    println!("Shape: {:?}", recv_handle.shape());
+    println!("Dtype: {:?}", recv_handle.dtype());
+}
+// TensorHandle is RAII — refcount decremented automatically on drop
+```
+
+The pool is created lazily on first use and shared across all `Topic<Tensor>` instances with the same name — even across processes. Pool IDs are derived deterministically from the topic name.
+
+## With Manual TensorPool
+
+For advanced use cases, you can manage pools directly:
+
+```rust
+use horus::prelude::*;
+
+let pool = TensorPool::new(1, TensorPoolConfig::default())?;
+let handle = TensorHandle::alloc(
+    Arc::new(pool),
+    &[1080, 1920, 3],
+    TensorDtype::U8,
+    Device::cpu(),
+)?;
+
+// Write data
+handle.data_slice_mut()?[0] = 255;
+
+// Share via Topic
+topic.send(*handle.tensor());
+```
+
+## Domain Types
+
+For common robotics data, use the high-level domain types `Image`, `PointCloud`, and `DepthImage` which provide rich APIs (pixel access, point extraction, depth queries) while using the same zero-copy shared memory transport internally. See [Message Types](/concepts/message-types) for their full API.
 
 ## Python Interop
-
-Image, PointCloud, and DepthImage are available in Python with NumPy zero-copy access.
 
 ```python
 import horus
 import numpy as np
 
-# Subscribe to camera images
-# Topic(msg_type, capacity=None, endpoint=None) — the type comes first; the
-# channel name is passed as endpoint (the 2nd positional is an int capacity).
-topic = horus.Topic(horus.Image, endpoint="camera.rgb")
-img = topic.recv()
-if img is not None:
-    print(f"{img.width}x{img.height}, encoding: {img.encoding}")
-    arr = img.to_numpy()  # Zero-copy NumPy view
-
-# Subscribe to point clouds
-pc_topic = horus.Topic(horus.PointCloud, endpoint="lidar.points")
-pc = pc_topic.recv()
-if pc is not None:
-    points = pc.to_numpy()  # (N, fields) NumPy array
-    print(f"{pc.point_count} points")
-
-# Subscribe to depth images
-depth_topic = horus.Topic(horus.DepthImage, endpoint="camera.depth")
-depth = depth_topic.recv()
-if depth is not None:
-    depth_arr = depth.to_numpy()  # (H, W) NumPy array
+# TensorPool and TensorHandle are available from the native module
+pool = horus.TensorPool(pool_id=1, size_mb=1024, max_slots=1024)
+handle = pool.alloc(shape=(1080, 1920, 3), dtype="uint8")
 ```
 
 ## See Also
 
-- [Tensor](/rust/api/tensor) — Low-level tensor descriptor for ML pipelines
+- [TensorPool API](/rust/api/tensor-pool) — Pool management and configuration
 - [Message Types](/concepts/message-types) — All HORUS message types
-- [Python Image](/python/api/image), [Python PointCloud](/python/api/pointcloud), [Python DepthImage](/python/api/depth-image)

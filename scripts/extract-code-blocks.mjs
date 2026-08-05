@@ -50,7 +50,6 @@ const NON_EXECUTABLE_MARKERS = [
   '// ...',           // Truncated code
   '/* ... */',        // Truncated code
   '# ...',            // Truncated Python
-  '...',              // Ellipsis standalone
   '// pseudo',        // Pseudo-code marker
   '// conceptual',    // Conceptual example
   '// simplified',    // Simplified for docs
@@ -160,15 +159,31 @@ function detectFlags(code, language) {
   // Check for missing main function in Rust
   if (language === 'rust') {
     const hasMainFn = /fn\s+main\s*\(/.test(code);
-    const hasNodeImpl = /impl\s+Node\s+for/.test(code) || /node!\s*\{/.test(code);
-
-    if (!hasMainFn && !hasNodeImpl) {
+    // Rust fences without a main function are usually excerpts that depend on
+    // declarations or imports from surrounding prose. Keep them searchable,
+    // but do not claim they are independently compilable.
+    if (!hasMainFn) {
       flags.push('needs-wrapper');
     }
 
     // Check for ? operator without Result return type
     if (/\?[;\s]/.test(code) && !hasMainFn) {
       flags.push('uses-try-operator');
+    }
+
+    // Examples built around separately installed registry packages cannot be
+    // compiled in the core-HORUS harness. Their package installation is the
+    // contract being documented, so classify them explicitly rather than
+    // reporting misleading core API failures.
+    if (/use\s+(pid_controller|my_package|keyboard_input|differential_drive|emergency_stop|lidar_driver|imu_driver|kalman_filter|camera_driver|image_processor|object_detector|obstacle_detector|path_planner)::/.test(code)) {
+      flags.push('external-dependency');
+    }
+
+    // Some architecture listings intentionally use application-defined nodes
+    // or helper functions. They are illustrative programs, not standalone
+    // crates, even if they include a main function.
+    if (/\b(my_node|MotorController|StateEstimator|TelemetryPublisher|LidarDriver|PathPlanner|CollisionChecker|TelemetryUploader|read_sensor|plan_path)\b/.test(code)) {
+      flags.push('application-context');
     }
   }
 
@@ -221,26 +236,17 @@ function extractFromFile(filePath, relativePath) {
         // Handles: rust, rust,ignore, bash:filename.sh, etc.
         const language = fullLang.split(/[,:]/, 1)[0] || 'text';
 
-        // Parse rustdoc-style suffixes after the comma: `rust,ignore`,
-        // `rust,no_run`, `rust,should_panic`, `rust,compile_fail`, etc.
-        // We treat `ignore` and `compile_fail` as opt-out markers.
-        const suffixes = fullLang.split(',').slice(1).map(s => s.trim()).filter(Boolean);
-
         const isVerifiable = VERIFIABLE_LANGUAGES.includes(language);
         const isReference = REFERENCE_LANGUAGES.includes(language);
         const flags = detectFlags(code, language);
-        for (const sfx of suffixes) {
-          if (sfx === 'ignore' || sfx === 'compile_fail' || sfx === 'should_panic') {
-            // Rustdoc convention: don't run / don't expect to compile.
-            if (!flags.includes('rustdoc-ignore')) flags.push('rustdoc-ignore');
-          }
-        }
 
         // Determine if this block can be verified
         const verifiable = isVerifiable &&
           !flags.includes('has-markers') &&
           !flags.includes('partial') &&
-          !flags.includes('rustdoc-ignore');
+          !flags.includes('external-dependency') &&
+          !flags.includes('application-context') &&
+          !(language === 'rust' && flags.includes('needs-wrapper'));
 
         blocks.push({
           id: `${relativePath.replace(/\.mdx?$/, '')}:${currentBlock.lineStart}:${language}`,

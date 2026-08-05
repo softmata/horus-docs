@@ -4,57 +4,183 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
 import { useState, useEffect } from "react";
-import { pageLanguage, type Language } from "@/lib/language-pairs";
-
-const LANG_STORAGE_KEY = 'horus-docs-language';
-const LANG_SYNC_EVENT = 'horus-language-change';
-
-/**
- * Auto-generated sidebar navigation.
- *
- * This data is built from MDX frontmatter by `scripts/build-sidebar.js`.
- * To add a new page to the sidebar, just create a .mdx file with frontmatter:
- *
- *   ---
- *   title: "My New Page"
- *   order: 5
- *   ---
- *
- * Then run: node scripts/build-sidebar.js
- * (This runs automatically during `npm run build`)
- *
- * The page appears in the sidebar section matching its directory
- * (e.g., tutorials/ → Tutorials, rust/api/ → Rust > API Reference).
- *
- * To override the section, add `sidebar_section: "Section Name"` to frontmatter.
- * To hide a page from the sidebar, add `sidebar_hidden: true`.
- */
-import sidebarData from "@/lib/sidebar-data.json";
 
 interface DocLink {
   title: string;
   href: string;
   order?: number;
   children?: DocLink[];
-  /** Explicit language from frontmatter (build-sidebar.js), overrides the
-   *  path heuristic. Set for language-specific pages whose per-language
-   *  siblings live at mismatched slugs. */
-  language?: Language;
-}
-
-interface SidebarGroup {
-  label: string;
-  links: DocLink[];
 }
 
 interface SidebarSection {
   title: string;
   links: DocLink[];
-  /** Labelled sub-groups within the section (from `sidebar_group` frontmatter). */
-  groups?: SidebarGroup[];
 }
 
-const sections: SidebarSection[] = sidebarData as SidebarSection[];
+const sections: SidebarSection[] = [
+  {
+    title: "Getting Started",
+    links: [
+      { title: "What is HORUS?", href: "/concepts/what-is-horus", order: 0 },
+      { title: "Goals & Vision", href: "/concepts/goals", order: 1 },
+      { title: "Installation", href: "/getting-started/installation", order: 2 },
+      { title: "Quick Start", href: "/getting-started/quick-start", order: 3 },
+      { title: "Choosing a Language", href: "/getting-started/choosing-language", order: 4 },
+      { title: "Second Application", href: "/getting-started/second-application", order: 5 },
+      { title: "Architecture", href: "/concepts/architecture", order: 6 },
+      { title: "Common Mistakes", href: "/getting-started/common-mistakes", order: 7 },
+      { title: "Troubleshooting", href: "/troubleshooting", order: 8 },
+      { title: "Advanced Examples", href: "/rust/examples/advanced-examples", order: 9 },
+    ],
+  },
+  {
+    title: "Core Concepts",
+    links: [
+      { title: "Overview", href: "/concepts", order: 0 },
+      { title: "Nodes", href: "/concepts/core-concepts-nodes", order: 2 },
+      {
+        title: "Communication Patterns",
+        href: "/concepts/communication-overview",
+        order: 3,
+        children: [
+          { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic", order: 1 },
+          { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic", order: 2 },
+          { title: "Services (Beta)", href: "/concepts/services", order: 3 },
+          { title: "Actions (Beta)", href: "/concepts/actions", order: 4 },
+        ]
+      },
+      { title: "Scheduler", href: "/concepts/core-concepts-scheduler", order: 5 },
+      { title: "node! Macro", href: "/concepts/node-macro", order: 6 },
+      { title: "Message Types", href: "/concepts/message-types", order: 7 },
+      { title: "Real-Time Nodes", href: "/concepts/realtime-nodes", order: 9 },
+      { title: "Transform Frame", href: "/concepts/transform-frame", order: 10 },
+      { title: "Multi-Language", href: "/concepts/multi-language", order: 13 },
+    ],
+  },
+  {
+    title: "Rust",
+    links: [
+      { title: "Overview", href: "/rust", order: 0 },
+      {
+        title: "API Reference",
+        href: "/rust/api",
+        order: 1,
+        children: [
+          { title: "Overview", href: "/rust/api", order: 0 },
+          { title: "horus_core", href: "/rust/api/core", order: 1 },
+          { title: "horus_macros", href: "/rust/api/macros", order: 2 },
+          { title: "TensorPool", href: "/rust/api/tensor-pool", order: 3 },
+          { title: "Tensor Messages", href: "/rust/api/tensor-messages", order: 4 },
+          {
+            title: "Messages",
+            href: "/rust/api/messages",
+            order: 6,
+            children: [
+              { title: "Overview", href: "/rust/api/messages", order: 0 },
+              { title: "Control", href: "/rust/api/control-messages", order: 1 },
+              { title: "Diagnostics", href: "/rust/api/diagnostics-messages", order: 2 },
+              { title: "Force", href: "/rust/api/force-messages", order: 4 },
+              { title: "Geometry", href: "/rust/api/geometry-messages", order: 5 },
+
+              { title: "ML", href: "/rust/api/ml-messages", order: 7 },
+              { title: "Navigation", href: "/rust/api/navigation-messages", order: 8 },
+              { title: "Perception", href: "/rust/api/perception-messages", order: 9 },
+              { title: "Sensor", href: "/rust/api/sensor-messages", order: 10 },
+              { title: "Vision", href: "/rust/api/vision-messages", order: 10 },
+            ]
+          },
+        ]
+      },
+      {
+        title: "Examples",
+        href: "/rust/examples",
+        order: 2,
+        children: [
+          { title: "Basic Examples", href: "/rust/examples/basic-examples", order: 1 },
+          { title: "Advanced Examples", href: "/rust/examples/advanced-examples", order: 2 },
+        ]
+      },
+    ],
+  },
+  {
+    title: "Python",
+    links: [
+      { title: "Overview", href: "/python", order: 0 },
+      {
+        title: "API Reference",
+        href: "/python/api",
+        order: 1,
+        children: [
+          { title: "Overview", href: "/python/api", order: 0 },
+          { title: "Python Bindings", href: "/python/api/python-bindings", order: 1 },
+          { title: "Async Nodes", href: "/python/api/async-nodes", order: 2 },
+          { title: "Custom Messages", href: "/python/api/custom-messages", order: 3 },
+        ]
+      },
+      {
+        title: "Library",
+        href: "/python/library/python-message-library",
+        order: 2,
+        children: [
+          { title: "Message Library", href: "/python/library/python-message-library", order: 1 },
+          { title: "ML Utilities", href: "/python/library/ml-utilities", order: 2 },
+        ]
+      },
+      { title: "Examples", href: "/python/examples", order: 3 },
+    ],
+  },
+  {
+    title: "Development",
+    links: [
+      { title: "CLI Reference", href: "/development/cli-reference", order: 1 },
+      { title: "Monitor", href: "/development/monitor", order: 2 },
+      { title: "Testing", href: "/development/testing", order: 3 },
+      { title: "Parameters", href: "/development/parameters", order: 4 },
+      { title: "Static Analysis", href: "/development/static-analysis", order: 5 },
+      { title: "Error Handling", href: "/development/error-handling", order: 6 },
+      { title: "AI Integration", href: "/development/ai-integration", order: 7 },
+    ],
+  },
+  {
+    title: "Advanced Topics",
+    links: [
+      { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
+      { title: "Execution Modes", href: "/advanced/execution-modes", order: 2 },
+      { title: "Deterministic Execution", href: "/advanced/deterministic-execution", order: 3 },
+      { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
+      { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence", order: 6 },
+      { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
+      { title: "Circuit Breaker", href: "/advanced/circuit-breaker", order: 9 },
+      { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },
+      { title: "Record & Replay", href: "/advanced/record-replay", order: 12 },
+      { title: "Real-Time Configuration", href: "/advanced/rt-config", order: 13 },
+    ],
+  },
+  {
+    title: "Plugins",
+    links: [
+      { title: "Overview", href: "/plugins", order: 0 },
+      { title: "Creating CLI Plugins", href: "/plugins/creating-plugins", order: 1 },
+      { title: "Managing Plugins", href: "/plugins/managing-plugins", order: 2 },
+    ],
+  },
+  {
+    title: "Package Management",
+    links: [
+      { title: "Overview", href: "/package-management/package-management", order: 1 },
+      { title: "Using Prebuilt Nodes", href: "/package-management/using-prebuilt-nodes", order: 2 },
+      { title: "Environment Management", href: "/package-management/environment-management", order: 3 },
+      { title: "Configuration Reference", href: "/package-management/configuration", order: 4 },
+    ],
+  },
+  {
+    title: "Performance",
+    links: [
+      { title: "Optimization Guide", href: "/performance/performance", order: 1 },
+      { title: "Benchmarks", href: "/performance/benchmarks", order: 2 },
+    ],
+  },
+];
 
 interface DocsSidebarProps {
   isOpen?: boolean;
@@ -63,74 +189,19 @@ interface DocsSidebarProps {
 
 export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
   const pathname = usePathname();
-  const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>(() => {
-    const initial: Record<string, boolean> = {};
-    for (const section of sections) {
-      initial[section.title] = true;
-    }
-    return initial;
+  const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
+    "Getting Started": true,
+    "Core Concepts": true,
+    "Rust": true,
+    "Python": true,
+    "Development": true,
+    "Advanced Topics": true,
+    "Plugins": true,
+    "Package Management": true,
+    "Performance": true,
   });
 
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({});
-
-  // Selected language — used to filter per-language sidebar entries.
-  // SSR: start as null so first render shows all entries; hydration populates
-  // from localStorage and subsequent renders filter.
-  const [language, setLanguage] = useState<Language | null>(null);
-
-  useEffect(() => {
-    const stored = typeof window !== 'undefined'
-      ? (localStorage.getItem(LANG_STORAGE_KEY) as Language | null)
-      : null;
-    if (stored === 'Rust' || stored === 'Python' || stored === 'C++') {
-      setLanguage(stored);
-    } else {
-      setLanguage('Rust');
-    }
-  }, []);
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail;
-      if (detail === 'Rust' || detail === 'Python' || detail === 'C++') {
-        setLanguage(detail);
-      }
-    };
-    window.addEventListener(LANG_SYNC_EVENT, handler);
-    return () => window.removeEventListener(LANG_SYNC_EVENT, handler);
-  }, []);
-
-  useEffect(() => {
-    const handler = (e: StorageEvent) => {
-      if (e.key === LANG_STORAGE_KEY && (e.newValue === 'Rust' || e.newValue === 'Python' || e.newValue === 'C++')) {
-        setLanguage(e.newValue);
-      }
-    };
-    window.addEventListener('storage', handler);
-    return () => window.removeEventListener('storage', handler);
-  }, []);
-
-  // Recursively filter a link's children, dropping any that belong to a
-  // different language than the one currently selected.
-  const filterLink = (link: DocLink): DocLink | null => {
-    // Explicit frontmatter language wins; otherwise fall back to the path heuristic.
-    const linkLang = link.language ?? pageLanguage(link.href);
-    if (linkLang && language && linkLang !== language) return null;
-    const filteredChildren = link.children
-      ? (link.children.map(filterLink).filter(Boolean) as DocLink[])
-      : undefined;
-    return { ...link, children: filteredChildren };
-  };
-
-  const visibleSections: SidebarSection[] = sections
-    .map((section) => ({
-      ...section,
-      links: section.links.map(filterLink).filter(Boolean) as DocLink[],
-      groups: section.groups
-        ?.map((g) => ({ ...g, links: g.links.map(filterLink).filter(Boolean) as DocLink[] }))
-        .filter((g) => g.links.length > 0),
-    }))
-    .filter((section) => section.links.length > 0 || (section.groups?.length ?? 0) > 0);
 
   const toggleSection = (title: string) => {
     setExpandedSections((prev) => ({ ...prev, [title]: !prev[title] }));
@@ -206,7 +277,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
 
   const sidebarContent = (
     <div className="p-6 space-y-6 pb-12">
-      {visibleSections.map((section) => {
+      {sections.map((section) => {
         const isExpanded = expandedSections[section.title];
 
         return (
@@ -224,27 +295,11 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
             </button>
 
             {isExpanded && (
-              <div className="ml-6 space-y-4">
-                {section.links.length > 0 && (
-                  <ul className="space-y-1">
-                    {section.links
-                      .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-                      .map((link) => renderLink(link, 0))}
-                  </ul>
-                )}
-                {section.groups?.map((group) => (
-                  <div key={group.label}>
-                    <div className="px-3 mb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
-                      {group.label}
-                    </div>
-                    <ul className="space-y-1">
-                      {group.links
-                        .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-                        .map((link) => renderLink(link, 0))}
-                    </ul>
-                  </div>
-                ))}
-              </div>
+              <ul className="space-y-1 ml-6">
+                {section.links
+                  .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
+                  .map((link) => renderLink(link, 0))}
+              </ul>
             )}
           </div>
         );

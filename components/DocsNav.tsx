@@ -1,10 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { FiMenu, FiSearch, FiStar } from "react-icons/fi";
+import { FiGithub, FiMenu, FiSearch } from "react-icons/fi";
 import { ThemeToggle } from "./ThemeToggle";
 import { SearchModal } from "./SearchModal";
-import LanguageSelector from "./LanguageSelector";
 import { useState, useEffect } from "react";
 
 interface DocsNavProps {
@@ -69,23 +68,28 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
                 </kbd>
               </button>
 
-              {/* Star-on-GitHub call to action */}
+              {/* Registry */}
               <a
-                href="https://github.com/softmata/horus"
+                href="https://marketplace.horus-registry.dev/"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="group inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-[var(--text)] border border-[var(--border)] hover:border-[var(--accent)] hover:text-[var(--accent)] hover:bg-[var(--surface)] transition-colors"
-                title="Enjoying HORUS? Star it on GitHub"
-                aria-label="Star HORUS on GitHub"
+                className="hidden sm:inline-flex items-center px-3 py-1.5 text-sm font-medium text-[var(--text)] border border-[var(--border)] hover:border-[var(--border-hover)] hover:bg-[var(--surface)] transition-colors"
               >
-                <FiStar className="w-4 h-4 group-hover:fill-[var(--accent)] transition-colors" />
-                <span className="hidden sm:inline">Star on GitHub</span>
-                <span className="sm:hidden">Star</span>
+                Registry
               </a>
 
               <div className="flex items-center gap-1 ml-1">
-                <LanguageSelector />
                 <ThemeToggle />
+                <a
+                  href="https://github.com/softmata/horus"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="p-2 text-[var(--text-tertiary)] hover:text-[var(--text)] hover:bg-[var(--surface)] transition-colors"
+                  title="GitHub"
+                  aria-label="GitHub Repository"
+                >
+                  <FiGithub className="w-5 h-5" />
+                </a>
               </div>
             </div>
           </div>

@@ -3,9 +3,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { FiSearch, FiX, FiFileText, FiArrowRight } from "react-icons/fi";
 import Link from "next/link";
-import { Document } from "flexsearch";
+import { Document, type DocumentData } from "flexsearch";
 
-interface SearchDoc {
+interface SearchDoc extends DocumentData {
   id: number;
   title: string;
   description: string;
@@ -30,8 +30,7 @@ interface SearchModalProps {
 }
 
 // Create FlexSearch index
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let searchIndex: any = null;
+let searchIndex: Document<SearchDoc> | null = null;
 let docsCache: SearchDoc[] = [];
 
 function escapeHtml(text: string): string {
@@ -329,7 +328,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
 
           {indexReady && !loading && query && results.length === 0 && (
             <div className="p-8 text-center">
-              <div className="text-[var(--text-secondary)] mb-2">No results found for "{query}"</div>
+              <div className="text-[var(--text-secondary)] mb-2">No results found for &quot;{query}&quot;</div>
               <div className="text-sm text-[var(--text-tertiary)]">
                 Try different keywords or check your spelling
               </div>

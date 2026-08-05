@@ -23,6 +23,7 @@ const segmentLabels: Record<string, string> = {
 
   // Common file names
   "what-is-horus": "What is HORUS?",
+  "goals": "Goals & Vision",
   "complete-beginners-guide": "Complete Beginner's Guide",
   "installation": "Installation",
   "quick-start": "Quick Start",
@@ -47,6 +48,7 @@ const segmentLabels: Record<string, string> = {
   "network-communication": "Network",
   "node-macro": "node! Macro",
   "message-types": "Message Types",
+  "realtime-nodes": "Real-Time Nodes",
 
   // Development
   "cli-reference": "CLI Reference",
@@ -57,7 +59,7 @@ const segmentLabels: Record<string, string> = {
 
   // Package management files
   "using-prebuilt-nodes": "Using Prebuilt Nodes",
-  "lockfile": "Lockfile & Reproducibility",
+  "environment-management": "Environment Management",
   "configuration": "Configuration",
 
   // Multi-language files
@@ -98,7 +100,7 @@ export function Breadcrumb() {
 
   // Build breadcrumb trail
   let currentPath = "";
-  segments.forEach((segment) => {
+  segments.forEach((segment, index) => {
     currentPath += `/${segment}`;
     breadcrumbs.push({
       label: formatSegment(segment),

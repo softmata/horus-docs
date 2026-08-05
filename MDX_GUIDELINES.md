@@ -1,7 +1,5 @@
 # MDX Writing Guidelines for HORUS Documentation
 
-> **Content structure**: See [DOCS_STYLE_GUIDE.md](./DOCS_STYLE_GUIDE.md) for page templates and content rules. This file covers MDX syntax only.
-
 **CRITICAL REFERENCE**: Read this before editing any `.mdx` files to avoid common rendering errors.
 
 ## Common MDX Pitfalls (MUST AVOID)
@@ -152,47 +150,6 @@ If you're editing these files, be extra careful:
 - `benchmarks.mdx` - Contains many performance metrics with `<` symbols
 - `troubleshooting-runtime.mdx` - Contains error messages with generic types
 - Any file with tables showing performance data
-
-## Language Tabs
-
-Use `<LanguageTabs>` for code blocks that should show Rust, Python, and/or C++ versions. All `<LanguageTabs>` on the same page **sync automatically** — switching one switches all of them. The user's language preference persists across pages via localStorage.
-
-### Basic Usage
-
-```mdx
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-    let topic: Topic<f32> = Topic::new("sensor.temp")?;
-    topic.send(&22.5)?;
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    node = horus.Node(name="sensor", pubs=["sensor.temp"], tick=my_tick, rate=100)
-    node.send("sensor.temp", 22.5)
-    ```
-  </LangTab>
-</LanguageTabs>
-```
-
-### Rules
-
-- **Always use `<LangTab language="...">`** — the `language` prop must match exactly: `"Rust"`, `"Python"`, or `"C++"`.
-- **Order**: Put Rust first, Python second, C++ third (if present).
-- **Empty tabs**: Omit `<LangTab>` for a language that doesn't have content yet — the tab won't appear. Don't add empty placeholder tabs; the global selector already shows "Coming soon" for C++.
-- **Don't mix with old `<Tabs>`**: Use `<LanguageTabs>` for language switching. Keep `<Tabs>` for non-language tabs (e.g., OS selection, config formats).
-- **Prose goes outside tabs**: Explanatory text that applies to all languages goes before or after the `<LanguageTabs>` block, not inside a tab.
-- **Each tab must be self-contained**: Don't reference code from another tab ("unlike the Rust version above..."). A Python user may never see the Rust tab.
-
-### When to Use LanguageTabs vs Separate Pages
-
-| Situation | Use |
-|-----------|-----|
-| Concept page with code examples | `<LanguageTabs>` |
-| Recipe (short, copy-paste) | `<LanguageTabs>` |
-| Full tutorial (step-by-step walkthrough) | Separate pages with cross-language banner |
-| API reference | Separate sections (Rust API, Python API) |
 
 ## Auto-Fix Script
 

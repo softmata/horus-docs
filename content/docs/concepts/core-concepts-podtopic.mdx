@@ -1,155 +1,50 @@
 ---
-title: Custom Messages & Performance
-description: Define your own message types and understand how HORUS optimizes transfer speed
-order: 31
-sidebar_group: "Communication & Data"
+title: Core Concepts - POD Types
+description: How HORUS auto-detects POD types for zero-serialization, ultra-fast communication
+order: 25
 ---
 
-# Custom Messages & Performance
+# POD Types and Zero-Serialization
 
-Need a message type that doesn't exist in the standard library? Use the `message!` macro. HORUS handles all the optimization automatically — you never need to think about serialization or memory layout.
+When you use `Topic<T>`, HORUS **automatically detects** whether your message type is POD (Plain Old Data). POD types bypass serialization entirely — messages are transferred as raw bytes via direct memory copy, achieving **~50ns latency** instead of ~167ns with bincode serialization.
 
-For performance-sensitive applications: standard fixed-size types transfer at **~50ns** (zero-copy), variable-size types at **~167ns** (serialized). No configuration needed.
+You don't need a separate API. The same `Topic::new()` call automatically selects the fastest path for your type.
 
-## Automatic Optimization
+## How Auto-Detection Works
 
-When you create a `Topic<T>`, HORUS inspects the message type at compile time and selects the fastest transfer strategy:
+At topic creation time, HORUS checks whether your type is POD:
 
-- **Fixed-size types** (no heap allocations) use raw memory copy — no serialization overhead
-- **Variable-size types** (containing `String`, `Vec`, etc.) use fast bincode serialization
+- **No destructor** — The type has no `Drop` impl (no heap pointers like `String`, `Vec`, `Box`)
+- **Non-zero size** — Not a zero-sized type
 
-You always use the same API. The optimization is invisible:
+If both are true, HORUS uses the zero-copy memcpy path. If not, it falls back to bincode serialization. This happens transparently — you always use the same `Topic<T>` API:
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-    use horus_robotics::prelude::*;
+```rust
+use horus::prelude::*;
 
-    // Fixed-size type — automatically uses zero-copy (~50ns cross-process)
-    let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
-    cmd_topic.send(CmdVel::new(1.0, 0.5));
+// POD type - auto-detected, uses zero-copy memcpy (~50ns cross-process)
+let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+cmd_topic.send(CmdVel::new(1.0, 0.5));
 
-    // Variable-size type — automatically uses serialization (~167ns cross-process)
-    let log_topic: Topic<String> = Topic::new("log")?;
-    log_topic.send("Motor started".to_string());
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
+// Non-POD type - auto-detected, uses bincode serialization (~167ns cross-process)
+let log_topic: Topic<String> = Topic::new("log")?;
+log_topic.send("Motor started".to_string());
+```
 
-    # Fixed-size type — automatically uses zero-copy (~50ns cross-process)
-    cmd_topic = horus.Topic("cmd_vel", horus.CmdVel)
-    cmd_topic.send(horus.CmdVel(linear=1.0, angular=0.5))
+## Performance Impact
 
-    # Variable-size type — automatically uses serialization (~167ns cross-process)
-    log_topic = horus.Topic("log", str)
-    log_topic.send("Motor started")
-    ```
-  </LangTab>
-</LanguageTabs>
+POD detection affects cross-process performance:
 
-## Performance Comparison
+| Type | Cross-Process Latency | Notes |
+|------|----------------------|-------|
+| POD (e.g. `CmdVel`, `Imu`) | ~50-85ns | Zero-serialization, raw memory copy |
+| Non-POD (e.g. `String`, `Vec`) | ~167ns | Bincode serialization |
 
-| Type Category | Cross-Process Latency | Examples |
-|---------------|----------------------|----------|
-| Fixed-size (zero-copy) | ~50-85ns | `CmdVel`, `Imu`, `Pose2D`, `Heartbeat` |
-| Variable-size (serialized) | ~167ns | `String`, `Vec<f32>`, `HashMap<K,V>` |
+Same-process communication is fast for both POD and non-POD types since no shared memory serialization is needed.
 
-Same-process communication is fast for both categories since no shared memory serialization is needed.
+## Built-in POD Messages
 
-For most applications, the ~167ns serialized path is more than fast enough. Only high-frequency control loops running at 1kHz+ benefit noticeably from the zero-copy path.
-
-## Custom Messages
-
-Use the `message!` macro to define your own message types. Add `#[fixed]` for zero-copy shared memory transport (~50ns) when all fields are primitives:
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-
-    message! {
-        #[fixed]
-        /// Motor feedback — zero-copy via shared memory (~50ns)
-        MotorFeedback {
-            timestamp_ns: u64,
-            motor_id: u32,
-            velocity: f32,
-            current_amps: f32,
-            temperature_c: f32,
-        }
-    }
-
-    let feedback: Topic<MotorFeedback> = Topic::new("motor.feedback")?;
-    feedback.send(MotorFeedback {
-        timestamp_ns: 0,
-        motor_id: 1,
-        velocity: 3.14,
-        current_amps: 0.5,
-        temperature_c: 45.0,
-    });
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
-
-    @horus.message(fixed=True)
-    class MotorFeedback:
-        """Motor feedback — zero-copy via shared memory (~50ns)"""
-        timestamp_ns: int
-        motor_id: int
-        velocity: float
-        current_amps: float
-        temperature_c: float
-
-    feedback = horus.Topic("motor.feedback", MotorFeedback)
-    feedback.send(MotorFeedback(
-        timestamp_ns=0,
-        motor_id=1,
-        velocity=3.14,
-        current_amps=0.5,
-        temperature_c=45.0,
-    ))
-    ```
-  </LangTab>
-</LanguageTabs>
-
-For messages with `String`, `Vec`, or other dynamic data, omit `#[fixed]` — HORUS uses serialization transport automatically (~167ns):
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    message! {
-        /// Diagnostic log — flexible, serialized
-        DiagLog {
-            node_name: String,
-            message: String,
-            level: u8,
-        }
-    }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    @horus.message
-    class DiagLog:
-        """Diagnostic log — flexible, serialized"""
-        node_name: str
-        message: str
-        level: int
-    ```
-  </LangTab>
-</LanguageTabs>
-
-## Built-in Message Types
-
-All standard HORUS message types are pre-optimized. Fixed-size types automatically use the zero-copy fast path.
+All standard HORUS message types implement `PodMessage` and automatically use the fast path:
 
 ### Geometry
 
@@ -170,7 +65,7 @@ All standard HORUS message types are pre-optimized. Fixed-size types automatical
 | `Imu` | Inertial measurement unit data |
 | `LaserScan` | 2D laser range data |
 | `Odometry` | Position/velocity estimate |
-| `RangeSensor` | Single distance measurement |
+| `Range` | Single distance measurement |
 | `BatteryState` | Battery level and status |
 | `NavSatFix` | GPS position |
 
@@ -182,6 +77,8 @@ All standard HORUS message types are pre-optimized. Fixed-size types automatical
 | `DifferentialDriveCommand` | Differential drive control |
 | `ServoCommand` | Servo position/velocity |
 | `JointCommand` | Joint-level control |
+| `PwmCommand` | PWM signal output |
+| `StepperCommand` | Stepper motor control |
 | `TrajectoryPoint` | Trajectory waypoint |
 | `PidConfig` | PID controller parameters |
 
@@ -191,7 +88,7 @@ All standard HORUS message types are pre-optimized. Fixed-size types automatical
 |---------|-------------|
 | `Heartbeat` | Liveness signal |
 | `NodeHeartbeat` | Per-node health status |
-| `DiagnosticStatus` | General status report |
+| `Status` | General status report |
 | `EmergencyStop` | Emergency stop signal |
 | `SafetyStatus` | Safety system state |
 | `ResourceUsage` | CPU/memory usage |
@@ -202,10 +99,10 @@ All standard HORUS message types are pre-optimized. Fixed-size types automatical
 
 | Message | Description |
 |---------|-------------|
-| `NavGoal` | Navigation goal |
+| `Goal` | Navigation goal |
 | `GoalResult` | Goal completion result |
 | `Waypoint` | Navigation waypoint |
-| `NavPath` | Sequence of waypoints |
+| `Path` | Sequence of waypoints |
 | `PathPlan` | Planned path |
 | `VelocityObstacle` | Velocity obstacle for avoidance |
 | `VelocityObstacles` | Set of velocity obstacles |
@@ -216,6 +113,7 @@ All standard HORUS message types are pre-optimized. Fixed-size types automatical
 |---------|-------------|
 | `WrenchStamped` | Force/torque measurement |
 | `ForceCommand` | Force control command |
+| `TactileArray` | Tactile sensor array |
 | `ImpedanceParameters` | Impedance control config |
 | `ContactInfo` | Contact detection data |
 | `HapticFeedback` | Haptic output command |
@@ -231,58 +129,89 @@ All standard HORUS message types are pre-optimized. Fixed-size types automatical
 
 | Message | Description |
 |---------|-------------|
-| `Tensor` | Fixed-size tensor descriptor |
+| `HorusTensor` | Fixed-size tensor descriptor |
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-    use horus_robotics::prelude::*;
+```rust
+use horus::prelude::*;
 
-    // All built-in messages use the fastest available path automatically
-    let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;
-    let pose: Topic<Pose2D> = Topic::new("robot_pose")?;
-    let imu: Topic<Imu> = Topic::new("imu_data")?;
-    let estop: Topic<EmergencyStop> = Topic::new("emergency_stop")?;
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
+// All built-in messages are POD — fast path is automatic
+let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;
+let pose: Topic<Pose2D> = Topic::new("robot_pose")?;
+let imu: Topic<Imu> = Topic::new("imu_data")?;
+let estop: Topic<EmergencyStop> = Topic::new("emergency_stop")?;
+```
 
-    # All built-in messages use the fastest available path automatically
-    cmd = horus.Topic("cmd_vel", horus.CmdVel)
-    pose = horus.Topic("robot_pose", horus.Pose2D)
-    imu = horus.Topic("imu_data", horus.Imu)
-    estop = horus.Topic("emergency_stop", horus.EmergencyStop)
-    ```
-  </LangTab>
-</LanguageTabs>
+## Custom POD Messages
 
-## Design Decisions
+To make your own types use the fast path, implement the `PodMessage` trait:
 
-**Why automatic optimization instead of manual annotation?**
-In ROS2, you choose between message types and serialization strategies manually. HORUS inspects the type at compile time — if all fields are fixed-size primitives (no `String`, `Vec`, or heap pointers), it uses raw memory copy. If any field is dynamic, it uses fast bincode serialization. You always use the same `Topic<T>` API. The optimization is invisible and always correct.
+### Requirements
 
-**Why the `message!` macro instead of raw derives?**
-The macro generates the correct trait implementations (`Clone`, `Serialize`, `Deserialize`, and optionally `Copy` for fixed-size types) in one step. It also generates `LogSummary` for TUI debug logging and validates that `#[fixed]` types actually have fixed-size fields at compile time — catching mistakes that would otherwise cause silent performance degradation.
+1. **`#[repr(C)]`** — C-compatible memory layout (prevents Rust from reordering fields)
+2. **`Copy + Clone`** — Bitwise copyable, no heap allocations
+3. **`Pod + Zeroable`** — Safe to cast to/from bytes (from `bytemuck` crate)
+4. **Fixed size** — Size known at compile time (no `Vec`, `String`, or other dynamic types)
 
-**Why separate fixed-size and variable-size paths?**
-Fixed-size types can be memcpy'd directly into shared memory — no serialization, no allocation, ~50 ns. Variable-size types must be serialized because the receiver doesn't know the exact layout (how long is the `String`?). The two paths are invisible to the user but provide a 2–3x latency difference that matters at 1 kHz+.
+### Example
 
-## Trade-offs
+```rust
+use horus::prelude::*;
+use bytemuck::{Pod, Zeroable};
 
-| Gain | Cost |
-|------|------|
-| **Automatic optimization** — fastest path selected at compile time | Must understand fixed vs variable-size to optimize manually |
-| **Zero-copy for fixed-size types** — ~50 ns cross-process | Fixed-size types can't contain `String`, `Vec`, or `Box` |
-| **Same API for all types** — `Topic<T>` works identically | Variable-size types are ~3x slower (~167 ns) than fixed-size |
-| **`message!` macro** — one-line type definition with all derives | Macro syntax differs slightly from raw struct definition |
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct MotorFeedback {
+    pub timestamp_ns: u64,    // 8 bytes
+    pub motor_id: u32,        // 4 bytes
+    pub velocity: f32,        // 4 bytes
+    pub current_amps: f32,    // 4 bytes
+    pub temperature_c: f32,   // 4 bytes
+}
+
+// bytemuck traits for safe byte casting
+unsafe impl Zeroable for MotorFeedback {}
+unsafe impl Pod for MotorFeedback {}
+
+// HORUS PodMessage trait for ultra-fast IPC
+unsafe impl PodMessage for MotorFeedback {}
+
+// Now Topic<MotorFeedback> automatically uses the POD fast path
+let feedback: Topic<MotorFeedback> = Topic::new("motor.feedback")?;
+feedback.send(MotorFeedback {
+    timestamp_ns: 0,
+    motor_id: 1,
+    velocity: 3.14,
+    current_amps: 0.5,
+    temperature_c: 45.0,
+});
+```
+
+**Important**: Custom POD types also need `Clone + Serialize + DeserializeOwned` since `Topic<T>` requires these bounds. The serialization traits are used as a fallback if the type ever goes through a non-POD code path (e.g., logging).
+
+### Rules for POD Safety
+
+The `PodMessage` trait is `unsafe` because incorrect implementations can cause data corruption. Ensure:
+
+- **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`, `bool`) and fixed-size arrays of primitives
+- **No enums with discriminants** — Unless `#[repr(C)]` or `#[repr(u8)]` with explicit values
+- **Consistent layout** — The struct must have the same binary layout on all target platforms
+- **No implicit padding** — Use explicit padding fields (`_pad: [u8; N]`) if needed
+
+## When Types Are Not POD
+
+Types containing heap-allocated data are automatically detected as non-POD:
+
+```rust
+// These are NOT POD - HORUS auto-detects and uses bincode serialization
+Topic<String>        // String has Drop (heap-allocated)
+Topic<Vec<f32>>      // Vec has Drop (heap-allocated)
+Topic<HashMap<K,V>>  // HashMap has Drop
+```
+
+Non-POD types use bincode serialization through shared memory. This is still fast (~167ns cross-process) but ~3x slower than the POD path. For most applications, this difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
 
 ## See Also
 
-- [Topics — Full Reference](/concepts/core-concepts-topic) — The unified communication API
-- [Message Types](/concepts/message-types) — Full message type reference with all 70+ types
-- [Topic API](/rust/api/topic) — Complete Topic method documentation
-- [Architecture](/concepts/architecture) — How communication fits into the HORUS architecture
+- **[Topic](/concepts/core-concepts-topic)** — The unified communication API
+- **[Message Types](/concepts/message-types)** — Full message type reference
+- **[Architecture](/concepts/architecture)** — How communication fits into the HORUS architecture

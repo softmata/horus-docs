@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { openDocsIssue } from '@/lib/report-issue';
 
 interface CodeBlockProps {
   children: string;
@@ -10,6 +9,7 @@ interface CodeBlockProps {
 
 export default function CodeBlock({ children, className = '' }: CodeBlockProps) {
   const codeRef = useRef<HTMLElement>(null);
+  const [highlighted, setHighlighted] = useState(false);
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
   const [copied, setCopied] = useState(false);
   const language = className.replace(/language-/, '') || 'text';
@@ -74,6 +74,7 @@ export default function CodeBlock({ children, className = '' }: CodeBlockProps) 
 
           // Re-highlight with Prism
           Prism.highlightElement(codeRef.current);
+          setHighlighted(true);
         }
       } catch (error) {
         console.warn('Failed to load syntax highlighting:', error);
@@ -98,28 +99,17 @@ export default function CodeBlock({ children, className = '' }: CodeBlockProps) 
     marginBottom: '1.5rem',
   };
 
-  const handleReport = () => {
-    openDocsIssue({ snippet: { code: children, language } });
-  };
-
   return (
-    <div className="group" style={{ position: 'relative', marginBottom: '1.5rem' }}>
-      <div className="absolute top-2 right-2 flex gap-1 z-10" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
-        <button
-          onClick={handleReport}
-          title="Report an issue with this code block"
-          aria-label="Report an issue with this code block"
-          className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 px-2 py-1 text-xs font-medium bg-[var(--bg)] border border-[var(--border)] text-[var(--text-tertiary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-all duration-150"
-        >
-          Report an issue
-        </button>
-        <button
-          onClick={handleCopy}
-          className="px-2 py-1 text-xs font-medium bg-[var(--bg)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text)] hover:border-[var(--border-hover)] transition-colors"
-        >
-          {copied ? 'Copied' : 'Copy'}
-        </button>
-      </div>
+    <div style={{ position: 'relative', marginBottom: '1.5rem' }}>
+      <button
+        onClick={handleCopy}
+        className="absolute top-2 right-2 px-2 py-1 text-xs font-medium bg-[var(--bg)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text)] hover:border-[var(--border-hover)] transition-colors z-10"
+        style={{
+          fontFamily: 'var(--font-mono, monospace)',
+        }}
+      >
+        {copied ? 'Copied' : 'Copy'}
+      </button>
       <pre className={`code-block ${className}`} style={preStyle}>
         <code
           ref={codeRef}

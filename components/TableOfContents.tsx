@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 
 interface Heading {
   id: string;
@@ -20,7 +21,7 @@ export function TableOfContents() {
     const headingElements = article.querySelectorAll("h2, h3");
     const extractedHeadings: Heading[] = [];
 
-    headingElements.forEach((heading) => {
+    headingElements.forEach((heading, index) => {
       const text = heading.textContent || "";
       let id = heading.id;
 
@@ -119,36 +120,36 @@ export function TableOfContents() {
           </h4>
           <ul className="space-y-2">
             <li>
-              <a
+              <Link
                 href="/getting-started/installation"
                 className="text-xs text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors block touch-manipulation py-1"
               >
                 Getting Started
-              </a>
+              </Link>
             </li>
             <li>
-              <a
+              <Link
                 href="/examples"
                 className="text-xs text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors block touch-manipulation py-1"
               >
                 Examples
-              </a>
+              </Link>
             </li>
             <li>
-              <a
+              <Link
                 href="/api-node"
                 className="text-xs text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors block touch-manipulation py-1"
               >
                 API Reference
-              </a>
+              </Link>
             </li>
             <li>
-              <a
+              <Link
                 href="/benchmarks"
                 className="text-xs text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors block touch-manipulation py-1"
               >
                 Benchmarks
-              </a>
+              </Link>
             </li>
           </ul>
         </div>

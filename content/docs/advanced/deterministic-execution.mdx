@@ -1,0 +1,237 @@
+---
+title: "Deterministic Execution"
+description: "Achieving reproducible execution in HORUS for testing, debugging, and safety certification"
+weight: 42
+---
+
+# Deterministic Execution
+
+HORUS supports deterministic execution where the same inputs produce identical outputs every run. This is useful for debugging, regression testing, and safety-critical systems.
+
+## Why Determinism Matters
+
+**Debugging**: Non-deterministic bugs are hard to reproduce. Deterministic mode lets you replay exact sequences.
+
+**Testing**: Repeatable unit tests and regression testing require the same outputs for the same inputs.
+
+**Safety Certification**: Standards like ISO 26262 and IEC 62443 require predictable execution timing and reproducible behavior.
+
+## Determinism Levels
+
+HORUS offers different levels of deterministic guarantees:
+
+| Level | Config | What You Get | Use Case |
+|-------|--------|--------------|----------|
+| **Basic** | `Scheduler::new()` | Sequential execution, no learning | Most applications |
+| **+ Performance** | `.tier(NodeTier::*)` | Basic + explicit optimization tiers | Speed + determinism |
+| **+ Safety** | `.safety_monitor(true)` | Basic + watchdogs, WCET enforcement | Medical, industrial |
+| **+ Full** | `.deterministic(42)` | Virtual time, seeded RNG, execution tracing | Formal verification |
+
+### Level 1: Basic Determinism (Default)
+
+`Scheduler::new()` is deterministic out of the box:
+
+```rust,ignore
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    let mut scheduler = Scheduler::new();
+    scheduler.add(my_node).order(0).done();
+    scheduler.run()?;
+    Ok(())
+}
+```
+
+**Guarantees:**
+- Sequential execution (same order every tick)
+- No learning phase (no runtime profiling)
+- Reproducible runs with same inputs
+
+### Level 2: Determinism + Performance Tiers
+
+Use `.tier()` to get deterministic execution with explicit performance tiers:
+
+```rust,ignore
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new();
+
+scheduler.add(pid_controller).order(0).tier(NodeTier::UltraFast).done();  // <1μs inline
+scheduler.add(sensor_reader).order(1).tier(NodeTier::Fast).done();        // <10μs inline
+scheduler.add(data_logger).order(5).tier(NodeTier::Normal).done();        // Standard scheduling
+
+scheduler.run()?;
+```
+
+**Node tiers:**
+
+| Tier | Description | Default Failure Policy |
+|------|-------------|----------------------|
+| `NodeTier::UltraFast` | Ultra-fast inline (&lt;1μs) | Fatal (stop on failure) |
+| `NodeTier::Fast` | Inline execution (&lt;10μs) | Fatal |
+| `NodeTier::Normal` | Standard scheduling (&lt;100μs+) | Restart (5 attempts, 100ms delay) |
+
+Tiers are explicit — no runtime profiling needed, so execution is fully deterministic.
+
+### Level 3: Determinism + Safety
+
+Use builder methods to enable safety monitoring:
+
+```rust,ignore
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .safety_monitor(true)
+    .watchdog(Duration::from_millis(100))
+    .memory_locked(true);
+```
+
+**Adds:**
+- Watchdog timers (100ms timeout)
+- WCET enforcement
+- Deadline monitoring
+- Memory locking (mlockall)
+- Real-time scheduling class (SCHED_FIFO)
+- Safety monitor with zero tolerance for deadline misses
+
+### Level 4: Full Deterministic Mode
+
+Use the `.deterministic(seed)` builder method for full reproducibility with virtual time:
+
+```rust,ignore
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new()
+    .deterministic(42)
+    .with_blackbox(100);
+```
+
+**Adds:**
+- Virtual time (deterministic clock instead of wall clock)
+- Seeded RNG (all randomness derived from seed 42)
+- Execution tracing via the built-in recording system
+- BlackBox flight recorder (100MB)
+- Static execution order (no per-node rates)
+
+The deterministic config is managed internally — the scheduler creates the virtual clock and trace infrastructure automatically.
+
+## WCET Monitoring
+
+HORUS tracks Worst-Case Execution Time through the real-time node system. When a node's tick exceeds its WCET budget, a `WCETViolation` is recorded:
+
+```rust,ignore
+use horus::prelude::*;
+
+// Set WCET budget when adding an RT node
+let mut scheduler = Scheduler::new()
+    .safety_monitor(true);
+
+scheduler.add(motor_controller)
+    .order(0)
+    .rt()
+    .wcet_us(500)      // 500μs max execution time
+    .deadline_us(1000)  // 1ms deadline
+    .done();
+
+scheduler.run()?;
+```
+
+When a WCET budget is exceeded, the node's `on_wcet_violation` callback is invoked. For critical nodes, this triggers an emergency stop. For non-critical nodes, the violation is logged and recorded in the [BlackBox](/advanced/blackbox).
+
+RT nodes can handle violations in their implementation:
+
+```rust,ignore
+// Inside an RtNode implementation
+fn tick_rt(&mut self) -> Result<()> {
+    // ... your time-critical logic ...
+    Ok(())
+}
+
+fn on_wcet_violation(&mut self, violation: &WCETViolation) {
+    eprintln!("WCET violation: budget exceeded by {:?}", violation.overrun);
+}
+```
+
+## Deterministic vs Non-Deterministic
+
+**Default (Sequential, Deterministic):**
+```
+Run 1: Node A → Node B → Node C
+Run 2: Node A → Node B → Node C  (identical)
+Run 3: Node A → Node B → Node C  (identical)
+```
+
+**Parallel Mode (Non-Deterministic):**
+```
+Run 1: Node A → Node B → Node C
+Run 2: Node B → Node A → Node C  (thread scheduling varies)
+```
+
+| Metric | Sequential (Deterministic) | Parallel |
+|--------|---------------------------|----------|
+| Consistency | Perfect | Variable |
+| Multi-core | No | Yes |
+| Certification Ready | Yes | No |
+
+## Best Practices
+
+### Use Deterministic Seeds
+
+For any randomness in your nodes:
+
+```rust,ignore
+impl Node for RandomNode {
+    fn init(&mut self) -> Result<()> {
+        self.rng = StdRng::seed_from_u64(42);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        // Generates same sequence every run
+        let value = self.rng.gen::<f64>();
+    }
+}
+```
+
+### Avoid System Time
+
+```rust,ignore
+// BAD: Non-deterministic
+fn tick(&mut self) {
+    let now = std::time::Instant::now();  // Different every run
+}
+
+// GOOD: Use internal state counter
+fn tick(&mut self) {
+    self.tick_count += 1;  // Same sequence every run
+}
+```
+
+### Control External Inputs
+
+```rust,ignore
+// For testing, mock external sensors
+#[cfg(test)]
+impl Node for SensorNode {
+    fn tick(&mut self) {
+        self.output = self.test_data[self.tick_count % self.test_data.len()];
+    }
+}
+```
+
+## Summary
+
+| Use Case | Config |
+|----------|--------|
+| General robotics | `Scheduler::new()` |
+| Unit testing / debugging | `Scheduler::new()` |
+| Performance + deterministic | `.tier(NodeTier::*)` |
+| Medical / surgical robots | `Scheduler::new().safety_monitor(true)` |
+| Formal verification | `Scheduler::new().deterministic(42)` |
+| Max throughput (non-deterministic) | `Scheduler::new()` + `.compute()` per node |
+
+## Next Steps
+
+- [Execution Modes](/advanced/execution-modes) - Sequential vs parallel execution
+- [BlackBox Flight Recorder](/advanced/blackbox) - Event recording for post-mortem analysis
+- [Circuit Breaker](/advanced/circuit-breaker) - Fault tolerance patterns
