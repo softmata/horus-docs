@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiChevronRight, FiHome } from "react-icons/fi";
+import { localeFromPathname, localizedHref, stripLocale } from "@/lib/i18n";
 
 interface BreadcrumbItem {
   label: string;
@@ -87,15 +88,17 @@ function formatSegment(segment: string): string {
 
 export function Breadcrumb() {
   const pathname = usePathname();
+  const locale = localeFromPathname(pathname);
+  const localizedPathname = stripLocale(pathname);
 
   // Don't show breadcrumbs on home page
-  if (pathname === "/") {
+  if (localizedPathname === "/") {
     return null;
   }
 
-  const segments = pathname.split("/").filter(Boolean);
+  const segments = localizedPathname.split("/").filter(Boolean);
   const breadcrumbs: BreadcrumbItem[] = [
-    { label: "Home", href: "/" }
+    { label: "Home", href: localizedHref('/', locale) }
   ];
 
   // Build breadcrumb trail
@@ -104,7 +107,7 @@ export function Breadcrumb() {
     currentPath += `/${segment}`;
     breadcrumbs.push({
       label: formatSegment(segment),
-      href: currentPath
+      href: localizedHref(currentPath, locale)
     });
   });
 

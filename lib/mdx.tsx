@@ -34,6 +34,7 @@ import {
   TransformFrameConcurrentChart,
 } from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
+import { defaultLocale, type Locale } from '@/lib/i18n';
 
 const contentDirectory = path.join(process.cwd(), 'content');
 
@@ -48,6 +49,9 @@ export interface DocContent {
   slug: string;
   frontmatter: DocFrontmatter;
   content: React.ReactElement;
+  requestedLocale: Locale;
+  renderedLocale: Locale;
+  isFallback: boolean;
 }
 
 /**
@@ -69,20 +73,30 @@ export async function getDocSlugs(dir: string): Promise<string[]> {
 /**
  * Get a single MDX document by slug
  */
-export async function getDoc(slug: string[]): Promise<DocContent | null> {
+export async function getDoc(slug: string[], locale: Locale = defaultLocale): Promise<DocContent | null> {
   try {
+    const relativeSlug = slug[0] === 'docs' ? slug.slice(1) : slug;
+    const localizedRoot = path.join(contentDirectory, 'locales', locale, 'docs');
+    const englishRoot = path.join(contentDirectory, 'docs');
+    const requestedRoot = locale === defaultLocale ? englishRoot : localizedRoot;
+    const localizedDirect = path.join(requestedRoot, ...relativeSlug) + '.mdx';
+    const localizedIndex = path.join(requestedRoot, ...relativeSlug, 'index.mdx');
+    const hasLocalized = fs.existsSync(localizedDirect) || fs.existsSync(localizedIndex);
+    const documentRoot = hasLocalized ? requestedRoot : englishRoot;
+    const renderedLocale = hasLocalized ? locale : defaultLocale;
+
     // Try the direct file path first
-    let filePath = path.join(contentDirectory, ...slug) + '.mdx';
+    let filePath = path.join(documentRoot, ...relativeSlug) + '.mdx';
 
     // Prevent path traversal — resolved path must stay within content directory
-    const resolvedContent = path.resolve(contentDirectory);
+    const resolvedContent = path.resolve(documentRoot);
     if (!path.resolve(filePath).startsWith(resolvedContent + path.sep)) {
       return null;
     }
 
     // If that doesn't exist, try looking for an index.mdx file in a directory
     if (!fs.existsSync(filePath)) {
-      const indexPath = path.join(contentDirectory, ...slug, 'index.mdx');
+      const indexPath = path.join(documentRoot, ...relativeSlug, 'index.mdx');
       if (!path.resolve(indexPath).startsWith(resolvedContent + path.sep)) {
         return null;
       }
@@ -261,6 +275,9 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
       slug: slug.join('/'),
       frontmatter: data as DocFrontmatter,
       content,
+      requestedLocale: locale,
+      renderedLocale,
+      isFallback: locale !== renderedLocale,
     };
   } catch (error) {
     // A present but malformed document is a build/deployment defect, not a

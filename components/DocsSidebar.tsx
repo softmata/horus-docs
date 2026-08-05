@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
 import { useState, useEffect } from "react";
+import { localeFromPathname, localizedHref, stripLocale } from "@/lib/i18n";
 
 interface DocLink {
   title: string;
@@ -189,6 +190,8 @@ interface DocsSidebarProps {
 
 export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
   const pathname = usePathname();
+  const locale = localeFromPathname(pathname);
+  const unlocalizedPathname = stripLocale(pathname);
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     "Getting Started": true,
     "Core Concepts": true,
@@ -229,7 +232,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
   }, [isOpen, onClose]);
 
   const renderLink = (link: DocLink, depth: number = 0) => {
-    const isActive = pathname === link.href;
+    const isActive = unlocalizedPathname === link.href;
     const hasChildren = link.children && link.children.length > 0;
     const isExpanded = expandedItems[link.href];
 
@@ -250,7 +253,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
             </button>
           )}
           <Link
-            href={link.href}
+            href={localizedHref(link.href, locale)}
             onClick={handleLinkClick}
             className={`flex-1 block px-3 py-2 rounded text-sm transition-colors touch-manipulation ${
               hasChildren ? "" : depth > 0 ? "ml-4" : ""

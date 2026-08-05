@@ -5,12 +5,17 @@ import { FiGithub, FiMenu, FiSearch } from "react-icons/fi";
 import { ThemeToggle } from "./ThemeToggle";
 import { SearchModal } from "./SearchModal";
 import { useState, useEffect } from "react";
+import { usePathname } from "next/navigation";
+import { LanguageSelector } from "./LanguageSelector";
+import { localeFromPathname, localizedHref } from "@/lib/i18n";
 
 interface DocsNavProps {
   onMenuClick?: () => void;
 }
 
 export function DocsNav({ onMenuClick }: DocsNavProps) {
+  const pathname = usePathname();
+  const locale = localeFromPathname(pathname);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
 
   // Keyboard shortcut for search (Cmd+K / Ctrl+K)
@@ -45,7 +50,7 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
               )}
 
               <Link
-                href="/"
+                href={localizedHref('/', locale)}
                 className="flex items-center gap-2 font-bold text-lg text-[var(--text)] transition-colors"
               >
                 <span className="text-[var(--text)]">HORUS</span>
@@ -55,6 +60,7 @@ export function DocsNav({ onMenuClick }: DocsNavProps) {
 
             {/* Right: Search + Actions */}
             <div className="flex items-center gap-2">
+              <LanguageSelector />
               {/* Search Button */}
               <button
                 onClick={() => setIsSearchOpen(true)}

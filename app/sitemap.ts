@@ -1,171 +1,35 @@
-import { MetadataRoute } from 'next'
+import fs from 'fs';
+import path from 'path';
+import type { MetadataRoute } from 'next';
+import { locales, localizedHref } from '@/lib/i18n';
+
+const baseUrl = 'https://docs.horus-registry.dev';
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const baseUrl = 'https://docs.horus-registry.dev'
+  const contentDir = path.join(process.cwd(), 'content/docs');
+  const documents: Array<{ slug: string; modified: Date }> = [];
 
-  return [
-    // HIGHEST PRIORITY - Landing & Discovery Pages
-    {
-      url: baseUrl,
-      lastModified: new Date(),
-      changeFrequency: 'daily',
-      priority: 1.0,
-    },
-    {
-      url: `${baseUrl}/docs/what-is-horus`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 1.0,
-    },
-    {
-      url: `${baseUrl}/docs/complete-beginners-guide`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 1.0,
-    },
+  function visit(dir: string, base: string[] = []) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const filePath = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(filePath, [...base, entry.name]);
+      else if (entry.name.endsWith('.mdx')) {
+        const name = entry.name.replace(/\.mdx$/, '');
+        const parts = name === 'index' ? base : [...base, name];
+        if (parts.length) documents.push({ slug: `/${parts.join('/')}`, modified: fs.statSync(filePath).mtime });
+      }
+    }
+  }
 
-    // HIGH PRIORITY - Getting Started (Conversion Pages)
-    {
-      url: `${baseUrl}/getting-started/installation`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.95,
-    },
-    {
-      url: `${baseUrl}/getting-started/quick-start`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.95,
-    },
-    {
-      url: `${baseUrl}/getting-started`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.9,
-    },
+  visit(contentDir);
 
-    // HIGH PRIORITY - Performance & Comparisons (Decision Pages)
-    {
-      url: `${baseUrl}/performance/benchmarks`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.9,
+  return documents.flatMap(document => locales.map(locale => ({
+    url: `${baseUrl}${localizedHref(document.slug, locale)}`,
+    lastModified: document.modified,
+    changeFrequency: 'weekly' as const,
+    priority: document.slug.includes('getting-started') ? 0.9 : 0.7,
+    alternates: {
+      languages: Object.fromEntries(locales.map(value => [value, `${baseUrl}${localizedHref(document.slug, value)}`])),
     },
-    {
-      url: `${baseUrl}/performance/vs-ros2`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.9,
-    },
-
-    // MEDIUM-HIGH - Examples & Tutorials
-    {
-      url: `${baseUrl}/basic-examples`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.85,
-    },
-    {
-      url: `${baseUrl}/tutorials`,
-      lastModified: new Date(),
-      changeFrequency: 'weekly',
-      priority: 0.85,
-    },
-
-    // MEDIUM - Core Concepts (Education Pages)
-    {
-      url: `${baseUrl}/core-concepts`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/core-concepts/nodes`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/core-concepts/hub`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/core-concepts/scheduler`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-
-    // MEDIUM - Multi-Language Support
-    {
-      url: `${baseUrl}/multi-language/python-bindings`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-    {
-      url: `${baseUrl}/multi-language/rust-guide`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.8,
-    },
-
-    // MEDIUM - Architecture
-    {
-      url: `${baseUrl}/architecture`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.75,
-    },
-
-    // MEDIUM-LOW - Development Tools
-    {
-      url: `${baseUrl}/development/cli-reference`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-    {
-      url: `${baseUrl}/development/monitor`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.7,
-    },
-
-    // LOWER - Advanced Topics
-    {
-      url: `${baseUrl}/advanced`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.65,
-    },
-    {
-      url: `${baseUrl}/advanced/deterministic-execution`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.6,
-    },
-    {
-      url: `${baseUrl}/advanced/custom-nodes`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.6,
-    },
-
-    // API Reference
-    {
-      url: `${baseUrl}/api`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.6,
-    },
-    {
-      url: `${baseUrl}/api/core`,
-      lastModified: new Date(),
-      changeFrequency: 'monthly',
-      priority: 0.55,
-    },
-  ]
+  })));
 }

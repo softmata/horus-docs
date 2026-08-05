@@ -4,6 +4,7 @@ import { TableOfContents } from '@/components/TableOfContents';
 import { PrevNextNav } from '@/components/PrevNextNav';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
+import { locales, localizedHref } from '@/lib/i18n';
 
 // Only serve pre-rendered pages - return 404 for unknown paths
 // This ensures Vercel properly serves all static pages
@@ -31,6 +32,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const title = `${baseTitle} | HORUS - 575x Faster Than ROS2`;
   const description = doc.frontmatter.description || 'Learn to build production robots with HORUS - the world\'s fastest robotics framework. 87ns latency, 575x faster than ROS2. Rust & Python. FREE & open source.';
   const url = `https://docs.horus-registry.dev/${slug.join('/')}`;
+  const pathName = `/${slug.join('/')}`;
 
   return {
     title,
@@ -96,6 +98,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     },
     alternates: {
       canonical: url,
+      languages: Object.fromEntries(locales.map(locale => [locale, localizedHref(pathName, locale)])),
     },
     robots: {
       index: true,

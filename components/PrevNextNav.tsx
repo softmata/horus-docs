@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiArrowLeft, FiArrowRight } from "react-icons/fi";
+import { localeFromPathname, localizedHref, stripLocale } from "@/lib/i18n";
 
 interface DocLink {
   title: string;
@@ -107,8 +108,10 @@ const allPages: DocLink[] = [
 
 export function PrevNextNav() {
   const pathname = usePathname();
+  const locale = localeFromPathname(pathname);
+  const unlocalizedPathname = stripLocale(pathname);
 
-  const currentIndex = allPages.findIndex(page => page.href === pathname);
+  const currentIndex = allPages.findIndex(page => page.href === unlocalizedPathname);
   const prevPage = currentIndex > 0 ? allPages[currentIndex - 1] : null;
   const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1] : null;
 
@@ -120,7 +123,7 @@ export function PrevNextNav() {
     <nav className="mt-12 pt-6 border-t border-[var(--border)] flex justify-between items-center gap-4">
       {prevPage ? (
         <Link
-          href={prevPage.href}
+          href={localizedHref(prevPage.href, locale)}
           className="flex items-center gap-2 px-4 py-3 text-sm text-[var(--text-secondary)] hover:text-[var(--text)] hover:bg-[var(--surface)] border border-[var(--border)] transition-colors group"
         >
           <FiArrowLeft className="w-4 h-4 group-hover:-translate-x-1 transition-transform" />
@@ -135,7 +138,7 @@ export function PrevNextNav() {
 
       {nextPage ? (
         <Link
-          href={nextPage.href}
+          href={localizedHref(nextPage.href, locale)}
           className="flex items-center gap-2 px-4 py-3 text-sm text-[var(--text-secondary)] hover:text-[var(--text)] hover:bg-[var(--surface)] border border-[var(--border)] transition-colors group"
         >
           <div className="text-right">
