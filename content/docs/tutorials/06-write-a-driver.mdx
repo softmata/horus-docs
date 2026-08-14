@@ -53,15 +53,15 @@ Edit `horus.toml`:
 name = "horus-driver-serial-motor"
 version = "0.1.0"
 description = "Generic serial motor controller driver for HORUS"
-type = "driver"
+package-type = "driver"
 license = "Apache-2.0"
-keywords = ["motor", "serial", "driver", "actuator"]
+categories = ["motor", "serial", "driver", "actuator"]
 
 [dependencies]
 serialport = { version = "4.5", source = "crates.io" }
 ```
 
-The `type = "driver"` metadata tells the registry this is a driver package, which affects how it shows up in search results.
+The `package-type = "driver"` metadata tells the registry this is a driver package, which affects how it shows up in search results.
 
 ---
 
@@ -74,7 +74,6 @@ The `type = "driver"` metadata tells the registry this is a driver package, whic
 // simplified
 // src/main.rs
 use horus::prelude::*;
-use horus_robotics::prelude::*;
 use horus::hardware::{self, NodeParams};
 use horus::register_driver;
 use std::io::{Read, Write};
@@ -220,7 +219,8 @@ impl Node for SerialMotorDriver {
     fn init(&mut self) -> Result<()> {
         // Verify communication by reading positions once
         let positions = self.read_positions();
-        log::info!(
+        hlog!(
+            info,
             "SerialMotorDriver initialized: {} motors, positions: {:?}",
             self.motor_ids.len(),
             positions
@@ -231,20 +231,22 @@ impl Node for SerialMotorDriver {
     fn tick(&mut self) {
         // Read current state and publish
         let positions = self.read_positions();
-        self.state_pub.send(JointState {
-            name: self.motor_ids.iter().map(|id| format!("motor_{}", id)).collect(),
-            position: positions,
-            ..Default::default()
-        });
+        // JointState is a fixed-size POD message: fill it joint by joint
+        // (names/positions/velocities/efforts are [_; 16] arrays).
+        let mut state = JointState::new();
+        for (i, &pos) in positions.iter().enumerate() {
+            let _ = state.add_joint(&format!("motor_{}", self.motor_ids[i]), pos, 0.0, 0.0);
+        }
+        self.state_pub.send(state);
 
         // Apply commands if any
         if let Some(cmd) = self.cmd_sub.recv() {
-            self.write_positions(&cmd.position);
+            self.write_positions(&cmd.positions[..cmd.joint_count as usize]);
         }
     }
 
     fn shutdown(&mut self) -> Result<()> {
-        log::info!("SerialMotorDriver shutting down — stopping all motors");
+        hlog!(info, "SerialMotorDriver shutting down — stopping all motors");
         // Send zero velocity to all motors
         let zeros = vec![0.0; self.motor_ids.len()];
         self.write_positions(&zeros);
@@ -278,14 +280,14 @@ def tick(node):
     # Read current state and publish
     positions = driver.read_positions()
     node.send("motor.joint_state", horus.JointState(
-        name=[f"motor_{id}" for id in driver.motor_ids],
-        position=positions,
+        names=[f"motor_{id}" for id in driver.motor_ids],
+        positions=positions,
     ))
 
     # Apply commands if any
     cmd = node.recv("motor.joint_cmd")
     if cmd:
-        driver.write_positions(cmd.position)
+        driver.write_positions(cmd.positions)
 
 motor_node = horus.Node(
     "SerialMotorDriver",
@@ -313,8 +315,6 @@ horus.run(motor_node)
 ```rust
 // simplified
 fn main() -> Result<()> {
-    env_logger::init();
-
     // hardware::load() returns Vec<(String, Box<dyn Node>)>
     // Each entry is a ready-to-use node from [hardware] config
     let nodes = hardware::load()?;
@@ -322,15 +322,16 @@ fn main() -> Result<()> {
     let mut sched = Scheduler::new()
         .tick_rate(100_u64.hz());
 
-    for (name, node) in nodes {
-        sched = sched
-            .add(node)
-                .rate(100_u64.hz())
-                .on_miss(Miss::SafeMode)
-                .build()?;
+    for (_name, node) in nodes {
+        // .build() registers the node on the scheduler it borrows —
+        // it does not return an owned Scheduler, so do not reassign.
+        sched.add(node)
+            .rate(100_u64.hz())
+            .on_miss(Miss::SafeMode)
+            .build()?;
     }
 
-    sched.build()?.run()
+    sched.run()
 }
 ```
 
@@ -448,9 +449,9 @@ Before publishing, verify your driver follows these practices:
 
 ### Package metadata
 
-- [ ] `type = "driver"` in `horus.toml [package]`
+- [ ] `package-type = "driver"` in `horus.toml [package]`
 - [ ] `description` explains what hardware it supports
-- [ ] `keywords` include the hardware name and interface type
+- [ ] `categories` include the hardware name and interface type
 - [ ] `license` specified
 
 ---

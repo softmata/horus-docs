@@ -65,7 +65,7 @@ Which backend you land on does **not** set your latency — where the producer a
 When producer and consumer share a core the payload stays L1-hot (~12–19 ns). The moment they sit on different cores — whether that's two threads or two processes — you pay ~220 ns of cache-coherence traffic, and no backend or layout choice moves that number. An in-process heap ring would *not* beat SHM here. The fastest realistic route is to co-locate a producer and consumer on one executor thread.
 
 <Callout type="info">
-**Latencies above are for small messages (~16 bytes).** Larger messages scale linearly with size. A 304-byte IMU message adds ~940 ns cross-process. A 1.5 KB LaserScan adds ~2.2 µs. Pool-backed types (Image, PointCloud) transfer only a small descriptor (~200–336 bytes) regardless of actual data size.
+**Latencies above are for small messages (~16 bytes).** Larger messages scale linearly with size. A 304-byte IMU message adds ~940 ns cross-process. A 1.5 KB LaserScan adds ~2.2 µs. Pool-backed types (Image, PointCloud) transfer only a small descriptor (~168–280 bytes) regardless of actual data size.
 </Callout>
 
 ### Joining and Fan-out Changes
@@ -265,7 +265,6 @@ The `topics!` macro defines compile-time topic descriptors that prevent name typ
     ```rust
 // simplified
     use horus::prelude::*;
-    use horus_robotics::prelude::*;
 
     topics! {
         pub CMD_VEL: CmdVel = "cmd_vel",
@@ -280,7 +279,7 @@ The `topics!` macro defines compile-time topic descriptors that prevent name typ
   </LangTab>
   <LangTab language="Python">
     ```python
-    from horus.messages import CmdVel, MotorStatus
+    from horus import CmdVel, MotorStatus
 
     # Typed topic descriptors — type checked at publish/subscribe
     motor = horus.Node(
@@ -377,14 +376,14 @@ You never need to implement this trait manually — the blanket impl covers all 
 
 For large data types, copying through the ring buffer would be too slow. A 1920×1080 RGB image is 6 MB — copying it at 30 FPS would consume 180 MB/s of memory bandwidth just for one topic.
 
-HORUS solves this with **pool-backed types**. The actual data lives in a shared memory pool. The topic transfers only a small descriptor (~200–336 bytes) that points to the pool slot. The receiver reads the pixel data directly from the same memory — zero copies regardless of image size.
+HORUS solves this with **pool-backed types**. The actual data lives in a shared memory pool. The topic transfers only a small descriptor (~168–280 bytes) that points to the pool slot. The receiver reads the pixel data directly from the same memory — zero copies regardless of image size.
 
 | Type | Descriptor size | Actual data | Example size |
 |------|----------------|-------------|--------------|
-| `Image` | ~288 bytes | Pixel buffer in SHM pool | 6 MB (1080p RGB) |
-| `PointCloud` | ~200 bytes | Point array in SHM pool | 1.2 MB (30K points) |
-| `DepthImage` | ~200 bytes | Depth buffer in SHM pool | 4 MB (1080p f32) |
-| `Tensor` | ~336 bytes | Tensor data in SHM pool | Varies |
+| `Image` | 232 bytes | Pixel buffer in SHM pool | 6 MB (1080p RGB) |
+| `PointCloud` | 280 bytes | Point array in SHM pool | 1.2 MB (30K points) |
+| `DepthImage` | 232 bytes | Depth buffer in SHM pool | 4 MB (1080p f32) |
+| `Tensor` | 168 bytes | Tensor data in SHM pool | Varies |
 
 The API is identical — `send()`, `recv()`, `try_send()` all work the same:
 
@@ -407,7 +406,7 @@ The API is identical — `send()`, `recv()`, `try_send()` all work the same:
   </LangTab>
   <LangTab language="Python">
     ```python
-    from horus.messages import Image
+    from horus import Image
 
     camera_node = horus.Node("Camera", tick=cam_tick, pubs=[Image])
 
@@ -444,13 +443,13 @@ Ring buffer (capacity = 4):
   cursor      cursor
 ```
 
-The default capacity is **4 slots**. This is intentionally small — robotics control loops care about the latest data, not history. Increase capacity when you need more buffering:
+There is no single default capacity: `Topic::new()` derives it from the message size as `4096 / size_of::<T>()`, clamps the result to **16–1024 slots**, then rounds up to a power of two. So a 4-byte message gets 1024 slots, a 64-byte message gets 64, and anything from roughly 240 bytes upward bottoms out at the 16-slot minimum. Set the capacity explicitly when you need different buffering:
 
 <LanguageTabs>
   <LangTab language="Rust">
     ```rust
 // simplified
-    // Default: 4 slots, auto-sized
+    // Default: capacity auto-sized from the message size (16–1024 slots)
     let topic = Topic::<Imu>::new("imu")?;
 
     // Custom: 16 slots, auto-sized — for high-frequency bursty publishers
@@ -462,9 +461,9 @@ The default capacity is **4 slots**. This is intentionally small — robotics co
   </LangTab>
   <LangTab language="Python">
     ```python
-    from horus.messages import Imu, LaserScan
+    from horus import Imu, LaserScan
 
-    # Default: 4 slots, auto-sized
+    # Default: capacity auto-sized from the message size (16–1024 slots)
     imu_node = horus.Node("ImuReader", tick=imu_tick, subs=[Imu])
 
     # Capacity is configured at the Rust level — Python nodes use the
@@ -479,14 +478,14 @@ Capacity must be a power of 2 (4, 8, 16, 32, ...). This allows the ring buffer t
 
 ### Memory Usage
 
-| Message Type | Size | Default Capacity | Approximate Memory |
-|-------------|------|------------------|-------------------|
-| `f32` | 4 B | 4 slots | ~1 KB |
-| `CmdVel` | 16 B | 4 slots | ~1 KB |
-| `Imu` | ~300 B | 4 slots | ~2 KB |
-| `LaserScan` | ~1.5 KB | 4 slots | ~7 KB |
+| Message Type | Size | Auto Capacity | Approximate Memory |
+|-------------|------|---------------|-------------------|
+| `f32` | 4 B | 1024 slots | ~73 KB |
+| `CmdVel` | 16 B | 256 slots | ~19 KB |
+| `Imu` | ~300 B | 16 slots | ~5 KB |
+| `LaserScan` | ~1.5 KB | 16 slots | ~25 KB |
 
-For most robotics applications, total topic memory is well under 1 MB.
+Small POD messages occupy a 64-byte slot each (the sequence number sits on the same cache line as the data), so tiny types cost more per slot than their size suggests. For most robotics applications, total topic memory is well under 1 MB.
 
 ### Cleaning Up Shared Memory
 
@@ -524,7 +523,6 @@ When active, every `send()` and `recv()` records timing and message summaries. W
     ```rust
 // simplified
     use horus::prelude::*;
-    use horus_robotics::prelude::*;
 
     let topic = Topic::<CmdVel>::new("cmd_vel")?;
 
