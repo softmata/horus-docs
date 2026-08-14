@@ -1,115 +1,142 @@
-# HORUS Documentation
+# HORUS Documentation Site
 
-Official documentation site for [HORUS](https://github.com/softmata/horus) — a real-time robotics framework with zero-copy IPC and deterministic scheduling.
+Open-source documentation for the HORUS robotics framework.
 
-**Live**: [docs.horusrobotics.dev](https://docs.horusrobotics.dev)
+## Overview
 
-## Stats
-
-- **295 pages** across 15 sidebar sections
-- **Rust + Python + C++** with per-language paired navigation (header toggle) and synced `<LanguageTabs>` on shared-concept pages
-- **32 Rust API pages**, **31 Python API pages**, plus a 15-page C++ API reference at near-Rust parity
-- **33 recipes** (copy-paste robotics patterns), **28 tutorials** (step-by-step)
-- **40+ pre-rendered Mermaid diagrams** (static SVG via `mmdc`), interactive Recharts benchmark charts
-- Full-text search (FlexSearch), dark/light mode, Vercel CDN deployment
+This is the official documentation site for HORUS - a production-grade, open-source robotics framework built in Rust. The site provides comprehensive guides, API references, and performance benchmarks.
 
 ## Running Locally
 
 ```bash
+# Install dependencies
 npm install
-npm run dev        # http://localhost:3009
-npm run build      # Production build (295 pages)
-npm start          # Production server
+
+# Start development server (port 3009)
+npm run dev
+
+# Build for production
+npm run build
+
+# Start production server
+npm start
 ```
+
+Visit `http://localhost:3009` to view the documentation.
 
 ## Content Structure
 
 ```
-content/docs/
-  getting-started/   # 17 pages — installation, quick start, language guides
-  tutorials/         # 28 pages — numbered step-by-step (Rust / Python / C++)
-  recipes/           # 33 pages — copy-paste robotics patterns
-  concepts/          # 25 pages — architecture, nodes, topics, scheduler, RT
-  rust/              # 37 pages — API (rust/api/ 32) + guides
-  python/            # 66 pages — API (python/api/ 31) + guides (GIL, NumPy, deploy…)
-  cpp/               # 25 pages — C++ API reference + guides (near-Rust parity)
-  stdlib/            # 16 pages — per-message deep dives (Imu, CmdVel, LaserScan)
-  development/       # 14 pages — CLI reference, testing, debugging, monitoring
-  advanced/          # 9 pages  — RT setup, safety monitor, blackbox, record/replay
-  reference/         # 7 pages  — cheatsheets, API index, internals
-  package-management/ # 5 pages — horus.toml, lockfile, registry, publishing
-  learn/             # 4 pages  — vs ROS2, why HORUS
-  performance/       # 4 pages  — benchmarks (measured), optimization guide
-  plugins/           # 3 pages  — plugin system
-  operations/        # 2 pages  — deployment (SSH, Docker, systemd)
+content/
+── docs/                              # Core documentation (30+ pages)
+   ── getting-started.mdx
+   ── installation.mdx
+   ── quick-start.mdx
+   ── node-macro.mdx
+   ── monitor.mdx
+   ── parameters.mdx
+   ── cli-reference.mdx
+   ── package-management.mdx        # Package install/publish
+   ── environment-management.mdx    # Freeze/restore environments
+   ── registry.mdx                   # Registry
+   ── authentication.mdx             # GitHub OAuth, API keys
+   ── remote-deployment.mdx          # Deploy to robots
+   ── library-reference.mdx          # Standard library components
+   ── core-concepts-nodes.mdx
+   ── core-concepts-topic.mdx
+   ── core-concepts-scheduler.mdx
+   ── core-concepts-shared-memory.mdx
+   ── api-node.mdx                   # Node API reference
+   ── api-topic.mdx                  # Topic API reference
+   ── api-scheduler.mdx              # Scheduler API reference
+   ── message-types.mdx
+   ── examples.mdx
+   ── performance.mdx
+   ── multi-language.mdx             # Python bindings
+   ── architecture.mdx
+── assets/         # Images and media
 ```
+
+### Documentation Categories
+
+**Getting Started**
+- Installation, Quick Start, node! Macro
+
+**Core Concepts**
+- Nodes, Topic (Pub/Sub), PodTopic (Ultra-Fast), Scheduler, Shared Memory
+
+**Guides**
+- Monitor, Parameters, CLI Reference
+- Package Management, Environment Management
+- Registry, Authentication
+- Remote Deployment, Library Reference
+- Message Types, Examples, Performance, Multi-Language
+
+**API Reference**
+- Node, Topic, PodTopic, Scheduler APIs
 
 ## Tech Stack
 
-- **Next.js 15** with App Router (static generation)
-- **MDX** via next-mdx-remote 6 + remark-gfm
-- **Tailwind CSS** with dark/light mode
-- **Shiki** for syntax highlighting (20+ languages)
-- **Recharts** for interactive benchmark charts
-- **Mermaid** diagrams pre-rendered to static SVG at build time
-- **FlexSearch** for client-side full-text search
-- **Vercel** for CDN deployment with security headers
+- **Next.js 14** - React framework with App Router
+- **MDX** - Markdown with React components
+- **Tailwind CSS** - Utility-first styling
+- **Shiki** - Syntax highlighting
+- **TypeScript** - Type safety
 
-## Build Pipeline
+## Open Source
 
-```bash
-npm run build
-```
+This documentation site is part of the HORUS open-source project:
 
-Runs these steps in order:
-
-1. `build-sidebar.js` — scan MDX frontmatter, generate `sidebar-data.json`
-2. `build-search-index.js` — index all pages into `search-index.json`
-3. `build-llms-full.js` — generate LLM context document
-4. `pre-render-mermaid.mjs` — render 31 Mermaid diagrams to static SVG via mmdc
-5. `extract-code-blocks.mjs` — validate code samples
-6. `next build` — static generation (244 pages)
-
-## Key Components
-
-| Component | Purpose |
-|-----------|---------|
-| `LanguageTabs` / `LangTab` | Synced Rust/Python/C++ code tabs |
-| `CodeBlock` | Shiki-highlighted code with copy button |
-| `Callout` | Info/warning/error callout boxes |
-| `MermaidDiagram` | Pre-rendered SVG diagrams (build-time) |
-| `BenchmarkCharts` | Interactive Recharts (13 chart types) |
-| `SearchModal` | Full-text search (Cmd/Ctrl+K) |
-| `Details` | Collapsible sections |
-
-## Writing Docs
-
-Before editing `.mdx` files, read [MDX_GUIDELINES.md](./MDX_GUIDELINES.md).
-
-Key rules:
-- Escape `<` in prose text: `&lt;1%`, `` `Topic<T>` `` (backtick generic types)
-- Use `<LanguageTabs>` / `<LangTab>` for Rust+Python side-by-side code
-- All API claims must match source code — verify constructors against `horus_py/src/messages.rs` (Python) and `horus_core/src/` (Rust)
-- Run `npm run build` before committing to catch MDX errors
-
-Cross-reference strategy: [CROSS_REFERENCES.md](./CROSS_REFERENCES.md)
+- **License**: Apache-2.0
+- **Repository**: https://github.com/softmata/horus
+- **Framework**: `/horus` directory in the main repository
 
 ## Contributing
 
+We welcome contributions! To contribute to the documentation:
+
 1. Fork the repository
 2. Create a feature branch
-3. Make changes in `content/docs/`
+3. Make your changes in `content/`
 4. Test locally with `npm run dev`
-5. Run `npm run build` to verify
-6. Submit a pull request
+5. Submit a pull request
+
+### Writing Guidelines
+
+**IMPORTANT**: Before editing any `.mdx` files, read [MDX_GUIDELINES.md](./MDX_GUIDELINES.md) to avoid common rendering errors!
+
+Common mistakes to avoid:
+- Using `<` directly in text (e.g., `<1%` should be `&lt;1%`)
+- Writing generic types without backticks (e.g., `Topic<T>` should be `` `Topic<T>` ``)
+- Starting headings with numbers
+
+General guidelines:
+- Use clear, concise language
+- Include code examples
+- Test all code snippets
+- Follow existing formatting
+- Update navigation if adding new pages
+- Run `npm run build` before committing to catch MDX errors
+
+## Performance Focus
+
+The documentation emphasizes HORUS's production-grade performance:
+
+- **~50ns-167ns** latency for real robotics messages (PodTopic ~50ns / Topic SPSC ~85ns / Topic MPMC ~167ns)
+- Production benchmarks with serde serialization
+- Real-world message types (CmdVel, LaserScan, IMU, etc.)
 
 ## Links
 
-- **Framework**: [github.com/softmata/horus](https://github.com/softmata/horus)
-- **Live Docs**: [docs.horusrobotics.dev](https://docs.horusrobotics.dev)
-- **Discord**: [discord.gg/hEZC3ev2Nf](https://discord.gg/hEZC3ev2Nf)
-- **Issues**: [github.com/softmata/horus-docs/issues](https://github.com/softmata/horus-docs/issues)
+- **Main Repository**: https://github.com/softmata/horus
+- **Discord Community**: https://discord.gg/hEZC3ev2Nf
+- **Issues**: https://github.com/softmata/horus/issues
+- **Discussions**: https://github.com/softmata/horus/discussions
 
 ## License
 
-Apache-2.0
+Documentation content is licensed under Apache-2.0, matching the HORUS framework license.
+
+---
+
+**Built with ❤️ by the open-source community**

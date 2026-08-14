@@ -1,26 +1,151 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import type { MermaidConfig } from 'mermaid';
+
+// HORUS brand colors
+const HORUS_COLORS = {
+  primary: '#06b6d4',      // Cyan
+  secondary: '#8b5cf6',    // Purple
+  accent: '#10b981',       // Emerald
+  warning: '#f59e0b',      // Amber
+  error: '#ef4444',        // Red
+};
+
+// Theme configurations
+const darkThemeConfig = {
+  theme: 'base' as const,
+  themeVariables: {
+    // Background colors
+    primaryColor: '#1f2937',
+    primaryBorderColor: HORUS_COLORS.primary,
+    primaryTextColor: '#f5f5f5',
+
+    // Secondary
+    secondaryColor: '#374151',
+    secondaryBorderColor: '#4b5563',
+    secondaryTextColor: '#e5e7eb',
+
+    // Tertiary
+    tertiaryColor: '#1e3a5f',
+    tertiaryBorderColor: HORUS_COLORS.primary,
+    tertiaryTextColor: '#f5f5f5',
+
+    // Lines and text
+    lineColor: '#6b7280',
+    textColor: '#f5f5f5',
+
+    // Notes
+    noteBkgColor: '#374151',
+    noteTextColor: '#f5f5f5',
+    noteBorderColor: '#4b5563',
+
+    // Flowchart specific
+    nodeBorder: HORUS_COLORS.primary,
+    clusterBkg: '#111827',
+    clusterBorder: '#374151',
+    defaultLinkColor: '#9ca3af',
+    titleColor: '#f5f5f5',
+    edgeLabelBackground: '#1f2937',
+
+    // Actor (sequence diagrams)
+    actorBkg: '#1f2937',
+    actorBorder: HORUS_COLORS.primary,
+    actorTextColor: '#f5f5f5',
+    actorLineColor: '#6b7280',
+
+    // Signals
+    signalColor: '#9ca3af',
+    signalTextColor: '#f5f5f5',
+
+    // Labels
+    labelBoxBkgColor: '#1f2937',
+    labelBoxBorderColor: '#374151',
+    labelTextColor: '#f5f5f5',
+
+    // Loop
+    loopTextColor: '#f5f5f5',
+
+    // Fonts
+    fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  },
+};
+
+const lightThemeConfig = {
+  theme: 'base' as const,
+  themeVariables: {
+    // Background colors
+    primaryColor: '#f3f4f6',
+    primaryBorderColor: '#0891b2',
+    primaryTextColor: '#1a1a1a',
+
+    // Secondary
+    secondaryColor: '#e5e7eb',
+    secondaryBorderColor: '#d1d5db',
+    secondaryTextColor: '#374151',
+
+    // Tertiary
+    tertiaryColor: '#e0f2fe',
+    tertiaryBorderColor: '#0891b2',
+    tertiaryTextColor: '#1a1a1a',
+
+    // Lines and text
+    lineColor: '#6b7280',
+    textColor: '#1a1a1a',
+
+    // Notes
+    noteBkgColor: '#fef3c7',
+    noteTextColor: '#1a1a1a',
+    noteBorderColor: '#d97706',
+
+    // Flowchart specific
+    nodeBorder: '#0891b2',
+    clusterBkg: '#f9fafb',
+    clusterBorder: '#d1d5db',
+    defaultLinkColor: '#6b7280',
+    titleColor: '#1a1a1a',
+    edgeLabelBackground: '#f3f4f6',
+
+    // Actor (sequence diagrams)
+    actorBkg: '#f3f4f6',
+    actorBorder: '#0891b2',
+    actorTextColor: '#1a1a1a',
+    actorLineColor: '#6b7280',
+
+    // Signals
+    signalColor: '#6b7280',
+    signalTextColor: '#1a1a1a',
+
+    // Labels
+    labelBoxBkgColor: '#f3f4f6',
+    labelBoxBorderColor: '#d1d5db',
+    labelTextColor: '#1a1a1a',
+
+    // Loop
+    loopTextColor: '#1a1a1a',
+
+    // Fonts
+    fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  },
+};
 
 interface MermaidDiagramProps {
   chart: string;
   caption?: string;
 }
 
-/**
- * MermaidDiagram — renders pre-built SVG diagrams.
- *
- * At build time, `scripts/pre-render-mermaid.mjs` renders all mermaid charts
- * to static SVG files in `public/diagrams/<sha256-prefix>.svg`.
- *
- * This component fetches the pre-rendered SVG by hash, with a client-side
- * mermaid fallback if the pre-rendered file is missing.
- */
 export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState<string>('');
   const [isDark, setIsDark] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [isMounted, setIsMounted] = useState(false);
+  const idRef = useRef(`mermaid-${Math.random().toString(36).substr(2, 9)}`);
+
+  // Only render on client side
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   // Theme detection
   useEffect(() => {
@@ -35,12 +160,14 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
 
     checkTheme();
 
+    // Watch for theme changes
     const observer = new MutationObserver(checkTheme);
     observer.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ['data-theme'],
     });
 
+    // Watch for system preference changes
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     mediaQuery.addEventListener('change', checkTheme);
 
@@ -50,98 +177,59 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
     };
   }, []);
 
-  // Compute SHA-256 hash on client to match build script
+  // Render diagram
+  const renderDiagram = useCallback(async () => {
+    if (!chart || !isMounted) return;
+
+    try {
+      // Dynamically import mermaid only on client side
+      const mermaid = (await import('mermaid')).default;
+
+      // Initialize mermaid with current theme
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        flowchart: {
+          htmlLabels: false,
+          padding: 20,
+          nodeSpacing: 50,
+          rankSpacing: 50,
+          curve: 'basis',
+          useMaxWidth: true,
+        },
+        ...(isDark ? darkThemeConfig : lightThemeConfig),
+      } as MermaidConfig);
+
+      // Generate unique ID for this render
+      const id = `${idRef.current}-${Date.now()}`;
+
+      // Render the diagram
+      const { svg: renderedSvg } = await mermaid.render(id, chart);
+      setSvg(renderedSvg);
+      setError(null);
+    } catch (err) {
+      console.error('Mermaid rendering error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to render diagram');
+    }
+  }, [chart, isDark, isMounted]);
+
   useEffect(() => {
-    if (!chart) {
-      setError('No chart data provided');
-      setLoading(false);
-      return;
-    }
+    renderDiagram();
+  }, [renderDiagram]);
 
-    async function loadDiagram() {
-      try {
-        const trimmed = chart.trim();
-        // Compute SHA-256 to match build script
-        const encoder = new TextEncoder();
-        const data = encoder.encode(trimmed);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-        const hash = hashHex.slice(0, 16);
-
-        // Try to fetch pre-rendered SVG
-        const resp = await fetch(`/diagrams/${hash}.svg`);
-        if (resp.ok) {
-          const svgText = await resp.text();
-          setSvg(svgText);
-          setLoading(false);
-          return;
-        }
-      } catch {
-        // Pre-rendered not available — fall through to client-side render
-      }
-
-      // Fallback: client-side mermaid rendering
-      try {
-        const mermaid = (await import('mermaid')).default;
-
-        // Extract init directives from chart before rendering
-        // Mermaid v11 can crash on %%{init:...}%% with 'replace' error
-        const trimmedChart = chart.trim();
-        let chartBody = trimmedChart;
-        let initConfig: Record<string, unknown> = {};
-
-        const initMatch = trimmedChart.match(/%%\{init:\s*(\{[\s\S]*?\})\s*\}%%/);
-        if (initMatch) {
-          try {
-            initConfig = JSON.parse(initMatch[1].replace(/'/g, '"'));
-          } catch {
-            // Invalid JSON in init — ignore and use defaults
-          }
-          chartBody = trimmedChart.replace(/%%\{init:[\s\S]*?\}%%\s*/, '').trim();
-        }
-
-        mermaid.initialize({
-          startOnLoad: false,
-          securityLevel: 'loose',
-          flowchart: {
-            htmlLabels: true,
-            padding: 20,
-            nodeSpacing: 50,
-            rankSpacing: 50,
-            curve: 'basis',
-            useMaxWidth: true,
-          },
-          theme: isDark ? 'dark' : 'default',
-          ...initConfig,
-        });
-
-        const id = `mermaid-fallback-${Math.random().toString(36).substr(2, 9)}`;
-        const { svg: renderedSvg } = await mermaid.render(id, chartBody);
-        setSvg(renderedSvg);
-        setLoading(false);
-      } catch (err) {
-        console.error('Mermaid rendering error:', err);
-        setError(err instanceof Error ? err.message : 'Failed to render diagram');
-        setLoading(false);
-      }
-    }
-
-    loadDiagram();
-  }, [chart, isDark]);
-
-  if (loading) {
+  // Show loading state during SSR and initial client render
+  if (!isMounted || (!svg && !error)) {
     return (
       <figure className="my-8">
         <div
-          className="overflow-x-auto p-6 rounded-lg border flex justify-center items-center animate-pulse"
+          className="overflow-x-auto p-6 rounded-lg border flex justify-center items-center"
           style={{
-            backgroundColor: isDark ? '#111827' : '#f9fafb',
-            borderColor: isDark ? '#374151' : '#e5e7eb',
+            backgroundColor: '#111827',
+            borderColor: '#374151',
             minHeight: '200px',
           }}
         >
-          <div className="w-3/4 h-24 rounded" style={{ backgroundColor: isDark ? '#1f2937' : '#e5e7eb' }} />
+          <span style={{ color: '#9ca3af' }}>Loading diagram...</span>
         </div>
         {caption && (
           <figcaption className="mt-2 text-center text-sm" style={{ color: '#9ca3af' }}>
@@ -164,6 +252,14 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
       >
         <p className="font-medium">Diagram Error</p>
         <pre className="mt-2 text-sm overflow-auto">{error}</pre>
+        <details className="mt-2">
+          <summary className="cursor-pointer text-sm opacity-70">Show source</summary>
+          <pre className="mt-2 text-xs overflow-auto p-2 rounded" style={{
+            backgroundColor: isDark ? '#111827' : '#f3f4f6',
+          }}>
+            Diagram source hidden
+          </pre>
+        </details>
       </div>
     );
   }
@@ -171,11 +267,11 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
   return (
     <figure className="my-8">
       <div
+        ref={containerRef}
         className="overflow-x-auto p-6 rounded-lg border flex justify-center"
         style={{
           backgroundColor: isDark ? '#111827' : '#f9fafb',
           borderColor: isDark ? '#374151' : '#e5e7eb',
-          // Invert colors for light mode if SVG was pre-rendered in dark mode
         }}
       >
         <div
@@ -184,8 +280,6 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
             display: 'flex',
             justifyContent: 'center',
             width: '100%',
-            // Apply CSS filter to adapt dark-rendered SVGs to light mode
-            filter: !isDark ? 'invert(1) hue-rotate(180deg)' : 'none',
           }}
           dangerouslySetInnerHTML={{ __html: svg }}
         />

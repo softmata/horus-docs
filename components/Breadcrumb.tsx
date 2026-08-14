@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { FiChevronRight, FiHome } from "react-icons/fi";
+import { localeFromPathname, localizedHref, stripLocale } from "@/lib/i18n";
 
 interface BreadcrumbItem {
   label: string;
@@ -23,6 +24,7 @@ const segmentLabels: Record<string, string> = {
 
   // Common file names
   "what-is-horus": "What is HORUS?",
+  "goals": "Goals & Vision",
   "complete-beginners-guide": "Complete Beginner's Guide",
   "installation": "Installation",
   "quick-start": "Quick Start",
@@ -47,6 +49,7 @@ const segmentLabels: Record<string, string> = {
   "network-communication": "Network",
   "node-macro": "node! Macro",
   "message-types": "Message Types",
+  "realtime-nodes": "Real-Time Nodes",
 
   // Development
   "cli-reference": "CLI Reference",
@@ -57,7 +60,7 @@ const segmentLabels: Record<string, string> = {
 
   // Package management files
   "using-prebuilt-nodes": "Using Prebuilt Nodes",
-  "lockfile": "Lockfile & Reproducibility",
+  "environment-management": "Environment Management",
   "configuration": "Configuration",
 
   // Multi-language files
@@ -85,24 +88,26 @@ function formatSegment(segment: string): string {
 
 export function Breadcrumb() {
   const pathname = usePathname();
+  const locale = localeFromPathname(pathname);
+  const localizedPathname = stripLocale(pathname);
 
   // Don't show breadcrumbs on home page
-  if (pathname === "/") {
+  if (localizedPathname === "/") {
     return null;
   }
 
-  const segments = pathname.split("/").filter(Boolean);
+  const segments = localizedPathname.split("/").filter(Boolean);
   const breadcrumbs: BreadcrumbItem[] = [
-    { label: "Home", href: "/" }
+    { label: "Home", href: localizedHref('/', locale) }
   ];
 
   // Build breadcrumb trail
   let currentPath = "";
-  segments.forEach((segment) => {
+  segments.forEach((segment, index) => {
     currentPath += `/${segment}`;
     breadcrumbs.push({
       label: formatSegment(segment),
-      href: currentPath
+      href: localizedHref(currentPath, locale)
     });
   });
 

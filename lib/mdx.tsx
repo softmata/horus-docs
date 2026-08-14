@@ -17,9 +17,6 @@ import { compileMDX } from 'next-mdx-remote/rsc';
 import remarkGfm from 'remark-gfm';
 import CodeBlock from '@/components/CodeBlock';
 import Callout from '@/components/Callout';
-import Tabs, { Tab } from '@/components/Tabs';
-import LanguageTabs, { LangTab } from '@/components/LanguageTabs';
-import Details from '@/components/Details';
 import {
   LatencyComparisonChart,
   LatencyScalingChart,
@@ -35,16 +32,9 @@ import {
   TransformFrameSpeedupChart,
   TransformFrameMemoryChart,
   TransformFrameConcurrentChart,
-  IPCBackendChart,
-  MessagePerformanceChart,
-  HorusVsUDPChart,
-  ThreadScalingChart,
-  DeterminismChart,
-  PythonFFIOverheadChart,
-  PythonZeroCopyChart,
-  HorusVsIceoryxChart,
 } from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
+import { defaultLocale, type Locale } from '@/lib/i18n';
 
 const contentDirectory = path.join(process.cwd(), 'content');
 
@@ -59,10 +49,9 @@ export interface DocContent {
   slug: string;
   frontmatter: DocFrontmatter;
   content: React.ReactElement;
-  /** ISO timestamp of the source .mdx file's last modification (for dateModified / sitemap lastmod). */
-  lastModified: string;
-  /** h2/h3 headings (code blocks excluded) — used for HowTo structured data. */
-  headings: { level: number; text: string; id: string }[];
+  requestedLocale: Locale;
+  renderedLocale: Locale;
+  isFallback: boolean;
 }
 
 /**
@@ -84,20 +73,30 @@ export async function getDocSlugs(dir: string): Promise<string[]> {
 /**
  * Get a single MDX document by slug
  */
-export async function getDoc(slug: string[]): Promise<DocContent | null> {
+export async function getDoc(slug: string[], locale: Locale = defaultLocale): Promise<DocContent | null> {
   try {
+    const relativeSlug = slug[0] === 'docs' ? slug.slice(1) : slug;
+    const localizedRoot = path.join(contentDirectory, 'locales', locale, 'docs');
+    const englishRoot = path.join(contentDirectory, 'docs');
+    const requestedRoot = locale === defaultLocale ? englishRoot : localizedRoot;
+    const localizedDirect = path.join(requestedRoot, ...relativeSlug) + '.mdx';
+    const localizedIndex = path.join(requestedRoot, ...relativeSlug, 'index.mdx');
+    const hasLocalized = fs.existsSync(localizedDirect) || fs.existsSync(localizedIndex);
+    const documentRoot = hasLocalized ? requestedRoot : englishRoot;
+    const renderedLocale = hasLocalized ? locale : defaultLocale;
+
     // Try the direct file path first
-    let filePath = path.join(contentDirectory, ...slug) + '.mdx';
+    let filePath = path.join(documentRoot, ...relativeSlug) + '.mdx';
 
     // Prevent path traversal — resolved path must stay within content directory
-    const resolvedContent = path.resolve(contentDirectory);
+    const resolvedContent = path.resolve(documentRoot);
     if (!path.resolve(filePath).startsWith(resolvedContent + path.sep)) {
       return null;
     }
 
     // If that doesn't exist, try looking for an index.mdx file in a directory
     if (!fs.existsSync(filePath)) {
-      const indexPath = path.join(contentDirectory, ...slug, 'index.mdx');
+      const indexPath = path.join(documentRoot, ...relativeSlug, 'index.mdx');
       if (!path.resolve(indexPath).startsWith(resolvedContent + path.sep)) {
         return null;
       }
@@ -109,7 +108,6 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
     }
 
     const source = fs.readFileSync(filePath, 'utf-8');
-    const lastModified = fs.statSync(filePath).mtime.toISOString();
     const { data, content: mdxContent } = matter(source);
 
     const { content } = await compileMDX<DocFrontmatter>({
@@ -124,14 +122,6 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
       components: {
         // Callout component for notes, warnings, etc.
         Callout,
-        // Tabs for Rust/Python language switching
-        Tabs,
-        Tab,
-        // Language-aware tabs that sync across all instances on the page
-        LanguageTabs,
-        LangTab,
-        // Collapsible sections for optional content
-        Details,
         // Benchmark charts
         LatencyComparisonChart,
         LatencyScalingChart,
@@ -148,15 +138,6 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
         TransformFrameSpeedupChart,
         TransformFrameMemoryChart,
         TransformFrameConcurrentChart,
-        // Measured benchmark charts
-        IPCBackendChart,
-        MessagePerformanceChart,
-        HorusVsUDPChart,
-        ThreadScalingChart,
-        DeterminismChart,
-        PythonFFIOverheadChart,
-        PythonZeroCopyChart,
-        HorusVsIceoryxChart,
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {
@@ -290,25 +271,20 @@ export async function getDoc(slug: string[]): Promise<DocContent | null> {
       },
     });
 
-    // Extract h2/h3 headings (excluding fenced code) for HowTo structured data.
-    const headings = (mdxContent.replace(/```[\s\S]*?```/g, '').match(/^#{2,3}\s+.+$/gm) || [])
-      .map((h) => {
-        const level = (h.match(/^#+/) as RegExpMatchArray)[0].length;
-        const text = h.replace(/^#+\s+/, '').replace(/[*_`]/g, '').trim();
-        const id = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-        return { level, text, id };
-      });
-
     return {
       slug: slug.join('/'),
       frontmatter: data as DocFrontmatter,
       content,
-      lastModified,
-      headings,
+      requestedLocale: locale,
+      renderedLocale,
+      isFallback: locale !== renderedLocale,
     };
   } catch (error) {
-    console.error('Error loading doc:', error);
-    return null;
+    // A present but malformed document is a build/deployment defect, not a
+    // missing route. Propagate compilation and I/O errors so `next build`
+    // fails instead of silently publishing a 404 for an authored page.
+    console.error(`Error loading doc "${slug.join('/')}":`, error);
+    throw error;
   }
 }
 

@@ -891,7 +891,7 @@ export function TransformFrameLatencyChart() {
       style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
     >
       <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        TransformFrame vs ROS2 TF2 Latency
+        HORUS Transform Frame vs ROS2 TF2 Latency
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
         Lower is better. Logarithmic scale (nanoseconds)
@@ -917,14 +917,14 @@ export function TransformFrameLatencyChart() {
           <Legend
             formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
           />
-          <Bar dataKey="transform_frame" fill={colors.horus} radius={[4, 4, 0, 0]} name="HORUS TransformFrame" />
+          <Bar dataKey="transform_frame" fill={colors.horus} radius={[4, 4, 0, 0]} name="HORUS Transform Frame" />
           <Bar dataKey="tf2" fill={colors.ros2} radius={[4, 4, 0, 0]} name="ROS2 TF2" />
         </BarChart>
       </ResponsiveContainer>
       <div className="mt-4 flex flex-wrap justify-center gap-4 md:gap-6 text-sm">
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.horus }}></div>
-          <span style={{ color: colors.text }}>HORUS TransformFrame (lock-free)</span>
+          <span style={{ color: colors.text }}>HORUS Transform Frame (lock-free)</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.ros2 }}></div>
@@ -955,10 +955,10 @@ export function TransformFrameSpeedupChart() {
       style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
     >
       <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        TransformFrame Speedup vs TF2
+        HORUS Transform Frame Speedup vs TF2
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
-        How many times faster TransformFrame is compared to TF2
+        How many times faster HORUS Transform Frame is compared to TF2
       </p>
       <ResponsiveContainer width="100%" height={300}>
         <BarChart data={data} layout="vertical" margin={{ top: 20, right: 80, left: 120, bottom: 20 }}>
@@ -1029,7 +1029,7 @@ export function TransformFrameMemoryChart() {
       style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
     >
       <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        TransformFrame Memory Usage
+        Transform Frame Memory Usage
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
         Pre-allocated memory by configuration preset (KB)
@@ -1103,7 +1103,7 @@ export function TransformFrameConcurrentChart() {
         Concurrent Read Performance
       </h3>
       <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Latency under contention (ns). TransformFrame uses lock-free reads.
+        Latency under contention (ns). HORUS Transform Frame uses lock-free reads.
       </p>
       <ResponsiveContainer width="100%" height={350}>
         <LineChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
@@ -1137,7 +1137,7 @@ export function TransformFrameConcurrentChart() {
             stroke={colors.horus}
             strokeWidth={3}
             dot={{ fill: colors.horus, strokeWidth: 2, r: 5 }}
-            name="HORUS TransformFrame"
+            name="HORUS Transform Frame"
           />
           <Line
             type="monotone"
@@ -1151,616 +1151,14 @@ export function TransformFrameConcurrentChart() {
         </LineChart>
       </ResponsiveContainer>
       <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        TransformFrame maintains <span style={{ color: colors.horus, fontWeight: 'bold' }}>near-constant latency</span> under contention due to lock-free design
-      </div>
-    </div>
-  );
-}
-
-/**
- * IPC Backend Latency — All measured paths (p50)
- * Data: all_paths_latency benchmark, 100K iterations, RDTSC timing
- */
-export function IPCBackendChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'DirectChannel\n(same thread)', p50: 12, p99: 13, category: 'intra' },
-    { name: 'SpmcIntra\n(1:N thread)', p50: 80, p99: 92, category: 'intra' },
-    { name: 'SpscIntra\n(1:1 thread)', p50: 91, p99: 107, category: 'intra' },
-    { name: 'FanoutIntra\n(N:N thread)', p50: 150, p99: 307, category: 'intra' },
-    { name: 'MpscIntra\n(N:1 thread)', p50: 187, p99: 372, category: 'intra' },
-    { name: 'FanoutShm\n(xproc N:N)', p50: 91, p99: 230, category: 'shm' },
-    { name: 'PodShm\n(broadcast)', p50: 152, p99: 227, category: 'shm' },
-    { name: 'MpscShm\n(xproc N:1)', p50: 158, p99: 190, category: 'shm' },
-    { name: 'SpscShm\n(xproc 1:1)', p50: 171, p99: 192, category: 'shm' },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        IPC Latency — All Backend Paths
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Measured p50 and p99 latency in nanoseconds. Lower is better.
-      </p>
-      <ResponsiveContainer width="100%" height={380}>
-        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 80 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text, fontSize: 10 }}
-            interval={0}
-            angle={0}
-            textAnchor="middle"
-            height={80}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            domain={[0, 400]}
-            tickFormatter={(value) => `${value}ns`}
-            label={{ value: 'Latency (ns)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any, name: any) => [`${value}ns`, name]}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Legend
-            formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
-          />
-          <Bar dataKey="p50" fill={colors.horus} radius={[4, 4, 0, 0]} name="p50 (median)" />
-          <Bar dataKey="p99" fill={colors.accent} radius={[4, 4, 0, 0]} name="p99" />
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="mt-4 flex flex-wrap justify-center gap-4 md:gap-6 text-sm">
-        <div className="flex items-center gap-2">
-          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.horus }}></div>
-          <span style={{ color: colors.text }}>Intra-process (no kernel)</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="w-3 h-3 rounded" style={{ backgroundColor: colors.accent }}></div>
-          <span style={{ color: colors.text }}>Cross-process (shared memory)</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Robotics message type performance
- * Data: robotics_messages_benchmark, 50K iterations, cross-thread
- */
-export function MessagePerformanceChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'CmdVel\n(16B)', median: 89, p99: 91, throughput: 11.1 },
-    { name: 'Imu\n(304B)', median: 119, p99: 150, throughput: 7.8 },
-    { name: 'JointCommand\n(928B)', median: 128, p99: 157, throughput: 8.1 },
-    { name: 'LaserScan\n(1.5KB)', median: 151, p99: 184, throughput: 6.3 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        Robotics Message Latency
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Measured median and p99 latency for standard robotics messages
-      </p>
-      <ResponsiveContainer width="100%" height={350}>
-        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text, fontSize: 11 }}
-            interval={0}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            domain={[0, 210]}
-            tickFormatter={(value) => `${value}ns`}
-            label={{ value: 'Latency (ns)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any, name: any) => [`${value}${name === 'throughput' ? 'M msg/s' : 'ns'}`, name]}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Legend
-            formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
-          />
-          <Bar dataKey="median" fill={colors.horus} radius={[4, 4, 0, 0]} name="Median" />
-          <Bar dataKey="p99" fill={colors.accent} radius={[4, 4, 0, 0]} name="p99" />
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
-        {data.map((d) => (
-          <div
-            key={d.name}
-            className="rounded-lg p-3"
-            style={{ backgroundColor: colors.cardBg }}
-          >
-            <div className="text-2xl font-bold" style={{ color: colors.horus }}>{d.throughput}M</div>
-            <div className="text-sm" style={{ color: colors.text }}>msg/s</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/**
- * HORUS SHM vs Raw UDP comparison
- * Data: competitor_comparison benchmark, 5s sustained
- */
-export function HorusVsUDPChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'HORUS SHM', size8: 23, size32: 23 },
-    { name: 'Raw UDP', size8: 1235, size32: 1122 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        HORUS vs Raw UDP
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        p50 latency in nanoseconds — HORUS eliminates kernel network stack entirely
-      </p>
-      <ResponsiveContainer width="100%" height={300}>
-        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text, fontSize: 12, fontWeight: 'bold' }}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            domain={[0, 1400]}
-            tickFormatter={(value) => `${value}ns`}
-            label={{ value: 'Latency (ns)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any, name: any) => [`${value}ns`, name === 'size8' ? '8B payload' : '32B payload']}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Legend
-            formatter={(value: any) => <span style={{ color: colors.text }}>{value === 'size8' ? '8B payload' : '32B payload'}</span>}
-          />
-          <Bar dataKey="size8" fill={colors.horus} radius={[4, 4, 0, 0]} name="size8" />
-          <Bar dataKey="size32" fill={colors.accent} radius={[4, 4, 0, 0]} name="size32" />
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        Speedup: <span style={{ color: colors.horus, fontWeight: 'bold' }}>54x</span> (8B)
-        {' '}&bull;{' '}
-        <span style={{ color: colors.horus, fontWeight: 'bold' }}>49x</span> (32B) over raw UDP
-      </div>
-    </div>
-  );
-}
-
-/**
- * Thread scaling chart — replaces ASCII bar charts
- * Data: scalability_benchmark, sustained throughput
- */
-export function ThreadScalingChart() {
-  const colors = useColors();
-
-  const producerData = [
-    { count: 1, throughput: 3.0 },
-    { count: 2, throughput: 8.7 },
-    { count: 3, throughput: 11.5 },
-    { count: 4, throughput: 11.9 },
-    { count: 6, throughput: 13.5 },
-    { count: 8, throughput: 11.5 },
-  ];
-
-  const consumerData = [
-    { count: 1, throughput: 2.8 },
-    { count: 2, throughput: 4.8 },
-    { count: 4, throughput: 4.8 },
-    { count: 8, throughput: 3.7 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        Thread Scaling
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Throughput (M msg/s) with varying thread counts. Higher is better.
-      </p>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div>
-          <h4 className="text-sm font-semibold mb-2 text-center" style={{ color: colors.textBold }}>
-            Producer Scaling (1 Consumer)
-          </h4>
-          <ResponsiveContainer width="100%" height={250}>
-            <BarChart data={producerData} margin={{ top: 10, right: 20, left: 10, bottom: 30 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-              <XAxis
-                dataKey="count"
-                stroke={colors.text}
-                tick={{ fill: colors.text }}
-                label={{ value: 'Producers', position: 'bottom', fill: colors.text, offset: 0 }}
-              />
-              <YAxis
-                stroke={colors.text}
-                tick={{ fill: colors.text }}
-                domain={[0, 16]}
-                tickFormatter={(value) => `${value}M`}
-              />
-              <Tooltip
-                formatter={(value: any) => [`${value}M msg/s`, 'Throughput']}
-                contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-                labelStyle={{ color: colors.text }}
-                labelFormatter={(label: any) => `${label} producer${label > 1 ? 's' : ''}`}
-              />
-              <Bar dataKey="throughput" radius={[4, 4, 0, 0]}>
-                {producerData.map((entry, index) => (
-                  <Cell
-                    key={`cell-${index}`}
-                    fill={entry.throughput >= 13 ? colors.horus : colors.horusLink}
-                  />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-          <p className="text-xs text-center mt-1" style={{ color: colors.text }}>
-            Peak at 6 producers (13.5M/s)
-          </p>
-        </div>
-        <div>
-          <h4 className="text-sm font-semibold mb-2 text-center" style={{ color: colors.textBold }}>
-            Consumer Scaling (1 Producer)
-          </h4>
-          <ResponsiveContainer width="100%" height={250}>
-            <BarChart data={consumerData} margin={{ top: 10, right: 20, left: 10, bottom: 30 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-              <XAxis
-                dataKey="count"
-                stroke={colors.text}
-                tick={{ fill: colors.text }}
-                label={{ value: 'Consumers', position: 'bottom', fill: colors.text, offset: 0 }}
-              />
-              <YAxis
-                stroke={colors.text}
-                tick={{ fill: colors.text }}
-                domain={[0, 6]}
-                tickFormatter={(value) => `${value}M`}
-              />
-              <Tooltip
-                formatter={(value: any) => [`${value}M msg/s`, 'Throughput']}
-                contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-                labelStyle={{ color: colors.text }}
-                labelFormatter={(label: any) => `${label} consumer${label > 1 ? 's' : ''}`}
-              />
-              <Bar dataKey="throughput" fill={colors.accent} radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-          <p className="text-xs text-center mt-1" style={{ color: colors.text }}>
-            Plateaus at 2 (broadcast semantics)
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * RT Determinism — percentile distribution
- * Data: determinism_benchmark, 10 runs x 100K iterations, CPU-pinned
- */
-export function DeterminismChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'Min', value: 61 },
-    { name: 'p50', value: 86 },
-    { name: 'p95', value: 102 },
-    { name: 'p99', value: 109 },
-    { name: 'p99.9', value: 112 },
-    { name: 'p99.99', value: 112 },
-    { name: 'Max', value: 112 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        Latency Distribution
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Percentile latencies in nanoseconds — tight clustering indicates deterministic behavior
-      </p>
-      <ResponsiveContainer width="100%" height={300}>
-        <AreaChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
-          <defs>
-            <linearGradient id="colorDeterminism" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={colors.horus} stopOpacity={0.4}/>
-              <stop offset="95%" stopColor={colors.horus} stopOpacity={0.05}/>
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            domain={[0, 140]}
-            tickFormatter={(value) => `${value}ns`}
-            label={{ value: 'Latency (ns)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any) => [`${value}ns`, 'Latency']}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Area
-            type="monotone"
-            dataKey="value"
-            stroke={colors.horus}
-            strokeWidth={3}
-            fillOpacity={1}
-            fill="url(#colorDeterminism)"
-            dot={{ fill: colors.horus, strokeWidth: 2, r: 5 }}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-      <div className="mt-4 grid grid-cols-3 md:grid-cols-4 gap-3 text-center">
-        <div className="rounded-lg p-3" style={{ backgroundColor: colors.cardBg }}>
-          <div className="text-xl font-bold" style={{ color: colors.horus }}>7.9ns</div>
-          <div className="text-xs" style={{ color: colors.text }}>std dev</div>
-        </div>
-        <div className="rounded-lg p-3" style={{ backgroundColor: colors.cardBg }}>
-          <div className="text-xl font-bold" style={{ color: colors.horus }}>0.060</div>
-          <div className="text-xs" style={{ color: colors.text }}>CV (run-to-run)</div>
-        </div>
-        <div className="rounded-lg p-3" style={{ backgroundColor: colors.cardBg }}>
-          <div className="text-xl font-bold" style={{ color: colors.horus }}>26ns</div>
-          <div className="text-xs" style={{ color: colors.text }}>max - median</div>
-        </div>
-        <div className="rounded-lg p-3" style={{ backgroundColor: colors.cardBg }}>
-          <div className="text-xl font-bold" style={{ color: colors.accent }}>0.02%</div>
-          <div className="text-xs" style={{ color: colors.text }}>miss rate @ 1&mu;s</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Python FFI overhead attribution
- * Data: research_bench_python.py, 5s sustained, Python 3.12
- */
-export function PythonFFIOverheadChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'CmdVel', rust: 14, python: 1712, overhead: 1698 },
-    { name: 'Pose2D', rust: 14, python: 1682, overhead: 1668 },
-    { name: 'Imu', rust: 14, python: 1884, overhead: 1870 },
-    { name: 'dict (small)', rust: 14, python: 6246, overhead: 6232 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        FFI Overhead: Rust vs Python
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Latency in nanoseconds — constant ~1.7&mu;s overhead from PyO3 + GIL + allocation
-      </p>
-      <ResponsiveContainer width="100%" height={350}>
-        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 40 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            scale="log"
-            domain={[5, 10000]}
-            tickFormatter={(value) => {
-              if (value >= 1000) return `${(value/1000).toFixed(1)}\u03BCs`;
-              return `${value}ns`;
-            }}
-            label={{ value: 'Latency (log scale)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any, name: any) => {
-              const label = name === 'rust' ? 'Rust' : 'Python';
-              if (value >= 1000) return [`${(value/1000).toFixed(2)}\u03BCs`, label];
-              return [`${value}ns`, label];
-            }}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Legend
-            formatter={(value: any) => <span style={{ color: colors.text }}>{value === 'rust' ? 'Rust (native)' : 'Python (PyO3)'}</span>}
-          />
-          <Bar dataKey="rust" fill={colors.horusLink} radius={[4, 4, 0, 0]} name="rust" />
-          <Bar dataKey="python" fill={colors.horus} radius={[4, 4, 0, 0]} name="python" />
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        Overhead breakdown: PyO3 crossing ~500ns + GIL acquisition ~500ns + Python object alloc ~700ns
-      </div>
-    </div>
-  );
-}
-
-/**
- * Python zero-copy image performance
- * Data: research_bench_python.py, 640x480 images
- */
-export function PythonZeroCopyChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'Image.to_numpy\n(SHM view)', latency: 3.0, throughput: 1.5, color: colors.horus },
-    { name: 'np.copy\n(baseline)', latency: 14.0, throughput: 0.334, color: colors.ros2 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        Python Image Zero-Copy
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        640&times;480 RGB image transfer latency (&mu;s). to_numpy() is a zero-copy view into shared memory — ~4.7x faster than copying.
-      </p>
-      <ResponsiveContainer width="100%" height={300}>
-        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text, fontSize: 11 }}
-            interval={0}
-            height={60}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            domain={[0, 16]}
-            tickFormatter={(value) => `${value}\u03BCs`}
-            label={{ value: 'Latency (\u03BCs)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any) => [`${value}\u03BCs`, 'Latency']}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Bar dataKey="latency" radius={[4, 4, 0, 0]}>
-            {data.map((entry, index) => (
-              <Cell key={`cell-${index}`} fill={entry.color} />
-            ))}
-          </Bar>
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="mt-4 grid grid-cols-3 gap-4 text-center">
-        {data.map((d) => (
-          <div
-            key={d.name}
-            className="rounded-lg p-3"
-            style={{ backgroundColor: colors.cardBg }}
-          >
-            <div className="text-xl font-bold" style={{ color: d.color }}>{d.throughput}M/s</div>
-            <div className="text-xs" style={{ color: colors.text }}>throughput</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/**
- * HORUS vs iceoryx2 comparison chart
- * Data: iceoryx2_comparison + fanout_shm_bench benchmarks
- */
-export function HorusVsIceoryxChart() {
-  const colors = useColors();
-
-  const data = [
-    { name: 'Same-thread', horus: 11, iceoryx2: 69 },
-    { name: 'Cross-thread', horus: 95, iceoryx2: 182 },
-    { name: 'Cross-process', horus: 170, iceoryx2: 361 },
-    { name: 'Xproc MPMC', horus: 96, iceoryx2: 135 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        HORUS vs iceoryx2
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        p50 latency in nanoseconds — HORUS beats iceoryx2 on every IPC path
-      </p>
-      <ResponsiveContainer width="100%" height={300}>
-        <BarChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="name"
-            stroke={colors.text}
-            tick={{ fill: colors.text, fontSize: 12, fontWeight: 'bold' }}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            domain={[0, 400]}
-            tickFormatter={(value: number) => `${value}ns`}
-            label={{ value: 'Latency (ns)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any, name: any) => [`${value ?? 0}ns`, name === 'horus' ? 'HORUS' : 'iceoryx2']}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-          />
-          <Legend
-            formatter={(value: string) => <span style={{ color: colors.text }}>{value === 'horus' ? 'HORUS' : 'iceoryx2'}</span>}
-          />
-          <Bar dataKey="horus" fill={colors.horus} radius={[4, 4, 0, 0]} name="horus" />
-          <Bar dataKey="iceoryx2" fill={colors.ros2} radius={[4, 4, 0, 0]} name="iceoryx2" />
-        </BarChart>
-      </ResponsiveContainer>
-      <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        Speedup:{' '}
-        <span style={{ color: colors.horus, fontWeight: 'bold' }}>6.3x</span> same-thread
-        {' '}&bull;{' '}
-        <span style={{ color: colors.horus, fontWeight: 'bold' }}>2.1x</span> cross-process
-        {' '}&bull;{' '}
-        <span style={{ color: colors.horus, fontWeight: 'bold' }}>1.4x</span> MPMC
-        {' '}&bull;{' '}
-        <span style={{ color: colors.horus, fontWeight: 'bold' }}>4.3x</span> throughput
+        HORUS Transform Frame maintains <span style={{ color: colors.horus, fontWeight: 'bold' }}>near-constant latency</span> under contention due to lock-free design
       </div>
     </div>
   );
 }
 
 // Export all charts as a single default for easy MDX import
-export default {
+const benchmarkCharts = {
   LatencyComparisonChart,
   LatencyScalingChart,
   ScalabilityChart,
@@ -1775,12 +1173,6 @@ export default {
   TransformFrameSpeedupChart,
   TransformFrameMemoryChart,
   TransformFrameConcurrentChart,
-  IPCBackendChart,
-  MessagePerformanceChart,
-  HorusVsUDPChart,
-  HorusVsIceoryxChart,
-  ThreadScalingChart,
-  DeterminismChart,
-  PythonFFIOverheadChart,
-  PythonZeroCopyChart,
 };
+
+export default benchmarkCharts;

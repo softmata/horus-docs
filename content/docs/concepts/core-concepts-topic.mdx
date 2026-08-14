@@ -1,599 +1,728 @@
 ---
-title: "Topics — Full Reference"
-description: "Deep dive into HORUS topics: automatic backend selection, communication patterns, memory model, and performance"
-order: 30
-sidebar_group: "Communication & Data"
+title: Core Concepts - Topic
+description: Understanding HORUS pub/sub communication system
+order: 6
 ---
 
-# Topics — Full Reference
+# Topic and Pub/Sub
 
-A self-driving forklift has a LiDAR scanning at 10 Hz, cameras streaming 30 FPS, wheel encoders firing at 1 kHz, and a safety system that must react within microseconds. All of this data needs to flow between nodes — but the forklift can't afford the 50–100 µs per message that sockets and pipes add. At 1 kHz, that overhead alone eats 5–10% of every control cycle. And when the vision team splits their processing into a separate process for fault isolation, you can't afford to rewrite every communication path.
+## Key Takeaways
 
-HORUS topics solve this with **automatic shared-memory IPC**. You call `send()` and `recv()`. Every topic is shared-memory-backed from the moment it's created; HORUS counts how many publishers and subscribers exist (and whether the payload is plain-old-data) and selects one of four lock-free SHM backends. Latency is dominated by **core locality**, not by the backend: when producer and consumer share an executor thread the data stays L1-hot (~12–19 ns one-way); across threads or processes it's ~220 ns one-way — cache-coherence physics that no backend choice can beat. Because every topic is already SHM-backed, a consumer in another process can attach later with no migration. Your code never changes.
+After reading this guide, you will understand:
+- How Topic provides ultra-fast pub/sub communication (~3ns to ~167ns latency) with automatic optimization
+- The send() and recv() methods for publishing and subscribing to typed topics
+- Communication patterns (one-to-one, one-to-many, many-to-one, many-to-many) for different architectures
+- When to use Topic for real-time, single-machine communication vs network-based messaging
 
-For a gentler introduction, start with [Topics: How Nodes Talk](/concepts/topics-beginner).
+The Topic is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **automatic optimization** — from **~3ns** (same-thread) to **~167ns** (cross-process, many-to-many) depending on topology.
 
-## Automatic Backend Selection
+## What is a Topic?
 
-HORUS doesn't expose one rigid communication backend — it has four shared-memory backends, each matched to a messaging pattern. Every topic is shared-memory-backed from the moment it's created; the system picks the backend automatically based on two factors:
+A `Topic<T>` is a **typed communication channel** that connects publishers and subscribers. The system automatically detects the optimal backend based on:
 
-1. **How many** publishers and subscribers exist?
-2. **What payload** — a plain-old-data (POD) type, or one that needs serialization?
+- **Where** participants are (same thread, same process, or different processes)
+- **How many** publishers and subscribers exist
 
-Note that these factors select the *pattern*, not the *speed*. Latency is set by **core locality** (see below): a producer and consumer on the same executor thread run ~12–19 ns one-way; anything cross-thread or cross-process is ~220 ns one-way, regardless of which backend is in play.
+You just call `send()` and `recv()` — HORUS handles the rest.
 
-<MermaidDiagram
-  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
-flowchart TD
-    A["Topic created<br/>(SHM-backed)"] --> B{"How many<br/>publishers × subscribers?"}
-    B -->|"1P × 1S"| C["SpscShm"]
-    B -->|"NP × 1S"| D["MpscShm"]
-    B -->|"1P × NS"| E{"POD type?"}
-    B -->|"NP × NS"| F["FanoutShm"]
-    E -->|Yes| G["PodShm"]
-    E -->|No| F
+### Key Features
 
-    style C fill:#3b82f6,stroke:#2563eb,color:#fff
-    style D fill:#3b82f6,stroke:#2563eb,color:#fff
-    style G fill:#a855f7,stroke:#9333ea,color:#fff
-    style F fill:#a855f7,stroke:#9333ea,color:#fff
-`}
-  caption="HORUS selects one of four SHM backends by pattern — you just call send() and recv(). Latency is set by core locality (~12–19 ns same executor thread, ~220 ns cross-thread/process), not by the backend."
-/>
+**Automatic Optimization**: The fastest communication path is auto-detected at runtime
 
-### Backend Reference
+**Zero-Copy Communication**: Simple fixed-size types are shared directly in memory without serialization
 
-All four backends are shared-memory-backed. They differ in the messaging *pattern* they serve, not in their latency tier:
+**Type Safety**: Compile-time guarantees for message types
 
-| Backend | Topology | Payload | Implementation |
-|---------|----------|---------|----------------|
-| `SpscShm` | 1 publisher : 1 subscriber | any | Lock-free SHM ring, Release/Acquire ordering |
-| `MpscShm` | N publishers : 1 subscriber | any | SHM ring + Lamport sequence numbers on head |
-| `PodShm` | 1 publisher : N subscribers | POD (plain-old-data) | Memory-mapped broadcast, direct read |
-| `FanoutShm` | N:M / non-POD broadcast | any (incl. serialized) | Per-pair SHM SPSC matrix |
+**Live Migration**: Communication paths upgrade/downgrade transparently as participants join or leave
 
-### Latency Is Core Locality
+## Automatic Optimization
 
-Which backend you land on does **not** set your latency — where the producer and consumer run does. The cliff is the CPU cache boundary, not intra-process-vs-shared-memory:
+HORUS auto-selects the fastest communication path based on your topology. You never need to configure this — it happens automatically when participants call `send()` or `recv()`.
 
-| Route | One-way latency |
-|-------|-----------------|
-| Same executor thread, self-loop (1 handle, `Both` fast path) | ~12 ns (~24 ns per send+recv) |
-| Same executor thread, real pub + sub (2 handles) | ~19 ns (~39 ns per send+recv) |
-| Cross-thread **or** cross-process | ~220 ns |
+| Scenario | Latency |
+|----------|---------|
+| Same thread | ~3ns |
+| Same process, 1:1 | ~18ns |
+| Same process, many-to-many | ~36ns |
+| Cross-process | ~50-167ns |
 
-When producer and consumer share a core the payload stays L1-hot (~12–19 ns). The moment they sit on different cores — whether that's two threads or two processes — you pay ~220 ns of cache-coherence traffic, and no backend or layout choice moves that number. An in-process heap ring would *not* beat SHM here. The fastest realistic route is to co-locate a producer and consumer on one executor thread.
+> **Note**: Latencies are for small messages (16B). Larger messages scale linearly with size.
 
-<Callout type="info">
-**Latencies above are for small messages (~16 bytes).** Larger messages scale linearly with size. A 304-byte IMU message adds ~940 ns cross-process. A 1.5 KB LaserScan adds ~2.2 µs. Pool-backed types (Image, PointCloud) transfer only a small descriptor (~200–336 bytes) regardless of actual data size.
-</Callout>
+If topology changes (e.g., a second subscriber joins), HORUS automatically migrates to the optimal path without dropping messages.
 
-### Joining and Fan-out Changes
+```rust
+// All of these use the same API — optimization is automatic
+let topic: Topic<f32> = Topic::new("velocity")?;
+topic.send(1.5);
+let msg = topic.recv();
+```
 
-Because every topic is shared-memory-backed from creation, a process **split needs no migration at all**: a consumer in another process simply attaches to the existing shared memory — no rewiring, no dropped messages. This is exactly why there is no separate "intra-process" path to migrate away from.
+> **Tip**: Simple fixed-size structs (no `String`, `Vec`, `Box`) automatically get a faster zero-copy path. Both types work with the same API — HORUS picks the fastest path for you.
 
-When the fan-out itself changes — a second subscriber joins a 1:1 topic, so the pattern shifts from `SpscShm` toward a broadcast backend (`PodShm` / `FanoutShm`) — HORUS re-selects the matching backend transparently. You never need to configure or trigger this; it happens automatically on the next `send()` or `recv()` after the change is detected.
+## Basic Usage
+
+### Creating a Topic
+
+```rust
+use horus::prelude::*;
+
+// Create a Topic for f32 values on topic "velocity"
+let topic: Topic<f32> = Topic::new("velocity")?;
+```
+
+### Publishing Messages
+
+```rust
+use horus::prelude::*;
+
+struct Publisher {
+    velocity_pub: Topic<f32>,
+}
+
+impl Publisher {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            velocity_pub: Topic::new("velocity")?,
+        })
+    }
+}
+
+impl Node for Publisher {
+    fn name(&self) -> &str {
+        "Publisher"
+    }
+
+    fn tick(&mut self) {
+        let velocity = 1.5;
+
+        // Send message — infallible, non-blocking
+        self.velocity_pub.send(velocity);
+    }
+}
+```
+
+### Subscribing to Messages
+
+```rust
+use horus::prelude::*;
+
+struct Subscriber {
+    velocity_sub: Topic<f32>,
+}
+
+impl Subscriber {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            velocity_sub: Topic::new("velocity")?,
+        })
+    }
+}
+
+impl Node for Subscriber {
+    fn name(&self) -> &str {
+        "Subscriber"
+    }
+
+    fn tick(&mut self) {
+        if let Some(velocity) = self.velocity_sub.recv() {
+            println!("Received velocity: {}", velocity);
+        }
+    }
+}
+```
+
+## Transport
+
+Topics use **local shared memory** for ultra-fast communication between processes on the same machine.
+
+```rust
+// Automatically uses local shared memory
+let topic: Topic<SensorData> = Topic::new("sensors")?;
+```
+
+**Performance**: ~3ns to ~167ns depending on topology
+**Use case**: All nodes on same machine
+**Pros**: Ultra-fast, deterministic, zero-copy
+
+For multi-machine communication, HORUS supports zero-configuration peer discovery via mDNS (requires the `mdns` feature flag).
+
+## API Reference
+
+> **Note**: HORUS separates introspection from the hot path. The `send()` and `recv()` methods have zero logging overhead by default.
+
+### send()
+
+```rust
+pub fn send(&self, msg: T)
+```
+
+Publishes a message to the topic. Infallible — uses "keep last" ring buffer semantics where the oldest message is overwritten when full.
+
+```rust
+// send() always succeeds — no error handling needed
+topic.send(data);
+```
+
+### recv()
+
+```rust
+pub fn recv(&self) -> Option<T>
+```
+
+Receives the next message from the topic. Returns `None` if no message is available. Non-blocking.
+
+```rust
+if let Some(data) = topic.recv() {
+    // Process the received message
+}
+```
+
+### try_send()
+
+```rust
+pub fn try_send(&self, msg: T) -> Result<(), T>
+```
+
+Attempts to send a message, returning it on failure. Unlike `send()` which silently handles errors, `try_send()` gives you explicit control over failure cases.
+
+```rust
+match topic.try_send(data) {
+    Ok(()) => { /* sent successfully */ }
+    Err(returned_data) => { /* buffer full, message returned */ }
+}
+```
+
+### try_recv()
+
+```rust
+pub fn try_recv(&self) -> Option<T>
+```
+
+Attempts to receive a message. Functionally identical to `recv()` for most use cases — both are non-blocking and return `Option<T>`.
+
+### read_latest()
+
+```rust
+pub fn read_latest(&self) -> Option<T>
+where
+    T: Copy,
+```
+
+Returns the most recent message **without advancing the consumer position**. Calling it multiple times returns the same message until a new one is published. Useful for reading infrequently-updated data like static transforms or configuration.
+
+> **`T: Copy` requirement**: `read_latest()` requires `T: Copy` to guarantee safe concurrent reads. Types with heap allocations (`String`, `Vec`, etc.) should use `recv()` instead.
+
+```rust
+// Read latest transform (doesn't consume it)
+if let Some(transform) = tf_topic.read_latest() {
+    self.apply_transform(transform);
+}
+```
+
+### has_message()
+
+```rust
+pub fn has_message(&self) -> bool
+```
+
+Checks if at least one message is available without consuming it.
+
+### pending_count()
+
+```rust
+pub fn pending_count(&self) -> u64
+```
+
+Returns the number of messages waiting to be consumed.
+
+### Runtime Debug Logging
+
+Debug logging is toggled at runtime from the TUI monitor — no code changes or recompilation needed. Select a topic in the Topics tab and press **Enter** to start logging; press **Esc** to stop.
+
+When debug logging is active, every `send()` and `recv()` records timing and message summaries to the log buffer. If the message type implements `LogSummary`, rich summaries are logged; otherwise, metadata-only entries (topic name, direction, IPC latency) are produced.
+
+```bash
+horus monitor --tui    # Open TUI, navigate to Topics tab, press Enter on a topic
+```
+
+Debug logging adds no overhead when disabled — introspection is fully separated from the hot path.
+
+### with_capacity()
+
+```rust
+pub fn with_capacity(name: &str, capacity: u32, slot_size: Option<usize>) -> Result<Self>
+```
+
+Creates a topic with a custom ring buffer capacity. By default, HORUS auto-sizes capacity based on the message type size. Use this when you need more buffering (e.g., bursty producers).
+
+```rust
+// 256-slot ring buffer (rounded up to next power of 2)
+let topic: Topic<f32> = Topic::with_capacity("velocity", 256, None)?;
+```
+
+## Type-Safe Topic Descriptors
+
+The `topics!` macro defines compile-time topic descriptors that prevent topic name typos and type mismatches across your codebase.
+
+### Defining Topics
+
+```rust
+use horus::prelude::*;
+
+// Define topics with compile-time type checking
+topics! {
+    pub CMD_VEL: CmdVel = "cmd_vel",
+    pub SENSOR_DATA: SensorReading = "sensor.data",
+    pub MOTOR_STATUS: MotorState = "motor.status",
+}
+```
+
+### Using Descriptors
+
+```rust
+// Publisher — type is enforced at compile time
+let pub_topic: Topic<CmdVel> = Topic::new(CMD_VEL.name())?;
+pub_topic.send(CmdVel::new(1.0, 0.5));
+
+// Subscriber — same type enforced
+let sub_topic: Topic<CmdVel> = Topic::new(CMD_VEL.name())?;
+if let Some(cmd) = sub_topic.recv() {
+    // cmd is guaranteed to be CmdVel
+}
+```
+
+This prevents common errors like:
+- Typos in topic names (caught at compile time)
+- Type mismatches between publishers and subscribers
+- Inconsistent topic names across modules
 
 ## Communication Patterns
 
-### One-to-One (SpscShm — ~19 ns same-thread, ~220 ns cross-thread/process)
+### One-to-One
 
-The simplest pattern: one publisher, one subscriber. Auto-selects `SpscShm` (single-producer, single-consumer) — the leanest backend. Co-locate both nodes on one executor thread and it runs L1-hot (~19 ns one-way); split them across cores or processes and it's ~220 ns either way.
+Single publisher, single subscriber (~18ns same-process, ~85ns cross-process).
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
+```rust
+struct PubNode {
+    data_pub: Topic<f32>,
+}
 
-    // Publisher
-    struct Sensor { data_pub: Topic<f32> }
-    impl Node for Sensor {
-        fn name(&self) -> &str { "Sensor" }
-        fn tick(&mut self) { self.data_pub.send(42.0); }
+impl Node for PubNode {
+    fn name(&self) -> &str { "PubNode" }
+
+    fn tick(&mut self) {
+        self.data_pub.send(42.0);
     }
+}
 
-    // Subscriber
-    struct Display { data_sub: Topic<f32> }
-    impl Node for Display {
-        fn name(&self) -> &str { "Display" }
-        fn tick(&mut self) {
-            if let Some(v) = self.data_sub.recv() { println!("{}", v); }
+struct SubNode {
+    data_sub: Topic<f32>,
+}
+
+impl Node for SubNode {
+    fn name(&self) -> &str { "SubNode" }
+
+    fn tick(&mut self) {
+        if let Some(data) = self.data_sub.recv() {
+            println!("Got: {}", data);
         }
     }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
+}
+```
 
-    # Publisher
-    def sensor_tick(node):
-        node.send("sensor.data", 42.0)
+### One-to-Many (Broadcast)
 
-    sensor = horus.Node("Sensor", tick=sensor_tick, pubs=["sensor.data"])
+Single publisher, multiple subscribers (~24ns same-process, ~70ns cross-process).
 
-    # Subscriber
-    def display_tick(node):
-        val = node.recv("sensor.data")
-        if val is not None:
-            print(val)
+```rust
+// One publisher
+struct Broadcaster {
+    broadcast_pub: Topic<String>,
+}
 
-    display = horus.Node("Display", tick=display_tick, subs=["sensor.data"])
+// Multiple subscribers — all receive the same messages
+struct Listener1 { broadcast_sub: Topic<String> }
+struct Listener2 { broadcast_sub: Topic<String> }
+struct Listener3 { broadcast_sub: Topic<String> }
+```
 
-    horus.run(sensor, display)
-    ```
-  </LangTab>
-</LanguageTabs>
+### Many-to-One (Aggregation)
 
-### One-to-Many / Broadcast (PodShm or FanoutShm — ~19 ns same-thread, ~220 ns cross-thread/process)
+Multiple publishers, single subscriber (~26ns same-process, ~65ns cross-process).
 
-One publisher, multiple subscribers. All subscribers independently receive every message. Auto-selects `PodShm` for plain-old-data payloads (memory-mapped broadcast) or `FanoutShm` for types that need serialization.
+```rust
+// Multiple publishers
+struct Sensor1 { reading_pub: Topic<f32> }
+struct Sensor2 { reading_pub: Topic<f32> }
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    // One publisher
-    struct Broadcaster { alert_pub: Topic<String> }
+// Single aggregator
+struct Aggregator {
+    reading_sub: Topic<f32>,
+}
 
-    // Three independent subscribers — all receive the same data
-    struct Logger { alert_sub: Topic<String> }
-    struct Dashboard { alert_sub: Topic<String> }
-    struct Recorder { alert_sub: Topic<String> }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    # One publisher
-    broadcaster = horus.Node("Broadcaster", tick=broadcast_tick, pubs=["alert"])
+impl Node for Aggregator {
+    fn name(&self) -> &str { "Aggregator" }
 
-    # Three independent subscribers — all receive the same data
-    logger    = horus.Node("Logger",    tick=log_tick,    subs=["alert"])
-    dashboard = horus.Node("Dashboard", tick=dash_tick,   subs=["alert"])
-    recorder  = horus.Node("Recorder",  tick=record_tick, subs=["alert"])
-    ```
-  </LangTab>
-</LanguageTabs>
-
-This is the standard pattern for sensor data: one camera node publishes, and the vision system, logger, and display all subscribe independently.
-
-### Many-to-One / Aggregation (MpscShm — ~19 ns same-thread, ~220 ns cross-thread/process)
-
-Multiple publishers, one subscriber. Auto-selects `MpscShm` (multiple-producer, single-consumer). Messages are interleaved in arrival order.
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    // Multiple sensors publishing to the same topic
-    struct TempSensor1 { pub_temp: Topic<f32> }
-    struct TempSensor2 { pub_temp: Topic<f32> }
-
-    // Single aggregator drains all readings
-    struct Aggregator { sub_temp: Topic<f32> }
-
-    impl Node for Aggregator {
-        fn name(&self) -> &str { "Aggregator" }
-        fn tick(&mut self) {
-            // Drain all readings — may come from either sensor
-            while let Some(reading) = self.sub_temp.recv() {
-                self.process(reading);
-            }
+    fn tick(&mut self) {
+        if let Some(reading) = self.reading_sub.recv() {
+            self.process(reading);
         }
     }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    # Multiple sensors publishing to the same topic
-    temp1 = horus.Node("TempSensor1", tick=temp1_tick, pubs=["temperature"])
-    temp2 = horus.Node("TempSensor2", tick=temp2_tick, pubs=["temperature"])
+}
+```
 
-    # Single aggregator drains all readings
-    def aggregator_tick(node):
-        while node.has_msg("temperature"):
-            reading = node.recv("temperature")
-            process(reading)
+### Many-to-Many
 
-    aggregator = horus.Node("Aggregator", tick=aggregator_tick, subs=["temperature"])
-    ```
-  </LangTab>
-</LanguageTabs>
+Multiple publishers and subscribers (~36ns same-process, ~167ns cross-process).
 
-### Many-to-Many (FanoutShm — ~19 ns same-thread, ~220 ns cross-thread/process)
+```rust
+struct Agent1 {
+    state_pub: Topic<RobotState>,
+    state_sub: Topic<RobotState>,
+}
 
-Multiple publishers and subscribers (or any non-POD broadcast). Auto-selects `FanoutShm`, which wires a per-pair SHM SPSC matrix — the most general path. The per-hop latency still follows the core-locality ladder above, but every added publisher/subscriber pair is extra work, so prefer a narrower pattern when you don't genuinely need N:M.
+struct Agent2 {
+    state_pub: Topic<RobotState>,
+    state_sub: Topic<RobotState>,
+}
+```
 
 ## Topic Naming
 
 ### Use Dots, Not Slashes
 
-HORUS uses **dots (`.`)** for topic name hierarchy:
+> **Important**: HORUS uses **dots (`.`)** for topic hierarchy, not slashes (`/`).
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    // CORRECT
-    Topic::<f32>::new("sensor.temperature")?;
-    Topic::<CmdVel>::new("robot.motor.cmd_vel")?;
-    Topic::<LaserScan>::new("lidar.front.scan")?;
+```rust
+// CORRECT - Use dots
+let topic = Topic::new("sensors.lidar");
+let topic = Topic::new("robot.cmd_vel");
 
-    // WRONG — fails on macOS
-    Topic::<f32>::new("sensor/temperature")?;
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    # CORRECT
-    pubs=["sensor.temperature"]
-    pubs=["robot.motor.cmd_vel"]
-    subs=["lidar.front.scan"]
+// WRONG - Do NOT use slashes
+let topic = Topic::new("sensors/lidar");   // Will cause errors!
+let topic = Topic::new("robot/cmd_vel");   // Will cause errors!
+```
 
-    # WRONG — fails on macOS
-    pubs=["sensor/temperature"]
-    ```
-  </LangTab>
-</LanguageTabs>
+**Why dots instead of slashes?**
 
-<Callout type="warning">
-Slashes cause `shm_open` (the POSIX shared-memory system call) to interpret the name as a file path on macOS, creating nested directories instead of a flat shared-memory region. Dots work identically on Linux and macOS.
+Slashes in topic names cause errors because they conflict with the underlying storage format. Always use dots.
 
-| Framework | Separator | Example |
-|-----------|-----------|---------|
-| ROS / ROS2 | `/` | `/sensor/lidar` |
+**Coming from ROS?**
+
+| Framework | Topic Separator | Example |
+|-----------|----------------|---------|
+| ROS/ROS2 | `/` | `/sensor/lidar` |
 | HORUS | `.` | `sensor.lidar` |
-</Callout>
 
-### Naming Conventions
+### Best Practices
 
-| Pattern | Example | Use for |
-|---------|---------|---------|
-| `subsystem.data` | `sensor.temperature` | Most topics |
-| `subsystem.device.data` | `camera.front.rgb` | Multi-device systems |
-| `robot_id.subsystem.data` | `robot1.motor.cmd_vel` | Multi-robot fleets |
+```rust
+// Descriptive names
+let topic = Topic::new("cmd_vel");           // Good
+let topic = Topic::new("data");              // Too vague
 
-**Avoid**: names starting with `_` (reserved for internal use), names containing special characters (`!@#$%^&*()`), and names containing `/`.
+// Hierarchical naming
+let topic = Topic::new("sensor.lidar");      // Hierarchical
+let topic = Topic::new("robot1.cmd_vel");    // Namespaced
+let topic = Topic::new("diagnostics.cpu");   // Categorized
+```
 
-### Type-Safe Topic Descriptors
+### Reserved Topic Names
 
-The `topics!` macro defines compile-time topic descriptors that prevent name typos and type mismatches:
+Avoid using these patterns:
+- Topics starting with `_` (internal use)
+- Topics containing `/` (causes file path errors)
+- Topics containing `/dev/` (conflicts with paths)
+- Topics with special characters: `!@#$%^&*()`
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-    use horus_robotics::prelude::*;
+## Error Handling
 
-    topics! {
-        pub CMD_VEL: CmdVel = "cmd_vel",
-        pub SENSOR_DATA: f32 = "sensor.data",
-        pub MOTOR_STATUS: MotorStatus = "motor.status",
+### Send Behavior
+
+`send()` is infallible — it uses ring buffer "keep last" semantics. When the buffer is full, the oldest message is overwritten:
+
+```rust
+// send() always succeeds — no error handling needed
+topic.send(data);
+```
+
+For explicit error handling, use `try_send()`:
+
+```rust
+match topic.try_send(data) {
+    Ok(()) => { /* success */ }
+    Err(msg) => { /* buffer full — msg returned to caller */ }
+}
+```
+
+### Receive Behavior
+
+`recv()` returns `None` when no message is available — this is normal, not an error:
+
+```rust
+match topic.recv() {
+    Some(data) => {
+        // Process data
     }
-
-    // Usage — type is enforced at compile time
-    let pub_topic = Topic::<CmdVel>::new(CMD_VEL.name())?;
-    let sub_topic = Topic::<CmdVel>::new(CMD_VEL.name())?;
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    from horus.messages import CmdVel, MotorStatus
-
-    # Typed topic descriptors — type checked at publish/subscribe
-    motor = horus.Node(
-        "Motor",
-        tick=motor_tick,
-        pubs=[CmdVel],                         # Type-safe publisher
-        subs={"motor.status": MotorStatus},    # Type-safe subscriber
-    )
-    ```
-  </LangTab>
-</LanguageTabs>
-
-This catches topic name typos and type mismatches at compile time instead of runtime.
+    None => {
+        // No data available - this is normal
+    }
+}
+```
 
 ## Message Types
 
-### What Types Work?
+### What Types Can I Use?
 
-Any type that implements `Clone + Send + Sync + Serialize + Deserialize + 'static` works with topics. In practice, this means almost everything:
+Most types work with `Topic` — just add standard derives:
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use serde::{Serialize, Deserialize};
+```rust
+use serde::{Serialize, Deserialize};
 
-    // Primitive types — work out of the box
-    let topic: Topic<f32> = Topic::new("float")?;
-    let topic: Topic<bool> = Topic::new("flag")?;
+// Primitive types work out of the box
+let topic: Topic<f32> = Topic::new("float_topic")?;
+let topic: Topic<bool> = Topic::new("bool_topic")?;
 
-    // Custom structs — add standard derives
-    #[derive(Clone, Serialize, Deserialize)]
-    struct MyMessage {
-        x: f32,
-        y: f32,
-        label: String,
+// Custom structs — just add derives
+#[derive(Clone, Serialize, Deserialize)]
+struct MyMessage {
+    x: f32,
+    y: f32,
+    name: String,
+}
+
+let topic: Topic<MyMessage> = Topic::new("my_topic")?;
+
+// Collections work too
+#[derive(Clone, Serialize, Deserialize)]
+struct SensorBatch {
+    readings: Vec<f32>,
+    timestamp: u64,
+}
+
+let topic: Topic<SensorBatch> = Topic::new("batch_topic")?;
+```
+
+### Required Traits
+
+Your message types need these traits (all auto-derived):
+
+| Trait | Why | How to Get It |
+|-------|-----|---------------|
+| `Clone` | Messages may be copied between backends | `#[derive(Clone)]` |
+| `Serialize` | For serialized shared memory path | `#[derive(Serialize)]` |
+| `Deserialize` | For serialized shared memory path | `#[derive(Deserialize)]` |
+
+Additionally, types must be `Send + Sync + 'static` — satisfied automatically by most types.
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct MyMessage {
+    // your fields
+}
+```
+
+## Advanced Usage
+
+### Conditional Publishing
+
+Only publish when certain conditions are met:
+
+```rust
+impl Node for ConditionalPublisher {
+    fn tick(&mut self) {
+        let data = self.read_sensor();
+
+        if data > self.threshold {
+            self.alert_pub.send(data);
+        }
     }
-    let topic: Topic<MyMessage> = Topic::new("custom")?;
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    # Primitive types — work out of the box
-    node.send("float", 42.0)
-    node.send("flag", True)
+}
+```
 
-    # Custom dicts — sent as-is
-    node.send("custom", {"x": 1.0, "y": 2.0, "label": "target"})
+### Message Buffering
 
-    # Dataclasses work too
-    from dataclasses import dataclass
+Cache the last received message using `read_latest()` or manual buffering:
 
-    @dataclass
-    class MyMessage:
-        x: float
-        y: float
-        label: str
+```rust
+struct BufferedSubscriber {
+    data_sub: Topic<f32>,
+    last_value: Option<f32>,
+}
 
-    node.send("custom", MyMessage(x=1.0, y=2.0, label="target"))
-    ```
-  </LangTab>
-</LanguageTabs>
+impl Node for BufferedSubscriber {
+    fn tick(&mut self) {
+        if let Some(value) = self.data_sub.recv() {
+            self.last_value = Some(value);
+        }
 
-### The TopicMessage Trait
-
-Under the hood, all types go through the `TopicMessage` trait, which defines a **wire format** for transmission:
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    pub trait TopicMessage: Sized + Send + 'static {
-        type Wire: Clone + Send + Sync + Serialize + DeserializeOwned + 'static;
-        fn to_wire(&self, pool: &Option<Arc<TensorPool>>) -> Self::Wire;
-        fn from_wire(wire: Self::Wire, pool: &Option<Arc<TensorPool>>) -> Self;
-        fn needs_pool() -> bool;
+        if let Some(value) = self.last_value {
+            self.process(value);
+        }
     }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    # Python handles wire format automatically — no manual trait implementation needed.
-    # All Python-serializable types (dicts, dataclasses, built-in messages) work
-    # out of the box via node.send() and node.recv().
-    ```
-  </LangTab>
-</LanguageTabs>
+}
+```
 
-For most types, the blanket implementation makes `Wire = T` — a direct pass-through with zero overhead. Pool-backed types (Image, PointCloud, DepthImage, Tensor) use a small descriptor as the wire format and transfer the actual data through shared memory pools.
+For `Copy` types, use `read_latest()` instead — it reads the latest message without consuming it:
 
-You never need to implement this trait manually — the blanket impl covers all standard types.
+```rust
+// Requires T: Copy — reads latest without advancing consumer position
+if let Some(transform) = self.tf_sub.read_latest() {
+    self.apply_transform(transform);
+}
+```
 
-### Pool-Backed Types (Zero-Copy for Large Data)
+### Rate Limiting
 
-For large data types, copying through the ring buffer would be too slow. A 1920×1080 RGB image is 6 MB — copying it at 30 FPS would consume 180 MB/s of memory bandwidth just for one topic.
+Publish at a specific rate:
 
-HORUS solves this with **pool-backed types**. The actual data lives in a shared memory pool. The topic transfers only a small descriptor (~200–336 bytes) that points to the pool slot. The receiver reads the pixel data directly from the same memory — zero copies regardless of image size.
+```rust
+struct RateLimitedPublisher {
+    data_pub: Topic<f32>,
+    tick_count: u32,
+    publish_every_n_ticks: u32,
+}
 
-| Type | Descriptor size | Actual data | Example size |
-|------|----------------|-------------|--------------|
-| `Image` | ~288 bytes | Pixel buffer in SHM pool | 6 MB (1080p RGB) |
-| `PointCloud` | ~200 bytes | Point array in SHM pool | 1.2 MB (30K points) |
-| `DepthImage` | ~200 bytes | Depth buffer in SHM pool | 4 MB (1080p f32) |
-| `Tensor` | ~336 bytes | Tensor data in SHM pool | Varies |
+impl Node for RateLimitedPublisher {
+    fn tick(&mut self) {
+        self.tick_count += 1;
 
-The API is identical — `send()`, `recv()`, `try_send()` all work the same:
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-
-    let camera = Topic::<Image>::new("camera.rgb")?;
-
-    // Send (moves Image into pool slot, sends descriptor through ring)
-    camera.send(image);
-
-    // IMPORTANT: drain every tick — images are large and stale frames waste pool slots
-    if let Some(img) = camera.recv() {
-        println!("{}x{} image received", img.width(), img.height());
+        if self.tick_count % self.publish_every_n_ticks == 0 {
+            self.data_pub.send(42.0);
+        }
     }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    from horus.messages import Image
+}
+```
 
-    camera_node = horus.Node("Camera", tick=cam_tick, pubs=[Image])
+### Message Filtering
 
-    # In the publisher tick
-    def cam_tick(node):
-        node.send("camera.rgb", image)
+Filter messages before processing:
 
-    # In the subscriber tick — drain every tick to free pool slots
-    def vision_tick(node):
-        img = node.recv("camera.rgb")
-        if img is not None:
-            print(f"{img.width}x{img.height} image received")
-    ```
-  </LangTab>
-</LanguageTabs>
-
-<Callout type="tip">
-You don't need to use `with_capacity()` for pool-backed types — they manage their own memory through the pool. `Topic::new()` is the correct constructor for Image, PointCloud, DepthImage, and Tensor.
-</Callout>
+```rust
+impl Node for FilteringSubscriber {
+    fn tick(&mut self) {
+        if let Some(data) = self.data_sub.recv() {
+            if data.is_valid() && data.quality > 0.8 {
+                self.process(data);
+            }
+        }
+    }
+}
+```
 
 ## Memory and Capacity
 
-### Ring Buffer Model
+### Memory Usage Per Topic
 
-Each topic is backed by a ring buffer with a fixed number of **slots**. When a publisher calls `send()` and all slots are occupied, a point-to-point (1:1) topic rejects the new message (keeping the queued messages in publish order); a broadcast (multi-subscriber) topic overwrites the oldest.
+By default, `Topic::new()` auto-sizes capacity based on message type size:
 
-```
-Ring buffer (capacity = 4):
-┌───┬───┬───┬───┐
-│ 3 │ 4 │ 5 │ _ │  ← slot 0 was overwritten by message 4
-└───┴───┴───┴───┘
-  ↑           ↑
-  read        write
-  cursor      cursor
-```
+| Message Type | Auto Capacity | Approximate Memory |
+|--------------|---------------|--------------------|
+| `f32` (4 bytes) | 1024 slots | ~73 KB |
+| `CmdVel` (16 bytes) | 256 slots | ~19 KB |
+| `Pose2D` (32 bytes) | 128 slots | ~10 KB |
+| `Twist` (56 bytes) | 73 slots | ~6 KB |
+| `Imu` (~300 bytes) | 16 slots | ~129 KB |
 
-The default capacity is **4 slots**. This is intentionally small — robotics control loops care about the latest data, not history. Increase capacity when you need more buffering:
+For most robotics applications, memory usage per topic is under 1 MB.
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    // Default: 4 slots, auto-sized
-    let topic = Topic::<Imu>::new("imu")?;
+### Cleaning Up
 
-    // Custom: 16 slots, auto-sized — for high-frequency bursty publishers
-    let topic = Topic::<Imu>::with_capacity("imu", 16, None)?;
-
-    // Custom: 8 slots, 4 KB each — for large variable-size messages
-    let topic = Topic::<LaserScan>::with_capacity("lidar.scan", 8, Some(4096))?;
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    from horus.messages import Imu, LaserScan
-
-    # Default: 4 slots, auto-sized
-    imu_node = horus.Node("ImuReader", tick=imu_tick, subs=[Imu])
-
-    # Capacity is configured at the Rust level — Python nodes use the
-    # default ring buffer size. For custom capacity, configure in horus.toml.
-    ```
-  </LangTab>
-</LanguageTabs>
-
-<Callout type="info">
-Capacity must be a power of 2 (4, 8, 16, 32, ...). This allows the ring buffer to use bitwise AND instead of modulo for index wrapping — a micro-optimization that matters at nanosecond latencies.
-</Callout>
-
-### Memory Usage
-
-| Message Type | Size | Default Capacity | Approximate Memory |
-|-------------|------|------------------|-------------------|
-| `f32` | 4 B | 4 slots | ~1 KB |
-| `CmdVel` | 16 B | 4 slots | ~1 KB |
-| `Imu` | ~300 B | 4 slots | ~2 KB |
-| `LaserScan` | ~1.5 KB | 4 slots | ~7 KB |
-
-For most robotics applications, total topic memory is well under 1 MB.
-
-### Cleaning Up Shared Memory
-
-Shared memory files persist after processes exit — by design, so new processes can join existing topics. Clean up between sessions:
+Shared memory files persist after processes exit (by design — allows new processes to join existing topics). Clean up between sessions:
 
 ```bash
-horus clean --shm            # Clean shared memory
-horus clean --shm --dry-run  # Preview what would be cleaned
-horus clean --all            # Clean everything (SHM + build cache)
+# Clean shared memory only (recommended)
+horus clean --shm
+
+# Preview what would be cleaned
+horus clean --shm --dry-run
+
+# Clean everything (shared memory + build cache)
+horus clean --all
 ```
 
-HORUS also performs automatic stale-topic cleanup — files with no active process are removed when new topics are created.
+HORUS also performs automatic stale-topic cleanup — files with no active process are removed automatically.
 
-## Runtime Debugging
+### Troubleshooting
 
-### CLI Tools
+**"No space left on device"** — Shared memory is full:
 
 ```bash
-horus topic list              # List all active topics
-horus topic echo sensor.data  # Print messages on a topic
-horus topic hz sensor.data    # Show publish rate
-horus monitor --tui           # Interactive dashboard
+horus clean --shm            # Clean up
 ```
 
-### TUI Debug Logging
+**Type mismatch** — Ensure publisher and subscriber use the exact same type for a topic name:
 
-Debug logging is toggled at runtime from the TUI monitor — no code changes or recompilation needed. Select a topic in the Topics tab and press **Enter** to start logging; press **Esc** to stop.
+```rust
+// Both sides MUST use the same type
+let pub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+let sub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+```
 
-When active, every `send()` and `recv()` records timing and message summaries. When disabled, there is zero overhead — introspection is fully separated from the hot path.
+## Performance
 
-### Programmatic Monitoring
+### Latency by Topology (16B message)
 
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-    use horus_robotics::prelude::*;
+| Scenario | Latency |
+|----------|---------|
+| Same thread | ~3ns |
+| Same process, 1:1 | ~18ns |
+| Same process, many-to-many | ~36ns |
+| Cross-process | ~50-167ns |
 
-    let topic = Topic::<CmdVel>::new("cmd_vel")?;
+### Latency by Message Size (cross-process)
 
-    // Check for drops (subscriber too slow)
-    if topic.dropped_count() > 0 {
-        hlog!(warn, "Dropped {} messages on '{}'", topic.dropped_count(), topic.name());
+| Message Type | Size | Latency |
+|--------------|------|---------|
+| CmdVel | 16B | ~167ns |
+| IMU | 304B | ~940ns |
+| LaserScan | 1.5KB | ~2.2µs |
+| PointCloud | 120KB | ~360µs |
+
+Latency scales linearly with message size.
+
+### Throughput
+
+- **Millions of messages per second** for small messages
+- **Gigabytes per second** for large messages
+- **Deterministic latency** regardless of system load
+
+## Best Practices
+
+**Use simple fixed-size types when possible** — they get the fastest path automatically:
+```rust
+Topic::<[f32; 3]>::new("position")?;   // Fixed-size: fastest path
+Topic::<Vec<f32>>::new("position")?;   // Dynamic: still fast, but uses serialization
+```
+
+**Keep messages small** — latency scales linearly with size.
+
+**Check recv() every tick** — don't skip ticks:
+```rust
+fn tick(&mut self) {
+    if let Some(msg) = self.sub.recv() {
+        self.process(msg);
     }
+}
+```
 
-    // Aggregate statistics
-    let m = topic.metrics();
-    println!("Sent: {}, Received: {}, Failures: {}",
-        m.messages_sent(), m.messages_received(), m.send_failures());
+**Use topics! macro** for shared topic definitions across modules:
+```rust
+topics! {
+    pub CMD_VEL: CmdVel = "cmd_vel",
+    pub ODOM: Odometry = "odom",
+}
+```
 
-    // Connection info
-    println!("Backend: {}, Pubs: {}, Subs: {}",
-        topic.backend_name(), topic.pub_count(), topic.sub_count());
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    # Programmatic monitoring from Python
-    def monitor_tick(node):
-        # Check if a message is available before receiving
-        if node.has_msg("cmd_vel"):
-            msg = node.recv("cmd_vel")
-            print(f"Received: {msg}")
+**send() is infallible** — no error handling needed:
+```rust
+self.pub_topic.send(data);
+```
 
-    # For detailed topic stats, use the CLI:
-    #   horus topic list
-    #   horus topic hz cmd_vel
-    #   horus monitor --tui
-    ```
-  </LangTab>
-</LanguageTabs>
+## Next Steps
 
-## Design Decisions
-
-**Why four backends instead of just one "shared memory"?**
-A single shared-memory implementation that handles every pattern must use the most conservative synchronization — CAS on both head and tail — even for the common case of one publisher and one subscriber, where a simple Release/Acquire ring (`SpscShm`) does the job. The four backends (`SpscShm`, `MpscShm`, `PodShm`, `FanoutShm`) let each messaging pattern use the minimal synchronization it needs, with automatic selection so you never think about it. Note that this is about synchronization overhead, not the latency tier: latency is governed by core locality (~12–19 ns same executor thread, ~220 ns cross-core), and co-locating a producer and consumer on one thread is the real lever.
-
-**Why ring buffers instead of unbounded queues?**
-Unbounded queues grow without limit. A slow subscriber on a fast publisher creates a memory leak that eventually crashes the process. Ring buffers have fixed, predictable memory usage. When full, a 1:1 topic rejects new sends (keeping its queued messages in order) and a broadcast topic overwrites the oldest — the publisher never blocks either way. For guaranteed delivery use `send_blocking()`; for freshest-wins on a 1:1 stream, drain with `recv_all()[-1]`.
-
-**Why automatic backend selection instead of manual configuration?**
-During development, everything runs in one process. In production, you split across processes for isolation. In simulation, you might run everything on one thread for determinism. If you had to manually configure the backend for every topology, you'd need different configurations for development, testing, and production. Automatic selection means the same code runs optimally everywhere.
-
-**Why SHM-backed from creation?**
-A new subscriber joining shouldn't require restarting the publisher, and a process splitting in two shouldn't require code changes. Because every topic is shared-memory-backed the instant it's created (the creator's PID is stamped at init), a consumer in another process just attaches to the existing shared memory — no migration, no coordination. When the fan-out pattern itself changes, HORUS re-selects the matching backend at runtime, without dropping messages.
-
-**Why dots instead of slashes for naming?**
-POSIX `shm_open` on macOS interprets slashes as directory separators. A topic named `"sensor/lidar"` creates a file at `/dev/shm/sensor/lidar` instead of `/dev/shm/sensor.lidar`, which fails if the `sensor/` directory doesn't exist. Dots work identically on Linux and macOS. This was a pragmatic cross-platform decision, not a stylistic one.
-
-## Trade-offs
-
-| Gain | Cost |
-|------|------|
-| **Four optimized backends** — each messaging pattern gets minimal-overhead sync | More complex internal implementation (transparent to users) |
-| **Automatic selection** — same code works across all topologies | Cannot force a specific backend (auto-selection is always optimal) |
-| **Ring buffer** — bounded memory, never blocks, always has latest data | Slow subscribers lose messages (detectable via `dropped_count()`) |
-| **Pool-backed zero-copy** — 6 MB images transfer in nanoseconds | Pool slots are finite; stale `recv()` wastes slots |
-| **SHM-backed from creation** — cross-process consumers attach with no migration | Backend re-selects on fan-out change (brief, transparent) |
-| **Type safety** — compiler enforces message types | All serializable types need `Clone + Serialize + Deserialize` derives |
-
-## See Also
-
-- [Topics: How Nodes Talk](/concepts/topics-beginner) — Beginner introduction
-- [Topic API](/rust/api/topic) — Complete API reference with every method signature
-- [Python Topic API](/python/api/python-bindings) — Topic API from Python
-- [Communication Overview](/concepts/communication-overview) — When to use topics vs services vs actions
-- [Image API](/rust/api/image) — Pool-backed camera images
-- [PointCloud API](/rust/api/pointcloud) — Pool-backed 3D point clouds
-- [Message Types](/concepts/message-types) — Standard robotics message types
+- Learn about the [Scheduler](/concepts/core-concepts-scheduler) for orchestrating nodes
+- Explore [Message Types](/concepts/message-types) for standard robotics messages
+- Read the [API Reference](/rust/api) for complete Topic documentation

@@ -57,8 +57,7 @@ function getAllDocs() {
           title: data.title || file.replace(/\.(mdx|md)$/, ''),
           description: data.description || '',
           slug: slug.startsWith('/') ? slug : `/${slug}`,
-          content: cleanContent.substring(0, 2000), // Truncated for FlexSearch UI
-          fullContent: cleanContent,                  // Complete content for AI agents
+          content: cleanContent.substring(0, 2000), // More content for better search
           headings: headings.join(' '),
           category: baseSlug.split('/')[1] || 'general',
         });
@@ -82,7 +81,7 @@ function buildSearchIndex() {
 
   // Create search index data
   const searchIndex = {
-    version: 3,
+    version: 2,
     generated: new Date().toISOString(),
     totalDocs: docs.length,
     docs: docs.map(doc => ({
@@ -91,7 +90,6 @@ function buildSearchIndex() {
       description: doc.description,
       slug: doc.slug,
       content: doc.content,
-      fullContent: doc.fullContent,
       headings: doc.headings,
       category: doc.category,
     })),

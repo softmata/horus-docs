@@ -1,18 +1,52 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Static HTML export — deployed to Cloudflare Pages (free static hosting).
-  // Security headers live in public/_headers (Cloudflare-native); `next export`
-  // does not run next.config `headers()`.
-  output: 'export',
+  // This repository lives in a multi-project workspace with another lockfile.
+  // Pin tracing to this app so Next does not treat the workspace parent as the
+  // application root.
+  outputFileTracingRoot: __dirname,
   pageExtensions: ['ts', 'tsx', 'js', 'jsx', 'md', 'mdx'],
+  // Ensure consistent URL handling on Vercel
   trailingSlash: false,
-  // Skip type checking during build (types checked in CI lint step)
-  typescript: {
-    ignoreBuildErrors: true,
+  // Optimize for static generation
+  experimental: {
+    // Improve static generation reliability
   },
-  // Static export has no Image Optimization server — serve images as-is.
-  images: {
-    unoptimized: true,
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY',
+          },
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff',
+          },
+          {
+            key: 'Referrer-Policy',
+            value: 'strict-origin-when-cross-origin',
+          },
+          {
+            key: 'X-DNS-Prefetch-Control',
+            value: 'on',
+          },
+          {
+            key: 'Permissions-Policy',
+            value: 'camera=(), microphone=(), geolocation=()',
+          },
+          {
+            key: 'Strict-Transport-Security',
+            value: 'max-age=63072000; includeSubDomains; preload',
+          },
+          {
+            key: 'Content-Security-Policy',
+            value: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://va.vercel-scripts.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://va.vercel-scripts.com; frame-ancestors 'none';",
+          },
+        ],
+      },
+    ];
   },
 }
 

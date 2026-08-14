@@ -1,393 +1,110 @@
 ---
 title: "Network Backends"
-description: "Communication backends in HORUS — automatic local IPC with opt-in LAN replication"
+description: "Communication backends in HORUS — automatic local IPC with planned network transport"
 weight: 40
 ---
 
 # Communication Backends
 
-You need to understand how HORUS routes messages between nodes and what latency to expect. HORUS automatically selects the optimal communication backend based on topology -- no configuration needed.
+HORUS automatically selects the optimal communication backend based on topology — no configuration needed. All current backends are **local** (same-machine), using shared memory or in-process channels.
 
-## When To Use This
+<Callout type="warn" title="Network Transport Not Yet Available">
 
-- You want to understand the latency characteristics of node-to-node communication
-- You are debugging unexpected latency in your pub/sub pipeline
-- You are planning a multi-process architecture and need to know cross-process overhead
-- You want to know your options for multi-machine communication
-
-**This is informational.** You do not need to configure backends manually -- HORUS selects them automatically.
-
-## Prerequisites
-
-- Familiarity with [Topics](/concepts/core-concepts-topic) and how pub/sub works in HORUS
-- Understanding of [Multi-Process Communication](/concepts/multi-process) if using cross-process topics
-
-<Callout type="info" title="LAN Replication is Opt-In (Experimental)">
-
-By default, topics created with `Topic::new("name")` use **local shared memory** — the fastest path, and all most robots need. Every topic is shared-memory-backed from creation, so a same-process or cross-process consumer can join with no migration. Cross-machine replication ships as an **opt-in, experimental** feature: build with `--features net` and `horus_net` transparently replicates topics to other HORUS instances on the same LAN, using the same `Topic<T>` API. This page covers the always-on local backends and the opt-in LAN path.
+HORUS currently operates as a **local shared memory IPC framework only**. Network transport (Zenoh, UDP, etc.) is planned but no network backend code exists yet. All topics created with `Topic::new("name")` use local shared memory or in-process channels. This page documents the existing backends and the planned network direction.
 
 </Callout>
 
 ## Automatic Backend Selection
 
-When you call `Topic::new("name")`, HORUS automatically selects one of four shared-memory backends based on the number of publishers, subscribers, and whether the message type is POD (plain old data):
+When you call `Topic::new("name")`, HORUS automatically detects the optimal backend based on the number of publishers, subscribers, and whether they're in the same process:
 
-- `SpscShm` — 1 publisher &rarr; 1 subscriber
-- `MpscShm` — many publishers &rarr; 1 subscriber
-- `PodShm` — 1 publisher &rarr; many subscribers, POD broadcast
-- `FanoutShm` — many-to-many, or non-POD broadcast
+```rust,ignore
+use horus::prelude::*;
 
-All four are shared-memory-backed from creation, so the choice is about topology, not process locality. A cross-process consumer joins the same segment with no migration.
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust,ignore
-    use horus::prelude::*;
-    use horus_robotics::prelude::*;
-
-    // Just create a topic — backend is auto-selected
-    let topic = Topic::<CmdVel>::new("motors.cmd_vel")?;
-    topic.send(CmdVel { linear: 1.0, angular: 0.0 });
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
-
-    def motor_tick(node):
-        # Just send to a topic — backend is auto-selected
-        node.send("motors.cmd_vel", {"linear": 1.0, "angular": 0.0})
-
-    motor = horus.Node(name="motor", tick=motor_tick, rate=100)
-    horus.run(motor)
-    ```
-  </LangTab>
-</LanguageTabs>
-
-No configuration needed. Because every topic is shared-memory-backed from creation, a consumer in another thread or process can join the same segment with no backend migration — what changes with locality is latency, not the transport.
-
-### Verifying the active backend
-
-Use `horus topic list --verbose` to see which backend each topic is using and how many publishers/subscribers are connected:
-
-```bash
-horus topic list --verbose
+// Just create a topic — backend is auto-selected
+let topic = Topic::<CmdVel>::new("motors.cmd_vel")?;
+topic.send(CmdVel { linear: 1.0, angular: 0.0 });
 ```
 
-```text
-TOPIC                  TYPE        BACKEND      PUBS  SUBS  LATENCY
-motors.cmd_vel         CmdVel      SpscShm      1     1     ~19ns
-sensors.imu            Imu         PodShm       1     3     ~19ns
-diagnostics.status     Generic     MpscShm      2     1     ~220ns
-camera.rgb             Image       FanoutShm    1     2     ~220ns
-```
-
-The `BACKEND` column names which of the four shared-memory backends a topic uses (`SpscShm`, `MpscShm`, `PodShm`, `FanoutShm`) — chosen by publisher/subscriber count and whether the type is POD. It does **not** tell you locality: all four are shared-memory-backed. The `LATENCY` column reflects **core locality** instead. When a topic's participants share one executor thread (L1-hot, same core) latency is ~12–19ns one-way; when a participant runs on a different core — a different thread *or* a different process — it jumps to ~220ns one-way (cache-coherence physics, not the backend). Above, `motors.cmd_vel` and `sensors.imu` are co-located on one thread; `diagnostics.status` and `camera.rgb` have a participant in a separate process.
-
-You can also check a single topic:
-
-```bash
-horus topic info motors.cmd_vel
-```
-
-This shows the backend type, message size, publisher/subscriber count, and measured latency.
+No configuration needed. The backend upgrades and downgrades dynamically as participants join and leave.
 
 ## Communication Paths
 
-All topics are shared-memory-backed. What sets latency is **core locality** — whether the producer and consumer run on the same core (L1-hot) or on different cores — not which of the four backends is chosen. All figures below are one-way, measured on an i9-14900K (release, 16-byte payload).
+HORUS selects the optimal path based on where your nodes are running and how many publishers/subscribers are involved:
 
-### Same-Core Communication (co-located on one executor thread)
+### Same-Process Communication
 
-| Scenario | Latency (one-way) |
+| Scenario | Latency |
 |----------|---------|
-| Self-loop — one handle sends and receives | ~12ns |
-| Real publisher + subscriber on one executor thread | ~19ns |
+| Same thread, 1 publisher → 1 subscriber | ~3ns |
+| 1 publisher → 1 subscriber | ~18ns |
+| 1 publisher → many subscribers | ~24ns |
+| Many publishers → 1 subscriber | ~26ns |
+| Many publishers → many subscribers | ~36ns |
 
-When producer and consumer share an executor thread, the shared-memory ring stays hot in L1 cache. No system calls, no serialization, no copies — the subscriber reads directly from the publisher's segment.
+### Cross-Process Communication (Shared Memory)
 
-### Cross-Core Communication (different thread or process)
-
-| Scenario | Latency (one-way) |
+| Scenario | Latency |
 |----------|---------|
-| Consumer on a different thread (same process) | ~220ns |
-| Consumer in a different process | ~220ns |
+| 1 publisher → 1 subscriber (simple types) | ~50ns |
+| Many publishers → 1 subscriber | ~65ns |
+| 1 publisher → many subscribers | ~70ns |
+| 1 publisher → 1 subscriber | ~85ns |
+| Many publishers → many subscribers | ~167ns |
 
-Crossing a core boundary costs the same ~220ns whether the consumer is another thread or another process — the jump is cache-coherence physics, not a change of backend. The topic uses the same POSIX shared memory (`shm_open` on Linux/macOS) it had from creation; the publisher writes to the segment and the consumer reads from it. For POD (plain old data) types this is zero-copy — the subscriber reads the bytes directly without deserialization.
+The path is selected based on:
+- **Process locality**: Same thread → same process → cross-process
+- **Topology**: Number of publishers and subscribers
+- **Data type**: Simple fixed-size types get the fastest cross-process path
 
-### How latency scales
+## Dynamic Migration
 
-Latency is determined by three factors:
-
-**Core locality.** This is the dominant factor. When producer and consumer are co-located on one executor thread the ring stays L1-hot: ~12ns one-way for a self-loop, ~19ns for a real publisher + subscriber. The moment a participant runs on a different core — whether that is another thread in the same process or another process entirely — latency jumps to ~220ns one-way. That cliff is cache-coherence physics; no backend or layout choice moves it (an in-process heap ring would not beat shared memory across cores). The fastest realistic route is to co-locate producer and consumer on the same executor thread.
-
-**Topology.** Additional subscribers and additional publishers each add a small amount of coordination overhead, but this is minor next to the core-locality cliff.
-
-**Message size.** For POD types, latency is nearly independent of message size up to a few KB (the shared memory segment is memory-mapped, so the OS handles paging). For serialized types (`String`, `Vec`, nested structs), serialization time scales linearly with payload size -- roughly 10ns per additional KB.
-
-The backend variant is selected based on:
-- **Topology**: Number of publishers and subscribers (`SpscShm`, `MpscShm`, `PodShm`, `FanoutShm`)
-- **Data type**: POD fixed-size types use the zero-copy broadcast path (`PodShm`); non-POD types use `FanoutShm`
-
-Latency, by contrast, is set by core locality — not by which backend is chosen.
-
-## No Backend Migration Needed
-
-Every topic is shared-memory-backed from the moment it is created (the creator's PID is stamped at init), so participants can join and leave across thread and process boundaries without any backend switch. What changes is latency — a function of core locality — not the transport:
+HORUS dynamically migrates between backends as topology changes:
 
 ```
-Publisher + subscriber co-located on one executor thread
-  → ~19ns one-way
+Single publisher + single subscriber (same process)
+  → ~18ns
 
-A subscriber on a different core (another thread or another process) joins
-  → that subscriber sees ~220ns one-way
+Second subscriber joins (same process)
+  → ~24ns
 
-Back to a single co-located subscriber
-  → ~19ns one-way
+Subscriber in different process joins
+  → ~70ns
+
+All subscribers disconnect except one in-process
+  → ~18ns
 ```
 
-There is no in-process-to-shared-memory upgrade to wait for: the segment already exists, so a late cross-process consumer simply attaches. `send()` and `recv()` calls are unaffected, with no message loss.
+Migration is transparent — `send()` and `recv()` calls are unaffected.
 
 ## Performance Characteristics
 
-| Metric | Same-core (one executor thread) | Cross-core (thread or process) |
+| Metric | In-Process | Shared Memory |
 |--------|-----------|---------------|
-| Latency (one-way) | ~12–19ns | ~220ns |
+| Latency | 3-36ns | 50-167ns |
 | Throughput | Millions msg/s | Millions msg/s |
-| Zero-copy | Yes | Yes |
+| Zero-copy | Yes | Yes (via mmap) |
 | Cross-machine | No | No |
 
-## Debugging Latency
+## Planned: Network Transport (Zenoh)
 
-If your topic latency is higher than expected, follow these steps in order:
+Future versions of HORUS will add Zenoh-based network transport for:
 
-### Step 1: Check core locality
+- **Multi-robot communication** across machines
+- **Cloud connectivity** for telemetry and remote monitoring
+- **ROS2 interoperability** via Zenoh DDS bridge
 
-```bash
-horus topic list --verbose
-```
+The planned architecture adds network backends alongside the existing local backends:
 
-Every topic is shared-memory-backed, so the `BACKEND` column names the variant (`SpscShm`, `MpscShm`, `PodShm`, `FanoutShm`), not the locality. The number that matters is `LATENCY`: ~12–19ns means the participants share an executor thread; ~220ns means at least one runs on a different core. Check whether the nodes that should be co-located are in the same `horus run` invocation.
-
-### Step 2: Check whether you crossed a core boundary
-
-A participant on a different core — another thread *or* another process — raises that link to ~220ns one-way. Same-process is not enough on its own: two nodes in one process but on different executor threads still pay the cross-core cost. To stay in the ~12–19ns range, co-locate producer and consumer on one executor thread.
-
-```bash
-# See how many processes are connected to a topic
-horus topic info sensors.imu
-```
-
-### Step 3: Check message size
-
-For serialized types (anything with `String`, `Vec`, or `Option`), larger payloads take longer to serialize. Measure with:
-
-```bash
-horus topic hz sensors.imu --latency
-```
-
-If latency grows with message size, consider:
-- Switching to a `#[fixed]` POD type (zero-copy, no serialization)
-- Reducing the payload (send only changed fields)
-- Using `GenericMessage` only for prototyping, not production
-
-### Step 4: Check CPU governor
-
-The CPU frequency governor has a major impact on latency. `powersave` mode can double latency compared to `performance` mode:
-
-```bash
-# Check current governor
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-
-# Set to performance (requires root)
-sudo cpufreq-set -g performance
-```
-
-On embedded systems (Raspberry Pi, Jetson), the default governor is often `ondemand` or `powersave`. For real-time control loops, always use `performance`.
-
-### Step 5: Measure with `horus topic hz`
-
-```bash
-# Measure publish rate and latency for a running topic
-horus topic hz motors.cmd_vel
-```
-
-This shows the actual publish frequency and per-message latency. If the measured rate is lower than the node's configured rate, the node's `tick()` function is taking too long -- the bottleneck is in your code, not the transport.
-
-### Step 6: Check for contention
-
-If many publishers write to the same topic, lock-free coordination adds overhead. The `horus topic list --verbose` output shows publisher and subscriber counts. For high-frequency topics, prefer a single-publisher architecture (one node publishes, many subscribe).
-
----
-
-## Multi-Machine: LAN Replication (opt-in)
-
-HORUS ships an **opt-in, experimental** LAN replication layer, `horus_net`. Enable it with the `net` feature:
-
-```bash
-cargo build --features net   # or add `net` to your horus.toml [features]
-```
-
-When enabled, `horus_net` starts automatically on `scheduler.run()` and transparently replicates your topics to other HORUS instances on the same LAN — the `Topic<T>` API is unchanged, no code edits required. Disable at runtime with `.network(false)` or the `HORUS_NET_ENABLED=false` environment variable.
-
-<Callout type="warning">
-**Authenticate your networked emergency-stop.** When any node triggers an
-emergency stop, `horus_net` replicates it to every peer on the LAN so the whole
-fleet halts together. Without a key, that channel is unauthenticated: any
-device that can reach the replication traffic can halt your fleet
-(GHSA-3frr-c2j9-hhr7).
-
-Set **`HORUS_ESTOP_KEY`** on every machine in the fleet and the channel is
-authenticated — each e-stop packet carries an HMAC-SHA256 tag, and an untagged
-or wrongly-tagged packet is rejected outright regardless of any other setting.
-
-```bash
-# 64 hex characters is taken as raw key material and has no guessing surface
-export HORUS_ESTOP_KEY=$(openssl rand -hex 32)
-```
-
-Anything shorter is treated as a passphrase and stretched with
-PBKDF2-HMAC-SHA256 — usable, but every packet on the wire is an offline
-guessing oracle for it, so prefer the random 64-hex form.
-
-With the key **unset**, behaviour is unchanged so that upgrading never silently
-severs an existing fleet's e-stop path: `HORUS_ESTOP_REMOTE=warn` (default)
-acts on remote e-stops and logs a loud one-time warning, and
-`HORUS_ESTOP_REMOTE=off` ignores them entirely. Your **local** e-stop
-(watchdog / deadline-miss) is independent of all of this.
-
-**Peer admission.** Datagrams are filtered by source address before any
-parsing. The default allows loopback, RFC1918 private space, link-local and
-CGNAT ranges only — a public-internet source is dropped. Override with
-`HORUS_NET_ALLOW_PEERS` (a comma-separated CIDR list, or `any` to disable the
-filter, which is never the default).
-</Callout>
-
-| Transport | Latency (one-way) | Use Case |
+| Transport | Latency | Use Case |
 |-----------|---------|----------|
-| Shared memory, same core | ~12–19ns | Producer + consumer on one executor thread |
-| Shared memory, cross-core | ~220ns | Same-machine IPC (different thread or process) |
-| LAN replication (`horus_net`, opt-in) | sub-millisecond (LAN) | Multi-machine on a local network |
+| In-process | 3-36ns | Same-process nodes |
+| Shared Memory | 50-167ns | Same-machine IPC |
+| Zenoh (planned) | ~100μs+ | Multi-robot, cloud, ROS2 |
 
-`horus_net` uses HORUS's own shared-memory replication — no external broker or DDS stack. It is experimental and evolving; for setups where you want fully independent instances instead, bridge them explicitly as described below.
-
-### Alternative: independent instances
-
-If you prefer fully independent instances over `horus_net` replication, you have two options:
-
-**Option 1: `horus deploy` (recommended).** Deploy your HORUS project to a remote machine and run it there. Each machine runs its own HORUS instance with local shared memory. Use an external coordinator (HTTP, MQTT, or a custom bridge node) to exchange data between machines. This is the most reliable approach today.
-
-```bash
-# Deploy and run on a remote machine
-horus deploy --target pi@192.168.1.10 --run
-```
-
-**Option 2: Custom UDP bridge node.** Write a node that subscribes to local topics, serializes messages, and sends them over UDP to a node on the other machine that deserializes and publishes locally. This adds ~1-5ms of latency (UDP + serialization) but works with any network topology.
-
-<LanguageTabs>
-  <LangTab language="Rust">
-    ```rust
-// simplified
-    use horus::prelude::*;
-    use horus_robotics::prelude::*;
-    use std::net::UdpSocket;
-
-    struct UdpBridge {
-        cmd_sub: Topic<CmdVel>,
-        socket: UdpSocket,
-        remote_addr: String,
-    }
-
-    impl Node for UdpBridge {
-        fn name(&self) -> &str { "UdpBridge" }
-        fn tick(&mut self) {
-            if let Some(cmd) = self.cmd_sub.recv() {
-                let data = serde_json::to_vec(&cmd).unwrap();
-                self.socket.send_to(&data, &self.remote_addr).ok();
-            }
-        }
-    }
-    ```
-  </LangTab>
-  <LangTab language="Python">
-    ```python
-    import horus
-    import socket
-
-    def bridge_sender_tick(node):
-        """Forward local CmdVel to remote machine over UDP."""
-        cmd = node.recv("cmd_vel")
-        if cmd is not None:
-            data = {"linear": cmd.linear, "angular": cmd.angular}
-            sock.sendto(horus.serialize(data), (REMOTE_IP, REMOTE_PORT))
-
-    bridge = horus.Node(name="UdpBridge", tick=bridge_sender_tick, rate=100,
-                        subs=[horus.CmdVel])
-    ```
-  </LangTab>
-</LanguageTabs>
-
-Both are alternatives to `horus_net` for cases where you want fully independent instances with an explicit bridge, rather than transparent LAN replication.
-
----
-
-## Design Decisions
-
-**Why shared memory instead of sockets?**
-
-Shared memory provides ~220ns latency across cores (and ~12–19ns when producer and consumer are co-located on one executor thread). Unix domain sockets would add 5-15us. TCP sockets add 50-100us. For robotics control loops running at 1kHz (1ms budget), every microsecond matters. At ~220ns, the transport is effectively invisible -- your control algorithm is always the bottleneck, not the communication layer.
-
-**Why automatic selection instead of manual configuration?**
-
-Developers should not need to know whether their nodes are in the same thread, same process, or different processes. `Topic::new("name")` always works, and HORUS picks the right backend variant for the topology. Because every topic is shared-memory-backed from creation, topology changes (moving a node to a separate process) do not require code changes and involve no backend migration. A node that works in a single-process prototype continues to work when deployed as multiple processes -- the same segment is simply attached from the new process.
-
-**Why shared memory from creation instead of migration?**
-
-Nodes can start and stop at any time. Because every topic is shared-memory-backed from the moment it is created, a cross-process subscriber that joins later simply attaches to the existing segment -- there is no in-process-to-shared-memory upgrade, and nothing to downgrade when it leaves. A late-joining consumer never forces a migration or a restart, and no messages are lost. Backing topics with shared memory from creation removes a whole class of migration edge cases that a start-in-process design would have to handle.
-
-**Why not DDS?**
-
-DDS (Data Distribution Service) is the transport layer behind ROS2. It provides multi-machine communication, QoS policies, and automatic discovery. However:
-
-- **Latency overhead.** DDS adds 50-200us of latency even for same-machine communication. HORUS achieves ~12–220ns.
-- **Complexity.** DDS requires configuring QoS profiles, domain IDs, and participant discovery. HORUS requires zero configuration.
-- **Binary size.** A DDS implementation (Fast-DDS, Cyclone DDS) adds 5-20MB to the binary. HORUS's shared memory backend adds &lt;100KB.
-- **Startup time.** DDS participant discovery takes 1-5 seconds. HORUS topics are available immediately.
-
-For teams that need ROS2 interoperability, a DDS bridge can run alongside HORUS as a separate process — keeping DDS overhead out of the core framework rather than baking it in.
-
-**Why not raw TCP/UDP for cross-process?**
-
-Even on localhost, TCP adds ~50us and UDP adds ~20us per message due to kernel-to-userspace copies and system call overhead. Shared memory eliminates these copies entirely -- the publisher and subscriber read and write the same physical memory pages. The OS kernel is not involved in the data path at all.
-
----
-
-## Trade-offs
-
-| Gain | Cost |
-|------|------|
-| Zero-configuration backend selection | Less explicit control over transport |
-| Sub-microsecond latency for all local paths | No cross-machine communication (yet) |
-| Topology changes need no code change (SHM-backed from creation) | A participant on a different core pays the ~220ns locality cost |
-| Shared memory provides zero-copy cross-process IPC | Shared memory segments require cleanup on crash (`horus clean --shm`) |
-| No DDS overhead or configuration | No built-in QoS policies (reliability, durability, history depth) |
-| Immediate topic availability (no discovery phase) | Topics must use dots not slashes for macOS compatibility |
-| Cross-process consumers attach to the existing segment automatically | Latency rises from ~12–19ns to ~220ns once a participant runs on a different core |
-
-## Common Errors
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Cross-process topic not receiving messages | Topic names do not match exactly (case-sensitive) | Verify topic names are identical in both processes |
-| Stale shared memory after crash | Process was killed without cleanup | Run `horus clean --shm` to clear shared memory segments |
-| Higher latency than expected | Producer and consumer run on different cores (different thread or process) | Co-locate them on one executor thread if latency is critical |
-| Topic names with `/` fail on macOS | macOS `shm_open` does not support slashes | Use dots instead of slashes: `"sensors.lidar"` not `"sensors/lidar"` |
-| Latency doubles after system idle | CPU governor switched to `powersave` | Set governor to `performance`: `sudo cpufreq-set -g performance` |
-| `horus topic list` shows no topics | No HORUS process is running | Start your application first, then inspect topics |
-| Subscriber gets stale data on startup | Shared memory retains last message from previous run | Run `horus clean --shm` before starting, or handle stale data in your node |
+When network transport is implemented, `Topic::new()` will continue to auto-select the optimal backend. Network transport will only be used when topics are explicitly configured for remote communication.
 
 ## See Also
 
-- [Topics](/concepts/core-concepts-topic) -- Shared memory architecture and Topic API
-- [Multi-Process Communication](/concepts/multi-process) -- Cross-process topic routing
-- [Rust API Reference](/rust/api) -- Topic creation and usage
-- [Performance](/performance/performance) -- Benchmarks and optimization
+- [Topic](/concepts/core-concepts-topic) - Shared memory architecture and Topic API
+- [Core API](/rust/api/core) - Topic creation and usage

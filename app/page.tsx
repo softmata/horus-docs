@@ -16,31 +16,14 @@ export const metadata: Metadata = {
     'robot programming', 'robotics documentation',
   ],
   alternates: {
-    canonical: 'https://docs.horusrobotics.dev',
+    canonical: 'https://docs.horus-registry.dev',
   },
   openGraph: {
     title: 'HORUS Documentation | Real-Time Robotics Framework',
     description: 'Build production robots 575x faster than ROS2. Sub-microsecond latency, zero-copy messaging, Rust & Python.',
-    url: 'https://docs.horusrobotics.dev',
+    url: 'https://docs.horus-registry.dev',
     siteName: 'HORUS Documentation',
     type: 'website',
-    locale: 'en_US',
-    images: [
-      {
-        url: 'https://docs.horusrobotics.dev/og-image.png',
-        width: 1200,
-        height: 630,
-        alt: 'HORUS — Real-Time Robotics Framework',
-      },
-    ],
-  },
-  twitter: {
-    card: 'summary_large_image',
-    title: 'HORUS Documentation | Real-Time Robotics Framework',
-    description: 'Build production robots 575x faster than ROS2. Sub-microsecond latency, zero-copy messaging, Rust & Python.',
-    images: ['https://docs.horusrobotics.dev/og-image.png'],
-    creator: '@horus_robotics',
-    site: '@horus_robotics',
   },
 };
 

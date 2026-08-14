@@ -1,0 +1,228 @@
+---
+title: "Topics & Communication"
+description: "Publish and subscribe to typed messages between nodes using zero-copy shared memory topics"
+order: 2
+---
+
+# Topics & Communication in Rust
+
+> **This is a usage guide.** For the complete API reference with per-method signatures, parameters, return types, and error conditions, see the [Topic API Reference](/rust/api/topic).
+
+`Topic<T>` is the primary way nodes communicate in HORUS. Topics are typed, shared-memory channels that connect publishers and subscribers automatically by name.
+
+## Creating a Topic
+
+```rust
+use horus::prelude::*;
+
+// Type is inferred from usage
+let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;
+
+// Turbofish syntax
+let scan = Topic::<LaserScan>::new("scan")?;
+
+// Custom capacity and slot size
+let lidar = Topic::<LaserScan>::with_capacity("scan", 8, 4096)?;
+```
+
+Two topics with the same name and type connect automatically — one publishes, the other subscribes.
+
+## Sending Messages
+
+```rust
+use horus::prelude::*;
+
+let topic = Topic::<CmdVel>::new("cmd_vel")?;
+
+// Fire-and-forget (overwrites oldest if buffer is full)
+topic.send(CmdVel { linear: 0.5, angular: 0.1 });
+
+// Try without blocking — returns the message back on failure
+match topic.try_send(CmdVel { linear: 0.5, angular: 0.1 }) {
+    Ok(()) => { /* sent */ }
+    Err(msg) => { /* buffer full, msg returned */ }
+}
+
+// Block up to 10ms waiting for space
+match topic.send_blocking(CmdVel { linear: 1.0, angular: 0.0 }, 10_u64.ms()) {
+    Ok(()) => { /* sent */ }
+    Err(SendBlockingError::Timeout) => { /* timed out */ }
+}
+```
+
+| Method | Behavior |
+|--------|----------|
+| `send(msg)` | Always succeeds. Drops oldest message if full |
+| `try_send(msg)` | Returns `Err(msg)` if buffer is full |
+| `send_blocking(msg, timeout)` | Blocks until space is available or timeout elapses |
+
+## Receiving Messages
+
+```rust
+use horus::prelude::*;
+
+let topic = Topic::<Imu>::new("imu")?;
+
+// Get next unread message (FIFO order)
+if let Some(msg) = topic.recv() {
+    println!("Accel: {}", msg.linear_accel.x);
+}
+
+// Drain all pending messages
+while let Some(msg) = topic.recv() {
+    process(msg);
+}
+
+// Skip to the latest value (requires T: Copy)
+if let Some(latest) = topic.read_latest() {
+    println!("Latest orientation: {:?}", latest.orientation);
+}
+```
+
+Use `recv()` when you need every message in order. Use `read_latest()` for state-like data (sensor readings, poses) where only the newest value matters.
+
+## Zero-Copy for Large Data
+
+For `Image`, `PointCloud`, `DepthImage`, and `Tensor`, HORUS uses pool-backed allocation. Only a descriptor goes through the ring buffer — the payload stays in shared memory.
+
+```rust
+use horus::prelude::*;
+
+let camera = Topic::<Image>::new("camera/rgb")?;
+
+// Send — moves the Image into the pool slot
+camera.send(image);
+
+// Receive — zero-copy access to the image data
+if let Some(img) = camera.recv() {
+    println!("{}x{} image received", img.width(), img.height());
+}
+```
+
+The same API works for all pool-backed types:
+
+```rust
+let cloud_topic = Topic::<PointCloud>::new("lidar/points")?;
+let depth_topic = Topic::<DepthImage>::new("camera/depth")?;
+let tensor_topic = Topic::<Tensor>::new("model/output")?;
+```
+
+## Custom Message Types
+
+Define your own messages with the `message!` macro:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    /// Motor feedback at 1kHz
+    pub struct MotorFeedback {
+        pub motor_id: u32,
+        pub velocity: f32,
+        pub current_amps: f32,
+        pub temperature_c: f32,
+    }
+}
+
+let feedback = Topic::<MotorFeedback>::new("motor.feedback")?;
+feedback.send(MotorFeedback {
+    motor_id: 1,
+    velocity: 3.14,
+    current_amps: 0.5,
+    temperature_c: 45.0,
+});
+```
+
+The macro generates serialization traits automatically. Fixed-size types get the zero-copy fast path (~50ns); variable-size types (containing `String`, `Vec`) use bincode (~167ns).
+
+## Using Topics in Nodes
+
+Topics are typically stored as fields on your node struct:
+
+```rust
+use horus::prelude::*;
+
+struct ObstacleAvoider {
+    scan_in: Topic<LaserScan>,
+    cmd_out: Topic<CmdVel>,
+}
+
+impl ObstacleAvoider {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan_in: Topic::new("scan")?,
+            cmd_out: Topic::new("cmd_vel")?,
+        })
+    }
+}
+
+impl Node for ObstacleAvoider {
+    fn name(&self) -> &str { "obstacle_avoider" }
+
+    fn tick(&mut self) {
+        if let Some(scan) = self.scan_in.recv() {
+            let min_range = scan.ranges.iter()
+                .copied()
+                .filter(|r| *r > scan.range_min && *r < scan.range_max)
+                .fold(f32::MAX, f32::min);
+
+            let speed = if min_range < 0.5 { 0.0 } else { 1.0 };
+            self.cmd_out.send(CmdVel { linear: speed, angular: 0.0 });
+        }
+    }
+}
+```
+
+## Communication Patterns
+
+**One-to-many** — one publisher, multiple subscribers. Each subscriber gets every message independently:
+
+```rust
+// Publisher node
+let status = Topic::<Heartbeat>::new("status")?;
+status.send(Heartbeat { stamp: now() });
+
+// Subscriber A and B both receive the heartbeat
+let status_a = Topic::<Heartbeat>::new("status")?;
+let status_b = Topic::<Heartbeat>::new("status")?;
+```
+
+**Many-to-one** — multiple publishers write to the same topic. The subscriber sees all messages interleaved:
+
+```rust
+// Motor 1 and Motor 2 both publish to "motor.feedback"
+let fb1 = Topic::<MotorFeedback>::new("motor.feedback")?;
+let fb2 = Topic::<MotorFeedback>::new("motor.feedback")?;
+
+// Aggregator reads all feedback
+let all_fb = Topic::<MotorFeedback>::new("motor.feedback")?;
+while let Some(fb) = all_fb.recv() {
+    println!("Motor {} velocity: {}", fb.motor_id, fb.velocity);
+}
+```
+
+## Monitoring
+
+Check topic health at runtime:
+
+```rust
+let topic = Topic::<CmdVel>::new("cmd_vel")?;
+
+if topic.has_message() {
+    println!("{} messages pending", topic.pending_count());
+}
+
+if topic.dropped_count() > 0 {
+    hlog!(warn, "Dropped {} messages", topic.dropped_count());
+}
+
+let m = topic.metrics();
+println!("Sent: {}, Received: {}", m.messages_sent(), m.messages_received());
+```
+
+## See Also
+
+- [Topic API Reference](/rust/api/topic) — Full method reference
+- [Message Performance](/concepts/core-concepts-podtopic) — How HORUS optimizes message transfer
+- [Communication Overview](/concepts/communication-overview) — Topics vs services vs actions
+- [message! Macro](/rust/api/macros#message) — Custom message type reference

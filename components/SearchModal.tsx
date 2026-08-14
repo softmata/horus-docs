@@ -3,9 +3,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { FiSearch, FiX, FiFileText, FiArrowRight } from "react-icons/fi";
 import Link from "next/link";
-import { Document } from "flexsearch";
+import { Document, type DocumentData } from "flexsearch";
+import { usePathname } from "next/navigation";
+import { localeFromPathname, localizedHref } from "@/lib/i18n";
 
-interface SearchDoc {
+interface SearchDoc extends DocumentData {
   id: number;
   title: string;
   description: string;
@@ -30,8 +32,7 @@ interface SearchModalProps {
 }
 
 // Create FlexSearch index
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let searchIndex: any = null;
+let searchIndex: Document<SearchDoc> | null = null;
 let docsCache: SearchDoc[] = [];
 
 function escapeHtml(text: string): string {
@@ -92,6 +93,8 @@ function getContentSnippet(content: string, query: string, maxLength = 150): str
 }
 
 export function SearchModal({ isOpen, onClose }: SearchModalProps) {
+  const pathname = usePathname();
+  const locale = localeFromPathname(pathname);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
@@ -163,7 +166,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
         setSelectedIndex(prev => Math.max(prev - 1, 0));
       } else if (e.key === "Enter" && results[selectedIndex]) {
         e.preventDefault();
-        const slug = results[selectedIndex].slug;
+        const slug = localizedHref(results[selectedIndex].slug, locale);
         if (slug.startsWith('/')) {
           window.location.href = slug;
         }
@@ -173,7 +176,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, onClose, results, selectedIndex]);
+  }, [isOpen, onClose, results, selectedIndex, locale]);
 
   // Scroll selected result into view
   useEffect(() => {
@@ -329,7 +332,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
 
           {indexReady && !loading && query && results.length === 0 && (
             <div className="p-8 text-center">
-              <div className="text-[var(--text-secondary)] mb-2">No results found for "{query}"</div>
+              <div className="text-[var(--text-secondary)] mb-2">No results found for &quot;{query}&quot;</div>
               <div className="text-sm text-[var(--text-tertiary)]">
                 Try different keywords or check your spelling
               </div>
@@ -341,7 +344,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
               {results.map((result, index) => (
                 <Link
                   key={result.id}
-                  href={result.slug}
+                  href={localizedHref(result.slug, locale)}
                   onClick={handleResultClick}
                   className={`block px-4 py-3 transition-colors border-l-2 ${
                     index === selectedIndex
