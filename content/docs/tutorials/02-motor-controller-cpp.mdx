@@ -1,0 +1,274 @@
+---
+title: "Tutorial 2: Motor Controller (C++)"
+description: "Build a closed-loop motor controller with PID, safety limits, and runtime tuning"
+order: 22
+---
+
+# Tutorial 2: Motor Controller (C++)
+
+In this tutorial you'll build a motor controller that:
+- Reads velocity commands from a topic
+- Applies PID control to track the commanded velocity
+- Enforces torque limits and safety constraints
+- Publishes motor state for monitoring
+- Enters safe state (stops motors) on safety events
+
+## What You'll Learn
+
+- Multi-topic Node with subscribers AND publishers
+- PID control loop with anti-windup
+- Runtime parameter tuning via `horus::Params`
+- Budget enforcement with `Miss::SafeMode`
+- `enter_safe_state()` for actuator safety
+
+## Prerequisites
+
+- Completed [Tutorial 1: IMU Sensor Node](/tutorials/01-sensor-node-cpp)
+- Understanding of PID control (see [PID Recipe](/recipes/pid-controller))
+
+## Step 1: Create the Project
+
+```bash
+horus new motor_ctrl --cpp
+cd motor_ctrl
+```
+
+## Step 2: Write the Motor Controller
+
+Replace `src/main.cpp`:
+
+```cpp
+#include <horus/horus.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+using namespace horus::literals;
+
+// ── Motor Controller Node ───────────────────────────────────────────────
+
+class MotorController : public horus::Node {
+public:
+    MotorController() : Node("motor_controller") {
+        // Subscribe to velocity commands from planner/teleop
+        cmd_sub_   = subscribe<horus::msg::CmdVel>("cmd_vel");
+        // Subscribe to encoder feedback
+        enc_sub_   = subscribe<horus::msg::CmdVel>("encoder.velocity");
+        // Publish motor commands (PWM duty cycle)
+        motor_pub_ = advertise<horus::msg::CmdVel>("motor.pwm");
+        // Publish motor state for monitoring
+        state_pub_ = advertise<horus::msg::CmdVel>("motor.state");
+    }
+
+    void init() override {
+        horus::log::info("motor", "Motor controller initialized");
+        horus::log::info("motor", "Waiting for encoder feedback...");
+    }
+
+    void tick() override {
+        // Read commanded velocity
+        if (auto cmd = cmd_sub_->recv()) {
+            target_linear_  = cmd->get()->linear;
+            target_angular_ = cmd->get()->angular;
+        }
+
+        // Read actual velocity from encoders
+        double actual_linear = 0, actual_angular = 0;
+        if (auto enc = enc_sub_->recv()) {
+            actual_linear  = enc->get()->linear;
+            actual_angular = enc->get()->angular;
+            encoder_alive_ = true;
+        }
+
+        // Safety: if no encoder feedback for 50 ticks (500ms), stop
+        if (!encoder_alive_) {
+            ticks_without_encoder_++;
+            if (ticks_without_encoder_ > 50) {
+                if (!encoder_timeout_logged_) {
+                    horus::log::error("motor", "Encoder timeout — stopping motors");
+                    horus::blackbox::record("motor", "Encoder timeout after 500ms");
+                    encoder_timeout_logged_ = true;
+                }
+                send_zero();
+                return;
+            }
+        } else {
+            ticks_without_encoder_ = 0;
+            encoder_timeout_logged_ = false;
+        }
+        encoder_alive_ = false;
+
+        // PID for linear velocity
+        double lin_error = target_linear_ - actual_linear;
+        lin_integral_ += lin_error * dt_;
+        lin_integral_ = std::clamp(lin_integral_, -integral_max_, integral_max_);
+        double lin_output = kp_ * lin_error + ki_ * lin_integral_
+                          + kd_ * (lin_error - lin_prev_error_) / dt_;
+        lin_prev_error_ = lin_error;
+
+        // PID for angular velocity
+        double ang_error = target_angular_ - actual_angular;
+        ang_integral_ += ang_error * dt_;
+        ang_integral_ = std::clamp(ang_integral_, -integral_max_, integral_max_);
+        double ang_output = kp_ * ang_error + ki_ * ang_integral_
+                          + kd_ * (ang_error - ang_prev_error_) / dt_;
+        ang_prev_error_ = ang_error;
+
+        // Clamp to actuator limits
+        lin_output = std::clamp(lin_output, -max_pwm_, max_pwm_);
+        ang_output = std::clamp(ang_output, -max_pwm_, max_pwm_);
+
+        // Publish motor command
+        horus::msg::CmdVel pwm{};
+        pwm.linear  = static_cast<float>(lin_output);
+        pwm.angular = static_cast<float>(ang_output);
+        motor_pub_->send(pwm);
+
+        // Publish state for monitoring (every 10th tick = 10 Hz)
+        if (++tick_count_ % 10 == 0) {
+            horus::msg::CmdVel state{};
+            state.linear  = static_cast<float>(actual_linear);
+            state.angular = static_cast<float>(lin_error);
+            state_pub_->send(state);
+        }
+    }
+
+    void enter_safe_state() override {
+        send_zero();
+        lin_integral_ = 0;
+        ang_integral_ = 0;
+        horus::blackbox::record("motor", "Safe state — motors zeroed");
+    }
+
+private:
+    void send_zero() {
+        horus::msg::CmdVel stop{};
+        motor_pub_->send(stop);
+    }
+
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Subscriber<horus::msg::CmdVel>* enc_sub_;
+    horus::Publisher<horus::msg::CmdVel>*  motor_pub_;
+    horus::Publisher<horus::msg::CmdVel>*  state_pub_;
+
+    double target_linear_ = 0, target_angular_ = 0;
+    double lin_integral_ = 0, lin_prev_error_ = 0;
+    double ang_integral_ = 0, ang_prev_error_ = 0;
+    double kp_ = 2.0, ki_ = 0.5, kd_ = 0.1;
+    double dt_ = 0.01;  // 100 Hz
+    double integral_max_ = 1.0;
+    double max_pwm_ = 1.0;
+    int tick_count_ = 0;
+    int ticks_without_encoder_ = 0;
+    bool encoder_alive_ = false;
+    bool encoder_timeout_logged_ = false;
+};
+
+// ── Simulated Encoder (for testing without hardware) ────────────────────
+
+class SimEncoder : public horus::Node {
+public:
+    SimEncoder() : Node("sim_encoder") {
+        cmd_sub_ = subscribe<horus::msg::CmdVel>("motor.pwm");
+        enc_pub_ = advertise<horus::msg::CmdVel>("encoder.velocity");
+    }
+
+    void tick() override {
+        if (auto cmd = cmd_sub_->recv()) {
+            // Simulate motor dynamics: velocity tracks PWM with lag
+            velocity_ = 0.9 * velocity_ + 0.1 * cmd->get()->linear;
+        }
+        horus::msg::CmdVel enc{};
+        enc.linear = static_cast<float>(velocity_);
+        enc_pub_->send(enc);
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Publisher<horus::msg::CmdVel>*  enc_pub_;
+    double velocity_ = 0;
+};
+
+// ── Main ────────────────────────────────────────────────────────────────
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz).name("motor_ctrl");
+
+    // Simulated encoder (order 0 — runs first, provides feedback)
+    SimEncoder encoder;
+    sched.add(encoder).order(0).build();
+
+    // Motor controller (order 10 — runs after encoder)
+    MotorController motor;
+    sched.add(motor)
+        .order(10)
+        .budget(5_ms)
+        .on_miss(horus::Miss::SafeMode)  // stop motors if tick overruns
+        .build();
+
+    // Simulated command source
+    auto cmd_pub = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+    sched.add("commander")
+        .order(5)
+        .tick([&] {
+            static int t = 0;
+            horus::msg::CmdVel cmd{};
+            cmd.linear = (t++ < 300) ? 0.5f : 0.0f;  // drive for 3s then stop
+            cmd_pub.send(cmd);
+        })
+        .build();
+
+    std::printf("Motor controller running at 100 Hz (Ctrl+C to stop)\n");
+    sched.spin();
+}
+```
+
+## Step 3: Build and Run
+
+```bash
+horus build && horus run
+```
+
+## Step 4: Monitor
+
+In another terminal:
+
+```bash
+horus topic echo motor.state    # watch motor state
+horus topic echo motor.pwm      # watch PWM output
+horus node list                  # see all 3 nodes running
+horus log                        # see init/error messages
+```
+
+## Key Concepts
+
+### Execution Order Matters
+
+```
+order 0: SimEncoder    → reads PWM, publishes encoder velocity
+order 5: Commander     → publishes velocity command
+order 10: MotorController → reads command + encoder, publishes PWM
+```
+
+The encoder runs BEFORE the controller so the controller always has fresh feedback. This is deterministic — guaranteed every tick.
+
+### Budget + SafeMode
+
+```cpp
+sched.add(motor).budget(5_ms).on_miss(horus::Miss::SafeMode).build();
+```
+
+If the motor controller takes longer than 5ms, the scheduler calls `enter_safe_state()` — motors stop immediately. This prevents a slow computation from leaving motors running with stale commands.
+
+### Encoder Timeout
+
+The controller tracks `ticks_without_encoder_`. If no encoder data arrives for 50 ticks (500ms at 100Hz), it assumes the encoder is dead and stops motors. This catches:
+- Disconnected encoder cable
+- Crashed encoder driver process
+- SHM corruption
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-cpp) — combine sensor, controller, and actuator
+- [Recipe: PID Controller](/recipes/pid-controller) — deeper PID tuning guide
+- [Guide: Real-Time C++](/cpp/realtime) — SCHED_FIFO, CPU pinning, watchdog

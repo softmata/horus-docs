@@ -1,0 +1,147 @@
+---
+title: "Sensor Messages"
+description: "LaserScan, Imu, Odometry, JointState, RangeSensor, BatteryState, NavSatFix, and more"
+sidebar_section: "C++"
+order: 60
+---
+
+# Sensor Messages (C++)
+
+All sensor types live in `horus::msg::` namespace. Include via `<horus/msg/sensor.hpp>`.
+
+## Quick Reference
+
+| Type | Size | Key Fields | Use Case |
+|------|------|------------|----------|
+| `LaserScan` | 1480 B | `ranges[360]`, `angle_min/max` | 2D LiDAR |
+| `Imu` | 304 B | `orientation[4]`, `angular_velocity[3]`, `linear_acceleration[3]` | IMU |
+| `Odometry` | 736 B | `pose` (Pose2D), `twist` (Twist), covariance matrices | Wheel encoders |
+| `JointState` | 912 B | `names[16][32]`, `positions[16]`, `velocities[16]`, `efforts[16]` | Robot arms |
+| `RangeSensor` | 32 B | `range`, `min/max_range`, `field_of_view` | Ultrasonic/IR |
+| `BatteryState` | 104 B | `voltage`, `current`, `percentage`, `health`, `power_supply_status` | Battery monitor |
+| `NavSatFix` | 128 B | `latitude`, `longitude`, `altitude`, `satellites_visible`, `status` | GPS |
+| `MagneticField` | 136 B | `magnetic_field[3]`, covariance | Magnetometer |
+| `Temperature` | 56 B | `temperature` (Celsius), `variance` | Thermometer |
+| `FluidPressure` | 56 B | `fluid_pressure` (Pascals) | Barometer |
+| `Illuminance` | 56 B | `illuminance` (Lux) | Light sensor |
+
+<Callout type="warning">
+**Breaking layout changes for C++ users.** These sizes and field names were
+reconciled against the Rust definitions, which are the source of truth for the
+shared-memory layout. Where the C++ headers had drifted, the C++ side changed.
+The ones that alter *values*, not just offsets:
+
+- `NavSatFix::status` was `int8_t` with `-1=no fix, 0=fix, 1=SBAS, 2=GBAS`. It
+  is now `uint8_t` with `0=no_fix, 1=fix, 2=sbas_fix, 3=gbas_fix`. Both the
+  sign and the numbering changed, so **a C++ reader that tested `status >= 0`
+  for "has a fix" now reports a fix when there is none.** Re-check every
+  comparison against this field.
+- `BatteryState::status` is now `power_supply_status`, and its encoding lost
+  the separate `not_charging` value: `0=unknown, 1=charging, 2=discharging,
+  3=full`.
+
+Field offsets are now asserted at compile time by
+`horus/layout_contract.hpp` — a future divergence between the C++ headers and
+Rust is a build failure rather than a silent misread of shared memory.
+</Callout>
+
+## LaserScan
+
+The most common sensor message. 360 range readings for a full-circle 2D LiDAR.
+
+```cpp
+#include <horus/horus.hpp>
+
+class LidarNode : public horus::Node {
+public:
+    LidarNode() : Node("lidar") {
+        pub_ = advertise<horus::msg::LaserScan>("lidar.scan");
+    }
+
+    void tick() override {
+        auto scan = pub_->loan();
+
+        // Fill range data (meters, 0 = invalid)
+        for (int i = 0; i < 360; i++) {
+            scan->ranges[i] = read_range(i);
+        }
+        scan->angle_min = 0.0f;          // start angle (radians)
+        scan->angle_max = 6.28318f;       // end angle (2*pi)
+        scan->min_range = 0.12f;          // sensor minimum (meters)
+        scan->max_range = 12.0f;          // sensor maximum
+        scan->time_increment = 0.0f;      // time between measurements
+        scan->scan_time = 0.1f;           // full scan duration (seconds)
+        scan->timestamp_ns = 0;
+
+        pub_->publish(std::move(scan));
+    }
+
+private:
+    horus::Publisher<horus::msg::LaserScan>* pub_;
+    float read_range(int angle) { return 2.0f; }  // placeholder
+};
+```
+
+### Finding Minimum Range
+
+```cpp
+auto scan = sub_->recv();
+if (!scan) return;
+
+float min_range = 999.0f;
+int min_angle = 0;
+for (int i = 0; i < 360; i++) {
+    float r = scan->get()->ranges[i];
+    if (r > 0.01f && r < min_range) {
+        min_range = r;
+        min_angle = i;
+    }
+}
+// min_angle is in degrees (0-359)
+```
+
+## Imu
+
+9-axis IMU: orientation quaternion + angular velocity + linear acceleration, each with 3x3 covariance.
+
+```cpp
+horus::msg::Imu imu{};
+imu.orientation[0] = 0.0;    // qx
+imu.orientation[1] = 0.0;    // qy
+imu.orientation[2] = 0.0;    // qz
+imu.orientation[3] = 1.0;    // qw (identity)
+imu.angular_velocity[2] = 0.01;    // yaw rate (rad/s)
+imu.linear_acceleration[2] = 9.81; // gravity (m/s^2)
+imu.timestamp_ns = 0;
+// Covariance: -1 in first element = "no data"
+imu.orientation_covariance[0] = -1.0;
+```
+
+## JointState
+
+Up to 16 joints with names, positions, velocities, and efforts:
+
+```cpp
+horus::msg::JointState js{};
+js.joint_count = 6;  // 6-DOF arm
+
+// Set joint names (null-terminated, max 31 chars)
+std::strncpy(reinterpret_cast<char*>(js.names[0]), "shoulder_pan", 31);
+std::strncpy(reinterpret_cast<char*>(js.names[1]), "shoulder_lift", 31);
+std::strncpy(reinterpret_cast<char*>(js.names[2]), "elbow", 31);
+std::strncpy(reinterpret_cast<char*>(js.names[3]), "wrist_1", 31);
+std::strncpy(reinterpret_cast<char*>(js.names[4]), "wrist_2", 31);
+std::strncpy(reinterpret_cast<char*>(js.names[5]), "wrist_3", 31);
+
+// Set positions (radians for revolute joints)
+js.positions[0] = 0.0;
+js.positions[1] = -1.57;  // shoulder down
+js.positions[2] = 1.57;   // elbow bent
+// velocities and efforts default to 0
+```
+
+## See Also
+
+- [Control Messages](/cpp/api/control-messages) — MotorCommand, ServoCommand, PidConfig
+- [Geometry Messages](/cpp/api/geometry-messages) — Twist, Pose2D, Point3, Quaternion
+- [Publisher & Subscriber API](/cpp/api/topic) — how to send/receive these types

@@ -1,0 +1,214 @@
+---
+title: "Tutorial 5: Hardware & Real-Time (C++)"
+description: "Connect real hardware with RT scheduling, CPU pinning, and watchdog protection"
+order: 52
+---
+
+# Tutorial 5: Hardware & Real-Time (C++)
+
+Connect real sensors and actuators to HORUS with proper real-time scheduling. This tutorial builds a motor controller that reads encoder feedback and drives a motor with SCHED_FIFO priority.
+
+## What You'll Learn
+
+- Opening serial ports from a Node
+- RT scheduling: `budget()`, `deadline()`, `pin_core()`, `priority()`
+- Watchdog for detecting frozen hardware
+- `enter_safe_state()` for actuator safety
+- CPU governor and kernel requirements
+
+## Prerequisites
+
+- Completed [Tutorial 2: Motor Controller](/tutorials/02-motor-controller-cpp)
+- A Linux machine (RT features require Linux)
+- Optional: USB serial device for testing
+
+## The Hardware Pattern
+
+Every hardware driver follows the same pattern:
+
+```
+init():    open device, configure, verify connection
+tick():    read sensor OR write actuator (never both blocking)
+safe():    zero actuators, disable outputs
+shutdown(): close device, release resources
+```
+
+## Complete Code: RT Motor Driver
+
+```cpp
+#include <horus/horus.hpp>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <cstdio>
+#include <cstring>
+using namespace horus::literals;
+
+class MotorDriver : public horus::Node {
+public:
+    MotorDriver(const char* port, int baudrate)
+        : Node("motor_driver"), port_(port), baudrate_(baudrate)
+    {
+        cmd_sub_   = subscribe<horus::msg::CmdVel>("motor.cmd");
+        state_pub_ = advertise<horus::msg::CmdVel>("motor.state");
+    }
+
+    void init() override {
+        fd_ = open(port_, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd_ < 0) {
+            horus::log::error("motor", "Failed to open serial port");
+            horus::blackbox::record("motor", "Serial port open failed");
+            return;
+        }
+
+        // Configure serial port
+        struct termios tty{};
+        tcgetattr(fd_, &tty);
+        cfsetispeed(&tty, baudrate_);
+        cfsetospeed(&tty, baudrate_);
+        tty.c_cflag |= (CLOCAL | CREAD);
+        tty.c_cflag &= ~PARENB;
+        tty.c_cflag &= ~CSTOPB;
+        tty.c_cflag &= ~CSIZE;
+        tty.c_cflag |= CS8;
+        tcsetattr(fd_, TCSANOW, &tty);
+
+        horus::log::info("motor", "Serial port opened, motor ready");
+    }
+
+    void tick() override {
+        if (fd_ < 0) return;
+
+        // Read command
+        auto cmd = cmd_sub_->recv();
+        if (cmd) {
+            float duty = cmd->get()->linear;
+            last_cmd_ = duty;
+
+            // Send PWM command to motor controller
+            // Protocol: "M<duty>\n" where duty is -100 to 100
+            char buf[32];
+            int n = std::snprintf(buf, sizeof(buf), "M%.0f\n", duty * 100.0f);
+            write(fd_, buf, n);
+        }
+
+        // Read encoder feedback (non-blocking)
+        char rbuf[64];
+        int n = read(fd_, rbuf, sizeof(rbuf) - 1);
+        if (n > 0) {
+            rbuf[n] = '\0';
+            float rpm = 0;
+            if (std::sscanf(rbuf, "E%f", &rpm) == 1) {
+                horus::msg::CmdVel state{};
+                state.linear = rpm;
+                state.angular = last_cmd_;
+                state_pub_->send(state);
+                watchdog_fed_ = true;
+            }
+        }
+
+        // Watchdog: if no encoder response for 100 ticks (1s), alarm
+        if (watchdog_fed_) {
+            watchdog_counter_ = 0;
+            watchdog_fed_ = false;
+        } else {
+            watchdog_counter_++;
+            if (watchdog_counter_ > 100 && !watchdog_alarmed_) {
+                horus::log::error("motor", "Encoder watchdog timeout");
+                horus::blackbox::record("motor", "Encoder timeout > 1s");
+                watchdog_alarmed_ = true;
+                send_zero();
+            }
+        }
+    }
+
+    void enter_safe_state() override {
+        send_zero();
+        horus::blackbox::record("motor", "Safe state: motor zeroed");
+    }
+
+private:
+    void send_zero() {
+        if (fd_ >= 0) {
+            write(fd_, "M0\n", 3);
+        }
+        horus::msg::CmdVel stop{};
+        state_pub_->send(stop);
+    }
+
+    const char* port_;
+    int baudrate_;
+    int fd_ = -1;
+    float last_cmd_ = 0;
+    int watchdog_counter_ = 0;
+    bool watchdog_fed_ = false;
+    bool watchdog_alarmed_ = false;
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::Publisher<horus::msg::CmdVel>*  state_pub_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz)
+         .name("rt_motor")
+         .prefer_rt();    // Use SCHED_FIFO if available
+
+    MotorDriver motor("/dev/ttyUSB0", B115200);
+    sched.add(motor)
+        .order(0)                    // highest priority
+        .budget(2_ms)                // must complete in 2ms
+        .deadline(5_ms)              // absolute deadline 5ms
+        .on_miss(horus::Miss::SafeMode)  // stop motor if overrun
+        .pin_core(2)                 // pin to CPU core 2
+        .priority(90)                // SCHED_FIFO priority 90
+        .watchdog(1_s)               // scheduler-level watchdog
+        .build();
+
+    sched.spin();
+}
+```
+
+## RT Configuration Explained
+
+```cpp
+sched.prefer_rt();         // Try SCHED_FIFO; degrade gracefully if unavailable
+// vs
+sched.require_rt();        // FAIL if SCHED_FIFO not available (production systems)
+```
+
+| Setting | Purpose | Typical Value |
+|---------|---------|---------------|
+| `budget(2_ms)` | Max time per tick | 50-80% of period |
+| `deadline(5_ms)` | Absolute tick deadline | 90-95% of period |
+| `pin_core(2)` | CPU affinity | Dedicated core, not core 0 |
+| `priority(90)` | SCHED_FIFO level | 80-99 for critical, 50-79 for normal |
+| `watchdog(1_s)` | Frozen node detection | 5-10x expected tick period |
+
+## RT Kernel Setup
+
+For full RT guarantees:
+
+```bash
+# Check current kernel
+uname -r  # Look for "-rt" suffix
+
+# Set CPU governor to performance
+sudo cpupower frequency-set -g performance
+
+# Grant RT privileges without root
+sudo setcap cap_sys_nice+ep ./my_robot
+
+# Or run with elevated privileges
+sudo nice -n -20 ./my_robot
+```
+
+Without an RT kernel, HORUS still works — `prefer_rt()` logs warnings but continues with best-effort scheduling.
+
+## Key Takeaways
+
+- `init()` opens hardware, `tick()` reads/writes, `enter_safe_state()` zeros actuators
+- Never block in `tick()` — use non-blocking I/O (`O_NONBLOCK`)
+- Watchdog detects frozen hardware (encoder cable disconnected, motor driver crash)
+- `pin_core()` prevents OS from migrating the thread — critical for latency
+- `budget()` + `SafeMode` = automatic motor shutdown on timing overrun
+- Test without RT kernel first, add RT for production deployment

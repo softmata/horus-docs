@@ -1,0 +1,227 @@
+---
+title: "Tutorial 6: Services & Actions (C++)"
+description: "Request/response RPC and long-running tasks with progress feedback"
+order: 62
+---
+
+# Tutorial 6: Services & Actions (C++)
+
+Topics are fire-and-forget. Sometimes you need a **response** (services) or **progress updates** (actions). This tutorial covers both.
+
+## What You'll Learn
+
+- `horus::ServiceClient` / `horus::ServiceServer` for request/response
+- `horus::ActionClient` / `horus::ActionServer` for long-running tasks
+- JSON-based type erasure for flexible RPC
+- Cross-process service calls
+
+## Services: Request/Response
+
+A service is like a function call across processes. Client sends a request, server returns a response.
+
+### Example: Add Two Numbers
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+#include <thread>
+#include <chrono>
+using namespace horus::literals;
+
+int main() {
+    // ── Server: listens for requests, computes response ─────────
+    horus::ServiceServer server("add_two_ints");
+
+    // Handler receives raw bytes, writes response
+    server.set_handler([](const uint8_t* req, size_t req_len,
+                          uint8_t* res, size_t* res_len) -> bool {
+        // Parse request JSON
+        char json[4096] = {};
+        std::memcpy(json, req, req_len);
+        // Simple parsing (production: use a JSON library)
+        int a = 0, b = 0;
+        std::sscanf(json, R"({"a":%d,"b":%d})", &a, &b);
+
+        // Compute response
+        int sum = a + b;
+        *res_len = std::snprintf(reinterpret_cast<char*>(res), 4096,
+                                  R"({"sum":%d})", sum);
+        return true;
+    });
+
+    // The server must be driven to answer requests. Pump process() on a
+    // background thread here; in a real app you'd call it from your main loop
+    // (or a scheduled node tick), typically in the server's own process.
+    std::atomic<bool> running{true};
+    std::thread server_thread([&] {
+        while (running.load()) {
+            server.process();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    // ── Client: sends request, waits for response ───────────────
+    horus::ServiceClient client("add_two_ints");
+
+    auto response = client.call(R"({"a": 3, "b": 4})",
+                                std::chrono::milliseconds(1000));
+    if (response) {
+        std::printf("Response: %s\n", response->c_str());
+        // Output: Response: {"sum":7}
+    } else {
+        std::printf("Service call timed out\n");
+    }
+
+    running.store(false);
+    server_thread.join();
+}
+```
+
+### How Services Work
+
+```
+Client                          Server
+  │                               │
+  │─── Request JSON ──────────→  │
+  │    (via SHM topic)           │ handler() called
+  │                               │ computes response
+  │  ←── Response JSON ──────── │
+  │    (via SHM topic)           │
+```
+
+Under the hood, services use `JsonWireMessage` Pod transport over two SHM topics:
+- `{service_name}.request` — client publishes, server subscribes
+- `{service_name}.response.{client_pid}` — server publishes, client subscribes
+
+## Actions: Long-Running Tasks with Progress
+
+Actions are for tasks that take time — navigating to a goal, calibrating a sensor, recording data.
+
+### Example: Navigate to Goal
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+#include <thread>
+#include <chrono>
+using namespace horus::literals;
+
+int main() {
+    // ── Client: send goal, monitor progress ─────────────────────
+    horus::ActionClient client("navigate");
+
+    auto goal = client.send_goal(R"({"target_x": 5.0, "target_y": 3.0})");
+    if (!goal) {
+        std::printf("Failed to send goal\n");
+        return 1;
+    }
+
+    std::printf("Goal sent (id=%lu)\n", goal.id());
+
+    // Poll for feedback and the final result. The client handle's own status()
+    // is local; live status/feedback/result arrive over the topics via poll_*.
+    horus::GoalStatus status;
+    std::string result_json;
+    uint64_t fb_id;
+    std::string fb_json;
+    while (!client.poll_result(goal.id(), status, result_json)) {
+        if (client.poll_feedback(fb_id, fb_json)) {
+            std::printf("  feedback: %s\n", fb_json.c_str());
+        }
+        // client.cancel(goal.id());  // request cancellation at any time
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    std::printf("Final status: %d, result: %s\n",
+        static_cast<int>(status), result_json.c_str());
+}
+```
+
+### Action Lifecycle
+
+```
+Client                          Server
+  │                               │
+  │── Goal JSON ──────────────→  │  accept_handler() → accept/reject
+  │                               │
+  │  ←── Feedback JSON ────────  │  (periodic progress updates)
+  │  ←── Feedback JSON ────────  │
+  │  ←── Feedback JSON ────────  │
+  │                               │
+  │  ←── Result JSON ──────────  │  (final result)
+  │                               │
+  │── Cancel ──────────────────→  │  (optional, client-initiated)
+```
+
+### Action Server
+
+Each accepted goal runs on its own thread, so the server stays responsive to
+cancellation while a goal executes. Drive the server by calling `process()` in a
+loop on the thread that created it.
+
+```cpp
+horus::ActionServer server("navigate");
+
+// Accept handler: decide whether to accept the goal (0 = accept, 1 = reject).
+server.set_accept_handler([](const uint8_t* goal, size_t len) -> uint8_t {
+    return 0;  // accept all goals
+});
+
+// Execute handler: runs on a dedicated thread per accepted goal. Wrap the raw
+// handle, poll for cancellation, publish feedback, and finish the goal.
+server.set_execute_handler([](HorusActionGoalHandle* h, const uint8_t* goal, size_t len) {
+    horus::ActionGoalHandle g(h);
+    while (!g.is_cancel_requested()) {
+        // ... do a step of work ...
+        g.publish_feedback(R"({"progress": 0.5})");
+        if (/* arrived */ true) {
+            g.succeed(R"({"success": true})");
+            return;
+        }
+    }
+    g.canceled(R"({"success": false})");  // cancellation was requested
+});
+
+// Drive the server (same thread it was constructed on).
+while (running) {
+    server.process();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
+```
+
+If the execute handler returns without calling `succeed`/`abort`/`canceled`, the
+goal is completed as **Aborted**. A `HorusActionGoalHandle*` is valid only for
+the duration of the execute call — never stash it and use it later.
+
+## Cross-Process Services
+
+Services work across processes — client and server can be separate binaries:
+
+```bash
+# Terminal 1: server
+./my_service_server
+
+# Terminal 2: client
+./my_service_client
+```
+
+Both connect through SHM. The topic names must match.
+
+## When To Use What
+
+| Pattern | Use Case | Latency |
+|---------|----------|---------|
+| **Topic** | Continuous data (sensor readings, commands) | ~15 ns |
+| **Service** | One-shot query (get parameter, check status) | ~5 us (JSON round-trip) |
+| **Action** | Long task with progress (navigate, calibrate) | ~5 us + task duration |
+
+## Key Takeaways
+
+- Services = synchronous request/response (like function calls)
+- Actions = asynchronous goal/feedback/result (like background tasks)
+- Both use `JsonWireMessage` for type-erased communication
+- Both work same-process and cross-process via SHM
+- Client must specify timeout for services (network could delay)
+- Actions support cancellation via `goal.cancel()`

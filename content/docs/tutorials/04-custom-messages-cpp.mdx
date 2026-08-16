@@ -1,0 +1,174 @@
+---
+title: "Tutorial 4: Custom Messages (C++)"
+description: "Define custom message types and use them with typed Publisher/Subscriber"
+order: 42
+---
+
+# Tutorial 4: Custom Messages (C++)
+
+HORUS provides 50+ built-in message types, but you'll often need your own. This tutorial shows how to define custom `#[repr(C)]` Pod messages usable across C++, Rust, and Python.
+
+## What You'll Learn
+
+- Defining `#[repr(C)]` structs that work as Pod messages
+- Using custom types with `Publisher<T>` / `Subscriber<T>`
+- Layout requirements for cross-language compatibility
+- When to use custom messages vs JsonWireMessage
+
+## The Two Approaches
+
+### Approach 1: Use JsonWireMessage (Quick, Flexible)
+
+For prototyping or when the message schema changes frequently, use JSON:
+
+The JSON wire type is reached through the C API, not `Publisher<T>` — there is
+no `Publisher<HorusJsonWireMsg>` specialization, so `advertise<HorusJsonWireMsg>()`
+does not compile. Use `horus_publisher_json_wire_new` / `_send`:
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstring>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+
+    // JSON wire message — sends arbitrary JSON through SHM.
+    HorusPublisher* json_pub = horus_publisher_json_wire_new("custom.data");
+
+    sched.add("sender")
+        .tick([&] {
+            // Pack custom data as JSON
+            HorusJsonWireMsg msg{};
+            const char* json = R"({"temperature": 25.3, "humidity": 60, "location": "lab"})";
+            std::memcpy(msg.data, json, std::strlen(json));
+            msg.data_len = static_cast<uint32_t>(std::strlen(json));
+            msg.msg_id = 1;
+            horus_publisher_json_wire_send(json_pub, &msg);
+        })
+        .build();
+
+    sched.spin();
+    horus_publisher_json_wire_destroy(json_pub);
+}
+```
+
+**Pros:** No Rust changes needed, any JSON schema, works immediately.
+**Cons:** 4KB max, serialization overhead, no compile-time type checking.
+
+### Approach 2: Define a Pod Struct (Production, Zero-Copy)
+
+For production use, define a `#[repr(C)]` struct in Rust, add it to the FFI pipeline, and create a matching C++ struct. This gives you zero-copy SHM transfer.
+
+#### Step 1: Define in Rust (your message crate)
+
+```rust
+/// Custom sensor reading from a weather station
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct WeatherData {
+    pub temperature: f32,     // Celsius
+    pub humidity: f32,        // 0-100%
+    pub pressure: f32,        // hPa
+    pub wind_speed: f32,      // m/s
+    pub wind_direction: f32,  // degrees (0=N, 90=E)
+    pub timestamp_ns: u64,
+}
+```
+
+#### Step 2: Add to FFI pipeline
+
+In `horus_cpp/src/topic_ffi.rs`:
+```rust
+// simplified
+impl_topic_ffi!(weather_data, WeatherData, my_messages::WeatherData);
+```
+
+In `horus_cpp/src/c_api.rs`:
+```rust
+// simplified
+impl_pod_topic_c_api!(weather_data, my_messages::WeatherData);
+```
+
+#### Step 3: Define matching C++ struct
+
+```cpp
+// In your project or in horus_cpp/include/horus/msg/
+namespace horus { namespace msg {
+
+struct WeatherData {
+    float temperature;      // Celsius
+    float humidity;         // 0-100%
+    float pressure;         // hPa
+    float wind_speed;       // m/s
+    float wind_direction;   // degrees
+    uint64_t timestamp_ns;
+};
+
+}} // namespace horus::msg
+```
+
+#### Step 4: Add C++ template specialization
+
+In `horus_cpp/include/horus/impl/topic_impl.hpp`:
+```cpp
+HORUS_TOPIC_IMPL(msg::WeatherData, weather_data)
+```
+
+#### Step 5: Use it
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class WeatherStation : public horus::Node {
+public:
+    WeatherStation() : Node("weather_station") {
+        pub_ = advertise<horus::msg::WeatherData>("weather.data");
+    }
+
+    void tick() override {
+        horus::msg::WeatherData data{};
+        data.temperature = read_temperature();
+        data.humidity = read_humidity();
+        data.pressure = read_pressure();
+        data.timestamp_ns = 0;
+        pub_->send(data);
+    }
+
+private:
+    horus::Publisher<horus::msg::WeatherData>* pub_;
+    float read_temperature() { return 22.5f; }
+    float read_humidity() { return 55.0f; }
+    float read_pressure() { return 1013.25f; }
+};
+```
+
+## Layout Rules for Custom Types
+
+| Rule | Why |
+|------|-----|
+| `#[repr(C)]` in Rust | Ensures C-compatible memory layout |
+| Only primitive types + fixed arrays | `Vec`, `String`, `Box` can't cross SHM |
+| Same field order in C++ and Rust | Memory layout must match exactly |
+| Use `f32`/`f64`/`u8`/`u16`/`u32`/`u64`/`i32`/`i64` | Cross-language compatible primitives |
+| Fixed-size arrays `[T; N]` only | Variable-length data needs JsonWireMessage |
+| `timestamp_ns: u64` as last field | Convention for all HORUS messages |
+
+## When To Use Each Approach
+
+| Scenario | Approach |
+|----------|----------|
+| Prototyping, schema changing | JsonWireMessage |
+| Production, performance-critical | Custom Pod struct |
+| Cross-language (C++ + Python + Rust) | Custom Pod struct |
+| One-off configuration messages | JsonWireMessage |
+| High-frequency sensor data (>100 Hz) | Custom Pod struct (zero-copy) |
+
+## Key Takeaways
+
+- JsonWireMessage is the fastest path for custom data — no Rust changes, JSON payload, 4KB max
+- Custom Pod structs give zero-copy SHM but require adding to the FFI pipeline (5 steps)
+- Both approaches work cross-language (C++ ↔ Rust ↔ Python)
+- Always put `timestamp_ns: u64` as the last field (convention)
+- The `HORUS_TOPIC_IMPL` macro generates the entire Publisher/Subscriber specialization in one line

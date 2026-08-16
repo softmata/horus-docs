@@ -1,0 +1,129 @@
+---
+title: "Migrating from ROS2 (C++)"
+description: "Side-by-side comparison of ROS2 rclcpp and HORUS C++ — move faster with less code"
+order: 120
+---
+
+# Migrating from ROS2 (C++)
+
+This guide shows ROS2 rclcpp patterns and their HORUS equivalents side by side.
+
+## Node Definition
+
+### ROS2 (35+ lines)
+
+```cpp
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+
+class Controller : public rclcpp::Node {
+public:
+    Controller() : Node("controller") {
+        sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+            "scan", 10,
+            std::bind(&Controller::scan_cb, this, std::placeholders::_1));
+        pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+    }
+private:
+    void scan_cb(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+        auto cmd = geometry_msgs::msg::Twist();
+        cmd.linear.x = msg->ranges[0] > 0.5 ? 0.3 : 0.0;
+        pub_->publish(cmd);
+    }
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_;
+};
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<Controller>());
+    rclcpp::shutdown();
+}
+```
+
+### HORUS (15 lines)
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz);
+    auto scan_sub = sched.subscribe<horus::msg::LaserScan>("scan");
+    auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("cmd_vel");
+
+    sched.add("controller")
+        .rate(50_hz)
+        .tick([&] {
+            auto scan = scan_sub.recv();
+            if (!scan) return;
+            auto cmd = cmd_pub.loan();
+            cmd->linear = scan->get()->ranges[0] > 0.5f ? 0.3f : 0.0f;
+            cmd_pub.publish(std::move(cmd));
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+## Pattern Comparison
+
+| Concept | ROS2 rclcpp | HORUS C++ |
+|---------|-------------|-----------|
+| Node | `class : public rclcpp::Node` | Lambda in `sched.add().tick([&]{})` |
+| Publisher | `create_publisher<T>(topic, qos)` | `sched.advertise<T>(topic)` |
+| Subscriber | `create_subscription<T>(topic, qos, cb)` | `sched.subscribe<T>(topic)` |
+| Callback | `std::bind(&Class::method, this, _1)` | Captured lambda `[&]{ sub.recv(); }` |
+| Message | `geometry_msgs::msg::Twist` | `horus::msg::CmdVel` |
+| Pointer | `SharedPtr` everywhere | Value types + move semantics |
+| Publish | `pub->publish(msg)` (copy) | `pub.publish(std::move(sample))` (zero-copy) |
+| Receive | Callback-driven | Poll: `sub.recv()` → `std::optional` |
+| Init | `rclcpp::init(argc, argv)` | Nothing needed |
+| Run | `rclcpp::spin(node)` | `sched.spin()` |
+| Rate | `rclcpp::Rate(100)` | `.rate(100_hz)` |
+| Timer | `create_wall_timer(100ms, cb)` | `.rate(10_hz)` on node |
+| QoS | `rclcpp::QoS(10).reliable()` | `.budget(5_ms).on_miss(Skip)` |
+
+## Key Differences
+
+### No Inheritance
+
+ROS2 requires subclassing `rclcpp::Node`. HORUS uses lambdas — no class hierarchy needed.
+
+### No SharedPtr
+
+ROS2 uses `SharedPtr` for everything (publishers, subscribers, messages). HORUS uses move semantics and RAII — `std::unique_ptr` for owned resources, `std::optional` for nullable results.
+
+### No IDL / .msg Files
+
+ROS2 requires `.msg` files + `rosidl` codegen. HORUS uses plain C++ structs with `#[repr(C)]` layout — same struct in Rust and C++, no codegen step.
+
+### Zero-Copy IPC
+
+ROS2 copies data through the DDS middleware (even with "zero-copy" DDS, there's middleware overhead). HORUS writes directly to shared memory via the loan pattern — the `operator->` call returns a raw pointer to SHM.
+
+### Deterministic Scheduling
+
+ROS2 uses callback queues with non-deterministic ordering. HORUS provides explicit `order()` and optional `deterministic(true)` mode for bit-exact reproducibility.
+
+## Migration Checklist
+
+1. Replace `rclcpp::Node` subclass with `sched.add(name).tick(lambda)`
+2. Replace `create_publisher` with `sched.advertise<T>`
+3. Replace `create_subscription` with `sched.subscribe<T>` (capture in lambda)
+4. Replace `std::bind` callbacks with captured lambdas
+5. Replace `SharedPtr` with value types
+6. Replace `.msg` files with `horus::msg::` types
+7. Replace `rclcpp::init/spin/shutdown` with `sched.spin()`
+8. Replace `package.xml` + `CMakeLists.txt` with `horus.toml`
+9. Replace `ros2 launch` with `horus launch`
+10. Replace `ros2 topic echo` with `horus topic echo`
+
+## Performance
+
+HORUS C++ FFI adds **15-17ns** per call (vs ~1-5us DDS serialization in ROS2). Scheduler tick: **250ns** (vs ~10-50us in rclcpp). Throughput: **2.84M ticks/sec**.
+
+See [Benchmarks: C++ Binding Performance](/performance/benchmarks#c-binding-performance) for full results.

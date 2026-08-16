@@ -1,0 +1,283 @@
+---
+title: "Runtime Parameters API"
+description: "Dynamic configuration for C++ nodes -- set, get, and live-tune parameters at runtime"
+sidebar_section: "C++"
+order: 56
+---
+
+# Runtime Parameters API
+
+`horus::Params` provides dynamic key-value configuration for nodes. Parameters can be read and written at any time -- including while the node is running. This enables live tuning of gains, thresholds, and behavior without restarting the system.
+
+```cpp
+#include <horus/params.hpp>
+```
+
+---
+
+## Quick Reference
+
+| Method | Description |
+|--------|-------------|
+| `Params()` | Create a new empty parameter store |
+| `set(key, value)` | Set a parameter (6 overloads by type) |
+| `get<T>(key, default)` | Get a typed parameter with fallback (5 specializations) |
+| `get_f64(key)` | Get as `optional<double>` |
+| `get_i64(key)` | Get as `optional<int64_t>` |
+| `get_bool(key)` | Get as `optional<bool>` |
+| `get_string(key)` | Get as `optional<string>` |
+| `has(key)` | Check if a key exists |
+
+---
+
+## Constructor
+
+```cpp
+horus::Params params;
+```
+
+Creates an empty parameter store. No arguments. Move-only -- copy construction and copy assignment are deleted.
+
+---
+
+## Typed Setters
+
+Six overloads of `set()` cover all supported types. Each returns `true` on success, `false` on failure.
+
+```cpp
+bool set(const char* key, double value);
+bool set(const char* key, int64_t value);
+bool set(const char* key, int value);
+bool set(const char* key, bool value);
+bool set(const char* key, const char* value);
+bool set(const char* key, const std::string& value);
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `key` | `const char*` | Parameter name. Use dot-separated namespaces (e.g., `"pid.kp"`). |
+| `value` | varies | The value to store. Type determines storage format. |
+
+**Returns** `true` if the parameter was set successfully, `false` on error.
+
+The `int` overload promotes to `int64_t` internally, so `set("count", 42)` and `set("count", int64_t(42))` are equivalent.
+
+```cpp
+horus::Params params;
+params.set("max_speed", 1.5);          // double
+params.set("timeout_ms", int64_t(500)); // int64_t
+params.set("retries", 3);              // int -> int64_t
+params.set("enabled", true);           // bool
+params.set("name", "robot1");          // const char*
+std::string label = "arm_left";
+params.set("label", label);            // const std::string&
+```
+
+---
+
+## Template Get with Default
+
+The primary way to read parameters. Returns the value if it exists and matches the type, otherwise returns the default.
+
+```cpp
+template<typename T>
+T get(const char* key, T default_val) const;
+```
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `key` | `const char*` | Parameter name to look up. |
+| `default_val` | `T` | Value to return if the key does not exist. |
+
+### Template Specializations
+
+| Type `T` | Internal Call | Example |
+|----------|---------------|---------|
+| `double` | `get_f64(key)` | `params.get<double>("kp", 1.0)` |
+| `int64_t` | `get_i64(key)` | `params.get<int64_t>("count", 0)` |
+| `int` | `get_i64(key)` cast to `int` | `params.get<int>("retries", 3)` |
+| `bool` | `get_bool(key)` | `params.get<bool>("enabled", true)` |
+| `std::string` | `get_string(key)` | `params.get<std::string>("name", "default")` |
+
+```cpp
+double kp = params.get<double>("pid.kp", 1.0);
+int64_t timeout = params.get<int64_t>("timeout_ms", 500);
+int retries = params.get<int>("retries", 3);
+bool debug = params.get<bool>("debug", false);
+std::string name = params.get<std::string>("robot.name", "unnamed");
+```
+
+---
+
+## Optional Getters
+
+For cases where you need to distinguish "parameter missing" from "parameter set to the default value," use the optional getters directly. Each returns `std::nullopt` if the key does not exist.
+
+### get_f64
+
+```cpp
+std::optional<double> get_f64(const char* key) const;
+```
+
+### get_i64
+
+```cpp
+std::optional<int64_t> get_i64(const char* key) const;
+```
+
+### get_bool
+
+```cpp
+std::optional<bool> get_bool(const char* key) const;
+```
+
+### get_string
+
+```cpp
+std::optional<std::string> get_string(const char* key) const;
+```
+
+Returns the string value if it exists. Internally uses a 1024-byte buffer -- strings longer than 1023 characters are truncated.
+
+```cpp
+auto maybe_name = params.get_string("robot.name");
+if (maybe_name.has_value()) {
+    horus::log::info("config", ("Name: " + *maybe_name).c_str());
+} else {
+    horus::log::warn("config", "No robot name configured");
+}
+```
+
+---
+
+## has()
+
+```cpp
+bool has(const char* key) const;
+```
+
+Returns `true` if the key exists in the parameter store, regardless of its type.
+
+```cpp
+if (params.has("safety.max_force")) {
+    double limit = params.get<double>("safety.max_force", 100.0);
+    // apply force limit...
+}
+```
+
+---
+
+## Parameter Naming Conventions
+
+Use dot-separated namespaces to organize parameters.
+
+| Pattern | Example | Purpose |
+|---------|---------|---------|
+| `subsystem.param` | `pid.kp` | Group by subsystem |
+| `subsystem.component.param` | `arm.elbow.max_torque` | Hierarchical grouping |
+| `safety.*` | `safety.max_speed` | Safety-critical parameters |
+
+Avoid flat names like `"kp"` or `"max_speed"` -- they collide across nodes.
+
+---
+
+## Example: PID Gain Tuning at Runtime
+
+A motor controller that reads PID gains from parameters, allowing live adjustment without restart.
+
+```cpp
+#include <horus/node.hpp>
+#include <horus/params.hpp>
+
+struct MotorController {
+    horus::Params params;
+    double integral = 0.0;
+    double prev_error = 0.0;
+
+    void init() {
+        // Set initial gains
+        params.set("pid.kp", 2.0);
+        params.set("pid.ki", 0.1);
+        params.set("pid.kd", 0.05);
+        params.set("pid.output_limit", 10.0);
+        params.set("pid.anti_windup", true);
+    }
+
+    double compute(double setpoint, double measured, double dt) {
+        // Read gains -- can be changed at runtime via CLI or dashboard
+        double kp = params.get<double>("pid.kp", 2.0);
+        double ki = params.get<double>("pid.ki", 0.1);
+        double kd = params.get<double>("pid.kd", 0.05);
+        double limit = params.get<double>("pid.output_limit", 10.0);
+        bool anti_windup = params.get<bool>("pid.anti_windup", true);
+
+        double error = setpoint - measured;
+        integral += error * dt;
+
+        // Anti-windup: clamp integral term
+        if (anti_windup) {
+            double i_max = limit / ki;
+            if (integral > i_max) integral = i_max;
+            if (integral < -i_max) integral = -i_max;
+        }
+
+        double derivative = (error - prev_error) / dt;
+        prev_error = error;
+
+        double output = kp * error + ki * integral + kd * derivative;
+
+        // Clamp output
+        if (output > limit) output = limit;
+        if (output < -limit) output = -limit;
+
+        return output;
+    }
+};
+```
+
+To tune gains at runtime, another node or the CLI updates the parameter store:
+
+```cpp
+// From a tuning node or dashboard callback:
+controller.params.set("pid.kp", 2.5);   // increase proportional gain
+controller.params.set("pid.ki", 0.05);  // reduce integral gain
+// Changes take effect on the next tick() -- no restart needed
+```
+
+---
+
+## Live Tuning Pattern
+
+For nodes that support runtime reconfiguration, read parameters every tick rather than caching them in `init()`. The overhead of `get()` is negligible compared to typical tick budgets.
+
+```cpp
+// Good: reads fresh values every tick
+void tick() {
+    double speed = params.get<double>("max_speed", 1.0);
+    bool enabled = params.get<bool>("enabled", true);
+    // ...
+}
+
+// Avoid: stale values after parameter update
+void init() {
+    max_speed_ = params.get<double>("max_speed", 1.0);  // cached, never refreshed
+}
+```
+
+For parameters that require validation or have side effects on change, check with `has()` and validate before applying:
+
+```cpp
+void tick() {
+    if (params.has("new_target")) {
+        auto target = params.get<std::string>("new_target", "");
+        if (validate_target(target)) {
+            current_target_ = target;
+            horus::log::info("nav", "Target updated");
+        }
+    }
+}
+```
