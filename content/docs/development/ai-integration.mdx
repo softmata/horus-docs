@@ -63,7 +63,7 @@ cam = Node(name="camera", pubs=["cam.image_raw"], tick=camera_tick, rate=30)
 # ML processing node
 def ml_tick(node):
     if node.has_msg("cam.image_raw"):
-        frame = node.get("cam.image_raw")
+        frame = node.recv("cam.image_raw")
         # Run your ML model here
         # e.g., model.predict(frame), torch inference, etc.
         result = process_frame(frame)
@@ -80,7 +80,7 @@ ml_node = Node(
 # Control node reacts to detections
 def control_tick(node):
     if node.has_msg("detections"):
-        detections = node.get("detections")
+        detections = node.recv("detections")
         # React to ML output
         if detections.get("obstacle_detected"):
             node.send("cmd_vel", {"linear": 0.0, "angular": 0.5})
@@ -114,7 +114,7 @@ model.eval()
 
 def detect_tick(node):
     if node.has_msg("cam.image_raw"):
-        frame = node.get("cam.image_raw")
+        frame = node.recv("cam.image_raw")
         results = model(frame)
         detections = results.pandas().xyxy[0].to_dict('records')
         node.send("detections", detections)
@@ -142,7 +142,7 @@ input_name = session.get_inputs()[0].name
 
 def inference_tick(node):
     if node.has_msg("cam.image_raw"):
-        frame = node.get("cam.image_raw")
+        frame = node.recv("cam.image_raw")
         # Preprocess
         input_data = np.array(frame).astype(np.float32)
         input_data = np.expand_dims(input_data, axis=0)
@@ -161,38 +161,54 @@ node = Node(
 run(node)
 ```
 
-### ML Utilities
+### Pass Frames as Tensors, Not Lists
 
-HORUS provides Python ML utilities for common patterns:
+There is no HORUS-supplied inference base class — no `horus.ml_utils`, no
+`horus.ai`. The session, the preprocessing and the postprocessing are all your
+code, exactly as written above. What HORUS does supply is a zero-copy carrier
+for the arrays: `horus.Tensor`.
+
+The camera examples above send `frame.tolist()`, which is fine for a smoke test
+and ruinous for real frames — a 640x480 RGB frame becomes ~920,000 Python ints
+on every tick. Declare the topic as `horus.Tensor` instead: the pixels are
+written once into a shared-memory pool and only a 168-byte descriptor crosses
+the topic.
 
 ```python
-from horus.ml_utils import ONNXInferenceNode, PerformanceMonitor
+import numpy as np
+import horus
 
-# Pre-built ONNX inference node
-class MyDetector(ONNXInferenceNode):
-    def __init__(self):
-        super().__init__(
-            model_path="models/detector.onnx",
-            input_topic="cam.image_raw",
-            output_topic="detections"
-        )
 
-    def preprocess(self, frame):
-        # Resize, normalize, etc.
-        return processed_frame
+def capture(node):
+    frame = np.random.default_rng().integers(0, 255, (480, 640, 3), dtype=np.uint8)
+    node.send("cam.image_raw", horus.Tensor.from_numpy(frame))
 
-    def postprocess(self, output):
-        # Parse model output into detections
-        return detections
 
-# Performance monitoring
-monitor = PerformanceMonitor(window_size=100)
-monitor.record(12.5)  # Record inference time in ms
-stats = monitor.get_stats()
-print(f"Avg: {stats['avg_latency_ms']:.1f}ms, P95: {stats['p95_latency_ms']:.1f}ms, FPS: {stats['fps']:.0f}")
+def infer(node):
+    t = node.recv("cam.image_raw")
+    if t is None:
+        return
+    frame = t.numpy()                    # zero-copy view of the same bytes
+    node.send("detections", {"mean": float(frame.mean())})
+
+
+horus.run(
+    horus.Node(name="camera", tick=capture, rate=10, order=0,
+               pubs=[horus.Pub("cam.image_raw", horus.Tensor)]),
+    horus.Node(name="detector", tick=infer, rate=10, order=1,
+               subs=[horus.Sub("cam.image_raw", horus.Tensor)],
+               pubs=["detections"]),
+    duration=1.0,
+)
 ```
 
-See [ML Utilities](/python/library/ml-utilities) for the full API.
+Give the subscriber the same rate as the publisher. A tensor topic hands over a
+reference rather than queueing copies, and a subscriber that ticks slower than
+the publisher receives nothing at all — `recv()` returns `None` every time. If
+inference only keeps up at 10 Hz, publish at 10 Hz.
+
+See [Python Tensors for ML](/python/library/ml-utilities) for the full tensor and
+pool API, including the torch bridge and the current CPU-only device situation.
 
 ---
 
@@ -307,7 +323,7 @@ API_KEY = os.environ["OPENAI_API_KEY"]
 
 def planner_tick(node):
     if node.has_msg("user.goal"):
-        goal = node.get("user.goal")
+        goal = node.recv("user.goal")
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {API_KEY}"},
@@ -421,32 +437,73 @@ def ml_tick(node):
     if node.has_msg("cam.image_raw"):
         frame_count += 1
         if frame_count % 5 == 0:  # Every 5th frame
-            frame = node.get("cam.image_raw")
+            frame = node.recv("cam.image_raw")
             result = model.predict(frame)
             node.send("detections", result)
 ```
 
-### Async Processing
+### Offload Inference Off the Control Loop
 
-Run ML in a background thread so the control loop isn't blocked:
+Local inference is CPU-bound, so run it on a `compute=True` node. HORUS puts that node on a
+worker pool, and the other nodes keep their own rates while it works:
 
 ```python
-from horus import AsyncNode, AsyncTopic
-import asyncio
+import time
+import horus
 
-class AsyncMLNode(AsyncNode):
-    async def setup(self):
-        self.input = AsyncTopic("cam.image_raw", dict)
-        self.output = AsyncTopic("detections", dict)
+def model_predict(frame):
+    time.sleep(0.03)                     # stands in for a real model
+    return {"boxes": [], "frame": frame["id"]}
 
-    async def tick(self):
-        frame = await self.input.try_recv()
-        if frame:
-            # Run in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, model.predict, frame)
-            await self.output.send(result)
+def infer(node):
+    if node.has_msg("cam.image_raw"):
+        frame = node.recv("cam.image_raw")
+        node.send("detections", model_predict(frame))
+
+def control(node):
+    if node.has_msg("detections"):
+        node.recv("detections")
+
+frames = {"n": 0}
+def camera(node):
+    frames["n"] += 1
+    node.send("cam.image_raw", {"id": frames["n"]})
+
+horus.run(
+    horus.Node(name="camera", tick=camera, rate=30, pubs=["cam.image_raw"], order=0),
+    horus.Node(name="infer", tick=infer, rate=30, order=1, compute=True,
+               subs=["cam.image_raw"], pubs=["detections"]),
+    horus.Node(name="control", tick=control, rate=100, order=2, subs=["detections"]),
+    duration=1.0,
+)
 ```
+
+Each `infer` tick takes ~30 ms, yet `camera` still gets its 30 ticks and `control` its 100,
+both under 130 µs. The control node reads the most recent detections and never waits.
+
+If instead you call a **remote** inference API, the work is I/O-bound — use an `async def`
+tick, which HORUS runs on its async I/O executor:
+
+```python
+import asyncio
+import horus
+
+async def remote_infer(node):
+    if not node.has_msg("cam.image_raw"):
+        return
+    frame = node.recv("cam.image_raw")
+    await asyncio.sleep(0.08)            # stands in for the HTTP round-trip
+    node.send("detections", {"frame": frame["id"], "boxes": []})
+
+horus.run(
+    horus.Node(name="remote", tick=remote_infer, rate=30,
+               subs=["cam.image_raw"], pubs=["detections"]),
+    duration=1.0,
+)
+```
+
+`compute=True` and an async tick are mutually exclusive — pick the one matching whether the
+bottleneck is CPU or I/O. See [Async Nodes](/python/api/async-nodes) for the execution model.
 
 ### Use Appropriate Models
 
@@ -468,7 +525,7 @@ class AsyncMLNode(AsyncNode):
    ```python
    def control_tick(node):
        if node.has_msg("detections"):
-           detections = node.get("detections")
+           detections = node.recv("detections")
            react_to(detections)
        else:
            # Safe default when no detections available

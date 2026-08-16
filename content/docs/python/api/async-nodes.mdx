@@ -1,277 +1,287 @@
 ---
 title: "Async Nodes"
-description: "Python async/await support for non-blocking HORUS nodes"
+description: "Using async/await inside a HORUS node tick with plain Python asyncio"
 order: 2
 ---
 
 # Async Nodes
 
-HORUS provides native Python async/await support through `AsyncNode` and `AsyncTopic` classes. These enable non-blocking I/O operations, making it easy to integrate with async libraries, HTTP APIs, databases, and other async-native Python code.
-
-## Overview
-
-| Class | Description |
-|-------|-------------|
-| `AsyncNode` | Base class for async nodes with `async def tick()` |
-| `AsyncTopic` | Async wrapper for Topic with `await send()` and `await recv()` |
-
-## AsyncNode
-
-The `AsyncNode` class lets you use Python's native async/await syntax:
+HORUS supports `async def` node ticks. There is **no separate async node class** — you
+write a normal `horus.Node` and pass a coroutine function as `tick`. HORUS detects it and
+schedules the node on its async I/O executor.
 
 ```python
-import horus
 import asyncio
-
-class MyAsyncNode(horus.AsyncNode):
-    async def setup(self):
-        """Called once at startup"""
-        self.topic = horus.AsyncTopic("sensor_data", dict)
-        self.api_url = "https://api.example.com/data"
-
-    async def tick(self):
-        """Called each scheduler cycle - use await freely!"""
-        # Fetch from HTTP API (non-blocking)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self.api_url) as response:
-                data = await response.json()
-
-        # Publish to HORUS topic
-        await self.topic.send(data)
-
-    async def shutdown(self):
-        """Called once at shutdown"""
-        print("Node shutting down")
-```
-
-### Lifecycle Methods
-
-| Method | Description |
-|--------|-------------|
-| `async def setup()` | One-time initialization before first tick |
-| `async def tick()` | Called each scheduler cycle |
-| `async def shutdown()` | Cleanup when node stops |
-
-### Running an AsyncNode
-
-```python
 import horus
 
-# Create scheduler
-scheduler = horus.Scheduler()
+async def poll_sensor(node):
+    # Any awaitable works here: HTTP, sockets, database drivers.
+    await asyncio.sleep(0.05)
+    node.send("reading", {"value": 42})
 
-# Add async node
-node = MyAsyncNode()
-scheduler.add(node, order=0)
-
-# Run - scheduler handles the async event loop
-scheduler.run()
-```
-
-## AsyncTopic
-
-`AsyncTopic` provides async send/receive operations:
-
-```python
-import horus
-
-# Create async topic
-topic = horus.AsyncTopic("my_topic", str)
-
-# Async send
-await topic.send("hello world")
-
-# Async receive (waits for message)
-msg = await topic.recv()
-
-# Try receive (returns None immediately if no message)
-msg = await topic.try_recv()
-```
-
-### API Reference
-
-```python
-class AsyncTopic:
-    def __init__(self, topic: str, msg_type: type):
-        """Create async topic with message type"""
-
-    async def send(self, msg: Any) -> None:
-        """Send message asynchronously"""
-
-    async def recv(self) -> Any:
-        """Receive message, waiting until available"""
-
-    async def try_recv(self) -> Optional[Any]:
-        """Try to receive, returns None if no message"""
-
-    def subscribe(self, callback: Callable) -> None:
-        """Subscribe with synchronous callback"""
-
-    async def async_subscribe(self, async_callback: Callable) -> None:
-        """Subscribe with async callback"""
-```
-
-### Async Subscriptions
-
-Subscribe with async callbacks for reactive patterns:
-
-```python
-async def handle_sensor_data(msg):
-    """Async callback - can use await!"""
-    processed = await process_data(msg)
-    await database.save(processed)
-
-topic = horus.AsyncTopic("sensors", dict)
-await topic.async_subscribe(handle_sensor_data)
-```
-
-## Utility Functions
-
-HORUS provides async utility functions:
-
-```python
-import horus
-
-# Non-blocking sleep
-await horus.sleep(0.1)
-
-# Run multiple async operations concurrently
-results = await horus.gather(
-    fetch_sensor_a(),
-    fetch_sensor_b(),
-    fetch_sensor_c()
+horus.run(
+    horus.Node(name="poller", tick=poll_sensor, rate=10, pubs=["reading"]),
+    duration=1.0,
 )
-
-# Wait with timeout
-try:
-    result = await horus.wait_for(slow_operation(), timeout=5.0)
-except asyncio.TimeoutError:
-    print("Operation timed out")
 ```
 
-## Complete Example: Async HTTP API Node
+`horus.asyncio` is the standard library's `asyncio` module, re-exported for convenience.
+`import horus` then `horus.asyncio.sleep(...)` and `import asyncio` then `asyncio.sleep(...)`
+are the same function. Everything you already know about asyncio applies unchanged.
+
+## APIs that do not exist
+
+Earlier versions of this page documented an async API that HORUS does not ship. If you have
+code or notes referring to these names, here is what to use instead:
+
+| Does not exist | Use instead |
+|----------------|-------------|
+| `horus.AsyncNode` | `horus.Node(tick=<async def>)` |
+| `horus.AsyncTopic` | `node.send()` / `node.recv()`, or `horus.Topic` |
+| `await topic.send(...)` / `await topic.recv()` | `node.send(...)` / `node.recv(...)` — these are synchronous and fast |
+| `horus.sleep()` | `asyncio.sleep()` |
+| `horus.gather()` | `asyncio.gather()` |
+| `horus.wait_for()` | `asyncio.wait_for()` |
+
+Topic sends and receives are shared-memory operations measured in microseconds. There is
+nothing to await, which is why no async topic type exists.
+
+## How an async tick runs
+
+When you pass a coroutine function to `tick`, `init`, or `shutdown`, HORUS:
+
+1. Detects it with `asyncio.iscoroutinefunction()`.
+2. Creates **one event loop for that node** and reuses it for the node's whole lifetime.
+3. Marks the node for the `async_io` execution class, so it runs on the async I/O executor
+   instead of the main scheduler thread.
+4. Each tick calls `loop.run_until_complete(your_coroutine(node))`.
+
+Step 4 is the one that shapes everything else, so it is worth stating plainly.
+
+### An async tick blocks until it finishes
+
+`run_until_complete` does not return until your coroutine completes. A tick does not overlap
+with the next tick of the same node — `rate` is a ceiling, not a promise.
 
 ```python
-import horus
-import aiohttp
 import asyncio
+import horus
 
-class WeatherNode(horus.AsyncNode):
-    """Fetches weather data from API and publishes to HORUS"""
+async def slow(node):
+    await asyncio.sleep(0.05)      # 50 ms of I/O
+    node.send("out", {"ok": True})
 
-    async def setup(self):
-        self.weather_pub = horus.AsyncTopic("weather", dict)
-        self.location = "San Francisco"
-        self.api_key = "your-api-key"
-        self.session = aiohttp.ClientSession()
+# rate=100 asks for a 10 ms period, but each tick needs 50 ms.
+horus.run(horus.Node(name="slow", tick=slow, rate=100, pubs=["out"]), duration=1.0)
+```
 
-    async def tick(self):
-        url = f"https://api.weather.com/v1/{self.location}?key={self.api_key}"
+Running this for one second produces about **20 ticks, not 100**, and the timing report shows
+an average tick of roughly 50,000 µs. If you need a node to keep ticking at its configured
+rate while long I/O is in flight, an async tick is the wrong tool — see
+[Long-lived streams](#long-lived-streams-background-thread) below.
 
+### Concurrency inside one tick works normally
+
+You cannot overlap ticks, but you can overlap awaits within a single tick:
+
+```python
+import asyncio
+import horus
+
+async def fan_out(node):
+    # These three run concurrently — total wait is ~50 ms, not 150 ms.
+    a, b, c = await asyncio.gather(
+        asyncio.sleep(0.05, result="sensor-a"),
+        asyncio.sleep(0.05, result="sensor-b"),
+        asyncio.sleep(0.05, result="sensor-c"),
+    )
+    node.send("merged", {"a": a, "b": b, "c": c})
+
+horus.run(horus.Node(name="fan", tick=fan_out, rate=10, pubs=["merged"]), duration=0.5)
+```
+
+The measured tick time is ~50 ms, confirming the three sleeps overlapped.
+
+### A slow async node does not stall other nodes
+
+Async nodes run on a separate executor, so blocking inside one does not delay your control
+loop:
+
+```python
+import asyncio
+import horus
+
+async def fetch(node):
+    await asyncio.sleep(0.05)            # slow network call
+    node.send("reading", {"value": 1})
+
+def control(node):
+    if node.has_msg("reading"):
+        reading = node.recv("reading")
+        node.send("cmd", {"speed": reading["value"] * 0.1})
+
+horus.run(
+    horus.Node(name="fetch", tick=fetch, rate=100, pubs=["reading"]),
+    horus.Node(name="control", tick=control, rate=100, subs=["reading"], pubs=["cmd"]),
+    duration=1.0,
+)
+```
+
+Over one second the `control` node gets its full 100 ticks at ~80 µs each, while `fetch`
+manages ~20. The sync node consumes whatever the async node last published and never waits
+for it. This is the pattern to reach for: **slow I/O in an async node, timing-critical logic
+in a sync node, data passed between them over a topic.**
+
+## Async init and shutdown
+
+`init` and `shutdown` accept coroutine functions too. Because the node keeps one event loop
+for its entire life, objects created in `init` stay valid in every later tick — connections,
+sessions, and `asyncio` primitives all survive.
+
+```python
+import asyncio
+import horus
+
+class Connection:
+    """Stand-in for aiohttp.ClientSession, asyncpg pool, or a websocket."""
+    async def open(self):
+        await asyncio.sleep(0.01)
+        self.seq = 0
+
+    async def read(self):
+        await asyncio.sleep(0.01)
+        self.seq += 1
+        return {"seq": self.seq}
+
+    async def close(self):
+        await asyncio.sleep(0.01)
+
+async def connect(node):
+    node.conn = Connection()
+    await node.conn.open()
+    node.log_info("connected")
+
+async def poll(node):
+    node.send("telemetry", await node.conn.read())
+
+async def disconnect(node):
+    await node.conn.close()
+    node.log_info("disconnected")
+
+horus.run(
+    horus.Node(
+        name="link",
+        tick=poll,
+        init=connect,
+        shutdown=disconnect,
+        rate=20,
+        pubs=["telemetry"],
+    ),
+    duration=0.5,
+)
+```
+
+Open expensive resources in `init`, not in `tick`. Reopening a session every tick is the most
+common way to make an async node far slower than it needs to be.
+
+## Execution classes are mutually exclusive
+
+A node picks exactly one execution class. Combining them raises `ValueError` at construction:
+
+```python
+horus.Node(tick=async_fn, compute=True)     # ValueError
+horus.Node(tick=async_fn, on="scan")        # ValueError
+```
+
+> Execution class is mutually exclusive: only one of async tick, compute=True, or on='topic' can be set
+
+| Setting | Use for |
+|---------|---------|
+| `async def tick` | I/O-bound work: HTTP, sockets, async database drivers |
+| `compute=True` | CPU-bound work: model inference, point-cloud processing |
+| `on="topic"` | Event-driven ticks that fire when a message arrives |
+
+## Long-lived streams: background thread
+
+An async tick opens and closes its work each cycle. That is a poor fit for a connection that
+should stay open and push messages at its own pace, like a websocket feed. For that, run the
+event loop in a background thread and hand results to a **sync** node through a queue:
+
+```python
+import asyncio
+import queue
+import threading
+import horus
+
+inbox = queue.Queue(maxsize=256)
+stop = threading.Event()
+
+async def stream():
+    """One long-lived connection producing messages at its own pace."""
+    while not stop.is_set():
+        await asyncio.sleep(0.02)        # stands in for `await ws.recv()`
         try:
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    await self.weather_pub.send({
-                        "temperature": data["temp"],
-                        "humidity": data["humidity"],
-                        "timestamp": data["timestamp"]
-                    })
-        except aiohttp.ClientError as e:
-            print(f"API error: {e}")
+            inbox.put_nowait({"t": "tick"})
+        except queue.Full:
+            pass                         # drop when the node falls behind
 
-    async def shutdown(self):
-        await self.session.close()
+threading.Thread(target=lambda: asyncio.run(stream()), daemon=True).start()
 
+def drain(node):
+    """Sync tick: never blocks, just takes whatever arrived."""
+    while True:
+        try:
+            node.send("stream", inbox.get_nowait())
+        except queue.Empty:
+            return
 
-class WeatherConsumer(horus.AsyncNode):
-    """Consumes weather data and logs to database"""
-
-    async def setup(self):
-        self.weather_sub = horus.AsyncTopic("weather", dict)
-        # Setup async database connection
-        self.db = await asyncpg.connect("postgresql://localhost/robotics")
-
-    async def tick(self):
-        weather = await self.weather_sub.try_recv()
-        if weather:
-            await self.db.execute(
-                "INSERT INTO weather_log (temp, humidity, ts) VALUES ($1, $2, $3)",
-                weather["temperature"],
-                weather["humidity"],
-                weather["timestamp"]
-            )
-
-    async def shutdown(self):
-        await self.db.close()
-
-
-def main():
-    scheduler = horus.Scheduler()
-    scheduler.add(WeatherNode(), order=0)
-    scheduler.add(WeatherConsumer(), order=1)
-    scheduler.run()
-
-if __name__ == "__main__":
-    main()
+horus.run(horus.Node(name="drain", tick=drain, rate=50, pubs=["stream"]), duration=0.5)
+stop.set()
 ```
 
-## When to Use AsyncNode
+The `drain` node ticks in roughly 0.1 ms because it never waits — it only moves whatever the
+background loop already produced. Use a **bounded** queue and drop on overflow so a fast
+producer cannot grow memory without limit.
 
-**Good use cases:**
-- HTTP/REST API integration
-- Database operations (asyncpg, aioredis)
-- WebSocket connections
-- File I/O operations
-- Any I/O-bound operations
+## Rate: pacing a background loop
 
-**Not ideal for:**
-- CPU-bound computations (use regular Node with multiprocessing)
-- Real-time control loops requiring deterministic timing
-- Operations requiring &lt;1ms latency
-
-## Mixing Sync and Async
-
-You can mix regular `Node` and `AsyncNode` in the same scheduler:
+`horus.Rate` is the rate-control primitive for loops you drive yourself, such as the
+background thread above. It compensates for drift, unlike `time.sleep(1 / hz)`.
 
 ```python
 import horus
 
-# Regular sync node uses callback pattern
-def read_sensor(node):
-    """Fast sensor reading - blocking is OK"""
-    reading = node.get("sensor.raw")
-    if reading:
-        node.send("sensor.processed", reading * 2)
+rate = horus.Rate(50)                    # 50 Hz -> 20 ms period
+print("period:", rate.period(), "target:", rate.target_hz())
 
-sync_node = horus.Node(
-    name="sensor_reader",
-    subs=["sensor.raw"],
-    pubs=["sensor.processed"],
-    tick=read_sensor,
-    rate=100
-)
+for _ in range(25):
+    do_work = sum(range(10_000))         # your loop body
+    if rate.is_late():                   # check BEFORE sleeping
+        print("overran the 20 ms period")
+    rate.sleep()                         # drift-compensated
 
-# Async node uses class inheritance
-class AsyncCloudNode(horus.AsyncNode):
-    """Async node for cloud upload"""
-    async def setup(self):
-        self.topic = horus.AsyncTopic("sensor.processed", dict)
-
-    async def tick(self):
-        msg = await self.topic.try_recv()
-        if msg:
-            await self.upload_to_cloud(msg)
-
-# Both work together
-scheduler = horus.Scheduler()
-scheduler.add(sync_node, order=0)           # Runs first
-scheduler.add(AsyncCloudNode(), order=10)   # Runs later
-scheduler.run()
+print("headroom: %.0f Hz" % rate.actual_hz())
+rate.reset()
 ```
+
+| Method | Returns |
+|--------|---------|
+| `sleep()` | Sleeps just long enough to hold the target rate |
+| `period()` | Target period in seconds (`1 / hz`) |
+| `target_hz()` | The rate you asked for |
+| `actual_hz()` | Rate implied by **work time alone**, excluding the sleep |
+| `is_late()` | `True` if the work since the last sleep exceeded the period |
+| `reset()` | Restarts the timing baseline |
+
+`actual_hz()` is easy to misread. It reports the frequency the loop *could* sustain if it
+never slept, so a healthy 50 Hz loop doing 5 ms of work reports about 190 Hz, not 50. Read it
+as headroom: when it falls **below** `target_hz()`, the loop can no longer keep up. Check
+`is_late()` before `sleep()`, since after sleeping you are on schedule again by definition.
+
+`Rate.sleep()` blocks the calling thread and does not release the GIL. Use it in dedicated
+background threads, never inside a node tick — the scheduler already paces ticks via `rate=`.
 
 ## See Also
 
-- [Python Bindings](/python/api/python-bindings) - Core Python API
-- [ML Utilities](/python/library/ml-utilities) - ML inference helpers
-- [Examples](/python/examples) - More Python examples
+- [Python Bindings](/python/api/python-bindings) — core `Node`, `run`, and topic API
+- [Examples](/python/examples) — more complete Python programs
