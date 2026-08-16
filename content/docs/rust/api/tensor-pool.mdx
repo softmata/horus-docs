@@ -6,14 +6,13 @@ weight: 40
 
 # TensorPool API
 
-HORUS provides efficient tensor memory management through shared memory pools, enabling zero-copy data sharing between processes for both CPU and GPU tensors.
+HORUS provides efficient tensor memory management through shared memory pools, enabling zero-copy data sharing between processes.
 
 ## Overview
 
 The TensorPool system consists of:
 
-- **TensorPool** - CPU tensor allocation via shared memory
-- **CudaTensorPool** - GPU tensor allocation with CUDA IPC support
+- **TensorPool** - tensor allocation via shared memory (mmap-backed)
 - **TensorHandle** - RAII wrapper for automatic memory management
 - **Tensor** - 168-byte Pod tensor descriptor (metadata only)
 - **Device** - Pod-safe device location (`Device::cpu()`, `Device::cuda(N)`)
@@ -100,16 +99,12 @@ let config = TensorPoolConfig {
     pool_size: 2 * 1024 * 1024 * 1024, // 2GB
     max_slots: 2048,
     slot_alignment: 64,                 // Cache-line aligned
+    allocator: PoolAllocator::Mmap,     // the only backend today
 };
 let pool = Arc::new(TensorPool::new(1, config)?);
-
-// Open an existing pool (for consumer processes)
-let pool = Arc::new(TensorPool::open(1)?);
-
-// Preset configs
-let small_config = TensorPoolConfig::small();  // 64MB, 256 slots
-let large_config = TensorPoolConfig::large();  // 4GB, 4096 slots
 ```
+
+`TensorPool::new` is create-or-open: a consumer process that calls it with the same `pool_id` attaches to the pool that already exists in shared memory rather than making a second one.
 
 ### Allocating Tensors
 
@@ -160,8 +155,9 @@ let handle2 = handle.clone();
 | `pool_size` | `usize` | 1GB | Total pool size in bytes |
 | `max_slots` | `usize` | 1024 | Maximum concurrent tensors |
 | `slot_alignment` | `usize` | 64 | Memory alignment in bytes |
+| `allocator` | `PoolAllocator` | `Mmap` | Backend for the data region |
 
-**Presets:** `TensorPoolConfig::small()` (64MB, 256 slots), `TensorPoolConfig::large()` (4GB, 4096 slots).
+`PoolAllocator` has a single variant, `Mmap`. There are no preset constructors — build the struct or start from `TensorPoolConfig::default()`.
 
 ### Pool Statistics
 
@@ -174,22 +170,25 @@ println!("Pool: {}/{} slots used, {}/{} bytes",
 
 ## GPU Support (CUDA)
 
-HORUS includes CUDA availability detection via `cuda_available()` and `cuda_device_count()`. Tensors can target GPU devices using `Device::cuda(N)`:
+`Device` can *describe* a GPU location — `Device::cuda(0)`, `Device::parse("cuda:1")` — and a `Tensor` descriptor can carry it:
 
 ```rust
 use horus::prelude::*;
 
-// Check CUDA availability
-if cuda_available() {
-    println!("CUDA devices: {}", cuda_device_count());
-}
-
-// Create a tensor descriptor targeting GPU
 let mut tensor = Tensor::default();
 tensor.set_device(Device::cuda(0));
+assert!(tensor.device().is_cuda());
 ```
 
-GPU tensor pool management is exposed to Python via `horus.cuda_is_available()` and the `horus.ai` module. See the Python API docs for details.
+**No pool can back that device today.** `PoolAllocator` has one variant, `Mmap`, so allocating from a pool with a CUDA device fails:
+
+```text
+Allocation failed: device mismatch: requested cuda:0 but pool backend
+targets cpu (backend: mmap). Use a pool created with the matching backend,
+or pass Device::cpu() to alloc().
+```
+
+There is no `cuda_available()` or `cuda_device_count()` function in the crate, and no `CudaTensorPool`. Keep tensors on the CPU as the transport, and do device placement inside your inference framework (torch, ONNX Runtime, TensorRT) after reading the pool memory.
 
 ## Tensor Descriptor
 
@@ -208,34 +207,23 @@ Use `Device::cpu()`, `Device::cuda(0)`, `Device::cuda(1)`, etc. for device place
 
 ## Python API
 
+The same pools are reachable from Python as `horus.TensorPool` and `horus.Tensor`. A Python process and a Rust process sharing a `pool_id` share the memory.
+
 ```python
+import numpy as np
 import horus
 
-# Check CUDA availability
-if horus.cuda_is_available():
-    print(f"CUDA devices: {horus.cuda_device_count()}")
-
-# Create tensor pool
 pool = horus.TensorPool(pool_id=1, size_mb=1024, max_slots=1024)
 
-# Allocate CPU tensor
-handle = pool.alloc(shape=(1080, 1920, 3), dtype="float32")
+# Allocate from the pool, or copy an existing array in
+handle = pool.alloc((1080, 1920, 3), dtype="float32")
+frame = horus.Tensor.from_numpy(np.zeros((480, 640, 3), dtype=np.uint8))
 
-# Use numpy arrays directly with ML models
-import numpy as np
-from horus.ai import Model
-
-arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-mat = np.array([[1, 2], [3, 4]], dtype=np.float32)
-
-# Load and run model inference (returns np.ndarray)
-model = Model.load("model.onnx", device="cuda:0")
-output = model(np.zeros((1, 3, 640, 640), dtype=np.float32))
-
-# Convert to framework tensors as needed
-import torch
-torch_tensor = torch.from_numpy(arr)  # Zero-copy
+view = frame.numpy()          # zero-copy ndarray over the pool slot
+print(frame.shape, frame.dtype, frame.device, pool.stats()["allocated_slots"])
 ```
+
+There is no `horus.cuda_is_available()` and no `horus.ai` module; model loading and inference are your own code. See [Python Tensors for ML](/python/library/ml-utilities) for the complete Python surface.
 
 ## Performance
 
@@ -246,25 +234,7 @@ torch_tensor = torch.from_numpy(arr)  # Zero-copy
 | Slot allocation | ~100ns |
 | Cross-process access | Zero-copy via mmap |
 
-### GPU TensorPool
-
-| Operation | Latency |
-|-----------|---------|
-| Allocation (VGA) | ~260us |
-| Allocation (1080p) | ~960us |
-| Allocation (4K) | ~3.4ms |
-| IPC handle transfer | ~26ns |
-| Pool create | ~156us |
-| Pool open | ~42us |
-
-### IPC vs Memcpy
-
-For a 1080p RGB f32 tensor (~24MB):
-
-| Method | Latency | Speedup |
-|--------|---------|---------|
-| CPU memcpy | ~2.26ms | 1x |
-| CUDA IPC | ~26ns | **87,000x** |
+Regardless of tensor size, only the 168-byte descriptor travels through the ring buffer — the data stays in the mmap and is read in place by the receiver. There are no GPU pool figures to quote: there is no GPU allocator in the crate.
 
 ## Best Practices
 
@@ -273,8 +243,8 @@ For a 1080p RGB f32 tensor (~24MB):
 3. **Reuse pools**: Create pools once at startup, not per-tensor
 4. **Use TensorHandle**: Prefer `TensorHandle` over manual `retain`/`release` for automatic refcounting
 5. **Match dtypes**: Ensure sender and receiver use same dtype
-6. **Close IPC handles**: Always close imported CUDA IPC handles to prevent leaks
-7. **Check CUDA availability**: Guard GPU code with `cuda_available()`
+6. **Keep tensors on the CPU**: The pool cannot allocate on `Device::cuda(N)`; move batches to the GPU inside your inference framework
+7. **Watch `allocated_slots`**: `max_slots`, not `pool_size`, is usually the limit a leaking pipeline hits first
 
 ## See Also
 

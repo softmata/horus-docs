@@ -1,352 +1,372 @@
 ---
-title: "Python ML Utilities"
-description: "Machine learning helper classes for PyTorch, TensorFlow, and ONNX integration in Python HORUS nodes"
+title: "Python Tensors for ML"
+description: "Move ML data through HORUS with horus.Tensor and horus.TensorPool: numpy interop, zero-copy hand-off between nodes, and where your PyTorch or ONNX code plugs in"
 order: 20
 ---
 
-# Python ML Utilities
+# Python Tensors for ML
 
-HORUS provides Python ML utility classes in `horus.ml_utils` for easy integration with popular machine learning frameworks. These helper classes handle model loading, preprocessing, inference, and performance tracking.
+HORUS does not load models and does not run inference. There is no `horus.ml_utils`
+module, no `horus.ai`, and no `horus.cuda_is_available()` — importing any of them
+raises `ModuleNotFoundError` / `AttributeError`. Earlier versions of this page
+documented those names; they were never part of the shipped package.
 
-## Overview
+What HORUS gives an ML workload is the **data path**: `horus.Tensor`, a
+shared-memory array with numpy interop, and `horus.TensorPool`, the arena those
+arrays live in. Your model stays your own code — PyTorch, ONNX Runtime, whatever
+you already use — and HORUS carries its inputs and outputs between nodes.
 
-The `ml_utils` module provides:
+| What you need | Where it comes from |
+|---|---|
+| Move image / feature arrays between nodes | `horus.Tensor` sent over a topic |
+| Control the shared-memory budget | `horus.TensorPool` |
+| numpy view of incoming data | `Tensor.numpy()` |
+| Load a model, run inference | your code (`onnxruntime`, `torch`, …) |
+| Resize, normalize, NMS, letterbox | numpy / OpenCV / your framework |
 
-| Class | Framework | Use Case |
-|-------|-----------|----------|
-| `MLNodeBase` | Any | Base class for ML inference nodes |
-| `PyTorchInferenceNode` | PyTorch | TorchScript and checkpoint models |
-| `TensorFlowInferenceNode` | TensorFlow/Keras | SavedModel and .h5 files |
-| `ONNXInferenceNode` | ONNX Runtime | Cross-platform ONNX models |
-| `PerformanceMonitor` | Any | Track inference latency and throughput |
-
-## Base Class: MLNodeBase
-
-All ML inference nodes inherit from `MLNodeBase`:
-
-```python
-from horus.ml_utils import MLNodeBase
-
-class MLNodeBase:
-    def __init__(self, model_path: str, input_topic: str, output_topic: str):
-        """
-        Args:
-            model_path: Path to the model file
-            input_topic: Topic to subscribe to for inputs
-            output_topic: Topic to publish predictions to
-        """
-        ...
-
-    def load_model(self):
-        """Override to load your model"""
-        raise NotImplementedError()
-
-    def preprocess(self, data):
-        """Override to preprocess input data"""
-        return data
-
-    def infer(self, data):
-        """Override to run inference"""
-        raise NotImplementedError()
-
-    def postprocess(self, output):
-        """Override to postprocess model output"""
-        return output
-
-    def run_inference(self, data) -> tuple[Any, float]:
-        """Run full pipeline, returns (result, latency_ms)"""
-        ...
-
-    def get_stats(self) -> dict:
-        """Get inference statistics"""
-        ...
-```
-
-## PyTorch Integration
-
-### PyTorchInferenceNode
+## Creating tensors
 
 ```python
-from horus import Node, Topic
-from horus.ml_utils import PyTorchInferenceNode
-
-class ObjectDetector(PyTorchInferenceNode):
-    def __init__(self):
-        super().__init__(
-            model_path="models/yolov8n.pt",
-            input_topic="camera.raw",
-            output_topic="detections",
-            device="cuda:0"  # or "cpu"
-        )
-
-    def load_model(self):
-        import torch
-        self.model = torch.jit.load(self.model_path, map_location=self.device)
-        self.model.eval()
-
-    def preprocess(self, image_data):
-        import torch
-        # Convert numpy to tensor, normalize
-        tensor = torch.from_numpy(image_data).float() / 255.0
-        tensor = tensor.permute(2, 0, 1).unsqueeze(0)  # HWC -> NCHW
-        return tensor.to(self.device)
-
-    def infer(self, tensor):
-        import torch
-        with torch.no_grad():
-            return self.model(tensor)
-
-    def postprocess(self, output):
-        # Convert detections to list
-        return output[0].cpu().numpy().tolist()
-```
-
-### Usage with HORUS Node
-
-```python
-from horus import Node, Scheduler
-from horus.ml_utils import PyTorchInferenceNode
-
-def vision_tick(node):
-    if node.has_msg("camera.raw"):
-        frame = node.get("camera.raw")
-        result, latency_ms = detector.run_inference(frame)
-        node.send("detections", result)
-        print(f"Inference latency: {latency_ms:.2f}ms")
-
-detector = ObjectDetector()
-detector.load_model()
-
-vision_node = Node(
-    name="vision",
-    subs=["camera.raw"],
-    pubs=["detections"],
-    tick=vision_tick,
-    rate=30,
-)
-
-# Run
-scheduler = Scheduler()
-scheduler.add(vision_node, order=0)
-scheduler.run()
-```
-
-## TensorFlow Integration
-
-### TensorFlowInferenceNode
-
-```python
-from horus.ml_utils import TensorFlowInferenceNode
-
-class ImageClassifier(TensorFlowInferenceNode):
-    def __init__(self):
-        super().__init__(
-            model_path="models/mobilenet_v2",
-            input_topic="camera.raw",
-            output_topic="classification",
-            use_gpu=True
-        )
-
-    def load_model(self):
-        import tensorflow as tf
-        # Handles both SavedModel and .h5 formats
-        if self.model_path.endswith(".h5"):
-            self.model = tf.keras.models.load_model(self.model_path)
-        else:
-            self.model = tf.saved_model.load(self.model_path)
-
-    def preprocess(self, image_data):
-        import tensorflow as tf
-        img = tf.image.resize(image_data, [224, 224])
-        img = img / 255.0
-        return tf.expand_dims(img, 0)
-```
-
-## ONNX Integration
-
-### ONNXInferenceNode
-
-ONNX Runtime provides cross-platform inference for models exported from PyTorch, TensorFlow, and other frameworks.
-
-```python
-from horus.ml_utils import ONNXInferenceNode
 import numpy as np
+import horus
 
-class YOLODetector(ONNXInferenceNode):
-    def __init__(self):
-        super().__init__(
-            model_path="models/yolov8n.onnx",
-            input_topic="camera.raw",
-            output_topic="detections",
-            use_gpu=True  # Uses CUDAExecutionProvider if available
-        )
+# From an existing numpy array — copies once into the shared-memory pool.
+frame = np.zeros((480, 640, 3), dtype=np.uint8)
+t = horus.Tensor.from_numpy(frame)
 
-    def load_model(self):
-        import onnxruntime as ort
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if self.use_gpu else ["CPUExecutionProvider"]
-        )
-        self.session = ort.InferenceSession(self.model_path, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [o.name for o in self.session.get_outputs()]
+# Or allocate directly, without a numpy array to copy from.
+scores = horus.Tensor([1, 1000], dtype="float32")          # zero-filled
+scratch = horus.Tensor.empty([8, 3, 224, 224], dtype="float32")
 
-    def preprocess(self, image_data):
-        # Resize to 640x640, normalize, NCHW format
-        img = np.array(image_data).astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-        return np.expand_dims(img, 0)
-
-    def infer(self, data):
-        outputs = self.session.run(self.output_names, {self.input_name: data})
-        return outputs[0] if len(outputs) == 1 else outputs
+print(t.shape, t.dtype, t.device)      # [480, 640, 3] uint8 cpu
+print(t.numel, t.nbytes)               # 921600 921600
 ```
 
-## Preprocessing Utilities
+`Tensor(shape, dtype)`, `Tensor.zeros(...)` and `Tensor.empty(...)` all do the
+same thing today: they take a slot from pool `1` and hand it back zeroed (pool
+pages come from the OS already zeroed).
 
-The module includes common preprocessing functions:
+Accepted dtype strings: `float32`, `float64`, `float16`, `bfloat16`, `int8`,
+`int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `bool`.
+Aliases such as `f32`, `u8`, `int`, `half` work too. `bfloat16` allocates, but
+numpy has no bfloat16 type, so `.numpy()` on one gives you a raw 2-byte void
+array — keep bf16 conversion inside your framework.
 
-### ImageNet Preprocessing
+## numpy interop
 
-```python
-from horus.ml_utils import preprocess_image_imagenet
-
-# Standard ImageNet preprocessing for classification models
-preprocessed = preprocess_image_imagenet(
-    image,
-    target_size=(224, 224),
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225]
-)
-# Returns (1, C, H, W) normalized tensor
-```
-
-### YOLO Preprocessing
-
-```python
-from horus.ml_utils import preprocess_image_yolo
-
-# Letterbox preprocessing for YOLO models
-preprocessed, scale, pad_w, pad_h = preprocess_image_yolo(
-    image,
-    target_size=640
-)
-# Returns preprocessed image and transform params for postprocessing
-```
-
-### Non-Maximum Suppression
-
-```python
-from horus.ml_utils import nms
-
-# Filter overlapping detections
-keep_indices = nms(
-    boxes,      # (N, 4) as [x, y, w, h]
-    scores,     # (N,) confidence scores
-    iou_threshold=0.45
-)
-```
-
-## Performance Monitoring
-
-Track inference performance in real-time:
-
-```python
-from horus.ml_utils import PerformanceMonitor
-
-monitor = PerformanceMonitor(window_size=100)
-
-# In your inference loop
-for frame in frames:
-    result, latency_ms = model.run_inference(frame)
-    monitor.record(latency_ms)
-
-# Get statistics
-stats = monitor.get_stats()
-print(f"Avg latency: {stats['avg_latency_ms']:.2f}ms")
-print(f"P95 latency: {stats['p95_latency_ms']:.2f}ms")
-print(f"FPS: {stats['fps']:.1f}")
-
-# Or print summary
-monitor.print_stats()
-```
-
-### Available Statistics
-
-| Metric | Description |
-|--------|-------------|
-| `avg_latency_ms` | Average inference time |
-| `min_latency_ms` | Fastest inference |
-| `max_latency_ms` | Slowest inference |
-| `std_latency_ms` | Standard deviation |
-| `p50_latency_ms` | Median latency |
-| `p95_latency_ms` | 95th percentile |
-| `p99_latency_ms` | 99th percentile |
-| `fps` | Frames per second |
-
-## Zero-Copy Tensor Integration
-
-> **Note**: `TensorPool` and `TensorHandle` are not directly exposed in Python. They are used internally by the `Image`, `PointCloud`, and `DepthImage` domain types. Use these domain types for zero-copy data sharing.
-
-Combine ML utilities with HORUS domain types for zero-copy data sharing:
+`from_numpy()` copies **into** the pool once. `numpy()` goes the other way with
+no copy at all: you get an ndarray pointing at the same bytes.
 
 ```python
 import horus
-import numpy as np
 
-# Image supports zero-copy numpy access
-img = horus.Image(height=480, width=640, encoding="rgb8")
+t = horus.Tensor([2, 3], dtype="float32")
 
-# Zero-copy to numpy
-np_array = img.numpy()  # No copy!
+view = t.numpy()          # ndarray sharing the tensor's memory
+view[0, 0] = 42.0         # writes straight into the pool slot
+print(t.numpy()[0, 0])    # 42.0
 
-# Check GPU availability
-if horus.cuda_is_available():
-    print(f"CUDA devices: {horus.cuda_device_count()}")
+print(t.is_cpu(), t.is_contiguous())   # True True
+print(t[0])                            # indexing returns a numpy view: [42. 0. 0.]
 ```
 
-## Complete Example
+Because the ndarray aliases pool memory, the tensor keeps an extra reference on
+its slot for as long as it may be viewed — `t.refcount` reads `2` after the
+first `numpy()` call. The slot is returned when the `Tensor` is garbage
+collected, or immediately if you call `t.release()`.
+
+## Shape, slices, reductions
 
 ```python
-from horus import Node, Scheduler
-from horus.ml_utils import PyTorchInferenceNode, PerformanceMonitor
 import numpy as np
+import horus
 
-def camera_tick(node):
-    """Simulate camera frame"""
-    frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    node.send("camera.raw", frame)
+t = horus.Tensor.from_numpy(np.arange(12, dtype=np.float32).reshape(3, 4))
 
-detector = ObjectDetector()
-detector.load_model()
-monitor = PerformanceMonitor()
+print(t.reshape(4, 3).shape)     # [4, 3]
+print(t.flatten().shape)         # [12]
+print(t.unsqueeze(0).shape)      # [1, 3, 4]  (add a batch dimension)
+print(t.slice(0, 2).shape)       # [2, 4]     (first dimension only)
+print(t.T.shape)                 # (4, 3)     numpy array, not a Tensor
 
-def detector_tick(node):
-    if node.has_msg("camera.raw"):
-        frame = node.get("camera.raw")
-        result, latency = detector.run_inference(frame)
-        monitor.record(latency)
-        node.send("detections", result)
-
-        # Print stats every 100 frames
-        if monitor.get_stats()["samples"] % 100 == 0:
-            monitor.print_stats()
-
-
-def main():
-    camera = Node(name="camera", pubs=["camera.raw"], tick=camera_tick, rate=30)
-    detect = Node(name="detector", subs=["camera.raw"], pubs=["detections"], tick=detector_tick, rate=30)
-
-    scheduler = Scheduler()
-    scheduler.add(camera, order=0)
-    scheduler.add(detect, order=1)
-    scheduler.run()
-
-if __name__ == "__main__":
-    main()
+print(t.sum().tolist())          # [66.0]
+print(t.mean(dim=0).tolist())    # [4.0, 5.0, 6.0, 7.0]
+print(t.max().tolist())          # [11.0]
 ```
+
+`reshape`, `flatten`, `squeeze`, `unsqueeze`, `view` and `slice` return
+`Tensor`s over the same memory. `t.T` and `t[...]` hand you numpy arrays
+instead, because they delegate to numpy for the general case. Reductions
+(`sum`, `mean`, `min`, `max`, with an optional `dim=`) return a `Tensor`; call
+`.tolist()` to read the value in Python.
+
+## Changing dtype
+
+Convert through numpy and re-wrap:
+
+```python
+import numpy as np
+import horus
+
+t = horus.Tensor.from_numpy(np.zeros((2, 2), dtype=np.uint8))
+
+as_f32 = horus.Tensor.from_numpy(t.numpy().astype(np.float32) / 255.0)
+print(as_f32.dtype)   # float32
+```
+
+The `Tensor.astype()` / `to_float32()` / `to_float16()` / `to_uint8()` methods
+exist on the class but abort with `pyo3_runtime.PanicException: Already
+borrowed` in the current build (v0.2.2) — do not use them. The numpy round-trip
+above is the supported path, and it costs one copy, which is what a dtype change
+costs anyway.
+
+## Passing tensors between nodes
+
+Declare the topic's type as `horus.Tensor` on both sides. Only the 168-byte
+descriptor travels through the ring buffer; the pixels stay where they were
+written.
+
+```python
+import numpy as np
+import horus
+
+
+def capture(node):
+    frame = np.random.default_rng().integers(0, 255, (240, 320, 3), dtype=np.uint8)
+    node.send("camera.frames", horus.Tensor.from_numpy(frame))
+
+
+def consume(node):
+    t = node.recv("camera.frames")     # None when nothing new arrived
+    if t is None:
+        return
+    print("frame", t.shape, t.dtype, t.numpy().mean())
+
+
+camera = horus.Node(
+    name="camera", tick=capture, rate=10, order=0,
+    pubs=[horus.Pub("camera.frames", horus.Tensor)],
+)
+worker = horus.Node(
+    name="worker", tick=consume, rate=10, order=1,
+    subs=[horus.Sub("camera.frames", horus.Tensor)],
+)
+
+horus.run(camera, worker, duration=1.0)   # drop `duration` to run until Ctrl+C
+```
+
+**Run the subscriber at the publisher's rate.** Unlike ordinary message topics,
+a tensor topic delivers nothing to a subscriber that ticks slower than the
+publisher: with the camera at 10 Hz and the worker at 10 Hz the worker sees
+frames, at 30 Hz / 10 Hz `node.recv()` returns `None` on every tick. If your
+model can only keep up at 10 Hz, publish frames at 10 Hz — do not publish at 30
+and hope to sample them.
+
+If you need to move a descriptor yourself (across a process boundary you manage
+by hand, for instance), `t.to_descriptor()` gives you those 168 bytes and
+`horus.Tensor.from_descriptor(pool_id, blob)` reattaches to the same slot.
+
+## The pool
+
+Every tensor comes from a `TensorPool`. Create one explicitly when you want to
+bound how much shared memory a pipeline can hold:
+
+```python
+import horus
+
+pool = horus.TensorPool(pool_id=7, size_mb=64, max_slots=32)
+
+frame = pool.alloc((240, 320, 3), dtype="uint8")
+feats = pool.alloc([16, 16], dtype="float32")
+
+print(pool.stats())
+frame.release()                              # drop early instead of waiting for GC
+print(pool.stats()["allocated_slots"])       # 1
+```
+
+`stats()` returns a dict with `pool_id`, `pool_size`, `max_slots`,
+`allocated_slots`, `total_refcount`, `used_bytes` and `free_bytes`. Watch
+`allocated_slots` against `max_slots` — that is the limit you hit first in a
+pipeline that forgets to drop references. `used_bytes` is a high-water mark for
+the bump allocator, so it does not fall back to zero when slots are freed and
+reused.
+
+Pools are keyed by `pool_id` and live in shared memory, so a second process
+constructing `TensorPool(pool_id=7, ...)` opens the existing pool rather than
+making a new one. `horus.Tensor(...)`, `Tensor.zeros/empty/from_numpy` all use
+pool `1`, created on first use with default settings.
+
+## Devices: CPU today
+
+`Tensor` carries a device field and the string parser understands `cuda:N`, but
+the shipped wheel is built without CUDA, so there is nowhere to put a GPU
+tensor:
+
+```python
+t = horus.Tensor([2, 2])
+print(t.device, t.is_gpu)   # cpu False
+
+t.cuda()
+# RuntimeError: CUDA support not compiled. Rebuild with --features cuda
+#               or use torch.as_tensor(handle).cuda()
+
+pool.alloc((2, 2), device="cuda:0")
+# RuntimeError: Allocation failed: ... device mismatch: requested cuda:0
+#               but pool backend targets cpu (backend: mmap)
+```
+
+So GPU placement is your framework's job: keep the HORUS tensor on the CPU as
+the transport, and move the batch onto the device inside torch or ONNX Runtime.
+
+## Plugging in your model
+
+Here is the whole shape of it — HORUS moves frames in, your session runs, HORUS
+moves results out.
+
+```python
+import numpy as np
+import onnxruntime as ort
+import horus
+
+session = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+
+def capture(node):
+    """Stand-in for a real camera driver."""
+    frame = np.random.default_rng().integers(0, 255, (240, 320, 3), dtype=np.uint8)
+    node.send("camera.frames", horus.Tensor.from_numpy(frame))
+
+
+def detect(node):
+    t = node.recv("camera.frames")
+    if t is None:
+        return
+
+    frame = t.numpy()                                  # zero-copy HWC uint8 view
+    batch = frame.astype(np.float32) / 255.0           # your preprocessing
+    batch = np.ascontiguousarray(batch.transpose(2, 0, 1)[None])
+
+    out = session.run(None, {input_name: batch})[0]    # your model, your rules
+
+    node.send("detections", horus.Tensor.from_numpy(np.ascontiguousarray(out)))
+
+
+def plan(node):
+    d = node.recv("detections")
+    if d is not None:
+        print("detections", d.shape, d.dtype)
+
+
+camera = horus.Node(
+    name="camera", tick=capture, rate=10, order=0,
+    pubs=[horus.Pub("camera.frames", horus.Tensor)],
+)
+detector = horus.Node(
+    name="detector", tick=detect, rate=10, order=1,
+    subs=[horus.Sub("camera.frames", horus.Tensor)],
+    pubs=[horus.Pub("detections", horus.Tensor)],
+)
+planner = horus.Node(
+    name="planner", tick=plan, rate=10, order=2,
+    subs=[horus.Sub("detections", horus.Tensor)],
+)
+
+horus.run(camera, detector, planner, duration=1.0)
+```
+
+Two details worth copying: build the session **once** at import/startup, never
+inside `tick`; and pass `np.ascontiguousarray(...)` to `from_numpy` when your
+preprocessing produced a transposed or strided view, since the pool stores C-
+contiguous data.
+
+### PyTorch
+
+`Tensor.torch()` is the same bridge as `numpy()` — it calls
+`torch.as_tensor(handle)`, so you get a CPU torch tensor over the pool slot with
+no copy. `torch` must be installed in your environment; HORUS does not depend on
+it.
+
+```python
+import torch
+
+t = node.recv("camera.frames")
+shared = t.torch()                       # CPU tensor aliasing shared memory
+batch = shared.permute(2, 0, 1).unsqueeze(0).float().div(255).cuda()
+
+with torch.no_grad():
+    out = model(batch)
+```
+
+Use out-of-place ops (`.float()`, `.div()`) on that first view. An in-place op
+such as `.div_(255)` would write through into the pool slot, corrupting the
+frame every other subscriber is reading.
+
+## Measuring inference latency
+
+There is no `PerformanceMonitor` class; the scheduler already prints a per-node
+timing report (avg / p99 / max / overruns / deadline misses) on shutdown. For
+latency of the model call alone, time it yourself:
+
+```python
+import statistics
+import time
+from collections import deque
+
+latencies = deque(maxlen=100)
+
+
+def timed_infer(node):
+    t = node.recv("camera.frames")
+    if t is None:
+        return
+
+    start = time.perf_counter()
+    result = session.run(None, {input_name: preprocess(t.numpy())})
+    latencies.append((time.perf_counter() - start) * 1e3)
+
+    if len(latencies) == latencies.maxlen:
+        window = sorted(latencies)
+        print(f"avg {statistics.mean(window):.2f} ms  "
+              f"p95 {window[int(0.95 * len(window)) - 1]:.2f} ms  "
+              f"max {window[-1]:.2f} ms")
+        latencies.clear()
+```
+
+To have the scheduler police the budget instead of just reporting it, give the
+node a `budget=` and a `deadline=` (both in seconds — `budget=5 * horus.ms`
+reads well); overruns then show
+up in the timing report and can trigger the configured `on_miss` policy.
+
+## API summary
+
+`horus.Tensor`
+
+| Member | What it does |
+|---|---|
+| `Tensor(shape, dtype="float32")` | Allocate a zeroed tensor in pool 1 |
+| `Tensor.zeros(shape, dtype)` / `.empty(shape, dtype)` | Static forms of the same allocation |
+| `Tensor.from_numpy(array)` | Copy a numpy array into the pool |
+| `Tensor.from_descriptor(pool_id, bytes)` / `.to_descriptor()` | Reattach to / export a slot descriptor |
+| `.numpy()` / `.torch()` | Zero-copy views (torch requires `torch` installed) |
+| `.shape`, `.dtype`, `.device`, `.numel`, `.nbytes`, `.refcount`, `.is_gpu`, `.T` | Properties |
+| `.is_cpu()`, `.is_cuda()`, `.is_contiguous()` | Predicates |
+| `.reshape()`, `.view()`, `.flatten()`, `.squeeze()`, `.unsqueeze(dim)`, `.slice(start, end)` | Shape ops returning `Tensor` |
+| `.sum()`, `.mean()`, `.min()`, `.max()` (optional `dim=`), `.tolist()` | Reductions and readout |
+| `.cpu()` / `.cuda(device)` | CPU is a no-op clone; CUDA raises in this build |
+| `.release()` | Return the slot now |
+
+`horus.TensorPool`
+
+| Member | What it does |
+|---|---|
+| `TensorPool(pool_id=1, size_mb=1024, max_slots=1024)` | Create or open a pool |
+| `.alloc(shape, dtype="float32", device="cpu")` | Allocate a `Tensor` from this pool |
+| `.stats()` | Dict of pool occupancy counters |
+| `.pool_id` | The pool's id |
 
 ## See Also
 
 - [Python Bindings](/python/api/python-bindings) - Core Python API
-- [AI Integration](/development/ai-integration) - Rust-native ML inference
+- [AI Integration](/development/ai-integration) - End-to-end ML pipeline patterns
+- [Tensor Pool (Rust)](/rust/api/tensor-pool) - The pool implementation these tensors sit on

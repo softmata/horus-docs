@@ -1,0 +1,387 @@
+---
+title: "Node API"
+description: "Complete API reference for the HORUS C++ Node class — struct-based nodes, LambdaNode, lifecycle, pub/sub, and introspection"
+sidebar_section: "C++"
+order: 52
+---
+
+# Node API
+
+Every component in a HORUS system -- sensor drivers, controllers, planners, loggers -- is a node. The C++ API provides three styles: inline lambdas (simplest), `horus::Node` subclasses (most control), and `horus::LambdaNode` (declarative builder). All three are scheduled identically by the `Scheduler`.
+
+> **Rust**: See [`Node`](/rust/api/node) for the Rust trait. Same lifecycle semantics.
+> **Python**: See [`horus.Node`](/python/api) for the Python wrapper.
+
+```cpp
+// simplified
+#include <horus/node.hpp>
+#include <horus/messages.hpp>
+```
+
+---
+
+## Quick Reference -- Node (Base Class)
+
+| Method | Virtual | Default | Description |
+|--------|---------|---------|-------------|
+| `Node(string_view name)` | -- | -- | Constructor with node name |
+| `tick()` | **Pure** | -- | Main execution, called every cycle |
+| `init()` | Yes | no-op | One-time initialization at startup |
+| `enter_safe_state()` | Yes | no-op | Called by watchdog on critical timeout |
+| `on_shutdown()` | Yes | no-op | Cleanup on scheduler exit |
+| `name()` | No | -- | Returns the node name |
+| `advertise<T>(topic)` | No | -- | Create a `Publisher<T>*` (call in constructor) |
+| `subscribe<T>(topic)` | No | -- | Create a `Subscriber<T>*` (call in constructor) |
+| `publishers()` | No | -- | List of published topic names |
+| `subscriptions()` | No | -- | List of subscribed topic names |
+
+## Quick Reference -- LambdaNode
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `LambdaNode(string_view name)` | `LambdaNode` | Constructor with node name |
+| `.pub<T>(topic)` | `LambdaNode&` | Declare a publisher (builder) |
+| `.sub<T>(topic)` | `LambdaNode&` | Declare a subscriber (builder) |
+| `.on_tick(fn)` | `LambdaNode&` | Set tick callback: `void(LambdaNode&)` |
+| `.on_init(fn)` | `LambdaNode&` | Set init callback: `void(LambdaNode&)` |
+| `.send<T>(topic, msg)` | `void` | Send a message by copy (call from tick) |
+| `.recv<T>(topic)` | `optional<BorrowedSample<T>>` | Receive a message (call from tick) |
+| `.has_msg<T>(topic)` | `bool` | Check if a message is available |
+| `.name()` | `const string&` | Returns the node name |
+| `.publishers()` | `const vector<string>&` | List of published topic names |
+| `.subscriptions()` | `const vector<string>&` | List of subscribed topic names |
+
+---
+
+## Lifecycle
+
+The scheduler manages the node lifecycle in a strict order, regardless of which node style you use:
+
+```
+Construction --> Registration --> Init --> Tick Loop --> Shutdown
+     you          scheduler      once     repeated       once
+```
+
+1. **Construction** -- You create the node, declare topics, set initial state
+2. **Registration** -- `sched.add(node).build()` validates and registers the node
+3. **Initialization** -- On first `spin()` or `tick_once()`, the scheduler calls `init()` once
+4. **Tick Loop** -- Each cycle: feed watchdog, call `tick()`, measure timing, check budget/deadline
+5. **Shutdown** -- On Ctrl+C, SIGTERM, or `sched.stop()`: `on_shutdown()` called on each node
+
+If `tick()` throws an exception, HORUS catches it (`catch_unwind` equivalent via the FFI boundary). The node is marked unhealthy but the scheduler continues running other nodes.
+
+---
+
+## Style 1: horus::Node Subclass
+
+The most powerful style. Subclass `horus::Node`, override lifecycle methods, and create topics in the constructor. This is the C++ equivalent of Rust's `impl Node for T`.
+
+```cpp
+#include <horus/horus.hpp>
+
+class ObstacleDetector : public horus::Node {
+public:
+    ObstacleDetector() : Node("obstacle_detector") {
+        scan_sub_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        alert_pub_ = advertise<horus::msg::DiagnosticStatus>("safety.alert");
+    }
+
+    void init() override {
+        printf("[%s] initialized, min_range=%.2f\n", name().c_str(), min_range_);
+    }
+
+    void tick() override {
+        auto scan = scan_sub_->recv();
+        if (!scan) return;
+
+        for (int i = 0; i < 360; ++i) {
+            if (scan->get()->ranges[i] > 0.0f && scan->get()->ranges[i] < min_range_) {
+                auto alert = alert_pub_->loan();
+                alert->level = 1;  // WARN
+                alert_pub_->publish(std::move(alert));
+                return;
+            }
+        }
+    }
+
+    void enter_safe_state() override {
+        // Called by watchdog on timeout -- publish emergency alert
+        auto alert = alert_pub_->loan();
+        alert->level = 3;  // CRITICAL
+        alert_pub_->publish(std::move(alert));
+    }
+
+    void on_shutdown() override {
+        printf("[%s] shutting down\n", name().c_str());
+    }
+
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_sub_;
+    horus::Publisher<horus::msg::DiagnosticStatus>* alert_pub_;
+    float min_range_ = 0.3f;
+};
+```
+
+Register with the scheduler:
+
+```cpp
+ObstacleDetector detector;
+sched.add(detector)
+    .rate(50_hz)
+    .budget(5_ms)
+    .on_miss(horus::Miss::Skip)
+    .build();
+```
+
+### Topic Creation in Constructor
+
+Call `advertise<T>()` and `subscribe<T>()` in the constructor. They return raw pointers that the `Node` base class owns internally (via `shared_ptr`). The pointers are valid for the lifetime of the node:
+
+```cpp
+class MyNode : public horus::Node {
+public:
+    MyNode() : Node("my_node") {
+        // Create topics in constructor -- Node base class owns them
+        pub_ = advertise<horus::msg::CmdVel>("cmd");
+        sub_ = subscribe<horus::msg::Imu>("imu");
+    }
+
+    void tick() override {
+        auto imu = sub_->recv();
+        if (!imu) return;
+        pub_->send(horus::msg::CmdVel{0, 0.5f, 0.0f});
+    }
+
+private:
+    horus::Publisher<horus::msg::CmdVel>* pub_;
+    horus::Subscriber<horus::msg::Imu>* sub_;
+};
+```
+
+---
+
+## Style 2: Lambda Node (Inline)
+
+For simple nodes that do not need their own class. Pass a lambda to `NodeBuilder::tick()`:
+
+```cpp
+auto cmd_pub = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+auto scan_sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+
+sched.add("reactive_driver")
+    .rate(50_hz)
+    .budget(2_ms)
+    .init([&] {
+        printf("Reactive driver ready\n");
+    })
+    .tick([&] {
+        auto scan = scan_sub.recv();
+        if (!scan) return;
+
+        float front = scan->get()->ranges[0];
+        float speed = front > 1.0f ? 0.5f : 0.0f;
+        cmd_pub.send(horus::msg::CmdVel{0, speed, 0.0f});
+    })
+    .safe_state([&] {
+        cmd_pub.send(horus::msg::CmdVel{0, 0.0f, 0.0f});
+    })
+    .build();
+```
+
+Lambda nodes capture topics from the enclosing scope by reference. Topics must outlive the scheduler. Since topics are created on the scheduler, this is guaranteed.
+
+---
+
+## Style 3: LambdaNode (Declarative Builder)
+
+`LambdaNode` combines topic declaration and callbacks in a single builder chain. It is the C++ equivalent of Python's `horus.Node(name, pubs, subs, tick)`:
+
+```cpp
+auto controller = horus::LambdaNode("controller")
+    .sub<horus::msg::LaserScan>("lidar.scan")
+    .sub<horus::msg::Imu>("imu.data")
+    .pub<horus::msg::CmdVel>("motor.cmd")
+    .on_init([](horus::LambdaNode& self) {
+        printf("[%s] ready\n", self.name().c_str());
+    })
+    .on_tick([](horus::LambdaNode& self) {
+        auto scan = self.recv<horus::msg::LaserScan>("lidar.scan");
+        if (!scan) return;
+
+        float speed = scan->get()->ranges[0] > 1.0f ? 0.3f : 0.0f;
+        self.send("motor.cmd", horus::msg::CmdVel{0, speed, 0.0f});
+    });
+
+sched.add(controller)
+    .rate(50_hz)
+    .budget(5_ms)
+    .build();
+```
+
+### LambdaNode Runtime API
+
+Inside the `on_tick` callback, use `self.send()`, `self.recv()`, and `self.has_msg()`:
+
+```cpp
+.on_tick([](horus::LambdaNode& self) {
+    // Check before consuming
+    if (self.has_msg<horus::msg::Imu>("imu.data")) {
+        auto imu = self.recv<horus::msg::Imu>("imu.data");
+        // process...
+    }
+
+    // Send by copy (simple, slight overhead for large messages)
+    self.send("motor.cmd", horus::msg::CmdVel{0, 0.5f, 0.1f});
+})
+```
+
+---
+
+## Introspection
+
+Both `Node` and `LambdaNode` expose their topic lists for monitoring and debugging:
+
+```cpp
+// Node subclass
+ObstacleDetector detector;
+for (const auto& topic : detector.publishers()) {
+    printf("publishes: %s\n", topic.c_str());
+}
+for (const auto& topic : detector.subscriptions()) {
+    printf("subscribes: %s\n", topic.c_str());
+}
+
+// LambdaNode
+auto node = horus::LambdaNode("nav")
+    .pub<horus::msg::CmdVel>("cmd")
+    .sub<horus::msg::Odometry>("odom");
+
+// node.publishers()   -> ["cmd"]
+// node.subscriptions() -> ["odom"]
+```
+
+The scheduler uses these lists for the topic graph, `horus monitor`, and BlackBox flight recorder.
+
+---
+
+## Panic Safety and Error Handling
+
+HORUS wraps every `tick()` call at the FFI boundary. If a C++ node throws an unhandled exception:
+
+1. The exception is caught at the FFI boundary (equivalent to Rust's `catch_unwind`)
+2. The node is marked as **unhealthy**
+3. Other nodes continue running normally
+4. The watchdog may call `enter_safe_state()` depending on configuration
+
+This means a bug in one node does not crash the entire system:
+
+```cpp
+void tick() override {
+    auto scan = scan_sub_->recv();
+    if (!scan) return;
+
+    // If this throws, the node is isolated -- other nodes keep running
+    process_scan(*scan);
+}
+```
+
+Best practice: handle errors locally within `tick()` rather than letting exceptions propagate.
+
+---
+
+## Common Patterns
+
+### Stateful Node with Configuration
+
+```cpp
+class PidController : public horus::Node {
+public:
+    PidController(float kp, float ki, float kd)
+        : Node("pid_controller"), kp_(kp), ki_(ki), kd_(kd)
+    {
+        error_sub_ = subscribe<horus::msg::Pose2D>("nav.error");
+        cmd_pub_   = advertise<horus::msg::CmdVel>("motor.cmd");
+    }
+
+    void tick() override {
+        auto error = error_sub_->recv();
+        if (!error) return;
+
+        float e = static_cast<float>(error->get()->x);
+        integral_ += e;
+        float derivative = e - last_error_;
+        last_error_ = e;
+
+        float output = kp_ * e + ki_ * integral_ + kd_ * derivative;
+
+        auto cmd = cmd_pub_->loan();
+        cmd->linear = output;
+        cmd->angular = 0.0f;
+        cmd_pub_->publish(std::move(cmd));
+    }
+
+    void enter_safe_state() override {
+        // Zero output on safety event
+        cmd_pub_->send(horus::msg::CmdVel{0, 0.0f, 0.0f});
+        integral_ = 0.0f;
+    }
+
+private:
+    horus::Subscriber<horus::msg::Pose2D>* error_sub_;
+    horus::Publisher<horus::msg::CmdVel>* cmd_pub_;
+    float kp_, ki_, kd_;
+    float integral_ = 0.0f;
+    float last_error_ = 0.0f;
+};
+
+// Usage:
+PidController pid(1.0f, 0.01f, 0.1f);
+sched.add(pid).rate(100_hz).budget(500_us).build();
+```
+
+### Multiple Nodes Sharing Topics
+
+Nodes communicate through shared topics. Create topics on the scheduler, then reference them from multiple nodes:
+
+```cpp
+auto odom_pub = sched.advertise<horus::msg::Odometry>("odom");
+auto odom_sub = sched.subscribe<horus::msg::Odometry>("odom");
+auto cmd_pub  = sched.advertise<horus::msg::CmdVel>("cmd");
+
+sched.add("localizer")
+    .rate(100_hz)
+    .tick([&] {
+        auto odom = odom_pub.loan();
+        odom->pose.x = compute_x();
+        odom->pose.y = compute_y();
+        odom_pub.publish(std::move(odom));
+    })
+    .build();
+
+sched.add("controller")
+    .rate(50_hz)
+    .tick([&] {
+        auto odom = odom_sub.recv();
+        if (!odom) return;
+        cmd_pub.send(horus::msg::CmdVel{0, 0.3f, 0.0f});
+    })
+    .build();
+```
+
+### Choosing a Node Style
+
+| Style | Best For | Topic Creation | State |
+|-------|----------|---------------|-------|
+| Lambda (inline) | Simple nodes, prototyping | On scheduler | Captured variables |
+| `horus::Node` subclass | Complex nodes, reusable components | In constructor | Member variables |
+| `horus::LambdaNode` | Declarative, Python-like ergonomics | Builder chain | Via callback closure |
+
+---
+
+## See Also
+
+- [Scheduler API](/cpp/api/scheduler) -- Node registration and execution
+- [Publisher and Subscriber API](/cpp/api/topic) -- Zero-copy messaging details
+- [Services and Actions API](/cpp/api/services) -- RPC and long-running tasks
+- [C++ Real-Time Guide](/cpp/realtime) -- Budget, deadline, miss policies
+- [C++ API Overview](/cpp/api) -- All classes at a glance

@@ -14,8 +14,8 @@ Complete Python examples demonstrating HORUS capabilities.
 |---------|-------------|--------------|
 | [Basic Node](#basic-node) | Simple sensor-to-motor node | Node, `get()`, `send()` |
 | [Typed Topics](#typed-pub-sub) | Direct pub/sub with typed messages | Topic, CmdVel, LaserScan |
-| [Async Node](#async-node) | Non-blocking I/O with async/await | `AsyncNode`, `AsyncTopic` |
-| [ML Inference](#ml-inference) | ONNX model inference pipeline | `ONNXInferenceNode`, `PerformanceMonitor` |
+| [Async Node](#async-node) | I/O-bound work with async/await | `Node(tick=async def)`, `asyncio` |
+| [ML Inference](#ml-inference) | ONNX inference over a Tensor topic | `horus.Tensor`, `onnxruntime` |
 | [Cross-Language](#cross-language-communication) | Python-Rust communication | Typed topics, shared memory |
 | [Multi-Node System](#multi-node-system) | Scheduler with multiple nodes | Scheduler, run() |
 | [Sensor Processing](#sensor-processing-pipeline) | LaserScan obstacle avoidance | Topic, LaserScan, CmdVel |
@@ -32,7 +32,7 @@ from horus import Node, run
 def controller(node):
     """Simple obstacle avoidance"""
     if node.has_msg("sensor.distance"):
-        distance = node.get("sensor.distance")
+        distance = node.recv("sensor.distance")
         if distance < 0.5:
             node.send("motor.cmd", {"linear": 0.0, "angular": 0.5})
         else:
@@ -91,122 +91,76 @@ shm_topic = Topic(CmdVel, backend="mpmc_shm")
 
 ## Async Node
 
-Non-blocking I/O with `AsyncNode` and `AsyncTopic`:
+There is no `AsyncNode` class — pass an `async def` function as a node's `tick` and HORUS
+runs it on its async I/O executor. Pair a slow async producer with a fast sync consumer:
 
 ```python
+import asyncio
 import horus
 
-class WeatherFetcher(horus.AsyncNode):
-    """Fetch data from HTTP API without blocking"""
+async def fetch_weather(node):
+    """I/O-bound: await the network instead of blocking on it."""
+    await asyncio.sleep(0.2)             # stands in for an aiohttp GET
+    node.send("weather", {"temp": 21.5})
 
-    def __init__(self):
-        super().__init__()
+def log_weather(node):
+    """Sync tick — keeps its own rate no matter how slow the fetch is."""
+    if node.has_msg("weather"):
+        weather = node.recv("weather")
+        node.log_info(f"Temperature: {weather['temp']}C")
 
-    async def setup(self):
-        self.weather_pub = horus.AsyncTopic("weather", dict)
-
-    async def tick(self):
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.example.com/weather") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await self.weather_pub.send(data)
-        await horus.sleep(60.0)  # Fetch every 60 seconds
-
-    async def shutdown(self):
-        print("Weather fetcher stopping")
-
-
-class WeatherLogger(horus.AsyncNode):
-    """Log weather data to database"""
-
-    def __init__(self):
-        super().__init__()
-
-    async def setup(self):
-        self.weather_sub = horus.AsyncTopic("weather", dict)
-
-    async def tick(self):
-        weather = await self.weather_sub.try_recv()
-        if weather:
-            print(f"Temperature: {weather.get('temp')}°C")
-
-
-# Run both nodes together
-scheduler = horus.Scheduler()
-scheduler.add(WeatherFetcher(), order=0)
-scheduler.add(WeatherLogger(), order=1)
-scheduler.run()
+horus.run(
+    # rate= sets the polling interval; there is no horus.sleep().
+    horus.Node(name="fetcher", tick=fetch_weather, rate=2, order=0, pubs=["weather"]),
+    horus.Node(name="logger", tick=log_weather, rate=10, order=1, subs=["weather"]),
+    duration=2.0,
+)
 ```
+
+An async tick blocks until its coroutine finishes, so `rate` is an upper bound for that node.
+The sync `logger` is unaffected and keeps its full 10 Hz. See
+[Async Nodes](/python/api/async-nodes) for the details.
 
 ---
 
 ## ML Inference
 
-Using ONNX models with the ML utilities:
+HORUS ships no model-loading or inference helpers — `horus.ml_utils` does not
+exist. Inference is your own `onnxruntime` / `torch` code; HORUS carries the
+data. Use `horus.Tensor` so frames cross shared memory without a copy.
 
 ```python
 import numpy as np
-from horus.ml_utils import ONNXInferenceNode, PerformanceMonitor
+import horus
 
-class PoseEstimationNode(ONNXInferenceNode):
-    """Human pose estimation using ONNX model"""
+session = None  # your onnxruntime.InferenceSession, loaded in init
 
-    def __init__(self, model_path="models/movenet_lightning.onnx"):
-        super().__init__(
-            model_path=model_path,
-            input_topic="camera.raw",
-            output_topic="poses"
-        )
-        self.monitor = PerformanceMonitor(window_size=30)
+def estimate(node):
+    frame = node.recv("camera.raw")
+    if frame is None:
+        return
+    # frame is a horus.Tensor: view it as numpy without copying
+    img = frame.numpy()
+    outputs = session.run(None, {"input": img[None, ...]})
+    node.send("poses", horus.Tensor.from_numpy(np.asarray(outputs[0])))
 
-    def load_model(self):
-        import onnxruntime as ort
-        providers = ['CPUExecutionProvider']
-        self.session = ort.InferenceSession(self.model_path, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [o.name for o in self.session.get_outputs()]
-
-    def preprocess(self, image_data):
-        """Resize and normalize for pose model"""
-        img = np.array(image_data).astype(np.float32)
-        img = (img / 127.5) - 1.0  # Normalize to [-1, 1]
-        img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-        return np.expand_dims(img, 0)  # Add batch dimension
-
-    def infer(self, preprocessed):
-        return self.session.run(None, {self.input_name: preprocessed})[0]
-
-    def postprocess(self, output):
-        """Parse keypoints from model output"""
-        keypoints = []
-        for i in range(17):  # 17 body keypoints
-            y, x, conf = output[0, i, 0], output[0, i, 1], output[0, i, 2]
-            if conf > 0.3:
-                keypoints.append({'id': i, 'x': float(x), 'y': float(y), 'confidence': float(conf)})
-        return keypoints
+node = horus.Node(
+    name="pose_estimation",
+    tick=estimate,
+    subs="camera.raw",
+    pubs="poses",
+    rate=30,
+    compute=True,   # inference is CPU-bound
+)
 ```
 
-**Performance monitoring:**
-```python
-from horus.ml_utils import PerformanceMonitor
+<Callout type="warn">
+Run the subscriber at the publisher's rate. A Tensor topic drops everything
+for a subscriber ticking slower than the publisher — at 20 Hz publish / 10 Hz
+subscribe, measured delivery is zero. See
+[Python Tensors for ML](/python/library/ml-utilities).
+</Callout>
 
-monitor = PerformanceMonitor(window_size=100)
-
-# Record inference latencies
-monitor.record(12.5)  # ms
-monitor.record(13.1)
-
-# Get statistics
-stats = monitor.get_stats()
-print(f"Avg: {stats['avg_latency_ms']:.1f}ms, P95: {stats['p95_latency_ms']:.1f}ms, FPS: {stats['fps']:.0f}")
-
-# Pretty print
-monitor.print_stats()
-```
-
----
 
 ## Cross-Language Communication
 
@@ -258,7 +212,7 @@ def sensor_tick(node):
 # Controller node - processes sensor data, outputs commands
 def controller_tick(node):
     if node.has_msg("sensor.distance"):
-        dist = node.get("sensor.distance")
+        dist = node.recv("sensor.distance")
         if dist < 0.5:
             node.send("cmd_vel", {"linear": 0.0, "angular": 0.5})
         else:
@@ -267,7 +221,7 @@ def controller_tick(node):
 # Logger node - records data
 def logger_tick(node):
     if node.has_msg("cmd_vel"):
-        cmd = node.get("cmd_vel")
+        cmd = node.recv("cmd_vel")
         print(f"Command: {cmd}")
 
 sensor = Node(name="sensor", pubs=["sensor.distance"], tick=sensor_tick, rate=30)

@@ -1,0 +1,337 @@
+---
+title: "Advanced Examples"
+description: "Multi-process pipelines, cross-language systems, RT control, and production patterns"
+sidebar_section: "C++"
+order: 71
+---
+
+# Advanced Examples
+
+Production-grade patterns for real robots.
+
+---
+
+## Example 1: Multi-Process Robot
+
+Three separate binaries communicating over SHM.
+
+### sensor_driver.cpp
+
+```cpp
+#include <horus/horus.hpp>
+#include <cmath>   // std::sin
+using namespace horus::literals;
+
+class LidarDriver : public horus::Node {
+public:
+    LidarDriver() : Node("lidar") {
+        pub_ = advertise<horus::msg::LaserScan>("lidar.scan");
+    }
+    void tick() override {
+        auto scan = pub_->loan();
+        for (int i = 0; i < 360; i++)
+            scan->ranges[i] = 2.0f + 0.3f * std::sin(i * 0.1f + tick_ * 0.05f);
+        scan->angle_min = 0.0f;
+        scan->angle_max = 6.28318f;
+        pub_->publish(std::move(scan));
+        tick_++;
+    }
+private:
+    horus::Publisher<horus::msg::LaserScan>* pub_;
+    int tick_ = 0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(10_hz).name("lidar_proc");
+    LidarDriver lidar;
+    sched.add(lidar).order(0).build();
+    sched.spin();
+}
+```
+
+### controller.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class Controller : public horus::Node {
+public:
+    Controller() : Node("controller") {
+        scan_ = subscribe<horus::msg::LaserScan>("lidar.scan");
+        cmd_  = advertise<horus::msg::CmdVel>("cmd_vel");
+    }
+    void tick() override {
+        auto scan = scan_->recv();
+        if (!scan) return;
+        float min_r = 999.0f;
+        for (int i = 0; i < 360; i++)
+            if (scan->get()->ranges[i] > 0.01f && scan->get()->ranges[i] < min_r)
+                min_r = scan->get()->ranges[i];
+        horus::msg::CmdVel cmd{};
+        cmd.linear = min_r > 0.5f ? 0.3f : 0.0f;
+        cmd.angular = min_r > 0.5f ? 0.0f : 0.5f;
+        cmd_->send(cmd);
+    }
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        cmd_->send(stop);
+    }
+private:
+    horus::Subscriber<horus::msg::LaserScan>* scan_;
+    horus::Publisher<horus::msg::CmdVel>* cmd_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(50_hz).name("ctrl_proc").prefer_rt();
+    Controller ctrl;
+    sched.add(ctrl).order(0).budget(5_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.spin();
+}
+```
+
+### Run
+
+```bash
+# Terminal 1 (start subscriber first)
+LD_LIBRARY_PATH=target/debug ./controller &
+sleep 0.5
+# Terminal 2
+LD_LIBRARY_PATH=target/debug ./sensor_driver &
+# Terminal 3
+horus topic list    # shows lidar.scan + cmd_vel
+horus topic echo cmd_vel
+```
+
+---
+
+## Example 2: Cross-Language Pipeline
+
+C++ sensor + Python AI + C++ motor control.
+
+### cpp_sensor.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(30_hz);
+
+    auto pub = sched.advertise<horus::msg::CmdVel>("camera.detections");
+
+    sched.add("camera")
+        .tick([&] {
+            horus::msg::CmdVel det{};
+            det.linear = 0.95f;   // detection confidence
+            det.angular = 1.0f;   // class: person
+            pub.send(det);
+        })
+        .build();
+
+    sched.spin();
+}
+```
+
+### python_ai.py
+
+```python
+import horus
+from horus._horus import Topic, CmdVel
+
+src = Topic(CmdVel)  # reads "cmd_vel"
+
+def ai_tick(node):
+    det = node.recv("camera.detections")
+    if det is not None and det.linear > 0.8:
+        # High-confidence detection → slow down
+        node.send("ai.decision", CmdVel(linear=0.1, angular=0.0))
+    else:
+        node.send("ai.decision", CmdVel(linear=0.3, angular=0.0))
+
+horus.run(
+    horus.Node(name="ai", subs=["camera.detections"],
+               pubs=["ai.decision"], tick=ai_tick, rate=10)
+)
+```
+
+### cpp_motor.cpp
+
+```cpp
+#include <horus/horus.hpp>
+using namespace horus::literals;
+
+class MotorCtrl : public horus::Node {
+public:
+    MotorCtrl() : Node("motor") {
+        sub_ = subscribe<horus::msg::CmdVel>("ai.decision");
+        pub_ = advertise<horus::msg::CmdVel>("motor.pwm");
+    }
+    void tick() override {
+        auto cmd = sub_->recv();
+        if (!cmd) return;
+        // Scale to PWM range
+        horus::msg::CmdVel pwm{};
+        pwm.linear = cmd->get()->linear * 255.0f;
+        pub_->send(pwm);
+    }
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        pub_->send(stop);
+    }
+private:
+    horus::Subscriber<horus::msg::CmdVel>* sub_;
+    horus::Publisher<horus::msg::CmdVel>* pub_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz).prefer_rt();
+    MotorCtrl motor;
+    sched.add(motor).order(0).budget(2_ms).on_miss(horus::Miss::SafeMode).build();
+    sched.spin();
+}
+```
+
+### Run all three
+
+```bash
+./cpp_motor &        # C++ motor (subscriber — start first)
+python3 python_ai.py &  # Python AI
+./cpp_sensor &       # C++ sensor (publisher)
+
+horus topic list     # 3 topics from 3 languages
+horus node list      # 3 nodes with different PIDs
+```
+
+---
+
+## Example 3: 1 kHz RT Control Loop
+
+Production motor control with jitter tracking.
+
+```cpp
+#include <horus/horus.hpp>
+#include <chrono>
+#include <cstdio>
+using namespace horus::literals;
+
+class RtMotor : public horus::Node {
+public:
+    RtMotor() : Node("rt_motor") {
+        cmd_ = subscribe<horus::msg::CmdVel>("motor.target");
+        pwm_ = advertise<horus::msg::CmdVel>("motor.pwm");
+    }
+
+    void init() override {
+        last_ = std::chrono::steady_clock::now();
+    }
+
+    void tick() override {
+        auto now = std::chrono::steady_clock::now();
+        auto dt = std::chrono::duration_cast<std::chrono::microseconds>(now - last_).count();
+        last_ = now;
+
+        if (dt > max_jitter_) max_jitter_ = dt;
+        ticks_++;
+
+        auto cmd = cmd_->recv();
+        double target = cmd ? cmd->get()->linear : 0.0;
+
+        // PID
+        double error = target - velocity_;
+        integral_ += error * 0.001;
+        double output = 2.0 * error + 0.1 * integral_;
+        velocity_ += output * 0.001;  // simulate dynamics
+
+        horus::msg::CmdVel pwm{};
+        pwm.linear = static_cast<float>(output);
+        pwm_->send(pwm);
+
+        if (ticks_ % 1000 == 0) {
+            std::printf("[RT] max_jitter=%ldus ticks=%d vel=%.3f\n",
+                max_jitter_, ticks_, velocity_);
+        }
+    }
+
+    void enter_safe_state() override {
+        horus::msg::CmdVel stop{};
+        pwm_->send(stop);
+        std::printf("[RT] SAFE STATE — max jitter was %ldus\n", max_jitter_);
+        horus::blackbox::record("rt_motor",
+            "Safe state, max_jitter=" + std::to_string(max_jitter_) + "us");
+    }
+
+private:
+    horus::Subscriber<horus::msg::CmdVel>* cmd_;
+    horus::Publisher<horus::msg::CmdVel>* pwm_;
+    std::chrono::steady_clock::time_point last_;
+    double velocity_ = 0, integral_ = 0;
+    long max_jitter_ = 0;
+    int ticks_ = 0;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(1000_hz).name("rt_demo").prefer_rt();
+
+    RtMotor motor;
+    sched.add(motor)
+        .order(0)
+        .budget(500_us)
+        .deadline(900_us)
+        .on_miss(horus::Miss::SafeMode)
+        .pin_core(3)
+        .priority(95)
+        .build();
+
+    sched.spin();
+}
+```
+
+---
+
+## Example 4: Service + Action
+
+Request/response RPC and long-running navigation goal.
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstring>
+#include <cstdio>
+
+int main() {
+    // Service: add two numbers
+    horus::ServiceServer server("calc.add");
+    server.set_handler([](const uint8_t* req, size_t len,
+                          uint8_t* res, size_t* res_len) -> bool {
+        int a = 0, b = 0;
+        std::sscanf(reinterpret_cast<const char*>(req), R"({"a":%d,"b":%d})", &a, &b);
+        *res_len = std::snprintf(reinterpret_cast<char*>(res), 4096,
+                                  R"({"sum":%d})", a + b);
+        return true;
+    });
+
+    horus::ServiceClient client("calc.add");
+    auto resp = client.call(R"({"a":10,"b":32})", std::chrono::milliseconds(1000));
+    if (resp) std::printf("10 + 32 = %s\n", resp->c_str());
+
+    // Action: navigate to goal
+    horus::ActionClient nav("navigate");
+    auto goal = nav.send_goal(R"({"x":5.0,"y":3.0})");
+    std::printf("Goal %lu: %s\n", goal.id(),
+        goal.is_active() ? "active" : "done");
+    goal.cancel();
+    std::printf("Canceled: %s\n",
+        goal.status() == horus::GoalStatus::Canceled ? "yes" : "no");
+}
+```
+
+## See Also
+
+- [Basic Examples](/cpp/examples/basic) — hello world, pub/sub, params, TF
+- [Tutorial 3: Full Robot](/tutorials/03-full-robot-cpp) — 6-node system
+- [Cross-Language Interop](/tutorials/cross-language-interop) — C++ + Rust + Python
