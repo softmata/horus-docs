@@ -6,7 +6,7 @@ order: 25
 
 # POD Types and Zero-Serialization
 
-When you use `Topic<T>`, HORUS **automatically detects** whether your message type is POD (Plain Old Data). POD types bypass serialization entirely — messages are transferred as raw bytes via direct memory copy, achieving **~50ns latency** instead of ~167ns with bincode serialization.
+When you use `Topic<T>`, HORUS **automatically detects** whether your message type is POD (Plain Old Data). POD types bypass serialization entirely — messages are transferred as raw bytes via direct memory copy, achieving **~50ns latency** on the POD shared-memory backend instead of paying a bincode encode and decode on every message.
 
 You don't need a separate API. The same `Topic::new()` call automatically selects the fastest path for your type.
 
@@ -26,7 +26,7 @@ use horus::prelude::*;
 let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 cmd_topic.send(CmdVel::new(1.0, 0.5));
 
-// Non-POD type - auto-detected, uses bincode serialization (~167ns cross-process)
+// Non-POD type - auto-detected, uses bincode serialization (encode/decode per message)
 let log_topic: Topic<String> = Topic::new("log")?;
 log_topic.send("Motor started".to_string());
 ```
@@ -38,9 +38,11 @@ POD detection affects cross-process performance:
 | Type | Cross-Process Latency | Notes |
 |------|----------------------|-------|
 | POD (e.g. `CmdVel`, `Imu`) | ~50-85ns | Zero-serialization, raw memory copy |
-| Non-POD (e.g. `String`, `Vec`) | ~167ns | Bincode serialization |
+| Non-POD (e.g. `String`, `Vec`) | Not benchmarked | Same shared-memory ring, plus bincode encode/decode per message |
 
-A single `Topic` instance that both sends and receives (`role = Both`) uses an in-process fast path that skips shared memory entirely. Communication between two separate `Topic` instances — even inside the same process — still goes through the shared-memory ring, so the POD/non-POD difference applies there too.
+The POD range is the per-backend design figure for the shared-memory backends the selector can pick for a POD type (~50ns broadcast, ~85ns single-producer/single-consumer). The measured end-to-end median for a 16-byte `CmdVel` on the reference machine is 75 ns — see [Benchmarks](/performance/benchmarks).
+
+A single `Topic` instance that both sends and receives (`role = Both`) takes an inlined fast path: it moves the value with a plain typed write into the ring, skipping the backend's function-pointer dispatch and the per-slot sequence flags, so nothing is serialized for either kind of type. The ring itself is still shared memory — every HORUS topic is SHM-backed. Communication between two separate `Topic` instances — even inside the same process — goes through the full backend path, so the POD/non-POD difference applies there too.
 
 ## Built-in POD Messages
 
@@ -140,7 +142,7 @@ let estop: Topic<EmergencyStop> = Topic::new("emergency_stop")?;
 
 ## Custom POD Messages
 
-Any `#[repr(C)]` type with no `Drop` impl and a size greater than one byte already takes the fast path automatically — no trait needed. Implementing `PodMessage` is optional: it adds bytemuck-backed layout guarantees plus the `as_bytes()`, `from_bytes()` and `zeroed()` helpers, and is the right choice for types whose validity invariants auto-detection cannot see (enums with limited discriminants, `NonZeroU32`). Most users should reach for the [`message!` macro](/rust-guide/topics#custom-message-types) instead of implementing it by hand.
+Any `#[repr(C)]` type with no `Drop` impl and a size greater than one byte already takes the fast path automatically — no trait needed. Implementing `PodMessage` is optional: it adds bytemuck-backed layout guarantees plus the `as_bytes()`, `from_bytes()` and `zeroed()` helpers. It does not change which path `Topic<T>` picks — auto-detection alone decides that — but it is worth adding for types whose validity invariants auto-detection cannot see (enums with limited discriminants, `NonZeroU32`): those slip past auto-detection onto the raw-byte path regardless, and the trait's required `bytemuck::Pod` bound is what turns the mistake into a compile error instead of silent UB. Most users should reach for the [`message!` macro](/rust-guide/topics#custom-message-types) instead of implementing it by hand.
 
 ### Requirements for Implementing `PodMessage`
 
@@ -210,7 +212,7 @@ Topic<HashMap<K,V>>  // HashMap has Drop
 
 A few built-in messages fall in this group for the same reason — `TactileArray`, for example, carries a `Vec<f32>` of taxel readings, so it travels the serialization path rather than the raw-memory one.
 
-Non-POD types use bincode serialization through shared memory. This is still fast (~167ns cross-process) but ~3x slower than the POD path. For most applications, this difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
+Non-POD types use bincode serialization through shared memory. The transport is the same shared-memory ring; the extra cost is an encode on every `send()` and a decode on every `recv()`, so the serialized path is slower than the POD path. HORUS's latency suite times POD messages only, so there is no published figure for it — treat it as "slower, unmeasured" rather than assuming a fixed number. For most applications the difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
 
 ## See Also
 

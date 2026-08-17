@@ -9,21 +9,21 @@ order: 6
 ## Key Takeaways
 
 After reading this guide, you will understand:
-- How Topic provides ultra-fast pub/sub communication (~3ns to ~167ns latency) with automatic optimization
+- How Topic provides ultra-fast pub/sub communication (~75ns in-process, ~200-300ns cross-process) with automatic optimization
 - The send() and recv() methods for publishing and subscribing to typed topics
 - Communication patterns (one-to-one, one-to-many, many-to-one, many-to-many) for different architectures
 - When to use Topic for real-time, single-machine communication vs network-based messaging
 
-The Topic is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **automatic optimization** — from **~3ns** (same-thread) to **~167ns** (cross-process, many-to-many) depending on topology.
+The Topic is HORUS's ultra-low latency publish-subscribe (pub/sub) communication system. It enables nodes to exchange messages through shared memory IPC with **automatic optimization** — **~75ns** median for a 16-byte message between threads in one process, **~200-300ns** between separate processes, depending on topology.
 
 ## What is a Topic?
 
 A `Topic<T>` is a **typed communication channel** that connects publishers and subscribers. The system automatically detects the optimal backend based on:
 
-- **Where** participants are (same thread, same process, or different processes)
 - **How many** publishers and subscribers exist
+- **Whether** the message type is simple and fixed-size or needs serialization
 
-You just call `send()` and `recv()` — HORUS handles the rest.
+You just call `send()` and `recv()` — HORUS handles the rest. Participants may share a thread, share a process, or live in different processes; every topic is shared-memory backed either way, so location changes neither the API nor the backend choice.
 
 ### Key Features
 
@@ -39,14 +39,14 @@ You just call `send()` and `recv()` — HORUS handles the rest.
 
 HORUS auto-selects the fastest communication path based on your topology. You never need to configure this — it happens automatically when participants call `send()` or `recv()`.
 
-| Scenario | Latency |
-|----------|---------|
-| Same thread | ~3ns |
-| Same process, 1:1 | ~18ns |
-| Same process, many-to-many | ~36ns |
-| Cross-process | ~50-167ns |
+| Topology | Ring HORUS selects | When the ring is full |
+|----------|--------------------|-----------------------|
+| 1 publisher, 1 subscriber | point-to-point | FIFO — the newest message is rejected |
+| Many publishers, 1 subscriber | multi-producer point-to-point | FIFO — the newest message is rejected |
+| 1 publisher, many subscribers | broadcast | latest-wins — the oldest slot is overwritten |
+| Many publishers, many subscribers | broadcast | latest-wins — the oldest slot is overwritten |
 
-> **Note**: Latencies are for small messages (16B). Larger messages scale linearly with size.
+The message type matters too: simple fixed-size types get a zero-copy ring, everything else gets a serializing one. The rings are internal — there is no backend type to name, import or select. See [Performance](#performance) for measured latency.
 
 If topology changes (e.g., a second subscriber joins), HORUS automatically migrates to the optimal path without dropping messages.
 
@@ -140,7 +140,7 @@ Topics use **local shared memory** for ultra-fast communication between processe
 let topic: Topic<SensorData> = Topic::new("sensors")?;
 ```
 
-- **Performance**: ~3ns to ~167ns depending on topology
+- **Performance**: ~75ns median for a 16-byte message in one process, ~200-300ns across processes
 - **Use case**: All nodes on same machine
 - **Characteristics**: Ultra-fast, deterministic, zero-copy
 
@@ -156,7 +156,7 @@ For multi-machine communication, HORUS supports zero-configuration peer discover
 pub fn send(&self, msg: T)
 ```
 
-Publishes a message to the topic. Fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (1 publisher, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead. Use `try_send()` to detect the drop, or `send_blocking(msg, timeout)` for guaranteed delivery on critical topics.
+Publishes a message to the topic. Fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (any number of publishers, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead. Use `try_send()` to detect the drop, or `send_blocking(msg, timeout)` to wait for room on critical topics.
 
 ```rust
 // send() returns no Result — but the message can still be dropped
@@ -183,22 +183,32 @@ if let Some(data) = topic.recv() {
 pub fn try_send(&self, msg: T) -> Result<(), T>
 ```
 
-Attempts to send a message, returning it on failure. Unlike `send()`, which silently drops the message after a brief retry, `try_send()` gives you explicit control over failure cases.
+Attempts to send a message, returning it on failure. Unlike `send()`, which on point-to-point topologies retries briefly and then drops the message, `try_send()` hands it back to you. On broadcast topologies the ring is latest-wins and never reports full, so `try_send()` does not fail there.
 
 ```rust
 match topic.try_send(data) {
     Ok(()) => { /* sent successfully */ }
-    Err(returned_data) => { /* buffer full, message returned */ }
+    Err(returned_data) => { /* point-to-point ring full, message returned */ }
 }
 ```
 
-### try_recv()
+### send_blocking()
 
 ```rust
-pub fn try_recv(&self) -> Option<T>
+pub fn send_blocking(&self, msg: T, timeout: std::time::Duration) -> Result<(), SendBlockingError>
 ```
 
-Low-level receive that bypasses the logging and recording hooks. Marked `#[doc(hidden)]` — intended for internal and test use. Prefer `recv()`, which also takes the same-instance fast path and participates in runtime debug logging.
+Sends a message, waiting for room in the ring instead of dropping it. It tries once immediately, then spins, then yields, then sleeps in 100µs steps until the deadline. The only error is `SendBlockingError::Timeout`, returned when the ring stayed full for the whole timeout — the message is not handed back. Use this on critical topics (emergency stop, motor setpoints) where a dropped message is unacceptable.
+
+`SendBlockingError` is not in the prelude; import it from `horus::horus_core::communication::SendBlockingError` if you need to match on it.
+
+```rust
+use std::time::Duration;
+
+if topic.send_blocking(command, Duration::from_millis(5)).is_err() {
+    // ring stayed full for 5ms — escalate rather than continue silently
+}
+```
 
 ### read_latest()
 
@@ -300,9 +310,11 @@ The declared message type in `topics!` is documentation only — `TopicDescripto
 
 ## Communication Patterns
 
+The API is identical in every pattern — only the ring HORUS picks underneath changes. Measured latency for each topology lives in [Performance](#performance) below.
+
 ### One-to-One
 
-Single publisher, single subscriber (~18ns same-process, ~85ns cross-process).
+Single publisher, single subscriber — a point-to-point ring, FIFO.
 
 ```rust
 struct PubNode {
@@ -334,7 +346,7 @@ impl Node for SubNode {
 
 ### One-to-Many (Broadcast)
 
-Single publisher, multiple subscribers (~24ns same-process, ~70ns cross-process).
+Single publisher, multiple subscribers — a broadcast ring, so every subscriber receives every message.
 
 ```rust
 // One publisher
@@ -350,7 +362,7 @@ struct Listener3 { broadcast_sub: Topic<String> }
 
 ### Many-to-One (Aggregation)
 
-Multiple publishers, single subscriber (~26ns same-process, ~65ns cross-process).
+Multiple publishers, single subscriber — a multi-producer point-to-point ring, FIFO across all publishers.
 
 ```rust
 // Multiple publishers
@@ -375,7 +387,7 @@ impl Node for Aggregator {
 
 ### Many-to-Many
 
-Multiple publishers and subscribers (~36ns same-process, ~167ns cross-process).
+Multiple publishers and subscribers — a broadcast ring, same as one-to-many.
 
 ```rust
 struct Agent1 {
@@ -440,7 +452,7 @@ Avoid using these patterns:
 
 ### Send Behavior
 
-`send()` is fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (1 publisher, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead.
+`send()` is fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (any number of publishers, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead.
 
 ```rust
 // send() returns no Result — but the message can still be dropped
@@ -668,18 +680,23 @@ let sub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 
 ### Latency by Topology (16B message)
 
-| Scenario | Latency |
-|----------|---------|
-| Same thread | ~3ns |
-| Same process, 1:1 | ~18ns |
-| Same process, many-to-many | ~36ns |
-| Cross-process | ~50-167ns |
+Every topic is shared-memory backed, so these are end-to-end one-way IPC figures, not in-process function calls. Measured by `all_paths_latency` on an Intel Core i7-10750H (6C/12T, `powersave` governor), 100K samples per scenario:
+
+| Scenario | p50 | p99 |
+|----------|-----|-----|
+| Cross-process, 1 publisher / 2 subscribers | ~198ns | ~298ns |
+| Cross-process, 1 publisher / 4 subscribers | ~236ns | ~417ns |
+| Cross-process, 1 publisher / 8 subscribers | ~276ns | ~510ns |
+| Cross-process, 4 publishers / 4 subscribers | ~304ns | ~1.5µs |
+| Raw shared-memory atomic (hardware floor) | ~167ns | ~319ns |
+
+The ~167ns row is the bare atomic round of a shared-memory handoff with no framework on top — a bound HORUS approaches, not a latency any topic achieves.
 
 ### Latency by Message Type
 
-The only per-message-type figure HORUS publishes is `CmdVel` (16B): **~20ns median / ~29ns p99** intra-process. Cross-process latency is measured per backend rather than per message type — SpmcShm is ~198ns p50 (1 publisher / 2 subscribers) rising to ~276ns p50 (1 publisher / 8 subscribers), against a raw shared-memory atomic floor of ~167ns.
+Per-message-type figures come from `robotics_messages_benchmark` (same process, publisher and subscriber on separate threads, 50K iterations). `CmdVel` (16B) is the reference point at **~75ns median / ~135ns p99**; see [Benchmarks](/performance/benchmarks) for the other message types.
 
-Latency scales linearly with message size, with one exception: `Image`, `PointCloud`, `DepthImage`, `OccupancyGrid` and `CostMap` are pool-backed — only a small fixed-size descriptor (224-440 bytes, depending on the type) crosses the ring, so their latency is independent of payload size.
+Latency grows with message size, with one exception: `Image`, `PointCloud`, `DepthImage`, `OccupancyGrid` and `CostMap` are pool-backed — only a small fixed-size descriptor (224-440 bytes, depending on the type) crosses the ring, so their latency is independent of payload size.
 
 ### Throughput
 
@@ -695,7 +712,7 @@ Topic::<[f32; 3]>::new("position")?;   // Fixed-size: fastest path
 Topic::<Vec<f32>>::new("position")?;   // Dynamic: still fast, but uses serialization
 ```
 
-**Keep messages small** — latency scales linearly with size.
+**Keep messages small** — latency grows with size.
 
 **Check recv() every tick** — don't skip ticks:
 ```rust

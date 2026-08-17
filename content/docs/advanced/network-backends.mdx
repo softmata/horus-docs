@@ -4,13 +4,13 @@ description: "Communication backends in HORUS — automatic shared-memory IPC wi
 weight: 40
 ---
 
-# Communication Backends
+# Network Backends
 
-HORUS automatically selects the optimal communication backend based on topology — no configuration needed. Every topic is shared-memory backed. HORUS picks one of five SHM backends — FanoutShm, PodShm, MpscShm, SpmcShm, SpscShm — from the publisher/subscriber topology and whether the message type is POD. Cross-machine replication is available separately via the opt-in `net` feature.
+HORUS automatically selects the optimal communication backend based on topology — no configuration needed. Every topic is shared-memory backed; cross-machine replication is available separately via the opt-in `net` feature.
 
 <Callout type="info" title="Network Transport Is Opt-In">
 
-HORUS ships transparent LAN replication over UDP in the `horus_net` crate. It is opt-in: build the `horus` crate with `--features net`, or run `horus run --net`. Replication auto-starts on `scheduler.run()`, discovers peers by UDP multicast (default group `224.0.69.72`, port `9100`), and costs ~50μs across the LAN. Configure it with `[network]` in `horus.toml` or `HORUS_NET_*` env vars; disable it with `.network(false)` or `HORUS_NO_NETWORK=1`. Zenoh is **not** the transport — it is an optional bridge package for cross-subnet/WiFi (`horus install horus-zenoh`).
+HORUS ships transparent LAN replication over UDP in the `horus_net` crate, but shared memory is the only transport until you turn it on — see [Network Transport (LAN replication)](#network-transport-lan-replication) below.
 
 </Callout>
 
@@ -30,19 +30,21 @@ No configuration needed. The backend upgrades and downgrades dynamically as part
 
 ## Shared-Memory Backends
 
-Every topic is shared-memory backed, so every backend is cross-process. HORUS picks one of five SHM backends from the publisher/subscriber topology and whether the message type is POD:
+Every topic is shared-memory backed, so every backend is cross-process. There are five SHM backends; `Topic::new()` picks one of the four auto-selected ones from the publisher/subscriber topology and whether the message type is POD:
 
 | Backend | Latency | Detection Criteria |
 |---------|---------|-------------------|
-| FanoutShm | ~40ns | pubs>1, subs>1, !is_pod (broadcast) |
-| PodShm | ~50ns | 1→many / 0→many, is_pod (broadcast) |
+| FanoutShm | ~40ns | subs>1, !is_pod (broadcast) |
+| PodShm | ~50ns | subs>1, is_pod (broadcast) |
 | MpscShm | ~65ns | pubs>1, subs<=1 |
-| SpmcShm | ~70ns | multi-consumer, non-POD |
+| SpmcShm | ~70ns | never auto-selected — see below |
 | SpscShm | ~85ns | pubs<=1, subs<=1 |
+
+SpmcShm exists as a backend but detection never chooses it: its consumers share one tail and compete for messages, so a fast consumer would starve the others — the wrong semantics for pub/sub broadcast. Multi-consumer topics get PodShm or FanoutShm instead, where every subscriber receives every message.
 
 The backend is selected based on:
 - **Topology**: Number of publishers and subscribers
-- **Data type**: POD (fixed-size, memcpy-able) types get the dedicated zero-copy path; variable-size types are serialized with bincode (~167ns cross-process)
+- **Data type**: POD (fixed-size, memcpy-able) types get the dedicated zero-copy path; variable-size types are serialized with bincode, which costs more per message than the POD path
 
 ## Dynamic Migration
 
@@ -53,10 +55,13 @@ Single publisher + single subscriber
   → SpscShm, ~85ns
 
 Second subscriber joins (non-POD payload)
-  → SpmcShm, ~70ns
+  → FanoutShm, ~40ns
 
 A second publisher joins as well
-  → FanoutShm, ~40ns
+  → FanoutShm, ~40ns (no migration — non-POD broadcast already uses the fanout matrix)
+
+The extra subscriber leaves — two publishers, one subscriber
+  → MpscShm, ~65ns
 
 All but one publisher and one subscriber disconnect
   → SpscShm, ~85ns
@@ -68,21 +73,21 @@ Migration is transparent — `send()` and `recv()` calls are unaffected.
 
 | Metric | Shared Memory |
 |--------|---------------|
-| Latency | 40-85ns |
+| Latency | 40-85ns backend transport; non-POD payloads add bincode serialization on top |
 | Throughput | Millions msg/s |
-| Zero-copy | Yes (via mmap) |
+| Zero-copy | Yes for POD types (via mmap); non-POD types are bincode-serialized |
 | Cross-machine | Not by shared memory itself — add the opt-in `net` feature / `horus run --net` for ~50μs LAN replication |
 
 ## Network Transport (LAN replication)
 
-Cross-machine topics ship today as the `horus_net` UDP replicator. It is opt-in — build the `horus` crate with `--features net`, or run `horus run --net`:
+Cross-machine topics are replicated by the `horus_net` UDP replicator. It is opt-in — build the `horus` crate with `--features net`, or run `horus run --net`:
 
 | Transport | Latency | Use Case |
 |-----------|---------|----------|
 | Shared Memory | 40-85ns | Same-machine IPC |
 | UDP LAN replication (`net` feature) | ~50μs | Multi-robot, cross-machine topics |
 
-`Topic::new()` continues to auto-select the optimal SHM backend either way. With the `net` feature enabled, replication activates automatically whenever remote horus peers are found on the LAN; topics you subscribe to but do not publish are imported by default (`import = "auto"`). Opt out with `.network(false)`, `HORUS_NO_NETWORK=1`, or `[network] enabled = false`; narrow the surface with `[network] import` / `HORUS_NET_IMPORT` and `[network] deny_export`.
+`Topic::new()` continues to auto-select the optimal SHM backend either way. With the `net` feature enabled, replication auto-starts on `scheduler.run()` and discovers peers by UDP multicast (default group `224.0.69.72`, port `9100`); topics you subscribe to but do not publish are imported by default (`import = "auto"`). Configure it with the `[network]` section of `horus.toml` or the `HORUS_NET_*` environment variables: opt out with `.network(false)`, `HORUS_NO_NETWORK=1`, or `[network] enabled = false`; narrow the surface with `[network] import` / `HORUS_NET_IMPORT` and `[network] deny_export`.
 
 Zenoh is not the transport. It is an optional bridge package (`horus install horus-zenoh`) for cases UDP multicast cannot reach — cross-subnet or WiFi links.
 

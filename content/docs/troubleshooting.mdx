@@ -484,29 +484,7 @@ if let Some(data) = self.data_sub.recv() {
    ```
    Check the "Topics" section to see active topic names.
 
-2. **Type Mismatch** (not silent — it fails loudly)
-   - Opening the same topic name with two different message types is rejected
-     at construction, so you get an error rather than zero messages:
-     ```
-     Type mismatch on topic 'data': existing type 'f32', attempted 'f64'.
-     ```
-
-   **Fix**: Ensure both use same type:
-   ```rust
-   // Publisher
-   let pub_topic: Topic<f32> = Topic::new("data")?;
-   pub_topic.send(3.14);
-
-   // Subscriber (WRONG TYPE) — Topic::new returns Err, recv() is never reached
-   let sub_topic: Topic<f64> = Topic::new("data")?;  // f64 != f32
-
-   // CORRECT:
-   let sub_topic: Topic<f32> = Topic::new("data")?;  // Same type
-   ```
-   If you see that error, either use the same type on both sides or pick
-   distinct topic names.
-
-3. **Publisher Hasn't Sent Yet**
+2. **Publisher Hasn't Sent Yet**
    - Subscriber starts before publisher sends first message
    - This is normal! First `recv()` will return `None`
 
@@ -523,7 +501,7 @@ if let Some(data) = self.data_sub.recv() {
    }
    ```
 
-4. **Wrong Priority Order**
+3. **Wrong Priority Order**
    - Subscriber runs before publisher in same tick
 
    **Fix**: Set priorities correctly:
@@ -534,6 +512,36 @@ if let Some(data) = self.data_sub.recv() {
    // Subscriber runs after (higher order number)
    scheduler.add(SubscriberNode::new()?).order(1).done();
    ```
+
+---
+
+### "Type mismatch on topic ..."
+
+A type mismatch is **not** a cause of silence — it fails loudly, at construction,
+before `recv()` is ever reached. It gets its own section because it is easy to
+mistake for a delivery problem.
+
+**Symptom**: `Topic::new()` returns an error on startup:
+```
+Type mismatch on topic 'data': existing type 'f32', attempted 'f64'.
+Two processes opened the same topic with different message types.
+Fix: use distinct topic names for different message types.
+```
+
+**Cause**: A topic's message type is fixed by whichever process creates it first. Opening the same name with a different type is rejected, so you get an error rather than zero messages.
+
+**Fix**: Use the same type on both sides, or pick distinct topic names:
+```rust
+// Publisher
+let pub_topic: Topic<f32> = Topic::new("data")?;
+pub_topic.send(3.14);
+
+// Subscriber (WRONG TYPE) — Topic::new returns Err here
+let sub_topic: Topic<f64> = Topic::new("data")?;  // f64 != f32
+
+// CORRECT:
+let sub_topic: Topic<f32> = Topic::new("data")?;  // Same type
+```
 
 ---
 
@@ -632,17 +640,60 @@ Starting application...
 
 **Symptom**: Publisher sends messages but subscriber never receives them, and no error is reported.
 
-**Cause**: `send()` is lossy. The usual cause is a full ring buffer — the subscriber isn't draining it fast enough. When the ring is full, `send()` retries briefly (one immediate retry, then 64 spins and 4 yields) and then drops the message, incrementing the topic's `send_failures` counter.
+**Cause**: `send()` is lossy. The usual cause is a full ring buffer — the subscriber isn't draining it fast enough. When the ring is full, `send()` retries briefly (one immediate retry, then 64 spins and 4 yields) and then drops the message, incrementing the topic's drop counter.
 
 Message size alone rarely causes drops: serialized payloads larger than 4KB are spilled to a shared TensorPool automatically, and a payload that still exceeds the current slot (default 8KB) triggers an automatic slot grow followed by a retry.
 
 **Fix**:
 
-**1. Make Sure the Subscriber Keeps Up:**
-- Check the topic's send failure count in the monitor.
-- Make sure the subscribing node ticks often enough to drain the ring buffer.
+**1. Confirm the drops and count them:**
+```rust
+// dropped_count() = send() calls that gave up after the bounded retry
+if self.topic.dropped_count() > 0 {
+    hlog!(warn, "{} messages dropped on '{}'",
+          self.topic.dropped_count(), self.topic.name());
+}
+```
+This counter is per-process and lives in the publishing process — it is not
+written to shared memory, so read it from the node that owns the topic rather
+than looking for it in `horus monitor`. (From Python: `topic.stats()["send_failures"]`.)
 
-**2. Check Message Size:**
+**2. Let the subscriber drain the ring:**
+
+Give the subscriber a tick rate at least as high as the publisher's:
+```rust
+scheduler.add(PublisherNode::new()?).order(0).rate(50_u64.hz()).done()?;
+scheduler.add(SubscriberNode::new()?).order(1).rate(200_u64.hz()).done()?;
+```
+
+Or drain everything queued on each tick instead of a single message:
+```rust
+fn tick(&mut self) {
+    while let Some(msg) = self.topic.recv() {
+        self.process(msg);
+    }
+}
+```
+
+**3. Give a bursty publisher a deeper ring:**
+```rust
+// Default capacity is one 4KB page worth of slots, clamped to 16..=1024
+// and rounded up to a power of two. Ask for more explicitly:
+let topic: Topic<SensorData> = Topic::with_capacity("sensor_data", 1024, None)?;
+```
+
+**4. For messages you cannot afford to lose, use `send_blocking()`:**
+```rust
+use std::time::Duration;
+
+// Waits for space instead of dropping; Err(SendBlockingError::Timeout)
+// if the ring stayed full for the whole timeout
+if let Err(e) = self.cmd_topic.send_blocking(cmd, Duration::from_millis(5)) {
+    hlog!(error, "cmd_vel send timed out: {}", e);
+}
+```
+
+**If you suspect an oversized payload instead**, message size rarely causes drops (see above), but you can check it directly:
 ```rust
 use std::mem::size_of;
 
@@ -651,39 +702,13 @@ use std::mem::size_of;
 println!("Message size: {} bytes", size_of::<MyMessage>());
 ```
 
-**3. Keep Messages Reasonably Sized:**
+A `#[repr(C)] #[derive(Clone, Copy)]` POD message bypasses serialization entirely and needs no serde derives. If you keep a serde message with a large fixed array, note that serde only derives for arrays up to length 32 — longer ones need `serde_arrays` (add `serde_arrays = "0.2"` to your dependencies):
 ```rust
-// BAD: Unbounded size — the payload grows with the data
-#[derive(Clone, Serialize, Deserialize)]
-pub struct LargeMessage {
-    pub data: Vec<u8>,
-}
-
-// GOOD: Fixed size
-// serde only derives for arrays up to length 32, so longer arrays
-// need `serde_arrays` (add `serde_arrays = "0.2"` to your dependencies).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LargeMessage {
     #[serde(with = "serde_arrays")]
     pub data: [u8; 4096],  // Fixed 4KB
 }
-
-// BETTER: Split into multiple messages
-#[derive(Clone, Serialize, Deserialize)]
-pub struct MessageChunk {
-    pub chunk_id: u32,
-    pub total_chunks: u32,
-    #[serde(with = "serde_arrays")]
-    pub data: [u8; 1024],
-}
-```
-
-Alternatively, make the struct a `#[repr(C)] #[derive(Clone, Copy)]` POD type — POD messages bypass serialization entirely and need no serde derives.
-
-**4. Use Monitor to Check:**
-```bash
-# The monitor shows send failure counts per topic
-horus monitor
 ```
 
 ---

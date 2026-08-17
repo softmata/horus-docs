@@ -6,22 +6,19 @@ order: 2
 
 # C++ Performance Guide
 
-## Zero-Copy Publishing
+## Publishing Patterns
 
-The loan pattern gives you a direct pointer into shared memory:
+The loan pattern reserves a sample, lets you fill it field by field, and consumes
+it on publish:
 
 ```cpp
 horus::Scheduler sched;
 auto pub = sched.advertise<horus::msg::LaserScan>("lidar.scan");
 
-auto sample = pub.loan();          // get pooled SHM buffer — no copy
-sample->ranges[0] = 1.5f;          // direct write into SHM
-sample->ranges[1] = 2.0f;          // no copies
-pub.publish(std::move(sample));     // make visible to subscribers
-// ~12 ns one-way when the subscriber shares this thread/core (L1-hot,
-// SHM-backed) — constant regardless of message size (LaserScan is 1480 bytes).
-// A subscriber on a different core or process costs ~220 ns one-way
-// (cache-coherence physics, not a per-byte copy).
+auto sample = pub.loan();          // reserve a sample
+sample->ranges[0] = 1.5f;          // fill it in place
+sample->ranges[1] = 2.0f;
+pub.publish(std::move(sample));     // hand it to the transport
 ```
 
 **vs. send by copy:**
@@ -29,10 +26,26 @@ pub.publish(std::move(sample));     // make visible to subscribers
 ```cpp
 horus::msg::LaserScan scan{};
 scan.ranges[0] = 1.5f;
-pub.send(scan);  // ~15ns — copies 1480 bytes to SHM
+pub.send(scan);                     // copies 1480 bytes into SHM
 ```
 
-**Rule:** Use `loan()` + `publish()` for large messages (> 64 bytes). Use `send()` for small messages (CmdVel = 16 bytes).
+Two things to know before you pick between them:
+
+**Where the subscriber runs does not change the cost.** Every HORUS topic is
+shared-memory and cross-process — there is no same-thread or in-process shortcut
+backend — so a publish costs the same whether the subscriber is a thread away or
+a process away.
+
+**Today the two paths cost the same.** In the current C++ binding `LoanedSample<T>`
+holds the message by value and `publish()` forwards straight to `send()`
+(`horus_cpp/include/horus/impl/topic_impl.hpp`), so loan + publish performs the
+same single copy that `send()` does. `loan()` is the shape the zero-copy path will
+take once the binding writes through to the SHM buffer; it is not a measured win
+right now. Do not budget for one.
+
+**Rule:** Use `loan()` + `publish()` for large messages such as `LaserScan`
+(1480 bytes), so the code is already in the right shape. Use `send()` for small
+messages (CmdVel = 16 bytes), where it will never matter.
 
 ## TensorPool for Large Data
 
@@ -55,18 +68,49 @@ float* data = reinterpret_cast<float*>(tensor.data());
 data[0] = 1.0f;  // Direct SHM write
 ```
 
+### Sizing a pool
+
+The two size arguments cap different things:
+
+- **`max_slots`** is the number of tensors alive at the same time, not the number
+  you allocate over the run. Releasing a tensor returns its slot to a free stack
+  for reuse, so size this to your peak in-flight count.
+- **`pool_size_bytes`** is the shared-memory data region. It is bump-allocated and
+  each allocation is rounded up to a 64-byte cache line. Freed bytes are only
+  reclaimed when a slot is reused for a payload that fits the largest allocation
+  that slot has ever held — so a pool cycling between sizes will keep bumping.
+  Size it as `max_slots x largest payload` to make every slot reusable for every
+  payload. Allocation returns null once the region is exhausted; check
+  `pool.stats()` for `used_bytes` / `free_bytes`.
+
+Bytes are usually the binding constraint. The 64MB pool above holds about ten
+1080p RGB frames at once, well under its 128-slot cap; raise it to 128 x 6.2MB
+(around 800MB) only if you really need 128 frames in flight.
+
 ## Measured Performance
+
+These rows come from two different harnesses, so read the Notes column for the
+basis of each figure.
+
+- **FFI / scheduler rows** are measured from the C++ side, across the FFI
+  boundary, by `horus_cpp/tests/cpp_benchmark.cpp`.
+- **Send rows** are *send-side* medians from the Rust `robotics_messages_benchmark`
+  on the reference i7-10750H — the time for `send()` to return, not the time for a
+  subscriber to see the message. There is no C++-side publisher benchmark, so
+  treat these as the floor for the C++ path, which adds the FFI call on top.
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
-| FFI call (horus_get_abi_version) | 11 ns | Baseline overhead |
-| CmdVel send (16 bytes) | 15 ns | Small message |
-| LaserScan send (1480 bytes) | ~20 ns | Zero-copy loan |
-| Scheduler tick (empty) | 37 ns | No nodes |
-| Scheduler tick (1 node) | 248 ns | Median |
-| Scheduler tick (10 nodes) | 2.2 us | Median |
-| Scheduler tick (50 nodes) | 10.9 us | Median |
-| Throughput | 2.89M ticks/sec | 1 node |
+| FFI call (horus_get_abi_version) | 11 ns | C++ bench — baseline overhead |
+| CmdVel send (16 bytes) | 75 ns | Send-side median (p99 135 ns) |
+| LaserScan send (1480 bytes) | 210 ns | Send-side median (p99 283 ns) |
+| Scheduler tick (empty) | 37 ns | C++ bench — no nodes |
+| Scheduler tick (1 node) | 248 ns | C++ bench — median |
+| Scheduler tick (10 nodes) | 2.2 us | C++ bench — median |
+| Scheduler tick (50 nodes) | 10.9 us | C++ bench — median |
+| Throughput | 2.89M ticks/sec | C++ bench — 1 node |
+
+Send cost scales with message size: 16 bytes costs 75 ns, 1480 bytes costs 210 ns.
 
 ## Avoiding Common Pitfalls
 
@@ -86,13 +130,13 @@ class MyNode : public horus::Node {
 };
 ```
 
-**Don't copy large messages:**
+**Prefer the loan shape for large messages:**
 ```cpp
-// BAD — copies 1480 bytes
+// OK for small messages — builds a full LaserScan on the stack, then copies it
 horus::msg::LaserScan scan{};
 pub.send(scan);
 
-// GOOD — writes directly to SHM
+// PREFERRED for large messages — fill the sample in place, then publish
 auto sample = pub.loan();
 sample->ranges[0] = 1.5f;
 pub.publish(std::move(sample));

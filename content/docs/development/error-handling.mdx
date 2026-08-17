@@ -49,7 +49,7 @@ name is `HorusError`, and the two names refer to the same type. New code should 
 | `Node(NodeError)` | Node lifecycle errors (tuple variant, not named fields) |
 | `Memory(MemoryError)` | Memory allocation and shared-memory errors |
 | `Serialization(SerializationError)` | Serialization/deserialization errors |
-| `NotFound(NotFoundError)` | Resource not found |
+| `NotFound(NotFoundError)` | Registry lookup failed (frame, topic, node, service, action, parameter) |
 | `Resource(ResourceError)` | Already exists, permission denied, or unsupported |
 | `InvalidInput(ValidationError)` | Invalid argument/input |
 | `Parse(ParseError)` | Parsing errors |
@@ -67,12 +67,10 @@ those live under `Resource(ResourceError)`. The enum is also `#[non_exhaustive]`
 
 ### Using Constructors
 
-`Error` provides exactly three convenience constructors — `config`, `node`, and `network_fault`.
-Every other variant is built by naming its structured sub-error:
+`Error` provides exactly three convenience constructors — `config`, `node`, and `network_fault`:
 
 ```rust
 use horus::prelude::*;
-use horus::horus_core::horus_internal;
 
 // Configuration error
 let err = Error::config("Invalid frequency: must be positive");
@@ -82,13 +80,19 @@ let err = Error::node("MotorController", "Failed to initialize PWM");
 
 // Network fault (takes peer + reason)
 let err = Error::network_fault("192.168.1.50:7447", "connection refused");
+```
 
-// Communication error (no constructor — use the variant + sub-error)
+### Using Variants Directly
+
+Every other variant is built by naming its structured sub-error:
+
+```rust
+use horus::prelude::*;
+
 let err = Error::Communication(CommunicationError::TopicNotFound {
     topic: "/cmd_vel".to_string(),
 });
 
-// Memory error
 let err = Error::Memory(MemoryError::AllocationFailed {
     reason: "Failed to allocate 1GB for buffer".to_string(),
 });
@@ -100,17 +104,6 @@ let err = Error::InvalidInput(ValidationError::OutOfRange {
     max: "100".into(),
     actual: "150".into(),
 });
-
-// Internal error (prefer horus_internal! macro for file/line capture)
-let err = horus_internal!("Unexpected state reached");
-```
-
-### Using Variants Directly
-
-More examples of variants built directly from their structured sub-error:
-
-```rust
-use horus::prelude::*;
 
 let err = Error::Resource(ResourceError::PermissionDenied {
     resource: "/dev/ttyUSB0".to_string(),
@@ -272,7 +265,8 @@ fn initialize_sensor() -> Result<()> {
 fn get_config() -> Result<Config> {
     match load_config_file("config.yaml") {
         Ok(config) => Ok(config),
-        Err(Error::NotFound(_)) => {
+        // A missing file surfaces as Error::Io, not Error::NotFound
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             // Expected: use defaults
             Ok(Config::default())
         }
@@ -354,9 +348,10 @@ mod tests {
     use horus::prelude::*;
 
     #[test]
-    fn test_returns_not_found_for_missing_file() {
+    fn test_returns_io_error_for_missing_file() {
+        // A missing file arrives as Error::Io — that is what `?` on std::fs produces
         let result = load_config("nonexistent.yaml");
-        assert!(matches!(result, Err(Error::NotFound(_))));
+        assert!(matches!(result, Err(Error::Io(_))));
     }
 
     #[test]
@@ -374,6 +369,13 @@ mod tests {
     }
 }
 ```
+
+Assert on the variant the code actually produces. `Error::NotFound` comes from HORUS registry
+lookups — a missing frame, topic, node, service, action, or parameter — never from the
+filesystem, so a missing file is an `Error::Io`; inspect `std::io::Error::kind()` if you need to
+tell "no such file" from a permission failure. Likewise, a YAML failure that reaches you through
+`?` is an `Error::Serialization`; `Error::Config` is what a loader returns when it maps the
+failure itself into `ConfigError::ParseFailed` (which is also what `?` produces for TOML).
 
 ## Integration with anyhow
 
@@ -403,36 +405,13 @@ fn horus_function() -> Result<Robot> {
 }
 ```
 
-## HorusError Variants Reference
-
-The `HorusError` enum (aliased as `Error`) contains all possible error types. Note that
-almost every payload is a **structured sub-error**, not a `String`:
-
-| Variant | Description |
-|---------|-------------|
-| `Io(std::io::Error)` | File system, network, or other I/O errors |
-| `Config(ConfigError)` | Configuration parsing or validation failure |
-| `Communication(CommunicationError)` | IPC, topic, or network communication failure |
-| `Node(NodeError)` | Node lifecycle error (init, tick, shutdown) |
-| `Memory(MemoryError)` | Shared memory allocation or mapping failure |
-| `Serialization(SerializationError)` | Message serialization/deserialization error |
-| `NotFound(NotFoundError)` | Resource (topic, node, service, frame) not found |
-| `Resource(ResourceError)` | Already exists, permission denied, or unsupported |
-| `InvalidInput(ValidationError)` | Invalid argument or parameter |
-| `Parse(ParseError)` | String/config parsing failure |
-| `InvalidDescriptor(String)` | Cross-process tensor descriptor validation failure |
-| `Transform(TransformError)` | Coordinate frame extrapolation or stale data |
-| `Timeout(TimeoutError)` | Operation exceeded time limit (resource, elapsed, optional deadline) |
-| `Internal { message, file, line }` | Internal error with source location |
-| `Contextual { message, source }` | Error chain wrapping an underlying cause |
-
-`HorusError` is `#[non_exhaustive]`, so every `match` on it must include a `_` (or `Err(e)`)
-arm — new variants may be added without a breaking change.
+## HorusError Reference
 
 ### Sub-Error Variants
 
-These are what you actually pattern-match on. All of them are exported by the prelude, and
-every one of these enums is `#[non_exhaustive]`, so match arms over them also need a `_`:
+Almost every `HorusError` payload is a **structured sub-error**, not a `String`, and those
+sub-errors are what you actually pattern-match on. All of them are exported by the prelude,
+and every one of these enums is `#[non_exhaustive]`, so match arms over them also need a `_`:
 
 | Sub-error | Variants |
 |-----------|----------|
@@ -478,62 +457,8 @@ pub type Result<T> = HorusResult<T>;  // Convenience alias
 pub type Error = HorusError;          // Short name
 ```
 
-## Rate and Stopwatch Utilities
-
-### Rate
-
-Drift-compensated rate limiter for controlling loop frequency:
-
-```rust
-use horus::prelude::*;
-
-let mut rate = Rate::new(100.0); // Target 100 Hz
-loop {
-    do_work();
-    rate.sleep(); // Sleeps for the remainder of the 10ms period
-}
-
-// Check actual performance
-println!("Actual: {:.1} Hz", rate.actual_hz());
-println!("Late: {}", rate.is_late());
-```
-
-| Method | Description |
-|--------|-------------|
-| `Rate::new(hz)` | Create targeting `hz` frequency |
-| `rate.sleep()` | Sleep for remainder of current period (drift-compensated) |
-| `rate.actual_hz()` | Exponentially smoothed actual frequency |
-| `rate.target_hz()` | Configured target frequency |
-| `rate.period()` | Target period as `Duration` |
-| `rate.reset()` | Reset cycle start (after long pauses) |
-| `rate.is_late()` | Whether current cycle exceeded target |
-
-### Stopwatch
-
-Simple elapsed time tracker:
-
-```rust
-use horus::prelude::*;
-
-let mut sw = Stopwatch::start();
-expensive_operation();
-println!("Took {:.2} ms", sw.elapsed_ms());
-
-// Lap: return elapsed and reset
-let lap_time = sw.lap();
-```
-
-| Method | Description |
-|--------|-------------|
-| `Stopwatch::start()` | Create and start immediately |
-| `sw.elapsed()` | Elapsed time as `Duration` |
-| `sw.elapsed_us()` | Elapsed microseconds (`u64`) |
-| `sw.elapsed_ms()` | Elapsed milliseconds (`f64`) |
-| `sw.reset()` | Reset to zero |
-| `sw.lap()` | Return elapsed and reset |
-
 ## See Also
 
 - [Core Concepts](/concepts/core-concepts-nodes) - Understanding HORUS nodes
-- [API Reference](/rust/api/core) - Core API including Error types
+- [API Reference](/rust/api/core) - Core API, including the `Error` types and the `Rate` / `Stopwatch` loop-timing helpers
 - [Troubleshooting](/troubleshooting) - Common issues and solutions

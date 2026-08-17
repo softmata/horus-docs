@@ -41,7 +41,7 @@ const segmentLabels: Record<string, string> = {
   "core": "Overview",
   "core-concepts-nodes": "Nodes",
   "core-concepts-topic": "Topic (Pub/Sub)",
-  "core-concepts-podtopic": "PodTopic (Ultra-Fast)",
+  "core-concepts-podtopic": "POD Types",
   "core-concepts-scheduler": "Scheduler",
   "communication-overview": "Communication Patterns",
   "communication-transport": "Communication Transport",

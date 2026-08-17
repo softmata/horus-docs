@@ -9,7 +9,7 @@ order: 54
 
 HORUS provides two communication patterns beyond pub/sub topics: **services** for synchronous request/response RPC, and **actions** for long-running tasks with progress feedback and cancellation. Both use JSON as the wire format over shared memory topics, so they work same-process and cross-process with zero configuration.
 
-> **Rust**: See [Services](/rust/api/services) and [Actions](/rust/api/actions) for the Rust API.
+> **Rust**: See [Services](/concepts/services) and [Actions](/concepts/actions) for the Rust API.
 > **Python**: services and actions are not exposed by the Python bindings -- use the Rust or C++ API.
 
 ```cpp
@@ -201,11 +201,17 @@ if (!goal) return;
 
 printf("Goal %lu submitted\n", goal.id());
 
-// Poll the result topic until the goal reaches a terminal status
+// Drain feedback and poll the result topic until the goal reaches a terminal status
 horus::GoalStatus status = horus::GoalStatus::Pending;
 std::string result_json;
+uint64_t fb_id = 0;
+std::string fb_json;
 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 while (std::chrono::steady_clock::now() < deadline) {
+    // One feedback topic per client, not per goal -- fb_id says which goal it is
+    while (client.poll_feedback(fb_id, fb_json)) {
+        printf("goal %lu feedback: %s\n", fb_id, fb_json.c_str());
+    }
     if (client.poll_result(goal.id(), status, result_json)) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
@@ -272,11 +278,15 @@ server.set_accept_handler([](const uint8_t* goal_data, size_t len) -> uint8_t {
 server.set_execute_handler([](HorusActionGoalHandle* h,
                               const uint8_t* goal_data, size_t len) {
     horus::ActionGoalHandle g(h);
+    bool done = false;
     while (!g.is_cancel_requested()) {
         g.publish_feedback(R"({"progress": 0.5})");
-        // ... do work; break when done ...
-        g.succeed(R"({"arrived": true})");
-        return;
+        // ... do a slice of work; set done = true when finished ...
+        if (done) {
+            g.succeed(R"({"arrived": true})");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     g.canceled(R"({"arrived": false})");
 });
@@ -336,7 +346,7 @@ These are standard HORUS topics -- you can monitor them with `horus topic list` 
 
 ## Ownership and Move Semantics
 
-All service and action types are **move-only**. Copy is deleted:
+The owning handles -- `ServiceClient`, `ServiceServer`, `ActionClient`, `ActionServer` and `GoalHandle` -- are **move-only**. Copy is deleted:
 
 ```cpp
 horus::ServiceClient a("my_svc");
@@ -349,6 +359,8 @@ horus::GoalHandle g2 = std::move(g);     // OK
 ```
 
 Resources are released in destructors via the C FFI (`horus_*_destroy` functions). Use RAII -- do not call destroy manually.
+
+`ActionGoalHandle` is the exception: it owns nothing, has no destructor, and is freely copyable. It is a **non-owning view** of a handle that lives on the goal thread's stack, valid *only* for the duration of the execute call. Do not stash it (or a copy of it) and call `succeed()` / `publish_feedback()` after the handler returns -- that is a use-after-free.
 
 ---
 
@@ -394,12 +406,16 @@ Services work across processes with no extra configuration. Start the server in 
 
 ```cpp
 // Process A: server
+std::atomic<bool> running{true};  // cleared from your shutdown path
+
 horus::ServiceServer server("robot.status");
 server.set_handler([](const uint8_t*, size_t,
                       uint8_t* res, size_t* res_len) -> bool {
     const char* s = R"({"battery": 85, "state": "idle"})";
-    std::memcpy(res, s, strlen(s));
-    *res_len = strlen(s);
+    size_t n = strlen(s);
+    if (n > *res_len) return false;   // *res_len arrives holding the capacity
+    std::memcpy(res, s, n);
+    *res_len = n;
     return true;
 });
 while (running) {          // drive the server to answer requests
@@ -477,5 +493,5 @@ sched.add("nav_executor").rate(50_hz)
 - [Node API](/cpp/api/node) -- Node lifecycle for hosting service/action servers
 - [Publisher and Subscriber API](/cpp/api/topic) -- The underlying SHM transport
 - [C++ API Overview](/cpp/api) -- All classes at a glance
-- [Rust Services API](/rust/api/services) -- Equivalent Rust service API
-- [Rust Actions API](/rust/api/actions) -- Equivalent Rust action API
+- [Rust Services API](/concepts/services) -- Equivalent Rust service API
+- [Rust Actions API](/concepts/actions) -- Equivalent Rust action API

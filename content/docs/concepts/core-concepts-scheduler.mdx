@@ -12,7 +12,7 @@ After reading this guide, you will understand:
 - How the Scheduler orchestrates node execution through init(), tick(), and shutdown() phases
 - `Scheduler::new()` as the single entry point, with builder methods for global settings
 - Per-node execution classes: real-time (implied by `.rate()`), `.compute()`, `.on(topic)`, `.async_io()`
-- The fluent NodeBuilder API for adding nodes with `.add(node).order(0).rate(1000_u64.hz()).done()`
+- The fluent NodeBuilder API for adding nodes with `.add(node).order(0).rate(1000_u64.hz()).done()?`
 - Per-node configuration: `.order()`, `.rate()`, `.budget()`, `.deadline()`
 - Priority-based execution where lower numbers run first (0 = highest priority)
 - Graceful shutdown via Ctrl+C signal handling
@@ -46,7 +46,7 @@ use horus::prelude::*;
 
 // Minimal — just capability detection, no syscalls
 let mut scheduler = Scheduler::new();
-scheduler.add(my_node).order(0).done();
+scheduler.add(my_node).order(0).done()?;
 scheduler.run()?;
 ```
 
@@ -63,7 +63,7 @@ let mut scheduler = Scheduler::new()
     .watchdog(500_u64.ms())    // Frozen-node watchdog
     .prefer_rt();              // Attempt RT priority + mlockall, degrade if unavailable
 
-scheduler.add(motor_ctrl).order(0).rate(1000_u64.hz()).budget(500_u64.us()).done();
+scheduler.add(motor_ctrl).order(0).rate(1000_u64.hz()).budget(500_u64.us()).done()?;
 scheduler.run()?;
 ```
 
@@ -77,10 +77,10 @@ Use the fluent builder API to add nodes with configuration:
 let mut scheduler = Scheduler::new();
 
 // Basic: just set execution order
-scheduler.add(sensor_node).order(0).done();
+scheduler.add(sensor_node).order(0).done()?;
 
 // With per-node tick rate
-scheduler.add(fast_sensor).order(0).rate(1000_u64.hz()).done();
+scheduler.add(fast_sensor).order(0).rate(1000_u64.hz()).done()?;
 
 // Real-time node with an explicit tick budget
 scheduler.add(motor_ctrl)
@@ -88,13 +88,13 @@ scheduler.add(motor_ctrl)
     .rate(1000_u64.hz())
     .budget(500_u64.us())    // 500us max execution time
     .deadline(1000_u64.us()) // 1ms deadline
-    .done();
+    .done()?;
 
 // Chain multiple nodes
-scheduler.add(safety_node).order(0).done();
-scheduler.add(controller).order(10).done();
-scheduler.add(sensor).order(50).done();
-scheduler.add(logger).order(200).done();
+scheduler.add(safety_node).order(0).done()?;
+scheduler.add(controller).order(10).done()?;
+scheduler.add(sensor).order(50).done()?;
+scheduler.add(logger).order(200).done()?;
 ```
 
 ### NodeBuilder Methods
@@ -128,6 +128,12 @@ Real-time is not declared, it is implied: a node becomes real-time by calling `.
 | `.failure_policy(policy)` | Override failure handling policy |
 | `.done()` | Finalize and register the node (alias for `.build()`) |
 
+`.done()` (like `.build()`) returns `HorusResult<&mut Scheduler>`, so write `.done()?` — a bare
+`.done();` discards the validation result. It rejects a zero or non-finite `.rate()`, a zero
+`.budget()` or `.deadline()`, an empty `.on("")` topic, `.budget()` / `.deadline()` on a node that
+`.compute()` / `.on()` / `.async_io()` made non-RT, and `.no_alloc()` or
+`.subscribe_with_timeout()` on an execution class that would never enforce them.
+
 ## Priority-Based Execution
 
 Priorities are `u32` values where **lower numbers = higher priority**:
@@ -146,10 +152,10 @@ Nodes execute **in priority order** every tick:
 let mut scheduler = Scheduler::new();
 
 // Execution order: Safety -> Controller -> Sensor -> Logger
-scheduler.add(safety_monitor).order(0).done();    // Runs 1st
-scheduler.add(controller).order(10).done();        // Runs 2nd
-scheduler.add(sensor).order(50).done();            // Runs 3rd
-scheduler.add(logger).order(200).done();           // Runs 4th
+scheduler.add(safety_monitor).order(0).done()?;    // Runs 1st
+scheduler.add(controller).order(10).done()?;        // Runs 2nd
+scheduler.add(sensor).order(50).done()?;            // Runs 3rd
+scheduler.add(logger).order(200).done()?;           // Runs 4th
 ```
 
 ## Running the Scheduler
@@ -209,12 +215,12 @@ scheduler.add(motor_ctrl)
     .rate(1000_u64.hz())  // RT execution class at 1kHz
     .budget(500_u64.us()) // 500us tick budget
     .deadline(1_u64.ms()) // 1ms deadline
-    .done();
+    .done()?;
 
 scheduler.add(sensor)
     .order(50)
     .compute()            // CPU-heavy, non-RT
-    .done();
+    .done()?;
 
 // Check what degraded (features that couldn't be applied)
 for deg in scheduler.degradations() {
@@ -257,7 +263,7 @@ scheduler.add(motor_ctrl)
     .rate(1000_u64.hz())
     .budget(500_u64.us())   // 500us tick budget
     .deadline(900_u64.us()) // 900us deadline
-    .done();
+    .done()?;
 ```
 
 ### Other Builder Methods
@@ -279,8 +285,8 @@ Individual nodes can run at different frequencies:
 
 ```rust
 let mut scheduler = Scheduler::new();
-scheduler.add(fast_sensor).order(0).rate(1000_u64.hz()).done();  // 1kHz
-scheduler.add(slow_logger).order(200).rate(10_u64.hz()).done();  // 10Hz
+scheduler.add(fast_sensor).order(0).rate(1000_u64.hz()).done()?;  // 1kHz
+scheduler.add(slow_logger).order(200).rate(10_u64.hz()).done()?;  // 10Hz
 
 // Or set rates after adding
 scheduler.set_node_rate("FastSensor", 100_u64.hz());
@@ -296,9 +302,7 @@ The scheduler automatically adjusts its internal tick period to be fast enough f
 When you call `run()`, the scheduler initializes all nodes by calling `init()`:
 
 - All nodes initialize before the main loop starts
-- If `init()` fails, the node enters Error state and won't tick
-- Other nodes continue normally — unless the error's `Severity` is `Fatal`, in which case the scheduler stops immediately
-- A panic inside `init()` is caught and converted to `NodeError::InitPanic`
+- If `init()` fails, the node enters Error state and won't tick — see [Node Initialization Failure](#node-initialization-failure) for how that affects the rest of the schedule
 
 ### Main Execution Loop
 
@@ -345,7 +349,7 @@ let mut scheduler = Scheduler::new()
     .with_recording()    // Enable recording (saves to ~/.horus/recordings/)
     .blackbox(16);       // 16MB flight recorder for crash forensics
 
-scheduler.add(my_node).order(0).done();
+scheduler.add(my_node).order(0).done()?;
 
 // Run normally — all node ticks are recorded
 scheduler.run()?;
@@ -399,7 +403,7 @@ for m in &metrics {
 
 ### Node Initialization Failure
 
-If `init()` fails, the node enters Error state and won't tick. Other nodes continue — unless the error's `Severity` is `Fatal`, in which case the scheduler stops immediately. Panics inside `init()` are caught and converted to `NodeError::InitPanic`.
+If `init()` fails, the node enters Error state and won't tick. Other nodes continue — unless the error's `Severity` is `Fatal`, in which case the scheduler stops immediately. Panics inside `init()` are caught and converted to `NodeError::InitPanic`, which is itself `Fatal` — so a panicking `init()` always stops the scheduler.
 
 ```rust
 fn init(&mut self) -> Result<()> {
@@ -432,23 +436,23 @@ fn tick(&mut self) {
 
 ```rust
 // Layer 1: Safety (Critical)
-scheduler.add(collision_detector).order(0).done();
-scheduler.add(emergency_stop).order(0).done();
+scheduler.add(collision_detector).order(0).done()?;
+scheduler.add(emergency_stop).order(0).done()?;
 
 // Layer 2: Control (High)
-scheduler.add(pid_controller).order(10).done();
-scheduler.add(motor_driver).order(10).done();
+scheduler.add(pid_controller).order(10).done()?;
+scheduler.add(motor_driver).order(10).done()?;
 
 // Layer 3: Sensing (Normal)
-scheduler.add(lidar_node).order(50).done();
-scheduler.add(camera_node).order(50).done();
+scheduler.add(lidar_node).order(50).done()?;
+scheduler.add(camera_node).order(50).done()?;
 
 // Layer 4: Processing (Low)
-scheduler.add(path_planner).order(100).done();
+scheduler.add(path_planner).order(100).done()?;
 
 // Layer 5: Monitoring (Background)
-scheduler.add(logger).order(200).done();
-scheduler.add(diagnostics).order(200).done();
+scheduler.add(logger).order(200).done()?;
+scheduler.add(diagnostics).order(200).done()?;
 ```
 
 ### Production Deployment
@@ -461,10 +465,10 @@ let mut scheduler = Scheduler::new()
     .blackbox(16)              // Flight recorder
     .watchdog(500_u64.ms());   // Frozen-node watchdog
 
-scheduler.add(safety_monitor).order(0).rate(1000_u64.hz()).budget(100_u64.us()).done();
-scheduler.add(motor_ctrl).order(5).rate(1000_u64.hz()).budget(500_u64.us()).done();
-scheduler.add(sensor).order(50).compute().rate(1000_u64.hz()).done();  // Compute class, ticked at 1 kHz
-scheduler.add(logger).order(200).async_io().done();
+scheduler.add(safety_monitor).order(0).rate(1000_u64.hz()).budget(100_u64.us()).done()?;
+scheduler.add(motor_ctrl).order(5).rate(1000_u64.hz()).budget(500_u64.us()).done()?;
+scheduler.add(sensor).order(50).compute().rate(1000_u64.hz()).done()?;  // Compute class, ticked at 1 kHz
+scheduler.add(logger).order(200).async_io().done()?;
 
 scheduler.run()?;
 ```
@@ -490,10 +494,10 @@ fn tick(&mut self) {
 
 **Use appropriate priorities** — don't make everything order 0:
 ```rust
-scheduler.add(emergency_stop).order(0).done();   // Critical
-scheduler.add(controller).order(10).done();       // High
-scheduler.add(sensor).order(50).done();           // Normal
-scheduler.add(logger).order(200).done();          // Background
+scheduler.add(emergency_stop).order(0).done()?;   // Critical
+scheduler.add(controller).order(10).done()?;       // High
+scheduler.add(sensor).order(50).done()?;           // Normal
+scheduler.add(logger).order(200).done()?;          // Background
 ```
 
 **Use builder methods for production** — enable RT features, the BlackBox flight recorder, and the frozen-node watchdog:
@@ -513,7 +517,7 @@ scheduler.add(safety_node)
     .order(0)
     .rate(1000_u64.hz())
     .on_miss(Miss::Stop)
-    .done();
+    .done()?;
 ```
 
 | Policy | Behavior | Use For |

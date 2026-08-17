@@ -95,7 +95,7 @@ cargo build --release
 
 # Test it as a HORUS plugin (simulating the environment variables only --
 # the real sandbox described below is not reproduced here)
-HORUS_PLUGIN=1 HORUS_VERSION=0.1.0 ./target/release/mycommand --target foo
+HORUS_PLUGIN=1 HORUS_VERSION=0.2.2 ./target/release/mycommand --target foo
 ```
 
 ### Step 5: Install Locally
@@ -126,7 +126,7 @@ HORUS sets these environment variables when executing plugins:
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `HORUS_PLUGIN` | `1` | Always set when running as a plugin |
-| `HORUS_VERSION` | e.g., `0.1.7` | Version of the HORUS CLI |
+| `HORUS_VERSION` | e.g., `0.2.2` | Version of the HORUS CLI |
 
 Your plugin inherits the user's `stdin`, `stdout`, and `stderr`, so interactive prompts and colored output work normally.
 
@@ -184,6 +184,13 @@ struct Cli {
     json: bool,
 }
 
+/// The `.meta` sidecar HORUS writes into `topics/` for every live topic.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TopicMeta {
+    name: String,
+    size: usize,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -192,15 +199,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Scan the sidecars, not the region files: sidecars are flat even for
+    // namespaced topics, and each one carries the real topic name.
     let mut topics = Vec::new();
     for entry in std::fs::read_dir(&cli.shm_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let size = entry.metadata()?.len();
-            topics.push((name, size));
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            continue;
         }
+        let meta: TopicMeta = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        topics.push((meta.name, meta.size));
     }
+    topics.sort();
 
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&topics)?);
@@ -215,7 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Topic backing files live in `/dev/shm/horus_<namespace>/topics/`, where the namespace defaults to the literal `default` and is overridden with `$HORUS_NAMESPACE` &mdash; pass `--shm-dir` to inspect another namespace. Because a topic name may contain `/`, namespaced topics such as `lidar/scan` are stored as subdirectories of `topics/`; the `is_file()` filter above lists only flat topic names, so recurse one level if you need the namespaced ones.
+Topic backing files live in `/dev/shm/horus_<namespace>/topics/`, where the namespace defaults to the literal `default` and is overridden with `$HORUS_NAMESPACE` &mdash; pass `--shm-dir` to inspect another namespace.
+
+The example enumerates the `.meta` sidecars rather than the region files themselves, because a topic name may contain `/`. A namespaced topic such as `lidar/scan` puts its region at `topics/lidar/scan` &mdash; nested one level down &mdash; but its sidecar stays flat in `topics/` with the separator rewritten, as `lidar_scan.meta`. Reading the sidecars therefore reaches every topic from a single non-recursive scan, and the `name` field inside each one gives back the original `lidar/scan`. A sidecar is written when the region is created and removed when its owner releases it, so what you get is the set of live topics.
 
 **Cargo.toml:**
 
@@ -232,6 +244,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 

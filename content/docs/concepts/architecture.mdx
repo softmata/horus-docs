@@ -103,7 +103,7 @@ Nodes need to exchange data. HORUS provides a single **Topic** API that automati
 
 ### Topic: One API, Automatic Optimization
 
-You always use the same `Topic::new()` call. HORUS detects the topology and picks the fastest backend for it. Measured end-to-end latency ranges from **~3ns** (same-thread) to **~167ns** (cross-process, many-to-many):
+You always use the same `Topic::new()` call. HORUS detects the topology and picks the fastest backend for it. Every backend is shared-memory backed, so measured latency depends on where the two ends run and how many participants contend: from **~20ns** (both ends on one thread) to **~280ns** (cross-process with multiple publishers):
 
 ```rust
 // Same API for all communication patterns
@@ -143,7 +143,7 @@ flowchart TB
   caption="Transparent Cross-Process Communication"
 />
 
-Data goes through shared memory with sub-microsecond latency. Simple fixed-size types get an even faster zero-copy path automatically.
+Data goes through shared memory with sub-microsecond latency. Plain-old-data types being broadcast to many subscribers get a dedicated broadcast path automatically.
 
 ---
 
@@ -160,25 +160,26 @@ Without coordination, nodes would:
 
 The HORUS scheduler solves these problems with intelligent orchestration.
 
-### Execution Modes
+### Execution Order
 
-Different applications need different scheduling strategies:
+There is no mode switch to pick between. By default the scheduler hands Rt, Compute, Event and AsyncIo nodes to dedicated executors, and runs the remaining BestEffort nodes in parallel on the main thread using the dependency graph it builds from the topics they publish and subscribe. Turning on deterministic mode replaces all of that with one sequential main thread:
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
 flowchart TB
-    SCHED["<b>Scheduler</b><br/>Choose execution mode"]
+    SCHED["<b>Scheduler</b>"]
 
-    SCHED --> PAR["<b>Parallel</b><br/>Multi-core"]
-    SCHED --> SEQ["<b>Sequential</b><br/>Simple & predictable"]
+    SCHED --> PAR["<b>Default</b><br/>Ready dispatch, multi-core"]
+    SCHED --> SEQ["<b>deterministic(true)</b><br/>Sequential, same order every run"]
 `}
-  caption="Execution Modes"
+  caption="Default Parallel Dispatch vs. Deterministic Mode"
 />
 
-| Mode | Best For | Tick Overhead |
-|------|----------|---------------|
-| **Sequential** | Safety-critical, debugging | Minimal |
-| **Parallel** | CPU-heavy workloads | Varies by core count |
+| Execution path | When it applies | Behavior |
+|----------------|-----------------|----------|
+| **Ready dispatch** | Default | BestEffort nodes run in parallel; each starts the instant its last dependency finishes |
+| **Deterministic** | `Scheduler::new().deterministic(true)` | No executor threads at all - every node ticks sequentially on the main thread in the same order each run, with the simulated clock advancing between graph steps. For replay and `tick_once()` testing |
+| **Sequential fallback** | No usable dependency graph (for example, a cycle was detected) | Nodes tick one at a time in `.order()` priority sequence |
 
 ### Profiling & Execution Classes
 
@@ -298,18 +299,21 @@ flowchart LR
 | Planner → Controller | Topic | Monitoring tools can observe |
 | Controller → Motors | Topic | Direct pipeline connection |
 
-**Total pipeline latency:** Under 1 microsecond for message passing (same-process backends). Tensor allocation is a separate cost that scales with tensor size.
+**Total pipeline latency:** Under 1 microsecond for message passing when all four nodes run in the same process. Every hop still goes through shared memory, so a hop that actually crosses a process boundary costs closer to 150-280 ns on its own. Tensor allocation is a separate cost that scales with tensor size.
 
 ---
 
 ## Performance Summary
 
-| Metric | Value |
-|--------|-------|
-| Same-thread topic | ~3 ns |
-| Same-process topic | ~18-36 ns |
-| Cross-process topic | ~50-167 ns |
-| Scheduler tick overhead | ~50-100ns |
+| Path | p50 |
+|------|-----|
+| Topic send, both ends on one thread (SpscShm) | ~20 ns |
+| Topic send, cross-thread 1P-1C (SpscShm) | ~63 ns |
+| Topic one-way, cross-process 1P-1C (SpscShm) | ~151 ns |
+| Topic one-way, cross-process 1P-MC (SpmcShm) | ~191 ns |
+| Topic broadcast, cross-process POD (PodShm) | ~223 ns |
+
+Measured with `all_paths_latency` on an Intel Core i7-10750H. Every topic is shared-memory backed, so what changes between rows is where the two ends run and how many participants contend - not the transport. Full tables in [Benchmarks](/performance/benchmarks).
 
 ---
 
