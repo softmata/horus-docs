@@ -8,58 +8,57 @@ weight: 41
 
 <Callout type="info" title="Quick Answer: Which Mode Should I Use?">
 
-**Use the default.** `Scheduler::new()` gives you deterministic, predictable execution that works for most robots.
+**Use the default.** `Scheduler::new()` runs your nodes in parallel, driven by their dependencies, which works for most robots — add `.deterministic(true)` when you need a reproducible execution order.
 
 | Your Situation | Recommended Setup |
 |----------------|------------------|
 | Learning HORUS | `Scheduler::new()` with defaults |
 | Prototyping | `Scheduler::new()` |
 | Need maximum speed | `Scheduler::new()` with `.compute()` execution class on heavy nodes |
-| Safety-critical (medical, aerospace) | `Scheduler::new().tick_hz(1000.0)` with `.rt()` execution class |
+| Safety-critical (medical, aerospace) | `Scheduler::new().deterministic(true).tick_rate(1000_u64.hz())` with `.rate()` on each node (promotes to RT) |
 
 **Don't overthink this.** Start with `Scheduler::new()` and configure per-node execution classes as needed.
 
 </Callout>
 
-HORUS supports two execution modes to optimize for different robotics scenarios. You configure the scheduler through `Scheduler::new()` and per-node execution classes (`.rt()`, `.compute()`, `.on(topic)`, `.async_io()`) — the scheduler handles the rest.
+HORUS supports two execution modes to optimize for different robotics scenarios. You pick the mode on the scheduler (`Scheduler::new()` is parallel; `.deterministic(true)` is sequential) and tune individual nodes with per-node execution classes (`.compute()`, `.on(topic)`, `.async_io()`, plus `.rate()`/`.budget()`/`.deadline()`, which promote a node to the RT class) — the scheduler handles the rest.
 
 ## Sequential Mode
 
 **The deterministic choice for safety-critical systems.**
 
-Sequential mode is the default. Nodes execute one-by-one in priority order, producing the same execution order every tick.
+Sequential mode is opt-in via `Scheduler::new().deterministic(true)`. With it, all nodes run one-by-one on the main thread in dependency/priority order, producing the same execution order every tick.
 
 ### How It Works
 
 - Nodes execute one-by-one in priority order
 - Same execution order every tick
-- Bit-for-bit reproducible runs
+- Identical execution order across runs, on a virtual clock (`SimClock`)
 
 ### Characteristics
 
 | Metric | Value |
 |--------|-------|
-| Latency | ~100-500ns per node |
 | Deterministic | **Yes** |
 | Multi-core | No (single thread) |
-| Best For | Safety-critical, certification |
+| Best For | Safety-critical control, replayable tests |
 
 ### When to Use
 
-- Medical/surgical robots requiring certification
+- Medical/surgical robots and other safety-critical control loops
 - Systems needing reproducible behavior
 - Debugging complex timing issues
 - Formal verification scenarios
 
-Sequential mode is the default when nodes are added with distinct order values. Use `Scheduler::new()` and assign execution classes like `.rt()` for real-time constraints.
+Enable sequential mode with `Scheduler::new().deterministic(true)`. Add real-time constraints per node with `.rate()` (or `.budget()`/`.deadline()`), which promotes the node to the RT execution class automatically.
 
 ```rust,ignore
 use horus::prelude::*;
 
 // Safety-critical robot controller — 1 kHz tick, RT execution class
-let mut scheduler = Scheduler::new().tick_hz(1000.0);
-scheduler.add(safety_monitor).rt().order(0).done();
-scheduler.add(controller).rt().order(1).done();
+let mut scheduler = Scheduler::new().deterministic(true).tick_rate(1000_u64.hz());
+scheduler.add(safety_monitor).order(0).rate(1000_u64.hz()).done();
+scheduler.add(controller).order(1).rate(1000_u64.hz()).done();
 scheduler.run()?;
 ```
 
@@ -67,19 +66,18 @@ scheduler.run()?;
 
 **Multi-core execution for maximum throughput.**
 
-Parallel mode schedules independent nodes on different CPU cores, executing them concurrently while still respecting priority ordering.
+Parallel mode is what `Scheduler::new()` gives you by default: independent nodes are scheduled on different CPU cores and execute concurrently, while nodes that depend on each other still run in order.
 
 ### How It Works
 
 - Schedules independent nodes on different cores
-- Respects priority ordering
+- Respects dependency order (topic graph, or `.order()` tiers as fallback)
 - Uses thread pool for concurrent execution
 
 ### Characteristics
 
 | Metric | Value |
 |--------|-------|
-| Latency | Variable (depends on workload) |
 | Deterministic | No |
 | Multi-core | **Yes** |
 | Best For | Multi-sensor fusion, compute-heavy pipelines |
@@ -91,7 +89,7 @@ Parallel mode schedules independent nodes on different CPU cores, executing them
 - Systems with many independent nodes
 - When you have multiple CPU cores available
 
-The scheduler uses parallel mode when multiple nodes share the same order value and are configured with execution classes like `.compute()`. Nodes at the same order level can run concurrently across cores:
+Parallelism is decided per node, not by `.order()` alone. `.compute()` nodes always run concurrently in the compute thread pool regardless of order. Default (`BestEffort`) nodes are parallelised by the dependency graph: it is built from pub/sub topic metadata when any exists, and falls back to `.order()` tiers when none does — same order value means one parallel step, different order values run sequentially:
 
 ```rust,ignore
 use horus::prelude::*;
@@ -114,8 +112,7 @@ scheduler.run()?;
 |---------|------------|----------|
 | Deterministic | **Yes** | No |
 | Multi-core | No | **Yes** |
-| Best Latency | 87-313ns | Variable |
-| Certification Ready | **Yes** | No |
+| Reproducible for audit/replay | **Yes** | No |
 
 ## Examples
 
@@ -125,10 +122,10 @@ scheduler.run()?;
 use horus::prelude::*;
 
 // Surgical robot — deterministic, 1 kHz tick with RT execution class
-let mut scheduler = Scheduler::new().tick_hz(1000.0);
-scheduler.add(safety_monitor).rt().order(0).done();
-scheduler.add(force_feedback).rt().order(1).done();
-scheduler.add(motion_controller).rt().order(1).done();
+let mut scheduler = Scheduler::new().deterministic(true).tick_rate(1000_u64.hz());
+scheduler.add(safety_monitor).order(0).rate(1000_u64.hz()).done();
+scheduler.add(force_feedback).order(1).rate(1000_u64.hz()).done();
+scheduler.add(motion_controller).order(1).rate(1000_u64.hz()).done();
 scheduler.run()?;
 ```
 
@@ -137,10 +134,15 @@ scheduler.run()?;
 ```rust,ignore
 use horus::prelude::*;
 
-// Competition robot — maximum speed, compute-heavy nodes run in parallel
+// Competition robot — maximum speed
 let mut scheduler = Scheduler::new();
-scheduler.add(imu_reader).compute().order(0).done();
-scheduler.add(motor_controller).compute().order(0).done();
+
+// .compute() nodes run concurrently in the compute pool — order is not what parallelises them
+scheduler.add(vision_pipeline).compute().done();
+scheduler.add(path_planner).compute().done();
+
+// The control loop gets .rate(), which promotes it to the RT execution class
+scheduler.add(motor_controller).rate(1000_u64.hz()).done();
 scheduler.run()?;
 ```
 

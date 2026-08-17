@@ -19,7 +19,7 @@ HORUS provides 50+ built-in message types, but you'll often need your own. This 
 
 ### Approach 1: Use JsonWireMessage (Quick, Flexible)
 
-For prototyping or when the message schema changes frequently, use JSON:
+For prototyping or when the message schema changes frequently, use JSON.
 
 The JSON wire type is reached through the C API, not `Publisher<T>` — there is
 no `Publisher<HorusJsonWireMsg>` specialization, so `advertise<HorusJsonWireMsg>()`
@@ -54,7 +54,7 @@ int main() {
 ```
 
 **Pros:** No Rust changes needed, any JSON schema, works immediately.
-**Cons:** 4KB max, serialization overhead, no compile-time type checking.
+**Cons:** 3968-byte payload max, serialization overhead, no compile-time type checking.
 
 ### Approach 2: Define a Pod Struct (Production, Zero-Copy)
 
@@ -108,14 +108,27 @@ struct WeatherData {
 }} // namespace horus::msg
 ```
 
-#### Step 4: Add C++ template specialization
+#### Step 4: Declare the C prototypes
+
+`horus_c.h` is a hand-maintained mirror of `c_api.rs` — nothing generates it (`horus_cpp/build.rs` is an empty stub). The specialization added in Step 5 calls seven `extern "C"` functions (`horus_publisher_weather_data_new/_destroy/_send` and `horus_subscriber_weather_data_new/_destroy/_recv/_has_msg`), so they must be declared by hand first, or the build fails with `use of undeclared identifier 'horus_publisher_weather_data_new'`.
+
+In `horus_cpp/include/horus/horus_c.h`, add a line alongside the existing `HORUS_DECLARE_TOPIC(...)` invocations:
+```c
+HORUS_DECLARE_TOPIC(weather_data)
+```
+
+The macro is defined at line 369 and `#undef`'d at line 414, so the line must land between them. Placed anywhere else — for example next to the explicit `horus_publisher_temperature_*` prototypes higher up in the file — it will not compile. (Equivalently, you can write the seven prototypes out longhand in the style of those `temperature` declarations.)
+
+#### Step 5: Add C++ template specialization
 
 In `horus_cpp/include/horus/impl/topic_impl.hpp`:
 ```cpp
 HORUS_TOPIC_IMPL(msg::WeatherData, weather_data)
 ```
 
-#### Step 5: Use it
+If you put the struct from Step 3 under `horus_cpp/include/horus/msg/`, `#include` it here too — `topic_impl.hpp` currently pulls in only `control.hpp`, `sensor.hpp`, `geometry.hpp`, `navigation.hpp` and `diagnostics.hpp`.
+
+#### Step 6: Use it
 
 ```cpp
 #include <horus/horus.hpp>
@@ -132,7 +145,7 @@ public:
         data.temperature = read_temperature();
         data.humidity = read_humidity();
         data.pressure = read_pressure();
-        data.timestamp_ns = 0;
+        data.timestamp_ns = 0;  // horus_cpp ships no clock helper — fill from std::chrono
         pub_->send(data);
     }
 
@@ -143,6 +156,34 @@ private:
     float read_pressure() { return 1013.25f; }
 };
 ```
+
+The same `HORUS_TOPIC_IMPL` line also gave you `Subscriber<horus::msg::WeatherData>`, so the receiving side needs no extra registration:
+
+```cpp
+#include <horus/horus.hpp>
+#include <cstdio>
+
+class WeatherLogger : public horus::Node {
+public:
+    WeatherLogger() : Node("weather_logger") {
+        sub_ = subscribe<horus::msg::WeatherData>("weather.data");
+    }
+
+    void tick() override {
+        // recv() returns std::optional<BorrowedSample<WeatherData>> —
+        // empty when no new sample arrived since the last tick.
+        auto sample = sub_->recv();
+        if (!sample) return;
+        const horus::msg::WeatherData& w = **sample;
+        std::printf("%.1f C, %.0f%% RH, %.1f hPa\n", w.temperature, w.humidity, w.pressure);
+    }
+
+private:
+    horus::Subscriber<horus::msg::WeatherData>* sub_;
+};
+```
+
+Use `sub_->has_msg()` if you only want to know whether a sample is waiting without consuming it.
 
 ## Layout Rules for Custom Types
 
@@ -167,8 +208,8 @@ private:
 
 ## Key Takeaways
 
-- JsonWireMessage is the fastest path for custom data — no Rust changes, JSON payload, 4KB max
-- Custom Pod structs give zero-copy SHM but require adding to the FFI pipeline (5 steps)
-- Both approaches work cross-language (C++ ↔ Rust ↔ Python)
+- JsonWireMessage is the fastest path for custom data — no Rust changes, JSON payload, 3968-byte max
+- Custom Pod structs give zero-copy SHM but require adding to the FFI pipeline (6 steps)
+- Both approaches work between C++ and Rust; reaching Python needs a matching binding in `horus_py` as well, which this tutorial does not cover
 - Always put `timestamp_ns: u64` as the last field (convention)
-- The `HORUS_TOPIC_IMPL` macro generates the entire Publisher/Subscriber specialization in one line
+- The `HORUS_TOPIC_IMPL` macro generates the entire Publisher/Subscriber specialization in one line — once the seven C prototypes from Step 4 exist

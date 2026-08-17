@@ -1,18 +1,18 @@
 ---
 title: "Tutorial 7: Parameters Deep Dive (C++)"
-description: "Runtime configuration with typed parameters, live tuning, and persistence"
+description: "Runtime configuration with typed parameters, startup loading from YAML, and organizing params by subsystem"
 order: 72
 ---
 
 # Tutorial 7: Parameters Deep Dive (C++)
 
-Parameters let you change robot behavior at runtime without recompiling. Tune PID gains, adjust speed limits, enable/disable features — all while the robot is running.
+Parameters let you change robot behavior without recompiling. Tune PID gains, adjust speed limits, enable/disable features — from a YAML file read at startup, or from your own code while the robot is running.
 
 ## What You'll Learn
 
 - `horus::Params` for typed key-value storage
 - `get<T>()` with defaults for safe access
-- Live tuning from `horus param` CLI
+- Loading startup values from `.horus/config/params.yaml` (written by `horus param set`)
 - Organizing parameters by subsystem
 
 ## Basic Usage
@@ -30,8 +30,14 @@ public:
         out_pub_ = advertise<horus::msg::CmdVel>("motor.cmd");
     }
 
+    void init() override {
+        // Read a startup value back — get<std::string>() falls back to "unnamed"
+        horus::log::info(name(), "robot: " + params_.get<std::string>("robot_name", "unnamed"));
+    }
+
     void tick() override {
-        // Read parameters every tick — picks up live changes
+        // Read parameters every tick — picks up any set() done elsewhere
+        // in this process (there is no live channel from the CLI)
         double max_speed = params_.get<double>("max_speed", 0.5);
         double gain      = params_.get<double>("controller_gain", 0.8);
         bool   enabled   = params_.get<bool>("motor_enabled", true);
@@ -62,7 +68,7 @@ private:
 int main() {
     horus::Params params;
 
-    // Set defaults
+    // Override whatever params.yaml supplied for these keys
     params.set("max_speed", 0.5);
     params.set("controller_gain", 0.8);
     params.set("motor_enabled", true);
@@ -77,6 +83,20 @@ int main() {
     sched.spin();
 }
 ```
+
+### Where startup values come from
+
+Constructing `horus::Params` layers three sources, lowest precedence first:
+HORUS's built-in defaults, then `.horus/config/params.yaml` (the file
+`horus param set` writes), then any `HORUS_PARAM_*` environment variables. That
+happens **once, in the constructor** — there is no file watcher and no live
+channel from the `horus param` CLI, so a `horus param set` issued while the node
+is running changes nothing until you restart the process.
+
+Note the ordering in `main()` above: the `params.set(...)` calls run *after* the
+file has been loaded, so they overwrite whatever `params.yaml` held for those
+keys. Drop them and rely on the fallbacks in `get<T>("key", default)` if you want
+the YAML file to win.
 
 ## Supported Types
 
@@ -113,19 +133,25 @@ params.set("safety.estop_enabled", true);
 void init() override {
     double kp = params_.get<double>("pid.kp", -1.0);
     if (kp < 0) {
-        horus::log::error("pid", "pid.kp must be >= 0");
+        horus::log::error(name(), "pid.kp must be >= 0");
         return;
     }
     double max_speed = params_.get<double>("loco.max_speed", 0.5);
     if (max_speed > 2.0) {
-        horus::log::warn("pid", "max_speed > 2.0 m/s — are you sure?");
+        horus::log::warn(name(), "max_speed > 2.0 m/s — are you sure?");
     }
 }
 ```
 
+The first argument to `horus::log::info` / `warn` / `error` is the **node name**,
+not a free-form category — it is what `horus log <node>` filters on. Inside a node,
+pass `name()` so the message lands under the node that emitted it (`tunable_ctrl`
+here), even though the key being checked lives under a different prefix.
+
 ## Key Takeaways
 
-- Read params every tick — captures live changes
+- Read params every tick — captures `set()` calls made elsewhere in the process
+- Startup values load once, in the `Params` constructor — restart to pick up a `horus param set`
 - Always provide defaults: `get<double>("key", 0.0)` never fails
 - Use dotted naming (`pid.kp`, `loco.max_speed`) to organize
 - Validate in `init()` — log warnings for dangerous values

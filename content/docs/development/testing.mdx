@@ -332,24 +332,27 @@ mod tests {
 horus test test_pubsub_communication --test-threads 1
 ```
 
-**Why `--test-threads 1`?**
-- Prevents tests from running in parallel (this is the default for `horus test`)
+**Why single-threaded (`--test-threads 1`)?**
+- Prevents tests from running in parallel — `horus test` already defaults to one thread, so the flag just makes that explicit
 - Avoids shared memory conflicts between tests
 - Ensures deterministic behavior
 
 **Expected Output:**
 
 ```
-running 2 tests
+running 1 test
 test tests::test_pubsub_communication ... ok
-test tests::test_multiple_messages ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out
 ```
+
+The positional filter is passed straight through to `cargo test`, so only tests
+whose full name contains `test_pubsub_communication` run — `test_multiple_messages`
+is filtered out. Drop the filter (`horus test --test-threads 1`) to run both.
 
 ## Testing Business Logic in Isolation
 
-Test node logic without real Topic connections.
+Test node logic without exercising any Topic traffic.
 
 ### Example: Extracting Testable Logic
 
@@ -666,25 +669,34 @@ sub_node.tick();
 
 ### 4. Run Tests Sequentially
 
-`horus test` defaults to single-threaded execution to prevent shared memory conflicts. If you use `--parallel`, ensure each test uses unique topic names:
+`horus test` defaults to single-threaded execution to prevent shared memory conflicts:
 
 ```bash
 horus test    # Already single-threaded by default
 ```
+
+If you override that with `--parallel`, make sure each test uses unique topic names.
 
 ### 5. Test Edge Cases
 
 ```rust
 #[test]
 fn test_no_messages() {
-    let mut node = SubscriberNode::new().unwrap();
-    node.tick();  // Should handle gracefully
+    // SubscriberNode::new takes the shared buffer it pushes into
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let mut node = SubscriberNode::new(Arc::clone(&received)).unwrap();
+
+    node.tick();  // Should handle an empty topic gracefully
+    assert!(received.lock().unwrap().is_empty());
 }
 
 #[test]
 fn test_invalid_data() {
-    let result = node.process(-1.0);
-    assert!(result.is_err());
+    let processor = TemperatureProcessor::new().unwrap();
+
+    // process_temperature is infallible — it has no Err to return, so an
+    // edge-case test asserts on the value it produces
+    assert!(processor.process_temperature(f32::NAN).is_nan());
 }
 ```
 
@@ -715,8 +727,8 @@ horus test --release
 # Skip the build step (use existing build artifacts)
 horus test --no-build
 
-# Verbose output
-horus test -v
+# Verbose output (no short -v form on this subcommand)
+horus test --verbose
 
 # Run integration tests (tests marked #[ignore])
 horus test --integration
@@ -775,14 +787,14 @@ HORUS supports recording node execution and replaying it later for deterministic
 Record all node inputs/outputs during a run:
 
 ```bash
-# Record while running
-horus run --record
+# Record while running — the value is the session name (required)
+horus run --record my_session
 ```
 
-Recordings are saved to `~/.horus/recordings/<session>/` in binary format (`.horus` files). Each node gets its own recording file:
+Recordings are saved to the platform data directory — `~/.local/share/horus/recordings/<session>/` on Linux (`$XDG_DATA_HOME/horus/recordings` if set; `~/Library/Application Support/horus/recordings` on macOS, `%LOCALAPPDATA%\horus\data\recordings` on Windows) — in binary format (`.horus` files). A project-local `.horus/recordings/` directory in the current working directory is also searched. Use `horus record list` to see sessions without knowing the path. Each node gets its own recording file:
 
 ```
-~/.horus/recordings/my_session/
+~/.local/share/horus/recordings/my_session/
 ├── sensor_node@abc123.horus       # Node recording
 ├── control_node@def456.horus      # Node recording
 └── scheduler@main789.horus        # Scheduler execution order
@@ -799,9 +811,13 @@ use std::path::PathBuf;
 fn test_replay_crash_scenario() {
     let mut scheduler = Scheduler::new();
 
-    // Replay the motor node from a crash recording
+    // Replay the motor node from a crash recording.
+    // `add_replay` opens the path verbatim — `~` is NOT expanded, so pass a real path.
+    let recording = PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".local/share/horus/recordings/crash/motor_node@abc123.horus");
+
     scheduler.add_replay(
-        PathBuf::from("~/.horus/recordings/crash/motor_node@abc123.horus"),
+        recording,
         1,  // priority
     ).unwrap();
 
@@ -824,11 +840,19 @@ fn test_replay_crash_scenario() {
 
 ```bash
 # List recording sessions
-ls ~/.horus/recordings/
+horus record list
 
-# Recordings auto-cap at 100MB per node
-# Delete old recordings to free space
+# Show file sizes and tick counts
+horus record list --long
+
+# Recordings are unlimited in size by default — delete old ones to free space
+horus record delete <session>
+horus record clean --older-than 7
 ```
+
+Note: a recording file larger than 100 MB is rejected when it is *loaded* for
+replay (a sanity check against corrupted files), but nothing caps a recording
+while it is being written.
 
 ## Troubleshooting Tests
 

@@ -11,23 +11,23 @@ Real robots run multiple processes — a sensor driver, a controller, a safety m
 ## What You'll Learn
 
 - Separate binaries sharing SHM topics
-- Process startup ordering (subscriber before publisher)
+- Process lifetime and SHM ownership across processes
 - Cross-process service calls
 - Using `horus launch` for multi-process orchestration
 
 ## Architecture
 
 ```
-Process 1: lidar_driver       Process 2: controller        Process 3: safety
+Process 1: lidar_driver      Process 2: controller        Process 3: safety
 ┌────────────────────┐       ┌────────────────────┐       ┌────────────┐
-│ Publisher           │──SHM─→│ Subscriber          │       │ Subscriber │
-│ "lidar.scan"        │       │ "lidar.scan"        │       │ "cmd_vel"  │
-└────────────────────┘       │ Publisher           │──SHM─→│            │
-                              │ "cmd_vel"           │       └────────────┘
-                              └────────────────────┘
+│ Publisher          │──SHM─→│ Subscriber         │       │ Subscriber │
+│ "lidar.scan"       │       │ "lidar.scan"       │       │ "cmd_vel"  │
+└────────────────────┘       │ Publisher          │──SHM─→│            │
+                             │ "cmd_vel"          │       └────────────┘
+                             └────────────────────┘
 ```
 
-All three processes open the **same SHM files** in `/dev/shm/horus_default/topics/`. No message broker, no serialization.
+All three processes map their topics out of the **same directory**, `/dev/shm/horus_default/topics/`, and the two ends of a topic map the same file: process 1 and 2 share `lidar.scan`, process 2 and 3 share `cmd_vel`. No message broker, no serialization.
 
 ## Process 1: Sensor Driver
 
@@ -103,36 +103,152 @@ int main() {
 }
 ```
 
+## Process 3: Safety Monitor
+
+The third process watches `cmd_vel` without ever touching the lidar topic — it only needs the one SHM file the controller publishes into. It also hosts the `estop` service, covered in the next section.
+
+```cpp
+// safety_monitor.cpp
+#include <horus/horus.hpp>
+#include <atomic>
+#include <cstring>
+using namespace horus::literals;
+
+static std::atomic<bool> g_estop{false};
+
+// A handler is a plain function pointer — it cannot capture. `*res_len` is
+// IN/OUT: on entry the capacity of `res`, on return the bytes written.
+static bool handle_estop(const uint8_t*, size_t, uint8_t* res, size_t* res_len) {
+    g_estop.store(true, std::memory_order_relaxed);
+    const char body[] = R"({"stopped":true})";
+    size_t n = sizeof(body) - 1;
+    if (n > *res_len) return false;
+    std::memcpy(res, body, n);
+    *res_len = n;
+    return true;
+}
+
+class SafetyMonitor : public horus::Node {
+public:
+    SafetyMonitor() : Node("safety"), estop_("estop") {
+        cmd_sub_ = subscribe<horus::msg::CmdVel>("cmd_vel");
+        estop_.set_handler(handle_estop);
+    }
+    void tick() override {
+        estop_.process();          // answer any pending requests
+        auto cmd = cmd_sub_->recv();
+        if (!cmd) return;
+        if (g_estop.load(std::memory_order_relaxed) || cmd->get()->linear > 0.5f)
+            horus::log::warn("safety", "commanded motion blocked");
+    }
+private:
+    horus::Subscriber<horus::msg::CmdVel>* cmd_sub_;
+    horus::ServiceServer                   estop_;
+};
+
+int main() {
+    horus::Scheduler sched;
+    sched.tick_rate(100_hz).name("safety_proc");
+    SafetyMonitor safety;
+    sched.add(safety).order(0).build();
+    sched.spin();
+}
+```
+
+## Cross-Process Service Calls
+
+Topics are one-way fan-out. When one process needs an *answer* from another — "are you armed?", "stop now" — use a service instead. `horus::ServiceServer` and `horus::ServiceClient` exchange JSON payloads over the same SHM machinery as topics, on `estop.request` and a per-client `estop.response.<pid>`.
+
+The server side is the `estop_` member above: construct it with a name, hand it a handler, and call `process()` on every tick so requests get answered from the thread that created it. The client side is three lines from any other process:
+
+```cpp
+// estop_client.cpp — a teleop binary, a watchdog, anything
+#include <horus/horus.hpp>
+#include <chrono>
+#include <cstdio>
+
+int main() {
+    horus::ServiceClient estop("estop");
+    auto reply = estop.call(R"({})", std::chrono::milliseconds(500));
+    if (!reply) { std::fprintf(stderr, "estop: no response\n"); return 1; }
+    std::printf("%s\n", reply->c_str());   // {"stopped":true}
+}
+```
+
+`call()` returns `std::nullopt` on timeout or transport error — there is no exception to catch.
+
+One caveat: `horus service list` finds a C++ service (it discovers services by scanning SHM for the `.request` topic), but `horus service call` does **not** reach one. The CLI delivers requests through a JSON file gateway under `/dev/shm/horus_default/topics/.service_gateway/`, and only the Rust `ServiceServer` polls it. Call a C++ service with a `ServiceClient`.
+
 ## Running Multi-Process
 
 ```bash
-# Build both
+# Build all three
 g++ -std=c++17 -I horus_cpp/include -o sensor sensor_driver.cpp \
     -L target/debug -lhorus_cpp -lpthread -ldl -lm
 g++ -std=c++17 -I horus_cpp/include -o controller controller.cpp \
     -L target/debug -lhorus_cpp -lpthread -ldl -lm
+g++ -std=c++17 -I horus_cpp/include -o safety safety_monitor.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
 
-# Run (subscriber process first — creates SHM)
+# Run (order does not matter — start them in any order)
 LD_LIBRARY_PATH=target/debug ./controller &
-sleep 0.5
 LD_LIBRARY_PATH=target/debug ./sensor &
+LD_LIBRARY_PATH=target/debug ./safety &
 
 # Monitor from any terminal
-horus topic list    # shows lidar.scan, cmd_vel
-horus node list     # shows lidar, controller (separate PIDs)
+horus topic list      # shows lidar.scan, cmd_vel, estop.request
+horus node list       # shows lidar, controller, safety (separate PIDs)
+horus service list    # shows estop
 ```
 
-## Startup Order Rule
+## Startup Order and SHM Lifetime
 
-**Subscriber must start before publisher** for the first message exchange. The first process to open a topic creates the SHM ring buffer. If the publisher creates it and exits, the data is gone before the subscriber connects.
+Startup order does not affect correctness — a subscriber can join a topic that is already being published to and will start receiving on its next `recv()`. What does matter is process *lifetime*: the first process to open a topic owns its SHM file and unlinks it on exit, so if the publisher is the sole owner and exits, the ring buffer disappears with it.
 
-For production, use `horus launch` which manages startup ordering automatically.
+When a process genuinely does need another one up first (a driver that must claim a device, say), express it in `horus launch` with `depends_on` and `start_delay` rather than by hand-sequencing shell commands.
+
+## Orchestrating with `horus launch`
+
+Backgrounding three binaries by hand does not survive contact with a real robot. `horus launch` reads a YAML file and starts, orders, and supervises the whole set:
+
+```yaml
+# robot.launch.yaml
+session: robot
+env:
+  LD_LIBRARY_PATH: target/debug
+
+nodes:
+  - name: lidar
+    command: ./sensor
+
+  - name: safety
+    command: ./safety
+
+  # Topics need no ordering, but we want the estop service answering
+  # before anything can command motion.
+  - name: controller
+    command: ./controller
+    depends_on: [safety]
+    start_delay: 0.2
+    restart: on-failure
+```
+
+```bash
+horus launch --dry-run robot.launch.yaml   # print the startup order, launch nothing
+horus launch robot.launch.yaml             # start the session
+horus launch --status                      # list running sessions
+horus launch --stop robot                  # stop this session by name
+```
+
+`depends_on` topologically orders startup, `start_delay` waits that many seconds before starting a node, and `restart` (`never`, the default, `always`, or `on-failure`) decides whether a node that dies is respawned.
 
 ## Key Takeaways
 
 - Each process has its own `Scheduler` — they don't share a scheduler
 - Topics are shared via SHM files (`/dev/shm/horus_default/topics/`)
-- Subscriber should start first to create the ring buffer
+- Any process can start first; whichever opens a topic first creates (and on exit unlinks) its SHM ring buffer
 - `horus topic list` shows topics from ALL processes
 - No message broker — direct SHM ring buffer, ~170ns cross-process latency
-- Each process can have different tick rates (10 Hz sensor, 50 Hz controller)
+- `ServiceServer` / `ServiceClient` add request/response on top of the same SHM — drive the server with `process()` on every tick
+- `horus launch` starts, orders (`depends_on`, `start_delay`) and restarts the whole set from one YAML file
+- Each process can have different tick rates (10 Hz sensor, 50 Hz controller, 100 Hz safety)

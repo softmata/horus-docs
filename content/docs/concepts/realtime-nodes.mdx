@@ -1,15 +1,15 @@
 ---
 title: Real-Time Nodes
-description: Build time-critical robotics applications with guaranteed response times using RtNode
+description: Build time-critical robotics applications with guaranteed response times using per-node timing constraints
 ---
 
 # Real-Time Nodes
 
-HORUS provides industrial-grade real-time support for time-critical robotics applications through the RtNode trait and safety monitoring infrastructure.
+HORUS provides industrial-grade real-time support for time-critical robotics applications through per-node timing constraints and safety monitoring infrastructure.
 
 ## Overview
 
-Real-time nodes (RtNode) enable deterministic execution for:
+Real-time nodes enable deterministic execution for:
 - **Surgical robots** requiring guaranteed response times
 - **Industrial robots** with hard real-time control loops
 - **Aerospace and defense systems** with strict deadlines
@@ -17,54 +17,55 @@ Real-time nodes (RtNode) enable deterministic execution for:
 
 ## Key Features
 
-### RtNode Trait
+### Real-Time Registration
 
-The `RtNode` trait extends the standard `Node` trait with real-time constraints:
+There is no separate real-time trait. Nodes implement the standard `Node` trait, and
+a node becomes real-time when it is registered with timing constraints:
 
 ```rust
-use horus::prelude::*; // Provides {RtNode, RtPriority, RtClass, DeadlineMissPolicy}
+use horus::prelude::*; // Provides {Scheduler, Node, Miss, RtStats, DurationExt, FailurePolicy, RtConfig, RtScheduler}
 use std::time::Duration;
 
-impl RtNode for YourControlNode {
-    fn wcet_budget(&self) -> Duration {
-        Duration::from_micros(100) // 100μs worst-case execution time
-    }
+let mut scheduler = Scheduler::new();
 
-    fn deadline(&self) -> Duration {
-        Duration::from_millis(1) // 1ms deadline for 1kHz control
-    }
-
-    fn rt_priority(&self) -> RtPriority {
-        RtPriority::Critical // Highest priority
-    }
-
-    fn rt_class(&self) -> RtClass {
-        RtClass::Hard // Must never miss deadline
-    }
-}
+scheduler.add(YourControlNode::new())
+    .order(0)                            // Runs first in the tick sequence
+    .rate(1000_u64.hz())                 // 1kHz control loop
+    .budget(Duration::from_micros(100))  // 100μs worst-case execution time
+    .deadline(Duration::from_millis(1))  // 1ms deadline for 1kHz control
+    .on_miss(Miss::SafeMode)             // Enter the node's safe state on a miss
+    .build()?;
 ```
 
 ### Priority Levels
 
-HORUS provides fine-grained priority control:
+Two independent knobs control priority:
 
-| Priority | Use Case | Value |
-|----------|----------|-------|
-| `RtPriority::Critical` | Critical control loops | 0 |
-| `RtPriority::High` | Important sensors/actuators | 10 |
-| `RtPriority::Medium` | Normal processing | 50 |
-| `RtPriority::Low` | Background tasks | 100 |
-| `RtPriority::Custom(u32)` | Custom priority | User-defined |
+- `.order(u32)` — position in the tick sequence (lower runs earlier).
+- `.priority(i32)` — OS thread priority for the node's RT thread (`SCHED_FIFO` 1-99,
+  higher = more priority). Requires `CAP_SYS_NICE` or root, and degrades gracefully
+  when unavailable.
 
-### Real-Time Classes
+Suggested `.order()` ranges:
 
-Three RT classes for different timing requirements:
+| Range | Use Case |
+|-------|----------|
+| 0-9 | Critical real-time (motor control, safety) |
+| 10-49 | High priority (sensors, fast control loops) |
+| 50-99 | Normal priority (processing, planning) |
+| 100-199 | Low priority (logging, diagnostics) |
+| 200+ | Background (telemetry, non-essential) |
 
-| Class | Description | Deadline Miss Behavior |
-|-------|-------------|----------------------|
-| `RtClass::Hard` | Must never miss deadline | Emergency stop |
-| `RtClass::Firm` | Occasional miss tolerated | Skip execution |
-| `RtClass::Soft` | Best effort timing | Warning only |
+### Deadline Miss Policies
+
+Deadline-miss behaviour is chosen per node with `.on_miss(Miss)`:
+
+| Policy | Behavior |
+|--------|----------|
+| `Miss::Warn` | Log a warning and continue normally (default) |
+| `Miss::Skip` | Skip this tick, resume next cycle |
+| `Miss::SafeMode` | Call `enter_safe_state()` on the node, then keep ticking |
+| `Miss::Stop` | Stop the entire scheduler (last resort) |
 
 ### Safety Monitor
 
@@ -75,30 +76,37 @@ The safety monitor provides comprehensive runtime protection:
 - **Watchdog Timers**: Detects hung or crashed nodes
 - **Emergency Stop**: Immediate shutdown for critical failures
 
+Budget and deadline monitoring are active for any node registered with `.rate()`,
+`.budget()` or `.deadline()` — no flag needed. Watchdog timers additionally require
+`Scheduler::watchdog(Duration)`, shown under [Safety-Critical Configuration](#safety-critical-configuration).
+
 ## Basic Usage
 
 ### Adding RT Nodes
 
 ```rust
 use horus::prelude::*;
+use std::time::Duration;
 
 let mut scheduler = Scheduler::new();
 
 // Add an RT node with explicit constraints using fluent API
 scheduler.add(MotorControlNode::new())
-    .order(0)           // Priority 0 (highest, runs first)
-    .rt()               // Mark as real-time node
-    .wcet_us(100)       // 100μs WCET budget
-    .deadline_us(1000)  // 1ms deadline
-    .done();
+    .order(0)                            // Order 0 (runs first in the tick sequence)
+    .rate(1000_u64.hz())                 // 1kHz control loop
+    .budget(Duration::from_micros(100))  // 100μs tick budget
+    .deadline(Duration::from_millis(1))  // 1ms deadline
+    .build()?;
 
-// Note: .wcet_us() and .deadline_us() automatically mark the node as RT,
-// so .rt() is optional when using those methods. .deadline_ms() is also available.
+// Note: .budget() and .deadline() implicitly enable RT scheduling even without
+// .rate(). .rate() on its own auto-derives budget (80% of the period) and
+// deadline (95% of the period); explicit .budget()/.deadline() override those
+// defaults.
 
 // Mix with regular nodes
-scheduler.add(SensorNode::new()).order(10).done();
+scheduler.add(SensorNode::new()).order(10).build()?;
 
-scheduler.run();
+scheduler.run()?;
 ```
 
 ### Safety-Critical Configuration
@@ -107,20 +115,21 @@ For medical or aerospace applications:
 
 ```rust
 use horus::prelude::*;
+use std::time::Duration;
 
 // Configure for safety-critical operation (1kHz tick rate)
 let mut scheduler = Scheduler::new()
-    .tick_hz(1000.0)
-    .safety_monitor(true)
-    .watchdog(Duration::from_millis(100))
-    .memory_locked(true);
+    .tick_rate(1000_u64.hz())
+    .prefer_rt()        // mlockall + SCHED_FIFO where available
+    .watchdog(Duration::from_millis(100));
 
 scheduler.add(SurgicalRobotControl::new())
     .order(0)
-    .rt()
-    .wcet_us(50)
-    .deadline_us(500)
-    .done();
+    .rate(1000_u64.hz())
+    .budget(Duration::from_micros(50))
+    .deadline(Duration::from_micros(500))
+    .on_miss(Miss::SafeMode)
+    .build()?;
 ```
 
 ### High-Performance Configuration
@@ -128,133 +137,177 @@ scheduler.add(SurgicalRobotControl::new())
 For racing robots or competition systems:
 
 ```rust
+use horus::prelude::*;
+use std::time::Duration;
+
 // Configure for maximum performance (10kHz tick rate)
 let mut scheduler = Scheduler::new()
-    .tick_hz(10000.0)
-    .memory_locked(true)
-    .cpu_affinity(&[2, 3]);
+    .tick_rate(10_000_u64.hz())
+    .prefer_rt()        // mlockall + SCHED_FIFO where available
+    .cores(&[2, 3]);
 
 scheduler.add(TractionControl::new())
     .order(0)
-    .rt()
-    .wcet_us(20)
-    .deadline_us(100)  // 10kHz
-    .done();
+    .rate(10_000_u64.hz())
+    .budget(Duration::from_micros(20))
+    .deadline(Duration::from_micros(100))  // 10kHz
+    .build()?;
 ```
 
 ## Advanced Features
 
-### Formal Verification (Debug Builds)
+### Safe-State Hooks
 
-RtNode supports contracts that are checked via `debug_assert!` (active in debug builds, zero overhead in release):
+The `Node` trait has two safety hooks. Both are ordinary runtime methods with
+default implementations, so override only the ones you need:
 
 ```rust
-impl RtNode for SafetyCriticalNode {
-    fn pre_condition(&self) -> bool {
-        // Verify system is safe before execution
-        self.system_armed && self.sensors_valid
+impl Node for SafetyCriticalNode {
+    fn tick(&mut self) { /* ... */ }
+
+    // Report whether the node is currently in a safe state
+    fn is_safe_state(&self) -> bool {
+        self.motors_stopped
     }
 
-    fn post_condition(&self) -> bool {
-        // Verify command was sent successfully
-        self.command_acknowledged
-    }
-
-    fn invariant(&self) -> bool {
-        // System safety invariant that must always hold
-        self.emergency_stop_available && self.watchdog_active
+    // Drive the node into its safe state
+    fn enter_safe_state(&mut self) {
+        self.pwm = 0.0;
     }
 }
 ```
+
+Pair `enter_safe_state()` with `.on_miss(Miss::SafeMode)` — that policy is what calls
+it on a deadline miss. It fires on every miss; the node is not isolated afterwards,
+and the scheduler does not poll `is_safe_state()` for automatic recovery.
 
 ### Custom Deadline Policies
 
-Configure response to deadline misses:
+Configure response to deadline misses per node with `.on_miss(Miss)`:
 
 ```rust
-fn deadline_miss_policy(&self) -> DeadlineMissPolicy {
-    match self.criticality_level {
-        Critical => DeadlineMissPolicy::EmergencyStop,
-        Important => DeadlineMissPolicy::Degrade,
-        Normal => DeadlineMissPolicy::Skip,
-        Low => DeadlineMissPolicy::Warn,
-    }
-}
+use horus::prelude::*;
+
+// Motor controller: enter safe mode on deadline miss
+scheduler.add(motor).rate(1000_u64.hz()).on_miss(Miss::SafeMode).build()?;
+
+// Video encoder: drop the frame, keep streaming
+scheduler.add(encoder).rate(30_u64.hz()).on_miss(Miss::Skip).build()?;
+
+// Last resort: stop the whole scheduler
+scheduler.add(estop_monitor).rate(100_u64.hz()).on_miss(Miss::Stop).build()?;
 ```
 
-### Fallback Nodes
+### Failure Handling and Degradation
 
-Implement N-version programming for redundancy:
+HORUS has no automatic fallback-node substitution. Degradation is expressed with
+two knobs: a failure policy for nodes that error out, and `Miss::SafeMode`
+for nodes that overrun their timing.
 
 ```rust
-fn fallback_node(&self) -> Option<Box<dyn RtNode>> {
-    Some(Box::new(SimplifiedController::new()))
-}
+use horus::prelude::*;
+use std::time::Duration;
+
+// Restart a recoverable node up to 3 times with backoff
+scheduler.add(PerceptionNode::new())
+    .failure_policy(FailurePolicy::restart(3, Duration::from_millis(50)))
+    .build()?;
+
+// Tolerate failures in a non-critical node with a cooldown
+scheduler.add(TelemetryLogger::new())
+    .failure_policy(FailurePolicy::skip(10, Duration::from_secs(60)))
+    .build()?;
+
+// Drop into the node's own safe state when it misses a deadline
+scheduler.add(MotorControl::new())
+    .rate(1000_u64.hz())
+    .on_miss(Miss::SafeMode)
+    .build()?;
 ```
 
-## Robot Presets
+## Starting Points by Robot Type
 
-Quick configurations for common robot types:
+HORUS has no preset constructors — each robot type is just a different scheduler
+tick rate plus the per-node constraints described above:
 
 ### Standard Industrial Robot
 ```rust
 let mut scheduler = Scheduler::new();
-// 60Hz control, fault tolerance, monitoring enabled
+// Default 100Hz tick; add .watchdog() and per-node .failure_policy() as needed
 ```
 
 ### Medical/Surgical Robot
 ```rust
-let mut scheduler = Scheduler::new().tick_hz(1000.0);
-// 1kHz control, add per-node .rt().wcet_us().deadline_us() for WCET enforcement
+let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz());
+// 1kHz control, add per-node .rate()/.budget()/.deadline() for budget enforcement
 ```
 
 ### Racing/Competition Robot
 ```rust
-let mut scheduler = Scheduler::new().tick_hz(10000.0);
-// 10kHz control, add per-node .rt().wcet_us().deadline_us() for timing constraints
+let mut scheduler = Scheduler::new().tick_rate(10_000_u64.hz());
+// 10kHz control, add per-node .rate()/.budget()/.deadline() for timing constraints
 ```
 
 ## Performance Characteristics
 
-Real-world performance on modern hardware:
+The measured figures HORUS publishes cover the IPC/topic paths, not scheduler tick
+latency or monitoring overhead. Every live topic backend is shared-memory and
+cross-process, and the backend is selected automatically — there is no
+intra-process or same-thread path, and no backend name for you to choose.
+Measured with `robotics_messages_benchmark` on an Intel Core i7-10750H @ 2.60 GHz
+(6C/12T), `powersave` governor, 50,000 iterations per message type:
 
-| Metric | Performance | Notes |
-|--------|------------|-------|
-| Tick Latency | ~50-100ns | With UltraFast tier |
-| WCET Overhead | &lt;5μs | Monitoring overhead |
-| Deadline Precision | ±10μs | Jitter bounds |
-| Watchdog Resolution | 1ms | Detection time |
-| Context Switch | &lt;1μs | Priority preemption |
+| Message | Size | Median | p99 |
+|---------|------|--------|-----|
+| `CmdVel` | 16 B | 75 ns | 135 ns |
+| `Imu` | 304 B | 121 ns | 235 ns |
+| `JointCommand` | 928 B | 135 ns | 226 ns |
+| `LaserScan` | 1480 B | 210 ns | 283 ns |
+
+Timing uses RDTSC with calibrated overhead subtraction; see
+[Benchmarks](/performance/benchmarks) for the full methodology. At a 1kHz control
+rate a 75 ns hop leaves essentially the whole 1ms period for the node's own work,
+so message transport is rarely what breaks a budget.
+
+One scheduler-side resolution limit is worth knowing:
+
+| Setting | Resolution | Notes |
+|---------|-----------|-------|
+| `Scheduler::watchdog()` | 1ms | Sub-millisecond timeouts are rounded up to the 1ms floor the config can store |
 
 ## Mixed RT and Normal Nodes
 
-HORUS supports mixed criticality systems through priority-based scheduling:
+HORUS supports mixed criticality systems by ordering nodes in the tick sequence and
+attaching timing constraints only to the ones that need them:
 
 ```rust
+use horus::prelude::*;
+use std::time::Duration;
+
 let mut scheduler = Scheduler::new();
 
-// Critical RT nodes (order 0-10)
+// Critical RT nodes (order 0-9)
 scheduler.add(FlightControl::new())
     .order(0)
-    .rt()
-    .wcet_us(100)
-    .deadline_us(1000)
-    .done();
+    .rate(1000_u64.hz())
+    .budget(Duration::from_micros(100))
+    .deadline(Duration::from_millis(1))
+    .build()?;
 
-// Important processing (order 11-50)
+// Important processing (order 10-49)
 scheduler.add(PathPlanning::new())
     .order(20)
-    .done();
+    .build()?;
 
-// Normal tasks (order 51-100)
+// Normal tasks (order 50-99)
 scheduler.add(TelemetryLogger::new())
     .order(60)
-    .done();
+    .build()?;
 
-// Background tasks (order 100+)
+// Background tasks (order 200+)
 scheduler.add(DataUploader::new())
-    .order(150)
-    .done();
+    .order(200)
+    .build()?;
 ```
 
 ## Best Practices
@@ -264,79 +317,95 @@ scheduler.add(DataUploader::new())
 Set budgets 20-30% higher than typical execution:
 ```rust
 // If typical execution is 75μs
-fn wcet_budget(&self) -> Duration {
-    Duration::from_micros(100) // Add 25% margin
-}
+scheduler.add(MotorControl::new())
+    .rate(1000_u64.hz())
+    .budget(Duration::from_micros(100)) // Add 25% margin
+    .build()?;
 ```
+
+`.budget()` overrides the budget `.rate()` derives on its own — see below.
 
 ### Deadline Configuration
 
-Use 2x WCET as default deadline:
+`.rate(f)` derives budget = 80% of the period and deadline = 95% of the period.
+Setting `.budget()` alone makes deadline = budget, so a budget overrun is also a
+deadline miss. Override either explicitly:
+
 ```rust
-fn deadline(&self) -> Duration {
-    self.wcet_budget() * 2
-}
+scheduler.add(MotorControl::new())
+    .rate(1000_u64.hz())
+    .budget(Duration::from_micros(500))   // override default 800μs
+    .deadline(Duration::from_micros(900)) // override default 950μs
+    .build()?;
 ```
 
 ### Priority Assignment
 
-Reserve priority ranges:
-- **0-10**: Critical RT nodes
-- **11-50**: Important processing
-- **51-100**: Normal operations
-- **100+**: Background tasks
+Reserve the `.order()` ranges listed under [Priority Levels](#priority-levels), and
+keep `.priority()` (the OS thread priority) for nodes that genuinely need to preempt
+others on the CPU.
 
 ### Testing Under Load
 
-Always verify timing constraints:
+Always verify timing constraints. Observed timing is read back from the scheduler,
+not from the node:
+
 ```rust
 #[test]
-fn test_wcet_compliance() {
-    let mut node = MotorControl::new();
-    let start = Instant::now();
-    node.tick();
-    let duration = start.elapsed();
-    assert!(duration <= node.wcet_budget());
+fn test_wcet_compliance() -> Result<()> {
+    let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz());
+
+    scheduler.add(MotorControl::new())
+        .order(0)
+        .rate(1000_u64.hz())
+        .budget(Duration::from_micros(100))
+        .build()?;
+
+    scheduler.run_for(Duration::from_millis(500))?;
+
+    // The lookup key is the node's Node::name(), which defaults to the type
+    // name — "MotorControl" here, unless the node overrides name()
+    let stats = scheduler.rt_stats("MotorControl").unwrap();
+    assert_eq!(stats.budget_violations(), 0);
+    Ok(())
 }
 ```
+
+`RtStats` also exposes `worst_execution()`, `avg_execution_us()`, `jitter_us()` and
+`deadline_misses()`. Two caveats: `Scheduler::rt_stats()` is `#[doc(hidden)]` —
+public but unstable, so treat it as a debugging aid rather than a supported API —
+and it returns `None` unless the node was registered as RT via `.rate()`,
+`.budget()` or `.deadline()`.
 
 ## Migration Guide
 
 ### From Standard Nodes
 
-1. Implement the RtNode trait:
-```rust
-impl RtNode for YourNode {
-    fn wcet_budget(&self) -> Duration {
-        Duration::from_micros(100)
-    }
+Your node keeps implementing `Node` — there is no separate real-time trait. A node
+becomes real-time through its registration.
 
-    fn deadline(&self) -> Duration {
-        Duration::from_millis(1)
-    }
-}
-```
-
-2. Update scheduler.add() to include RT constraints:
+1. Add RT constraints to `scheduler.add()`:
 ```rust
 // Before (regular node)
-scheduler.add(node).order(0).done();
+scheduler.add(node).order(0).build()?;
 
 // After (RT node with constraints)
 scheduler.add(node)
     .order(0)
-    .rt()
-    .wcet_us(100)
-    .deadline_us(1000)
-    .done();
+    .rate(1000_u64.hz())
+    .budget(Duration::from_micros(100))
+    .deadline(Duration::from_millis(1))
+    .on_miss(Miss::SafeMode)
+    .build()?;
 ```
 
-3. Configure scheduler for RT:
+2. Configure scheduler for RT:
 ```rust
-let mut scheduler = Scheduler::new().tick_hz(1000.0);
+let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz()).prefer_rt();
 ```
 
-4. Test with monitoring enabled
+3. Test under load and check `rt_stats()` for budget violations — see
+   [Testing Under Load](#testing-under-load)
 
 ## Troubleshooting
 
@@ -358,7 +427,7 @@ let mut scheduler = Scheduler::new().tick_hz(1000.0);
 - Check for priority inversions
 - Reduce system load
 - Increase deadline
-- Use firm/soft RT class
+- Relax the miss policy with `.on_miss(Miss::Skip)` or `.on_miss(Miss::Warn)`
 
 ### Emergency Stops
 
@@ -367,7 +436,7 @@ let mut scheduler = Scheduler::new().tick_hz(1000.0);
 **Solutions**:
 - Review safety monitor logs
 - Check critical node health
-- Increase max_deadline_misses
+- Raise the emergency-stop threshold with `Scheduler::max_deadline_misses(n)` (default 100)
 - Verify WCET budgets
 
 ### Watchdog Timeouts
@@ -435,7 +504,7 @@ fn main() -> Result<()> {
         .budget(Duration::from_micros(100))
         .deadline(Duration::from_millis(1))
         .on_miss(Miss::SafeMode)
-        .done()?;
+        .build()?;
 
     // Run the system
     scheduler.run()
@@ -444,10 +513,11 @@ fn main() -> Result<()> {
 
 ## System-Level RT Configuration
 
-RtNode provides node-level timing constraints. For system-level configuration (memory locking, CPU affinity, RT scheduling), see [Real-Time Configuration (RtConfig)](/advanced/rt-config).
+The node builder provides node-level timing constraints. For system-level configuration (memory locking, CPU affinity, RT scheduling), see [Real-Time Configuration (RtConfig)](/advanced/rt-config).
 
 ```rust
 use horus::prelude::*;
+use std::time::Duration;
 
 // System-level: Configure kernel RT features
 RtConfig::builder()
@@ -461,10 +531,10 @@ RtConfig::builder()
 // Node-level: Add nodes with timing constraints using fluent API
 scheduler.add(ControlNode::new())
     .order(0)
-    .rt()
-    .wcet_us(100)      // WCET budget
-    .deadline_us(1000) // Deadline
-    .done();
+    .rate(1000_u64.hz())
+    .budget(Duration::from_micros(100))  // Tick budget
+    .deadline(Duration::from_millis(1))  // Deadline
+    .build()?;
 ```
 
 ## Next Steps

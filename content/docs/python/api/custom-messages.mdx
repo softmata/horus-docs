@@ -6,147 +6,83 @@ order: 53
 
 # Custom Messages (horus.msggen)
 
-The `horus.msggen` module lets you define **custom typed messages** directly in Python. Two approaches are available:
+There are two ways to move a payload HORUS has no built-in type for. Only the
+first works on an installed HORUS:
 
-| Approach | Build Step | Latency | Best For |
-|----------|-----------|---------|----------|
-| **Runtime Messages** | None | ~20-40μs | Prototyping, quick iteration |
-| **Compiled Messages** | `maturin develop` | ~3-5μs | Production, high-frequency |
+| Approach | Build Step | Best For |
+|----------|-----------|----------|
+| **Dict topics** | None | Prototyping, quick iteration, pip-installed HORUS |
+| **Compiled messages** (`horus.msggen`) | `maturin develop` + a manual `lib.rs` edit | Adding Rust message types to a `horus_py` source checkout |
 
 ---
 
-## Runtime Messages (No Build Step)
+## Dict Topics (No Build Step)
 
-Create custom messages instantly without any compilation. Uses Python's `struct` module for fixed-layout binary serialization.
+Any bare-string topic is a **generic** topic: it serializes whatever you send
+with MessagePack, so a plain dict of primitives crosses processes with no schema,
+no code generation and no compilation. This is the path `build_messages()` itself
+points you at when you have no source checkout.
 
 ### Basic Usage
 
 ```python
-from horus.msggen import define_message
-
-# Define a custom message type
-RobotStatus = define_message('RobotStatus', 'robot/status', [
-    ('battery_level', 'f32'),
-    ('error_code', 'i32'),
-    ('is_active', 'bool'),
-    ('timestamp', 'u64'),
-])
-
-# Create instances
-status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, timestamp=0)
-
-# Access fields
-print(status.battery_level)  # 85.0
-status.error_code = 5
-
-# Serialize for IPC
-raw_bytes = status.to_bytes()  # 17 bytes
-
-# Reconstruct from bytes
-status2 = RobotStatus.from_bytes(raw_bytes)
-```
-
-### Supported Types
-
-| Type String | Size | Description |
-|-------------|------|-------------|
-| `f32` / `float32` | 4 bytes | 32-bit float |
-| `f64` / `float64` | 8 bytes | 64-bit float |
-| `i8` | 1 byte | Signed 8-bit int |
-| `i16` | 2 bytes | Signed 16-bit int |
-| `i32` | 4 bytes | Signed 32-bit int |
-| `i64` | 8 bytes | Signed 64-bit int |
-| `u8` | 1 byte | Unsigned 8-bit int |
-| `u16` | 2 bytes | Unsigned 16-bit int |
-| `u32` | 4 bytes | Unsigned 32-bit int |
-| `u64` | 8 bytes | Unsigned 64-bit int |
-| `bool` | 1 byte | Boolean |
-
-### NumPy Messages (Better Performance)
-
-If NumPy is available, use `define_numpy_message` for better performance:
-
-```python
-from horus.msggen import define_numpy_message
-import numpy as np
-
-# NumPy-based message (uses structured arrays internally)
-SensorData = define_numpy_message('SensorData', 'sensor/data', [
-    ('x', np.float32),
-    ('y', np.float32),
-    ('z', np.float32),
-    ('temperature', np.float32),
-    ('timestamp', np.uint64),
-])
-
-# Create instance
-data = SensorData(x=1.0, y=2.0, z=3.0, temperature=25.5, timestamp=0)
-
-# Get underlying numpy structured array
-arr = data.to_numpy()
-
-# Zero-copy bytes access
-raw = data.to_bytes()
-```
-
-### With Topic (IPC)
-
-Runtime messages work with Topic for inter-process communication. Use `to_bytes()` / `from_bytes()` for serialization over generic topics:
-
-```python
 from horus import Topic
-from horus.msggen import define_message
 
-# Define message
-RobotStatus = define_message('RobotStatus', 'robot/status', [
-    ('battery_level', 'f32'),
-    ('error_code', 'i32'),
-])
-
-# Publisher — use generic topic with manual serialization
-pub_topic = Topic("robot/status")
-status = RobotStatus(battery_level=85.0, error_code=0)
-pub_topic.send(status.to_bytes())
+# Publisher
+pub_topic = Topic("robot.status")
+pub_topic.send({
+    'battery_level': 85.0,
+    'error_code': 0,
+    'is_active': True,
+    'timestamp': 0,
+})
 
 # Subscriber (different process)
-sub_topic = Topic("robot/status")
-raw = sub_topic.recv()
-if raw:
-    received = RobotStatus.from_bytes(raw)
-    print(received.battery_level)  # 85.0
+sub_topic = Topic("robot.status")
+data = sub_topic.recv()          # -> dict, or None if nothing queued
+if data:
+    print(data['battery_level'])  # 85.0
 ```
 
-Or use the Node convenience API (handles serialization automatically):
+### Supported Values
+
+A generic topic carries JSON-shaped values: dicts, lists, strings, numbers and
+booleans, nested freely. It does **not** accept `bytes` — `send(b'...')` raises
+`TypeError: Failed to convert Python object: invalid type: byte array, expected any valid JSON value`.
+To move raw bytes, carry them inside the dict as a list of ints or as a base64
+string field.
+
+Note that `recv()` returns a plain dict, not an object — read fields with
+`data['battery_level']`, not `data.battery_level`.
+
+### With Node
+
+The same dict goes through the Node convenience API:
 
 ```python
 import horus
-from horus.msggen import define_message
-
-RobotStatus = define_message('RobotStatus', 'robot/status', [
-    ('battery_level', 'f32'),
-    ('error_code', 'i32'),
-])
 
 def publisher_tick(node):
-    status = RobotStatus(battery_level=85.0, error_code=0)
-    node.send("robot/status", status.to_bytes())
+    node.send("robot.status", {'battery_level': 85.0, 'error_code': 0})
 
 def subscriber_tick(node):
-    if node.has_msg("robot/status"):
-        raw = node.recv("robot/status")
-        status = RobotStatus.from_bytes(raw)
-        print(status.battery_level)  # 85.0
+    if node.has_msg("robot.status"):
+        data = node.recv("robot.status")   # -> dict
+        print(data['battery_level'])       # 85.0
 
-pub = horus.Node("publisher", pubs="robot/status", tick=publisher_tick)
-sub = horus.Node("subscriber", subs="robot/status", tick=subscriber_tick)
+pub = horus.Node("publisher", pubs="robot.status", tick=publisher_tick)
+sub = horus.Node("subscriber", subs="robot.status", tick=subscriber_tick)
 horus.run(pub, sub, duration=3)
 ```
 
 ---
 
-## Compiled Messages (Production)
+## Compiled Messages (Source Checkout Only)
 
-For maximum performance (~3-5μs), compile your messages to Rust. This generates PyO3 bindings with the same zero-copy performance as built-in types.
+`horus.msggen` turns Python message definitions into Rust PyO3 source and runs
+maturin over it. It is for adding message types to a `horus_py` source checkout;
+the generated files are not wired into the extension for you, and the resulting
+class does not get the zero-copy backend that built-in types use — see Step 3.
 
 ### Step 1: Define Messages
 
@@ -154,21 +90,46 @@ For maximum performance (~3-5μs), compile your messages to Rust. This generates
 from horus.msggen import register_message
 
 # Register one or more messages
-register_message('RobotStatus', 'robot/status', [
+register_message('RobotStatus', 'robot.status', [
     ('battery_level', 'f32'),
     ('error_code', 'i32'),
     ('is_active', 'bool'),
     ('timestamp', 'u64'),
 ])
 
-register_message('SensorReading', 'sensor/reading', [
+register_message('SensorReading', 'sensor.reading', [
     ('x', 'f64'),
     ('y', 'f64'),
     ('z', 'f64'),
 ])
 ```
 
+#### Field types accepted by `register_message`
+
+| Type string | Rust type |
+|-------------|-----------|
+| `f32` / `float32` | `f32` |
+| `f64` / `float64` / `float` | `f64` |
+| `i8` / `i16` / `i32` / `i64` | same |
+| `u8` / `u16` / `u32` / `u64` | same |
+| `int` | `i64` |
+| `uint` | `u64` |
+| `bool` / `boolean` | `bool` |
+| `string` / `str` | `String` |
+| `vec_f32` / `vec_f64` / `vec_i32` / `vec_u8` | `Vec<T>` |
+
+`[T; N]` array literals and raw `Vec<...>` strings also parse. Anything else
+raises `ValueError: Unknown type: ...`.
+
 ### Step 2: Build
+
+<Callout type="warning">
+`build_messages()` only works against a horus_py **source checkout** — it shells
+out to `maturin develop --release` and needs `horus_py/Cargo.toml`. On a
+pip-installed HORUS it raises `RuntimeError` and points you at dict topics.
+`maturin` must also be on `PATH`, or the call prints
+`Error: maturin not found` and returns `False`.
+</Callout>
 
 ```python
 from horus.msggen import build_messages
@@ -177,36 +138,54 @@ from horus.msggen import build_messages
 build_messages()  # Runs: maturin develop --release
 ```
 
-This generates Rust code in `horus_py/src/custom_messages/` and rebuilds the module.
+This writes one `.rs` file per message plus a `mod.rs` into
+`horus_py/src/custom_messages/`, then runs maturin.
 
-### Step 3: Use
+### Step 3: Wire the Generated Module In (Manual)
 
-After building, your messages are available directly from `horus`:
+Building writes the files, but nothing compiles them. `horus_py/src/lib.rs`
+declares no `mod custom_messages;`, so maturin skips the generated directory
+entirely and `from horus import RobotStatus` raises `ImportError`. Add both
+lines by hand:
 
-```python
-from horus import RobotStatus, SensorReading, Topic
+```rust
+// horus_py/src/lib.rs
+mod custom_messages;                                // with the other `mod` declarations
 
-# Create typed topic
-topic = Topic(RobotStatus)
-
-# Send
-status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, timestamp=0)
-topic.send(status)
-
-# Receive (typed!)
-received = topic.recv()
-print(received.battery_level)
+#[pymodule]
+fn _horus(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // ... existing add_class calls ...
+    custom_messages::register_custom_messages(m)?;  // generated into custom_messages/mod.rs
+    Ok(())
+}
 ```
 
-### YAML Schema (Recommended for Teams)
+Rebuild after editing `lib.rs`. The generated class is then importable and
+constructible:
 
-For larger projects, define messages in YAML:
+```python
+from horus import RobotStatus
+
+status = RobotStatus(battery_level=85.0, error_code=0, is_active=True, timestamp=0)
+print(status)   # RobotStatus(battery_level=85.000, error_code=0, is_active=true, timestamp=0)
+```
+
+**It is not usable as a topic message type.** `Topic()` selects the zero-copy
+POD backend only for the built-in types in the `pod_topic_types!` macro in
+`horus_py/src/topic.rs`; a generated name falls through to the `GenericMessage`
+MessagePack path, and the generated `#[pyclass]` derives no serde impls, so
+sending an instance raises `TypeError: Failed to convert Python object`. Send its
+fields as a dict instead.
+
+### YAML Schema (Code Generation Only)
+
+For larger projects, message definitions can live in YAML:
 
 ```yaml
 # messages.yaml
 messages:
   - name: RobotStatus
-    topic: robot/status
+    topic: robot.status
     fields:
       - name: battery_level
         type: f32
@@ -216,7 +195,7 @@ messages:
         type: bool
 
   - name: SensorReading
-    topic: sensor/reading
+    topic: sensor.reading
     fields:
       - name: x
         type: f64
@@ -227,9 +206,36 @@ messages:
 ```
 
 ```python
-from horus.msggen import generate_messages_from_yaml, build_messages
+from horus.msggen import generate_messages_from_yaml
 
-generate_messages_from_yaml('messages.yaml')
+# Writes one .rs file per message into output_dir, and returns the generated source.
+generate_messages_from_yaml('messages.yaml', output_dir='horus_py/src/custom_messages')
+```
+
+`generate_messages_from_yaml` is a **code emitter only**. It calls
+`generate_message` for each entry and never calls `register_message`, so nothing
+lands in the build registry — a following `build_messages()` prints
+`No custom messages registered. Nothing to build.` and returns `True` without
+building anything. Omit `output_dir` and it writes no files at all. It also
+requires `pyyaml`.
+
+To go through the build path, read the YAML yourself and register each entry:
+
+```python
+import yaml
+from horus.msggen import register_message, build_messages
+
+with open('messages.yaml') as f:
+    schema = yaml.safe_load(f)
+
+for msg in schema['messages']:
+    register_message(
+        msg['name'],
+        msg['topic'],
+        [(f['name'], f['type']) for f in msg['fields']],
+        doc=msg.get('doc'),
+    )
+
 build_messages()
 ```
 
@@ -254,59 +260,29 @@ build_messages(force=True)
 
 ---
 
-## Performance Comparison
+## Performance
 
-| Approach | Latency | Throughput | Use Case |
-|----------|---------|------------|----------|
-| **Built-in (Rust)** | ~3μs | 300K msgs/sec | CmdVel, Pose2D, etc. |
-| **Compiled Custom** | ~3-5μs | 200K msgs/sec | Production custom types |
-| **Runtime** | ~20-40μs | 25K msgs/sec | Prototyping |
-| **Runtime (NumPy)** | ~15-30μs | 35K msgs/sec | NumPy integration |
-| **Pickle** | ~50-100μs | 10K msgs/sec | Legacy/dynamic types |
+`Topic()` reaches the zero-copy POD backend only for the built-in message types
+listed in the `pod_topic_types!` macro in `horus_py/src/topic.rs` (CmdVel,
+Pose2D, Pose3D, Imu, Odometry, LaserScan, JointState, …). Every other type name
+— including generated custom messages — falls through to the `GenericMessage`
+path, which serializes with MessagePack. A custom message therefore cannot match
+built-in performance, no matter how it is defined.
 
-**Recommendation**: Start with runtime messages for fast iteration, then compile for production.
+For real numbers, run the benchmarks in the source tree rather than relying on
+figures quoted in docs:
+
+```bash
+cargo run --release -p horus_benchmarks --bin all_paths_latency
+```
 
 ---
 
 ## API Reference
 
-### define_message
-
-```python
-def define_message(
-    name: str,
-    topic: str,
-    fields: List[Tuple[str, str]]
-) -> Type[RuntimeMessage]: ...
-```
-
-Create a runtime message class.
-
-**Parameters:**
-- `name`: Class name (e.g., `"RobotStatus"`)
-- `topic`: Topic name (e.g., `"robot.status"`)
-- `fields`: List of `(field_name, type_string)` tuples
-
-**Returns:** New message class
-
-### define_numpy_message
-
-```python
-def define_numpy_message(
-    name: str,
-    topic: str,
-    fields: List[Tuple[str, Any]]
-) -> Type[NumpyMessage]: ...
-```
-
-Create a NumPy-based message class.
-
-**Parameters:**
-- `name`: Class name
-- `topic`: Topic name
-- `fields`: List of `(field_name, numpy_dtype)` tuples
-
-**Returns:** New NumPy message class
+`horus.msggen` exports exactly five names: `register_message`,
+`build_messages`, `check_needs_rebuild`, `generate_message` and
+`generate_messages_from_yaml`.
 
 ### register_message
 
@@ -314,11 +290,20 @@ Create a NumPy-based message class.
 def register_message(
     name: str,
     topic: str,
-    fields: List[Tuple[str, str]]
+    fields: List[Tuple[str, str]],
+    doc: Optional[str] = None
 ) -> None: ...
 ```
 
 Register a message for compiled generation.
+
+**Parameters:**
+- `name`: Class name (e.g., `"RobotStatus"`)
+- `topic`: Topic name (e.g., `"robot.status"`). Only embedded in the generated
+  Rust as the `__topic_name__` class attribute, so any string will do — there is
+  no separate naming convention for compiled messages
+- `fields`: List of `(field_name, type_string)` tuples
+- `doc`: Optional docstring, emitted as the generated Rust type's doc comment
 
 ### build_messages
 
@@ -345,41 +330,68 @@ def check_needs_rebuild() -> bool: ...
 
 Check if registered messages differ from last build.
 
+### generate_message
+
+```python
+def generate_message(
+    name: str,
+    topic: str,
+    fields: List[Tuple[str, str]],
+    doc: Optional[str] = None,
+    output_dir: Optional[Path] = None
+) -> str: ...
+```
+
+Generate the Rust source for one message and return it. This is a code emitter:
+it does **not** add the message to the build registry, so a following
+`build_messages()` will not see it. Use `register_message` for that.
+
+**Parameters:**
+- `name`, `topic`, `fields`, `doc`: as for `register_message`
+- `output_dir`: if given, the source is also written to `<output_dir>/<name>.rs`
+  with the name lowercased (`RobotStatus` → `robotstatus.rs`), creating the
+  directory if needed. Omit it and nothing is written to disk.
+
+**Returns:** the generated Rust source
+
+### generate_messages_from_yaml
+
+```python
+def generate_messages_from_yaml(
+    yaml_path: str,
+    output_dir: Optional[Path] = None
+) -> List[str]: ...
+```
+
+Call `generate_message` once per entry under the `messages:` key of a YAML file.
+Same caveat: nothing is registered. Requires `pyyaml`.
+
+**Returns:** one Rust source string per message, in file order
+
 ---
 
 ## Complete Example
 
 ```python
 #!/usr/bin/env python3
-"""Custom message example with runtime messages."""
+"""Custom message example with dict topics."""
 
 import horus
-from horus.msggen import define_message
-
-# Define custom sensor message
-MySensor = define_message('MySensor', 'my/sensor', [
-    ('distance', 'f32'),
-    ('angle', 'f32'),
-    ('confidence', 'f32'),
-    ('object_id', 'u32'),
-])
 
 def sensor_tick(node):
     """Publish sensor readings."""
-    reading = MySensor(
-        distance=2.5,
-        angle=0.785,
-        confidence=0.95,
-        object_id=42
-    )
-    node.send("my.sensor", reading.to_bytes())
+    node.send("my.sensor", {
+        "distance": 2.5,
+        "angle": 0.785,
+        "confidence": 0.95,
+        "object_id": 42,
+    })
 
 def processor_tick(node):
     """Process sensor readings."""
     if node.has_msg("my.sensor"):
-        raw = node.recv("my.sensor")
-        reading = MySensor.from_bytes(raw)
-        print(f"Object {reading.object_id}: {reading.distance}m at {reading.angle}rad")
+        reading = node.recv("my.sensor")   # -> dict
+        print(f"Object {reading['object_id']}: {reading['distance']}m at {reading['angle']}rad")
 
 # Create nodes
 sensor = horus.Node("sensor", pubs="my.sensor", tick=sensor_tick, rate=10)
@@ -393,19 +405,19 @@ horus.run(sensor, processor, duration=3)
 
 ## When to Use Each Approach
 
-### Use Runtime Messages When:
+### Use Dict Topics When:
 - Prototyping new message types
 - Message schema changes frequently
 - You don't want to wait for compilation
-- Performance requirements are moderate (&lt;50Hz)
+- You are on a pip-installed HORUS (no source checkout)
 
 ### Use Compiled Messages When:
-- Deploying to production
-- High-frequency data (>100Hz)
-- Cross-language compatibility required
-- Type safety is critical
+- You are developing against a `horus_py` source checkout
+- You want a real Rust type with named fields, and accept that its fields still
+  travel over topics as a dict (see Step 3)
+- You are prepared to wire the generated module into `horus_py/src/lib.rs` yourself
 
 ### Use Built-in Messages When:
 - Standard robotics types (CmdVel, Pose2D, LaserScan)
-- Maximum performance needed
+- Maximum performance needed — only built-in types reach the zero-copy POD backend
 - Compatibility with other HORUS systems

@@ -13,7 +13,7 @@ Production-grade patterns for real robots.
 
 ## Example 1: Multi-Process Robot
 
-Three separate binaries communicating over SHM.
+Two separate binaries communicating over SHM.
 
 ### sensor_driver.cpp
 
@@ -140,9 +140,7 @@ int main() {
 
 ```python
 import horus
-from horus._horus import Topic, CmdVel
-
-src = Topic(CmdVel)  # reads "cmd_vel"
+from horus import CmdVel
 
 def ai_tick(node):
     det = node.recv("camera.detections")
@@ -153,8 +151,11 @@ def ai_tick(node):
         node.send("ai.decision", CmdVel(linear=0.3, angular=0.0))
 
 horus.run(
-    horus.Node(name="ai", subs=["camera.detections"],
-               pubs=["ai.decision"], tick=ai_tick, rate=10)
+    # Typed specs, not plain strings: the C++ neighbours publish/subscribe the
+    # POD horus::msg::CmdVel. Plain strings would open GenericMessage
+    # (MessagePack) topics, which cannot read or write that wire format.
+    horus.Node(name="ai", subs={"camera.detections": CmdVel},
+               pubs={"ai.decision": CmdVel}, tick=ai_tick, rate=10)
 )
 ```
 
@@ -199,11 +200,11 @@ int main() {
 ### Run all three
 
 ```bash
-./cpp_motor &        # C++ motor (subscriber — start first)
-python3 python_ai.py &  # Python AI
-./cpp_sensor &       # C++ sensor (publisher)
+LD_LIBRARY_PATH=target/debug ./cpp_motor &   # C++ motor (subscriber — start first)
+python3 python_ai.py &                       # Python AI
+LD_LIBRARY_PATH=target/debug ./cpp_sensor &  # C++ sensor (publisher)
 
-horus topic list     # 3 topics from 3 languages
+horus topic list     # 3 topics across the 2 languages
 horus node list      # 3 nodes with different PIDs
 ```
 
@@ -302,6 +303,7 @@ Request/response RPC and long-running navigation goal.
 #include <horus/horus.hpp>
 #include <cstring>
 #include <cstdio>
+#include <thread>
 
 int main() {
     // Service: add two numbers
@@ -310,14 +312,27 @@ int main() {
                           uint8_t* res, size_t* res_len) -> bool {
         int a = 0, b = 0;
         std::sscanf(reinterpret_cast<const char*>(req), R"({"a":%d,"b":%d})", &a, &b);
-        *res_len = std::snprintf(reinterpret_cast<char*>(res), 4096,
-                                  R"({"sum":%d})", a + b);
+        size_t cap = *res_len;   // IN: real capacity of res, in bytes
+        int n = std::snprintf(reinterpret_cast<char*>(res), cap,
+                              R"({"sum":%d})", a + b);
+        if (n < 0 || static_cast<size_t>(n) >= cap) return false;  // failed or truncated
+        *res_len = static_cast<size_t>(n);   // OUT: bytes written
         return true;
     });
 
-    horus::ServiceClient client("calc.add");
-    auto resp = client.call(R"({"a":10,"b":32})", std::chrono::milliseconds(1000));
-    if (resp) std::printf("10 + 32 = %s\n", resp->c_str());
+    // call() blocks polling for its response, so run it on its own thread and
+    // drive the server from this one — nothing else pumps it.
+    std::thread caller([] {
+        horus::ServiceClient client("calc.add");
+        auto resp = client.call(R"({"a":10,"b":32})", std::chrono::milliseconds(1000));
+        if (resp) std::printf("10 + 32 = %s\n", resp->c_str());
+    });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        server.process();   // answers pending requests
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    caller.join();
 
     // Action: navigate to goal
     horus::ActionClient nav("navigate");
@@ -334,4 +349,4 @@ int main() {
 
 - [Basic Examples](/cpp/examples/basic) — hello world, pub/sub, params, TF
 - [Tutorial 3: Full Robot](/tutorials/03-full-robot-cpp) — 6-node system
-- [Cross-Language Interop](/tutorials/cross-language-interop) — C++ + Rust + Python
+- [Multi-Language Support](/concepts/multi-language) — C++ + Rust + Python in one system

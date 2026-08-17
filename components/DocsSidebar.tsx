@@ -45,7 +45,7 @@ const sections: SidebarSection[] = [
         order: 3,
         children: [
           { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic", order: 1 },
-          { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic", order: 2 },
+          { title: "POD Types", href: "/concepts/core-concepts-podtopic", order: 2 },
           { title: "Services (Beta)", href: "/concepts/services", order: 3 },
           { title: "Actions (Beta)", href: "/concepts/actions", order: 4 },
         ]

@@ -13,22 +13,79 @@ Path planning and goal types in `horus::msg::`. Include via `<horus/msg/navigati
 
 | Type | Key Fields | Use Case |
 |------|------------|----------|
-| `NavGoal` | `target_x`, `target_y`, `target_theta`, `tolerance` | Send navigation target |
-| `GoalResult` | `success`, `distance_error`, `angle_error` | Navigation completion |
-| `Waypoint` | `x`, `y`, `heading`, `velocity` | Path waypoint |
+| `NavGoal` | `target_pose` (Pose2D), `tolerance_position`, `tolerance_angle`, `timeout_seconds`, `priority`, `goal_id` | Send navigation target |
+| `GoalResult` | `goal_id`, `status` (`GOAL_STATUS_*`), `distance_to_goal`, `eta_seconds`, `progress`, `error_message[64]` | Navigation completion |
+| `Waypoint` | `pose` (Pose2D), `velocity` (Twist), `time_from_start`, `curvature`, `stop_required` | Path waypoint |
 | `PathPlan` | `waypoint_data[768]`, `waypoint_count`, `goal_pose[3]` | Planned path |
-| `VelocityObstacle` | `center[2]`, `velocity[2]`, `radius` | Collision avoidance |
+| `VelocityObstacle` | `position[2]`, `velocity[2]`, `radius`, `time_horizon`, `obstacle_id` | Collision avoidance |
+
+`GoalResult` has no boolean success field. `status` carries one of the `GOAL_STATUS_*`
+enumerators declared in `horus::msg`: `GOAL_STATUS_PENDING` (0), `GOAL_STATUS_ACTIVE` (1),
+`GOAL_STATUS_SUCCEEDED` (2), `GOAL_STATUS_ABORTED` (3), `GOAL_STATUS_CANCELLED` (4),
+`GOAL_STATUS_PREEMPTED` (5), `GOAL_STATUS_TIMED_OUT` (6) — so a completed goal is
+`result.status == horus::msg::GOAL_STATUS_SUCCEEDED`.
 
 ## NavGoal — Send Navigation Target
 
 ```cpp
 horus::msg::NavGoal goal{};
-goal.target_x = 5.0;       // meters
-goal.target_y = 3.0;       // meters
-goal.target_theta = 1.57;  // radians (face east)
-goal.tolerance = 0.1f;     // accept within 10cm
+goal.target_pose.x = 5.0;        // meters
+goal.target_pose.y = 3.0;        // meters
+goal.target_pose.theta = 1.57;   // radians
+goal.tolerance_position = 0.1;   // meters (double) — accept within 10cm
+goal.tolerance_angle = 0.05;     // radians
+goal.timeout_seconds = 0.0;      // 0 = no limit
+goal.priority = 0;               // 0 = highest
+goal.goal_id = 1;
 goal.timestamp_ns = 0;
 ```
+
+## GoalResult — Progress and Completion Feedback
+
+Published back by the navigator for the `goal_id` it was handed. There is no boolean
+success flag — read `status`.
+
+```cpp
+horus::msg::GoalResult result{};
+result.goal_id = 1;                              // echoes NavGoal::goal_id
+result.status = horus::msg::GOAL_STATUS_ACTIVE;  // uint8_t GOAL_STATUS_* code
+result.distance_to_goal = 2.5;                   // meters remaining
+result.eta_seconds = 5.0;                        // estimated time to arrival
+result.progress = 0.75f;                         // float, 0.0 to 1.0
+result.timestamp_ns = 0;
+
+// error_message is a 64-byte null-terminated buffer, left all-zero when nothing
+// failed. Write it through a char* (needs <cstdio> for snprintf):
+result.status = horus::msg::GOAL_STATUS_ABORTED;
+std::snprintf(reinterpret_cast<char*>(result.error_message),
+              sizeof(result.error_message), "obstacle blocking path");
+
+// On the receiving side:
+if (result.status == horus::msg::GOAL_STATUS_ABORTED) {
+    std::printf("goal %u aborted: %s\n", result.goal_id,
+                reinterpret_cast<const char*>(result.error_message));
+}
+```
+
+## Waypoint — One Point on a Path
+
+`velocity` is a full 6-DOF `Twist`, not a scalar speed: forward speed goes in
+`linear[0]`, yaw rate in `angular[2]`.
+
+```cpp
+horus::msg::Waypoint wp{};
+wp.pose.x = 1.0;                // meters
+wp.pose.y = 2.0;                // meters
+wp.pose.theta = 0.0;            // radians
+wp.velocity.linear[0]  = 0.5;   // 0.5 m/s forward  (linear is m/s [x, y, z])
+wp.velocity.angular[2] = 0.0;   // no yaw rate      (angular is rad/s [roll, pitch, yaw])
+wp.time_from_start = 2.0;       // seconds after the path starts
+wp.curvature = 0.0f;            // 1/radius, so 0 = straight, 2.0f = a 0.5 m turn radius
+wp.stop_required = 0;           // Rust bool in one byte: 0 = drive through, 1 = stop here
+```
+
+`Waypoint` is the element type of `NavPath` (also in `navigation.hpp`). `PathPlan` below
+does *not* store `Waypoint`s — it packs three floats per point instead.
 
 ## PathPlan — Compact Path Representation
 
@@ -57,7 +114,24 @@ plan.waypoint_data[7] = 3.0f;
 plan.waypoint_data[8] = 0.0f;
 ```
 
+## VelocityObstacle — Moving Obstacle for Avoidance
+
+One dynamic obstacle, modelled as a disc travelling at constant velocity. Unlike the
+other types on this page it has no `timestamp_ns` field.
+
+```cpp
+horus::msg::VelocityObstacle obs{};
+obs.position[0] = 3.0;    // meters, x
+obs.position[1] = 2.0;    // meters, y
+obs.velocity[0] = 0.5;    // m/s, x
+obs.velocity[1] = 0.0;    // m/s, y
+obs.radius = 0.3f;        // meters — 30cm disc around the obstacle
+obs.time_horizon = 5.0f;  // seconds to project it forward when predicting collisions
+obs.obstacle_id = 1;      // tracking ID, stable across frames
+```
+
 ## See Also
 
-- [Geometry Messages](/cpp/api/geometry-messages) — Pose2D used by Odometry
-- [Recipe: LiDAR Avoidance](/recipes/lidar-avoidance-cpp) — reactive navigation
+- [Geometry Messages](/cpp/api/geometry-messages) — Pose2D and Twist, used by `NavGoal` and `Waypoint`
+- [Sensor Messages](/cpp/api/sensor-messages) — LaserScan and Odometry, the inputs a navigator consumes
+- [Tutorial 3: Full Robot System (C++)](/tutorials/03-full-robot-cpp) — reactive LaserScan obstacle avoidance

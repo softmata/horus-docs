@@ -30,7 +30,7 @@ let pid_kp = self.params.get_or("pid_kp", 1.0);
 - **Persistence** - Save/load from YAML files
 - **Sharing** - Export/import parameter sets
 - **Safety** - Fallback to defaults if missing
-- **Validation** - Range, regex, enum, and read-only constraints
+- **Validation** - Framework-internal only; clamp your own values in code (see [Validate Parameter Values](#validate-parameter-values))
 - **Versioning** - Optimistic locking for concurrent edits
 
 ## Core Concepts
@@ -109,7 +109,7 @@ pub struct VelocityController {
 
 impl VelocityController {
     fn new() -> Result<Self> {
-        let params = RuntimeParams::init()?;
+        let params = RuntimeParams::new()?;
         let max_speed = params.get_or("max_speed", 1.5);
         let acceleration = params.get_or("acceleration_limit", 0.5);
         Ok(Self { params, max_speed, acceleration })
@@ -141,7 +141,7 @@ impl Node for VelocityController {
 let speed = self.params.get_or("max_speed", 1.5);            // f64
 let enabled = self.params.get_or("auto_mode", false);         // bool
 let rate = self.params.get_or("update_rate_hz", 60);          // i32
-let name = self.params.get_or("node_name", "default");        // String
+let name: String = self.params.get_or("node_name", "default".to_string());  // String
 ```
 
 **Generic get (returns `Option<T>`):**
@@ -152,10 +152,10 @@ if let Some(speed) = self.params.get::<f64>("max_speed") {
 }
 ```
 
-**Generic get with default:**
+**Generic get with explicit errors (`get_typed`, returns `HorusResult<T>`):**
 ```rust
-// Returns default if parameter doesn't exist
-let rate: i32 = self.params.get_or("update_rate_hz", 60);
+// Distinguishes "missing key" from "wrong type" instead of failing silently
+let rate: i32 = self.params.get_typed("update_rate_hz")?;
 ```
 
 **Set parameter:**
@@ -172,8 +172,15 @@ self.params.set("camera_resolution", vec![1920, 1080])?;
 self.params.has("max_speed");           // bool — check if key exists
 self.params.list_keys();                // Vec<String> — all parameter keys
 self.params.get_all();                  // BTreeMap<String, Value> — all params
+```
+
+**Mutating methods:**
+```rust
 self.params.remove("old_key");          // Option<Value> — remove and return
-self.params.reset()?;                   // Reset all params to defaults
+self.params.reset()?;                   // Drop every key, then restore the
+                                        // built-in defaults — in-memory values
+                                        // from params.yaml and HORUS_PARAM_*
+                                        // are discarded too
 ```
 
 **Persistence:**
@@ -214,7 +221,7 @@ impl Node for AdaptiveController {
 }
 ```
 
-**Performance note:** Parameter access is fast (~80-350ns via `Arc<RwLock>`), but avoid reading hundreds of parameters every tick. Cache values and reload periodically.
+**Performance note:** A parameter read is a read-lock plus a `BTreeMap` lookup and a `serde_json` deserialize — cheap, but not free. Avoid reading hundreds of parameters every tick. Cache values and reload periodically.
 
 ### Complex Parameter Types
 
@@ -251,10 +258,12 @@ if let Some(config) = self.params.get::<serde_json::Map<String, serde_json::Valu
 
 ## Default Parameters
 
-When `RuntimeParams::init()` is called and no `.horus/config/params.yaml` file exists, HORUS provides these defaults:
+`RuntimeParams::new()` always starts from these built-in defaults, then layers `.horus/config/params.yaml` and `HORUS_PARAM_*` environment variables over them key by key:
 
 ```yaml
-# .horus/config/params.yaml (auto-generated defaults)
+# Built-in defaults, as they would look written out to
+# .horus/config/params.yaml. Nothing writes this file for you —
+# it appears once `horus param set/save` or save_to_disk() runs.
 
 # System
 tick_rate: 30
@@ -281,7 +290,7 @@ pid_kd: 0.05
 ```
 
 **Customization:**
-1. Defaults are loaded if no params file exists in the project
+1. Built-in defaults are always the base layer; `.horus/config/params.yaml` overrides individual keys on top of them, and `HORUS_PARAM_*` environment variables (lower-cased, e.g. `HORUS_PARAM_CAMERA_FPS=60` → `camera_fps`) override both. A partial params.yaml does not suppress the other defaults.
 2. Edit the YAML file directly, use the monitor, or use `horus param set`
 3. Call `params.reset()` to restore defaults
 4. Call `params.save_to_disk()` to persist changes
@@ -303,13 +312,13 @@ horus monitor
 ```
 
 **Features:**
-- Live editing with validation
+- Live editing
 - Type indicators (number/string/boolean)
 - Export entire parameter set
 - Import from YAML/JSON
 - Delete individual parameters
 
-See [Monitor Guide](/development/monitor#tune-parameters-live) for API details.
+See [Monitor Guide](/development/monitor#api-endpoints) for the `/api/params` REST endpoints.
 
 ### Via Code
 
@@ -346,11 +355,11 @@ horus param set enabled true
 horus param delete old_key
 
 # Reset all parameters to defaults
-horus param reset
-horus param reset --force     # Skip confirmation
+# (--force is required; without it the command prints a notice and does nothing)
+horus param reset --force
 
 # Save/load from files
-horus param save -o my_preset.yaml
+horus param save my_preset.yaml
 horus param load my_preset.yaml
 
 # Dump all parameters as YAML to stdout
@@ -365,7 +374,7 @@ horus param dump
 # Edit parameters file (project-relative)
 vim .horus/config/params.yaml
 
-# Changes take effect on next RuntimeParams::init() or load_from_disk()
+# Changes take effect on next RuntimeParams::new() or load_from_disk()
 ```
 
 **Format:**
@@ -376,7 +385,9 @@ mode: "auto"              # string (quotes optional for simple strings)
 enabled: true             # boolean
 rates: [10, 30, 100]      # array
 
-# Comments are preserved
+# Comments survive only until something writes the file — `horus param
+# set/delete/reset/load` and `params.save_to_disk()` re-serialize the whole
+# map and drop all comments (keys are also re-sorted alphabetically).
 pid_kp: 1.0    # Proportional gain
 pid_ki: 0.1    # Integral gain
 pid_kd: 0.05   # Derivative gain
@@ -621,6 +632,8 @@ pid_ki: 0.1
 pid_kd: 0.05
 ```
 
+These comments are for humans reading the file, and they do not survive a write. `horus param set/delete/reset/load` and `params.save_to_disk()` re-serialize the whole parameter map and overwrite the file, dropping every comment. Keep the authoritative documentation in code (below) or in version control, not only in `params.yaml`.
+
 **Add documentation in code:**
 ```rust
 fn init(&mut self) -> Result<()> {
@@ -634,58 +647,30 @@ fn init(&mut self) -> Result<()> {
 
 ### Validate Parameter Values
 
-**Use built-in validation rules:**
+**Validation rules are internal — clamp in your own code.**
 
-RuntimeParams supports metadata with validation rules that are checked on `set()`:
+`set()` does check a parameter's metadata before writing: if metadata exists and marks the key read-only it returns `Parameter '<key>' is read-only`, and otherwise it runs the key's validation rules. But there is **no public API to attach that metadata**. `RuntimeParams::new()` starts with an empty metadata map, the `metadata` field is private with no public writer, and `ValidationRule` is `pub(crate)` — so it cannot even be named from outside `horus_core`. In practice, parameters you create carry no metadata and no rule ever fires.
 
-```rust
-use horus::prelude::*; // Provides RuntimeParams, ParamMetadata, ValidationRule
-
-let params = RuntimeParams::init()?;
-
-// Set validation rules for a parameter
-params.set_metadata("max_speed", ParamMetadata {
-    description: Some("Maximum robot speed".to_string()),
-    unit: Some("m/s".to_string()),
-    validation: vec![ValidationRule::Range(0.0, 5.0)],
-    read_only: false,
-})?;
-
-// This succeeds:
-params.set("max_speed", 2.0)?;
-
-// This returns an error (out of range):
-params.set("max_speed", 10.0)?; // Error!
-```
-
-**Available validation rules:**
-
-| Rule | Description |
-|------|-------------|
-| `MinValue(f64)` | Minimum numeric value |
-| `MaxValue(f64)` | Maximum numeric value |
-| `Range(f64, f64)` | Numeric range (min, max) |
-| `RegexPattern(String)` | String must match regex |
-| `Enum(Vec<String>)` | Value must be one of allowed strings |
-| `MinLength(usize)` | Minimum string/array length |
-| `MaxLength(usize)` | Maximum string/array length |
-| `RequiredKeys(Vec<String>)` | Object must contain these keys |
-
-**Read-only parameters:**
+The metadata API available to your code is read-only:
 
 ```rust
-params.set_metadata("version", ParamMetadata {
-    description: Some("System version".to_string()),
-    unit: None,
-    validation: vec![],
-    read_only: true,
-})?;
+use horus_core::params::ParamMetadata;
 
-// This returns an error:
-params.set("version", "1.0.0")?; // Error: Parameter 'version' is read-only
+// get_metadata returns Option<ParamMetadata>; it is None for any
+// parameter you created yourself
+let meta: Option<ParamMetadata> = params.get_metadata("max_speed");
+
+if let Some(meta) = meta {
+    println!("{:?} ({:?})", meta.description, meta.unit); // both Option<String>
+    println!("read-only: {}", meta.read_only());          // bool, via getter
+}
 ```
 
-**Manual bounds checking in code:**
+`description` and `unit` are the only public fields; `validation` and `read_only` are not, so `ParamMetadata` cannot be built with a struct literal outside `horus_core`. Note also that `ParamMetadata` is **not** in `horus::prelude` — only `RuntimeParams` is. Import it as `horus_core::params::ParamMetadata`.
+
+**Internal validation rules (for reference only):** `MinValue(f64)`, `MaxValue(f64)`, `Range(f64, f64)`, `RegexPattern(String)`, `Enum(Vec<String>)`, `MinLength(usize)`, `MaxLength(usize)`, `RequiredKeys(Vec<String>)`. These are framework-internal today — treat the manual clamping pattern below as the supported way to bound a parameter.
+
+**Manual bounds checking in code (recommended):**
 ```rust
 fn init(&mut self) -> Result<()> {
     let speed = self.params.get_or("max_speed", 1.5);
@@ -706,7 +691,7 @@ fn init(&mut self) -> Result<()> {
 
 ```bash
 # Save current parameters to a preset file
-horus param save -o aggressive_tuning.yaml
+horus param save aggressive_tuning.yaml
 
 # Backup current params and switch to a different preset
 cp .horus/config/params.yaml .horus/config/params_backup.yaml
@@ -722,7 +707,9 @@ horus param dump
 
 **Problem:** Parameters show default values even though YAML file exists.
 
-**Cause:** YAML syntax error, wrong file location, or file permissions.
+**Cause:** wrong file location (it must be `.horus/config/params.yaml` relative to the process's current working directory), an empty file (it parses as `null` and is treated as "no overrides"), or a `HORUS_PARAM_*` environment variable overriding the key.
+
+A malformed or unreadable `params.yaml` is *not* a silent fallback. `RuntimeParams::new()` refuses to start and returns `parameter file .horus/config/params.yaml is malformed: <err>. Refusing to start on built-in defaults — fix the file or remove it.` Only `RuntimeParams::default()` falls back, and it prints `[PARAMS] Failed to initialize RuntimeParams: ...` to stderr first. So if you see defaults with no diagnostic, the file isn't being found — not mis-parsed.
 
 **Solution:**
 ```bash
@@ -763,8 +750,10 @@ self.params.save_to_disk()?;
 
 **Error:**
 ```
-Parameter 'motion.max_speed' expected f64, got String
+Parameter 'max_speed' type mismatch: invalid type: string "1.5", expected f64
 ```
+
+This error is only produced by `get_typed()`. `get()` and `get_or()` fail *silently* — `get()` returns `None` and `get_or()` returns your default whenever the stored value doesn't deserialize into the requested type, so a type mismatch there looks like a missing parameter rather than an error.
 
 **Solution:**
 
@@ -777,24 +766,32 @@ max_speed: "1.5"
 max_speed: 1.5
 ```
 
-Or use type conversion in code:
+Or tolerate both shapes in code — `get_or` alone will not do this, it just
+hands back the default when the stored value is a string:
 ```rust
-// Try as number first, then parse string as fallback
-let speed = self.params.get_or("max_speed", 1.5);
+// Try as number first, then parse a string value as a fallback
+let speed = self.params
+    .get::<f64>("max_speed")
+    .or_else(|| {
+        self.params
+            .get::<String>("max_speed")
+            .and_then(|s| s.parse::<f64>().ok())
+    })
+    .unwrap_or(1.5);
 ```
 
 ### Lost Parameters After Update
 
 **Problem:** Parameters reset to defaults after code update.
 
-**Cause:** If `.horus/config/params.yaml` is deleted or empty, `RuntimeParams::init()` loads defaults.
+**Cause:** If `.horus/config/params.yaml` is deleted or empty, `RuntimeParams::new()` loads defaults.
 
 **Solution:**
 
 Backup parameters before updating:
 ```bash
 # Backup
-horus param save -o params_backup.yaml
+horus param save params_backup.yaml
 
 # After update, restore if needed
 horus param load params_backup.yaml
@@ -806,9 +803,11 @@ horus param load params_backup.yaml
 
 Parameters use `Arc<RwLock<BTreeMap>>`:
 
-- **Read**: ~80-350ns (read lock + BTreeMap lookup)
-- **Write**: ~100-500ns (write lock + BTreeMap insert + potential save)
+- **Read**: read lock + BTreeMap lookup + a `serde_json` deserialize of the stored value — cheap, but not free (a `String` read allocates)
+- **Write**: write lock + BTreeMap insert (plus validation and a version bump) — cheap, but not free
 - **Thread-safe**: Multiple nodes can read simultaneously
+
+The only published measurement is a coarse CI bound: 1000 sets and 1000 gets each complete in under 500 ms.
 
 **Fast enough for:**
 - Loading parameters in `init()` (one-time)

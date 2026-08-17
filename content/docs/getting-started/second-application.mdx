@@ -20,15 +20,15 @@ This demonstrates:
 - Multi-node communication patterns
 - Data pipeline processing
 - Real-time filtering
-- Monitor monitoring
+- Live inspection with `horus monitor`
 
 ## Architecture
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
 flowchart LR
-    S["<b>SensorNode</b><br/>Publish 25.3°C"] -->|raw_temp| F["<b>FilterNode</b><br/>Remove noise"]
-    F -->|filtered_temp| D["<b>DisplayNode</b><br/>Temp: 25.0°C"]
+    S["<b>SensorNode</b><br/>Publish raw temp"] -->|raw_temp| F["<b>FilterNode</b><br/>Smooth with EMA"]
+    F -->|filtered_temp| D["<b>DisplayNode</b><br/>Print filtered temp"]
 
     style S fill:#3b82f6,color:#fff
     style F fill:#10b981,color:#fff
@@ -40,9 +40,13 @@ flowchart LR
 ## Step 1: Create the Project
 
 ```bash
-horus new temperature_pipeline
+horus new temperature_pipeline -r
 cd temperature_pipeline
 ```
+
+`-r` picks plain Rust without macros, which is what the listing below uses. Leave the flag off
+and `horus new` turns interactive instead, prompting for a language and then for macros - the
+equivalent answers are `2` (Rust) and `N` (no macros).
 
 ## Step 2: Write the Code
 
@@ -57,7 +61,7 @@ use std::time::{Duration, Instant};
 // ============================================================================
 
 struct SensorNode {
-    temp_pub: Topic<f32>,
+    temp_pub: Option<Topic<f32>>,
     last_publish: Instant,
     reading: f32,
 }
@@ -65,7 +69,7 @@ struct SensorNode {
 impl SensorNode {
     fn new() -> Result<Self> {
         Ok(Self {
-            temp_pub: Topic::new("raw_temp")?,
+            temp_pub: None,
             last_publish: Instant::now(),
             reading: 20.0,
         })
@@ -78,6 +82,11 @@ impl Node for SensorNode {
     }
 
     fn init(&mut self) -> Result<()> {
+        // Build topics here, not in new(): the scheduler only sets the node
+        // context around init()/tick(), and Topic::new() uses it to record which
+        // node owns the topic. Topics built in main() have no owner, so they
+        // never show up under a node in `horus monitor`.
+        self.temp_pub = Some(Topic::new("raw_temp")?);
         hlog!(info, "Temperature sensor initialized");
         Ok(())
     }
@@ -94,7 +103,9 @@ impl Node for SensorNode {
             let temperature = base_temp + noise;
 
             // Publish raw temperature
-            self.temp_pub.send(temperature);
+            if let Some(ref temp_pub) = self.temp_pub {
+                temp_pub.send(temperature);
+            }
 
             hlog!(info, "Published raw temp: {:.2}°C", temperature);
 
@@ -114,8 +125,8 @@ impl Node for SensorNode {
 // ============================================================================
 
 struct FilterNode {
-    raw_sub: Topic<f32>,
-    filtered_pub: Topic<f32>,
+    raw_sub: Option<Topic<f32>>,
+    filtered_pub: Option<Topic<f32>>,
     filtered_value: Option<f32>,
     alpha: f32,  // Smoothing factor (0.0 - 1.0)
 }
@@ -123,8 +134,8 @@ struct FilterNode {
 impl FilterNode {
     fn new() -> Result<Self> {
         Ok(Self {
-            raw_sub: Topic::new("raw_temp")?,
-            filtered_pub: Topic::new("filtered_temp")?,
+            raw_sub: None,
+            filtered_pub: None,
             filtered_value: None,
             alpha: 0.3,  // 30% new data, 70% previous (smooth but responsive)
         })
@@ -137,13 +148,15 @@ impl Node for FilterNode {
     }
 
     fn init(&mut self) -> Result<()> {
+        self.raw_sub = Some(Topic::new("raw_temp")?);
+        self.filtered_pub = Some(Topic::new("filtered_temp")?);
         hlog!(info, "Filter initialized (alpha = {:.2})", self.alpha);
         Ok(())
     }
 
     fn tick(&mut self) {
         // Check for new temperature reading
-        if let Some(raw_temp) = self.raw_sub.recv() {
+        if let Some(raw_temp) = self.raw_sub.as_ref().and_then(|s| s.recv()) {
             // Apply exponential moving average filter
             let filtered = match self.filtered_value {
                 Some(prev) => self.alpha * raw_temp + (1.0 - self.alpha) * prev,
@@ -153,7 +166,9 @@ impl Node for FilterNode {
             self.filtered_value = Some(filtered);
 
             // Publish filtered temperature
-            self.filtered_pub.send(filtered);
+            if let Some(ref filtered_pub) = self.filtered_pub {
+                filtered_pub.send(filtered);
+            }
 
             hlog!(info, "Filtered: {:.2}°C -> {:.2}°C (removed {:.2}°C noise)",
                     raw_temp, filtered, raw_temp - filtered);
@@ -171,14 +186,14 @@ impl Node for FilterNode {
 // ============================================================================
 
 struct DisplayNode {
-    filtered_sub: Topic<f32>,
+    filtered_sub: Option<Topic<f32>>,
     display_counter: u32,
 }
 
 impl DisplayNode {
     fn new() -> Result<Self> {
         Ok(Self {
-            filtered_sub: Topic::new("filtered_temp")?,
+            filtered_sub: None,
             display_counter: 0,
         })
     }
@@ -190,6 +205,7 @@ impl Node for DisplayNode {
     }
 
     fn init(&mut self) -> Result<()> {
+        self.filtered_sub = Some(Topic::new("filtered_temp")?);
         hlog!(info, "Display initialized");
         println!("\n========================================");
         println!("  Temperature Monitor - Press Ctrl+C to stop");
@@ -198,7 +214,7 @@ impl Node for DisplayNode {
     }
 
     fn tick(&mut self) {
-        if let Some(temp) = self.filtered_sub.recv() {
+        if let Some(temp) = self.filtered_sub.as_ref().and_then(|s| s.recv()) {
             self.display_counter += 1;
 
             // Display temperature with visual indicator
@@ -247,9 +263,10 @@ fn main() -> Result<()> {
     // 3. DisplayNode (order 2) - Runs last to display results
     scheduler.add(DisplayNode::new()?).order(2).done();
 
-    println!("All nodes initialized. Running...\n");
+    println!("All nodes registered. Running...\n");
 
-    // Run the scheduler (blocks until Ctrl+C)
+    // Run the scheduler: it calls init() on every node, then ticks them
+    // in .order() sequence (blocks until Ctrl+C)
     scheduler.run()?;
 
     Ok(())
@@ -267,20 +284,26 @@ horus run
 ```
 Starting Temperature Pipeline...
 
-All nodes initialized. Running...
+All nodes registered. Running...
 
 ========================================
   Temperature Monitor - Press Ctrl+C to stop
 ========================================
 
-[Reading #1] Temperature: 23.4°C - Status: NORMAL
-[Reading #2] Temperature: 24.1°C - Status: NORMAL
-[Reading #3] Temperature: 25.8°C - Status: NORMAL
-[Reading #4] Temperature: 27.2°C - Status: NORMAL
-[Reading #5] Temperature: 28.6°C - Status: HOT
-[Reading #6] Temperature: 27.9°C - Status: NORMAL
-[Reading #7] Temperature: 26.3°C - Status: NORMAL
+[Reading #1] Temperature: 31.5°C - Status: HOT
+[Reading #2] Temperature: 31.4°C - Status: HOT
+[Reading #3] Temperature: 30.9°C - Status: HOT
+[Reading #4] Temperature: 30.0°C - Status: HOT
+[Reading #5] Temperature: 29.0°C - Status: HOT
+[Reading #6] Temperature: 28.1°C - Status: HOT
+[Reading #7] Temperature: 27.6°C - Status: NORMAL
 ```
+
+The simulation is deterministic, so these values are exactly what you'll see. Only this
+application's own `println!` output is shown above. Your terminal will show more:
+`hlog!` writes to stderr, so `[INFO] [SensorNode] Published raw temp: ...` and
+`[INFO] [FilterNode] Filtered: ...` lines are interleaved, and the scheduler prints its
+own startup lines (`Initialized node 'SensorNode'`, the dependency-graph summary) too.
 
 Press **Ctrl+C** to stop:
 
@@ -293,9 +316,15 @@ Ctrl+C received! Shutting down HORUS scheduler...
 ========================================
 ```
 
-## Step 4: Monitor with Monitor
+## Step 4: Inspect the Running Pipeline
 
-Open a **second terminal** and run:
+The monitor ships as a separate plugin, so install it once before using it:
+
+```bash
+horus install horus-monitor
+```
+
+Then start the pipeline again with `horus run`, open a **second terminal**, and run:
 
 ```bash
 horus monitor
@@ -303,17 +332,17 @@ horus monitor
 
 The monitor will show:
 
-### Nodes Tab
+### Nodes
 - **SensorNode**: Publishing to `raw_temp` every ~1 second
 - **FilterNode**: Subscribing to `raw_temp`, publishing to `filtered_temp`
 - **DisplayNode**: Subscribing to `filtered_temp`
 
-### Topics Tab
+### Topics
 - **raw_temp** (f32): Noisy temperature readings
 - **filtered_temp** (f32): Smooth temperature readings
 
-### Metrics Tab
-- **IPC Latency**: ~85ns-437ns (sub-microsecond!)
+### Metrics
+- **IPC Latency**: ~85ns p50 for these 1-publisher/1-subscriber topics (SpscShm backend; sub-microsecond!)
 - **Tick Duration**: How long each node takes to execute
 - **Message Counts**: Total messages sent/received
 
@@ -324,8 +353,13 @@ The monitor will show:
 ```rust
 // Publish every 1 second
 if self.last_publish.elapsed() >= Duration::from_secs(1) {
-    let temperature = 25.0 + noise;
-    self.temp_pub.send(temperature);
+    let base_temp = 25.0 + (self.reading * 0.1).sin() * 5.0;
+    let noise = (self.reading * 0.7).sin() * 2.0;
+    let temperature = base_temp + noise;
+
+    if let Some(ref temp_pub) = self.temp_pub {
+        temp_pub.send(temperature);
+    }
 }
 ```
 
@@ -339,7 +373,9 @@ if self.last_publish.elapsed() >= Duration::from_secs(1) {
 ```rust
 // Exponential moving average filter
 let filtered = self.alpha * raw_temp + (1.0 - self.alpha) * prev;
-self.filtered_pub.send(filtered);
+if let Some(ref filtered_pub) = self.filtered_pub {
+    filtered_pub.send(filtered);
+}
 ```
 
 **Key Points:**
@@ -354,7 +390,7 @@ self.filtered_pub.send(filtered);
 ### DisplayNode
 
 ```rust
-if let Some(temp) = self.filtered_sub.recv() {
+if let Some(temp) = self.filtered_sub.as_ref().and_then(|s| s.recv()) {
     println!("[Reading #{}] Temperature: {:.1}°C", count, temp);
 }
 ```
@@ -371,7 +407,7 @@ if let Some(temp) = self.filtered_sub.recv() {
 **Symptom:**
 ```
 Starting Temperature Pipeline...
-All nodes initialized. Running...
+All nodes registered. Running...
 
 ========================================
   Temperature Monitor - Press Ctrl+C to stop
@@ -422,7 +458,7 @@ error[E0433]: failed to resolve: use of undeclared type `Topic`
 **Fix:**
 - Ensure HORUS is installed: `horus --help`
 - Check import: `use horus::prelude::*;`
-- Run from project directory (where `horus.yaml` is)
+- Run from project directory (where `horus.toml` is)
 
 ## Experiments to Try
 
@@ -464,12 +500,43 @@ writeln!(file, "{:.1}", temp).ok();
 
 ### 4. Add Multiple Sensors
 
-Create a second sensor node:
+Create a second sensor node. Node names are the identity key for the watchdog, the
+shared-memory registry slot and the pause/kill control flags, so the scheduler refuses
+duplicate names - `run()` returns an error before the first tick. Give `SensorNode` a
+name of its own first:
 
 ```rust
-// In main()
-scheduler.add(SensorNode::new()?).order(0).done();  // Sensor 1
-scheduler.add(SensorNode::new()?).order(0).done();  // Sensor 2
+// 1. Make the name configurable
+struct SensorNode {
+    name: String,
+    temp_pub: Option<Topic<f32>>,
+    last_publish: Instant,
+    reading: f32,
+}
+
+impl SensorNode {
+    fn new(name: &str) -> Result<Self> {
+        Ok(Self {
+            name: name.to_string(),
+            temp_pub: None,
+            last_publish: Instant::now(),
+            reading: 20.0,
+        })
+    }
+}
+
+impl Node for SensorNode {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    // init(), tick() and shutdown() are unchanged
+}
+
+// 2. In main(), replace the single `scheduler.add(SensorNode::new()?)` line
+//    with two sensors that have distinct names
+scheduler.add(SensorNode::new("Sensor1")?).order(0).done();
+scheduler.add(SensorNode::new("Sensor2")?).order(0).done();
 ```
 
 Both will publish to the same topic, and FilterNode will process both!
@@ -495,11 +562,14 @@ Now that you've built a 3-node pipeline, try:
 3. **[node! Macro](/concepts/node-macro)** - Reduce boilerplate with macros
 4. **[Message Types](/concepts/message-types)** - Use complex message types instead of primitives
 
-## Full Code
+## Putting It Together
 
-The complete code above is production-ready. To save it:
+There is no second listing here - the code in [Step 2](#step-2-write-the-code) above is the
+whole program, and it is complete and runnable as-is. It is still a teaching example, though:
+the "sensor" is a sine wave and the display is a `println!`, so swap both for real hardware and
+a real sink before you rely on it. To save it:
 
-1. Copy the entire code block
+1. Copy the entire code block from Step 2
 2. Replace `main.rs` in your project
 3. Run with `horus run`
 

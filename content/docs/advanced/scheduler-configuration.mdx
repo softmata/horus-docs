@@ -17,9 +17,8 @@ use horus::prelude::*;
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new()
-        .tick_hz(1000.0)          // Global tick rate (default: 60 Hz)
-        .with_capacity(32)        // Pre-allocate for 32 nodes
-        .with_name("arm_control");// Name for logging/profiling
+        .tick_rate(1000_u64.hz()) // Global tick rate (default: 100 Hz)
+        .name("arm_control");     // Name for logging/profiling
 
     // ... add nodes ...
 
@@ -32,9 +31,10 @@ fn main() -> Result<()> {
 
 | Method | Description | Default |
 |--------|-------------|---------|
-| `.tick_hz(hz)` | Global scheduler tick rate in Hz | `60.0` |
-| `.with_capacity(n)` | Pre-allocate node storage | `16` |
-| `.with_name(name)` | Human-readable scheduler name | `"default"` |
+| `.tick_rate(freq)` | Global scheduler tick rate (`Frequency`) | `100.0` Hz |
+| `.name(name)` | Human-readable scheduler name | `"Scheduler"` |
+
+These are the two knobs used most often. The remaining global flags — `.prefer_rt()`, `.require_rt()`, and `.blackbox(mb)` — are covered under [Global Configuration with Builder Methods](#global-configuration-with-builder-methods) below.
 
 ## Adding Nodes
 
@@ -45,41 +45,40 @@ use horus::prelude::*;
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new()
-        .tick_hz(1000.0);
+        .tick_rate(1000_u64.hz());
 
     // Real-time motor control — runs first every tick
+    // (an explicit budget/deadline promotes the node to the RT class)
     scheduler.add(MotorController::new("arm"))
         .order(0)
-        .rt()
-        .wcet_us(200)
-        .deadline_ms(1)
-        .done();
+        .budget(200_u64.us())
+        .deadline(1_u64.ms())
+        .done()?;
 
     // Sensor node — high priority, custom rate
+    // (.rate() also promotes the node to the RT class)
     scheduler.add(LidarDriver::new("/dev/lidar0"))
         .order(10)
-        .rt()
-        .rate_hz(500.0)
-        .done();
+        .rate(500_u64.hz())
+        .done()?;
 
     // Compute-heavy planning — runs on a worker thread
     scheduler.add(PathPlanner::new())
         .order(50)
         .compute()
-        .done();
+        .done()?;
 
     // Event-driven node — wakes only when the topic has new data
     scheduler.add(CollisionChecker::new())
         .on("lidar/points")
-        .deadline_ms(5)
-        .done();
+        .done()?;
 
     // Async I/O — network or disk, never blocks the real-time loop
     scheduler.add(TelemetryUploader::new())
         .order(200)
         .async_io()
-        .rate_hz(10.0)
-        .done();
+        .rate(10_u64.hz())
+        .done()?;
 
     scheduler.run()?;
     Ok(())
@@ -92,16 +91,18 @@ Every node belongs to exactly one execution class. Set it in the builder chain:
 
 | Method | Class | Description |
 |--------|-------|-------------|
-| `.rt()` | Real-Time | Runs in the scheduler's RT loop. Use for control, safety, and sensors. |
+| `.rate(freq)` / `.budget(dur)` / `.deadline(dur)` | Real-Time | Any of these promotes an otherwise unclassified node to RT. Runs on a dedicated RT thread. Use for control, safety, and sensors. |
 | `.compute()` | Compute | Offloaded to a worker thread pool. Use for planning, SLAM, or ML inference. |
 | `.on(topic)` | Event-Driven | Wakes only when the named topic receives new data. |
 | `.async_io()` | Async I/O | Runs on an async executor. Use for network, disk, or cloud calls. |
 
-If no execution class is specified, the node defaults to the RT class.
+There is no `.rt()` method — the RT class is entered implicitly. If no execution class is specified, the node defaults to the **BestEffort** class and runs sequentially in the main tick loop. Calling `.rate()`, `.budget()`, or `.deadline()` on a BestEffort node auto-promotes it to the Rt class.
+
+On a node that already has an explicit class, `.rate()` does **not** promote it — it only rate-limits. `.rate(10_u64.hz()).async_io()` stays an Async I/O node, and `.rate(n).compute()` stays a Compute node.
 
 ### When to Use Each Class
 
-- **`.rt()`** — Motor controllers, safety monitors, sensor fusion, anything that must run every tick with bounded latency.
+- **`.rate(freq)`** — Motor controllers, safety monitors, sensor fusion, anything that must run every tick with bounded latency.
 - **`.compute()`** — Path planning, point cloud processing, ML inference. These can take longer than a single tick without blocking RT nodes.
 - **`.on(topic)`** — Collision detection, event handlers, reactive behaviors. Only runs when there is new data, saving CPU when idle.
 - **`.async_io()`** — Telemetry upload, log shipping, cloud API calls. Never blocks any real-time or compute work.
@@ -113,18 +114,18 @@ If no execution class is specified, the node defaults to the RT class.
 | Method | Description |
 |--------|-------------|
 | `.order(n)` | Execution priority within a tick (lower = runs first) |
-| `.rate_hz(hz)` | Node-specific tick rate, independent of the global rate |
-| `.wcet_us(us)` | Worst-Case Execution Time budget in microseconds |
-| `.deadline_ms(ms)` | Deadline in milliseconds from tick start |
-| `.deadline_us(us)` | Deadline in microseconds from tick start |
+| `.rate(freq)` | Node tick rate (`Frequency`), independent of the global rate; auto-derives budget (80% of period) and deadline (95% of period) |
+| `.budget(dur)` | Per-tick execution budget (`Duration`); defaults to 80% of the period from `.rate()` |
+| `.deadline(dur)` | Deadline from tick start (`Duration`); defaults to 95% of the period from `.rate()` |
 
-### Tier and Failure Policy
+`.budget()` and `.deadline()` are RT-only. Combining either with `.compute()`, `.on(topic)`, or `.async_io()` is rejected at `.done()` as a conflicting configuration.
+
+### Failure Policy and Finalization
 
 | Method | Description |
 |--------|-------------|
-| `.tier(NodeTier)` | Explicit execution tier (`Critical`, `Standard`, `BestEffort`) |
 | `.failure_policy(policy)` | Per-node failure handling (see [Circuit Breaker](/advanced/circuit-breaker)) |
-| `.done()` | Finalize and register the node |
+| `.done()` | Finalize and register the node (alias for `.build()`) |
 
 ### Order Guidelines
 
@@ -142,14 +143,12 @@ For complex setups, chain builder methods on `Scheduler::new()`:
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .tick_hz(1000.0)
-    .with_profiling()
-    .memory_locked(true)
-    .with_blackbox(64)
-    .circuit_breaker(true);
+    .tick_rate(1000_u64.hz())
+    .prefer_rt()        // memory locking + RT scheduling class, warn if unavailable
+    .blackbox(64);      // 64 MB flight recorder
 ```
 
-This is useful when you need to toggle features like memory locking or black-box recording without changing node code.
+This is useful when you need to toggle features like memory locking or black-box recording without changing node code. Use `.require_rt()` instead of `.prefer_rt()` when the run must abort on a kernel without RT support. Runtime profiling is always on — there is no opt-in flag. Fault handling is configured per node with `.failure_policy(...)`, not globally.
 
 ## OS Priority
 
@@ -164,88 +163,45 @@ Note: Requires root or `CAP_SYS_NICE` capability on Linux.
 
 ## Python API
 
-The Python API mirrors the Rust fluent builder:
+The Python API is not a fluent builder. `Scheduler.add()` takes a fully configured `horus.Node` and returns the scheduler itself, so all per-node settings are constructor keyword arguments. Durations (`budget`, `deadline`, `watchdog`) are in **seconds** — `horus.us` and `horus.ms` are the conversion constants.
 
 ```python
-from horus import Scheduler
+from horus import Scheduler, Node, us, ms
 
 # Create scheduler with global settings
-scheduler = Scheduler(tick_hz=1000.0, name="arm_control")
+scheduler = Scheduler(tick_rate=1000.0, name="arm_control")
 
 # Real-time motor controller
-scheduler.add(motor_ctrl).order(0).rt().wcet_us(200).deadline_ms(1).done()
+scheduler.add(Node(name="motor", tick=motor_ctrl, order=0, rate=1000,
+                   budget=200 * us, deadline=1 * ms))
 
 # Sensor with custom rate
-scheduler.add(lidar).order(10).rt().rate_hz(500.0).done()
+scheduler.add(Node(name="lidar", tick=lidar, order=10, rate=500))
 
 # Compute node
-scheduler.add(planner).order(50).compute().done()
+scheduler.add(Node(name="planner", tick=planner, order=50, compute=True))
 
 # Event-driven node
-scheduler.add(collision).on("lidar/points").deadline_ms(5).done()
+scheduler.add(Node(name="collision", tick=collision, on="lidar/points"))
 
-# Async I/O node
-scheduler.add(telemetry).order(200).async_io().rate_hz(10.0).done()
+# Async I/O node — declare `telemetry` as `async def`; async ticks are
+# auto-detected and run on the async I/O thread pool
+scheduler.add(Node(name="telemetry", tick=telemetry, order=200, rate=10))
 
 scheduler.run()
 ```
 
-You can also pass a config dict for global settings:
+Global settings are plain keyword arguments — there is no config dict:
 
 ```python
-scheduler = Scheduler(config={
-    "tick_hz": 1000.0,
-    "enable_profiling": True,
-    "memory_lock": True,
-    "black_box_size_mb": 64,
-})
+scheduler = Scheduler(tick_rate=1000.0, rt=True, blackbox_mb=64)
 ```
 
-## Node Tiers
-
-Different nodes have different execution time characteristics. Tiers let you declare a node's profile so the scheduler can make informed decisions about failure policies.
-
-| Node Type | Example | Typical Execution | Tier |
-|-----------|---------|-------------------|------|
-| Fast math | PID controller | &lt;1μs | **UltraFast** |
-| Sensors | Camera reader, IMU | &lt;10μs | **Fast** |
-| Algorithms | Path planner | &lt;100μs+ | **Normal** |
-
-### Using Tiers
-
-```rust,ignore
-use horus::prelude::*;
-
-let mut scheduler = Scheduler::new();
-
-scheduler.add(pid_node).order(0).tier(NodeTier::UltraFast).done();
-scheduler.add(sensor_node).order(1).tier(NodeTier::Fast).done();
-scheduler.add(planner_node).order(2).tier(NodeTier::Normal).done();
-
-scheduler.run()?;
-```
-
-### Tier Reference
-
-| Tier | Use For | Default Failure Policy |
-|------|---------|----------------------|
-| `NodeTier::UltraFast` | Ultra-fast math (&lt;1μs) | Fatal (stop on failure) |
-| `NodeTier::Fast` | Sensors, filters (&lt;10μs) | Fatal |
-| `NodeTier::Normal` | Algorithms (&lt;100μs+) | Restart (5 attempts, 100ms delay) |
-
-Most nodes work fine without tier annotations (defaults to `Fast`). Only annotate when you have specific performance needs:
-
-```rust,ignore
-// Good: Let HORUS use the default tier
-scheduler.add(my_node).done();
-
-// Only annotate when you have specific performance needs
-scheduler.add(critical_pid).tier(NodeTier::UltraFast).done();
-```
+`rt=True` turns on memory locking and the RT scheduling class; `blackbox_mb` sizes the black-box buffer.
 
 ## Execution Modes
 
-HORUS supports sequential and parallel execution. You configure this through `Scheduler::new()` and per-node execution classes.
+HORUS supports sequential and parallel execution. There is no mode argument to `Scheduler::new()` — the mode follows from the execution classes you give individual nodes.
 
 <Callout type="info" title="Quick Answer">
 
@@ -259,7 +215,6 @@ Nodes execute one-by-one in priority order — same execution order every tick. 
 
 | Metric | Value |
 |--------|-------|
-| Latency | ~100-500ns per node |
 | Deterministic | **Yes** |
 | Multi-core | No (single thread) |
 | Best For | Safety-critical, certification |
@@ -267,20 +222,21 @@ Nodes execute one-by-one in priority order — same execution order every tick. 
 ```rust,ignore
 use horus::prelude::*;
 
-// Safety-critical robot controller — 1 kHz tick, RT execution class
-let mut scheduler = Scheduler::new().tick_hz(1000.0);
-scheduler.add(safety_monitor).rt().order(0).done();
-scheduler.add(controller).rt().order(1).done();
+// Safety-critical robot controller — 1 kHz tick, everything on the main loop
+let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz());
+scheduler.add(safety_monitor).order(0).done()?;
+scheduler.add(controller).order(1).done()?;
 scheduler.run()?;
 ```
 
+Nodes with no execution class stay BestEffort, so they run in `order` sequence on the main thread. Adding `.deterministic(true)` to `Scheduler::new()` goes further and keeps *every* node on the main thread — no executor threads are spawned at all, even for nodes that declare an RT or compute class.
+
 ### Parallel Mode
 
-Schedules independent nodes on different CPU cores. Nodes at the same `order` level run concurrently:
+Concurrency is opt-in per node, through the execution class — not through `order`. A node leaves the main tick loop as soon as it has an execution class: RT (`.rate()` / `.budget()` / `.deadline()`) moves to a dedicated RT thread, `.compute()` to the parallel thread pool, `.on(topic)` to a per-node watcher thread, and `.async_io()` to the tokio blocking pool. `.order(n)` is a sequencing hint inside the main tick loop; nodes sharing an `order` value do **not** become concurrent, and a node with no execution class stays BestEffort and runs sequentially.
 
 | Metric | Value |
 |--------|-------|
-| Latency | Variable (depends on workload) |
 | Deterministic | No |
 | Multi-core | **Yes** |
 | Best For | Multi-sensor fusion, compute-heavy pipelines |
@@ -290,13 +246,13 @@ use horus::prelude::*;
 
 let mut scheduler = Scheduler::new();
 
-// These sensor nodes run in parallel (same order number)
-scheduler.add(lidar_node).order(0).done();
-scheduler.add(camera_node).order(0).done();
-scheduler.add(imu_node).order(0).done();
+// `.compute()` moves these sensor nodes onto the parallel thread pool
+scheduler.add(lidar_node).order(0).compute().done()?;
+scheduler.add(camera_node).order(0).compute().done()?;
+scheduler.add(imu_node).order(0).compute().done()?;
 
-// Fusion runs after all sensors (higher order number)
-scheduler.add(fusion_node).order(1).done();
+// Without an execution class, fusion stays sequential on the main tick loop
+scheduler.add(fusion_node).order(1).done()?;
 scheduler.run()?;
 ```
 
@@ -306,7 +262,6 @@ scheduler.run()?;
 |---------|------------|----------|
 | Deterministic | **Yes** | No |
 | Multi-core | No | **Yes** |
-| Best Latency | 87-313ns | Variable |
 | Certification Ready | **Yes** | No |
 
 ## See Also

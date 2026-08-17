@@ -10,7 +10,8 @@ HORUS's sub-microsecond IPC makes it well-suited for combining real-time control
 
 ## Overview
 
-HORUS supports AI integration through two main approaches:
+HORUS supports local AI inference through two main approaches (cloud APIs, covered further
+down, are a third path for higher-level reasoning):
 
 **Python ML Nodes** (Recommended for Prototyping)
 - Use any Python ML library (PyTorch, TensorFlow, ONNX, etc.)
@@ -54,11 +55,18 @@ import numpy as np
 
 # Simulated camera node (replace with your camera capture logic)
 def camera_tick(node):
-    # In a real robot, capture from camera hardware here
-    frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+    # In a real robot, capture from camera hardware here. A topic declared as a
+    # bare string carries at most 4KB per message, so this toy frame is
+    # deliberately tiny — real frames go over a horus.Tensor topic (see below).
+    frame = np.random.randint(0, 255, (24, 24, 3), dtype=np.uint8)
     node.send("cam.image_raw", frame.tolist())
 
-cam = Node(name="camera", pubs=["cam.image_raw"], tick=camera_tick, rate=30)
+cam = Node(name="camera", pubs=["cam.image_raw"], tick=camera_tick, rate=30, order=0)
+
+# Stand-in for your model — replace with real inference. The control node
+# below expects a dict back.
+def process_frame(frame):
+    return {"obstacle_detected": False}
 
 # ML processing node
 def ml_tick(node):
@@ -74,7 +82,8 @@ ml_node = Node(
     subs=["cam.image_raw"],
     pubs=["detections"],
     tick=ml_tick,
-    rate=10  # Process at 10 FPS
+    rate=10,  # Process at 10 FPS
+    order=1
 )
 
 # Control node reacts to detections
@@ -92,13 +101,14 @@ controller = Node(
     subs=["detections"],
     pubs=["cmd_vel"],
     tick=control_tick,
-    rate=30
+    rate=30,
+    order=2
 )
 
 scheduler = Scheduler()
-scheduler.add(cam, order=0)
-scheduler.add(ml_node, order=1)
-scheduler.add(controller, order=2)
+scheduler.add(cam)
+scheduler.add(ml_node)
+scheduler.add(controller)
 scheduler.run()
 ```
 
@@ -168,11 +178,13 @@ There is no HORUS-supplied inference base class — no `horus.ml_utils`, no
 code, exactly as written above. What HORUS does supply is a zero-copy carrier
 for the arrays: `horus.Tensor`.
 
-The camera examples above send `frame.tolist()`, which is fine for a smoke test
-and ruinous for real frames — a 640x480 RGB frame becomes ~920,000 Python ints
-on every tick. Declare the topic as `horus.Tensor` instead: the pixels are
-written once into a shared-memory pool and only a 168-byte descriptor crosses
-the topic.
+The camera example above sends `frame.tolist()`, which only works because its
+frame is a 24x24 stand-in. A topic declared as a bare string serializes to
+MessagePack and carries at most 4KB per message, so a real 640x480 RGB frame —
+~920,000 Python ints, ~1.7MB packed — is rejected outright: `ValueError: 'data'
+out of range: expected [0..4096]`, raised on every tick. Declare it as `horus.Tensor`
+instead: the pixels are written once into a shared-memory pool and only a
+168-byte descriptor crosses the topic.
 
 ```python
 import numpy as np
@@ -202,10 +214,11 @@ horus.run(
 )
 ```
 
-Give the subscriber the same rate as the publisher. A tensor topic hands over a
-reference rather than queueing copies, and a subscriber that ticks slower than
-the publisher receives nothing at all — `recv()` returns `None` every time. If
-inference only keeps up at 10 Hz, publish at 10 Hz.
+Give the subscriber the same rate as the publisher. Unlike the ordinary message
+topics used elsewhere on this page, a tensor topic hands over a reference rather
+than queueing copies, and a subscriber that ticks slower than the publisher
+receives nothing at all — `recv()` returns `None` every time. If inference only
+keeps up at 10 Hz, publish at 10 Hz.
 
 See [Python Tensors for ML](/python/library/ml-utilities) for the full tensor and
 pool API, including the torch bridge and the current CPU-only device situation.
@@ -221,14 +234,14 @@ For production deployments where you need maximum performance, integrate ML infe
 The `ort` crate provides Rust bindings for ONNX Runtime:
 
 ```toml
+# horus.toml
 [dependencies]
-horus_core = "0.1"
-horus_library = "0.1"
+horus = "0.2"
 ort = "2.0"
 ndarray = "0.15"
 ```
 
-Add the ONNX runtime crates first:
+Or let the CLI write those two entries for you:
 
 ```bash
 horus add ort --source crates.io
@@ -274,9 +287,9 @@ impl InferenceNode {
 Tract runs ONNX models with zero external dependencies:
 
 ```toml
+# horus.toml
 [dependencies]
-horus_core = "0.1"
-horus_library = "0.1"
+horus = "0.2"
 tract-onnx = "0.21"
 ```
 
@@ -479,7 +492,8 @@ horus.run(
 ```
 
 Each `infer` tick takes ~30 ms, yet `camera` still gets its 30 ticks and `control` its 100,
-both under 130 µs. The control node reads the most recent detections and never waits.
+each averaging under 130 µs of tick time. The control node reads the most recent detections
+and never waits.
 
 If instead you call a **remote** inference API, the work is I/O-bound — use an `async def`
 tick, which HORUS runs on its async I/O executor:

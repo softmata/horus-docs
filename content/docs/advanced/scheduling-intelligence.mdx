@@ -1,98 +1,112 @@
 ---
 title: "Scheduling Intelligence"
-description: "Node tier annotations for optimized execution"
+description: "Execution class annotations for optimized scheduling"
 weight: 36
 ---
 
 # Scheduling Intelligence
 
-## Why Tiers Exist
+## Why Execution Classes Exist
 
-Different nodes have different execution time characteristics:
+Different nodes need different scheduling:
 
-| Node Type | Example | Typical Execution | Tier |
-|-----------|---------|-------------------|------|
-| Fast math | PID controller | &lt;1μs | **UltraFast** |
-| Sensors | Camera reader, IMU | &lt;10μs | **Fast** |
-| Algorithms | Path planner | &lt;100μs+ | **Normal** |
+| Node Type | Example | What it needs | Builder method |
+|-----------|---------|---------------|----------------|
+| Control loop | PID controller | Fixed rate, low jitter | `.rate(freq)` |
+| Data-triggered | Camera detector | Wake on new data | `.on("topic")` |
+| Algorithms | Path planner | Throughput, isolation from RT | `.compute()` |
+| I/O | Telemetry uploader | Blocking calls off the hot path | `.async_io()` |
+| Everything else | IMU reader, glue logic | Simple sequential ticking | *(none)* |
 
-Tiers let you declare a node's execution characteristics so the scheduler can make informed decisions about failure policies and execution strategy.
+Declaring a node's execution class tells the scheduler which execution group it belongs to: at startup the scheduler splits the registered nodes into RT, compute, event, async-I/O, and main-loop groups, and each group gets its own execution strategy.
 
-## Node Tier Annotation
+## Declaring an Execution Class
 
-Use `NodeTier` to explicitly declare a node's execution characteristics:
+The node builder assigns the execution class — there is no separate enum for you to import or construct:
 
 ```rust,ignore
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new();
 
-// Annotate nodes with their tier
-scheduler.add(pid_node).order(0).tier(NodeTier::UltraFast).done();
-scheduler.add(sensor_node).order(1).tier(NodeTier::Fast).done();
-scheduler.add(planner_node).order(2).tier(NodeTier::Normal).done();
+// RT control loop, main-loop sensor, and CPU-bound planner
+scheduler.add(pid_node).order(0).rate(1000_u64.hz()).build()?;
+scheduler.add(sensor_node).order(1).build()?;
+scheduler.add(planner_node).order(2).compute().build()?;
 
 scheduler.run()?;
 ```
 
-### Available Tiers
+Examples elsewhere in these docs end the chain with `.done()` instead — it is a compatibility alias for `.build()`. Both validate the node and return `HorusResult<&mut Scheduler>`, so both need `?`.
 
-| Tier | Use For | Description | Default Failure Policy |
-|------|---------|-------------|----------------------|
-| `NodeTier::UltraFast` | Ultra-fast math (&lt;1μs) | Highest-priority inline execution | Fatal (stop on failure) |
-| `NodeTier::Fast` | Sensors, filters (&lt;10μs) | Inline execution (default tier) | Fatal |
-| `NodeTier::Normal` | Algorithms (&lt;100μs+) | Standard scheduling | Restart (5 attempts, 100ms delay) |
+### Available Execution Classes
 
-### Default Failure Policies
+| Builder method | Execution class | Use For | Where it runs |
+|----------------|-----------------|---------|---------------|
+| `.rate(freq)` | `Rt` | Fixed-rate control loops | Dedicated high-priority thread, spin-wait timing |
+| `.compute()` | `Compute` | CPU-bound work: planning, ML inference, SLAM | Parallel thread pool |
+| `.on("topic")` | `Event` | Data-triggered processing | Wakes when the topic is updated |
+| `.async_io()` | `AsyncIo` | Blocking I/O: network, disk, database | Tokio blocking pool |
+| *(none)* | `BestEffort` | Everything else — the default | Main tick loop, dispatched by topic dependencies and `.order()` |
 
-Each tier has a default failure policy that can be overridden:
+`.rate()` auto-selects `Rt` only for a node that has not already been given another class; on a `.compute()`, `.on()`, or `.async_io()` node it just rate-limits.
+
+## Failure Policies
+
+Failure handling is independent of the execution class. A node has no failure policy unless you set one. Without one, a panicking `tick()` is logged and the scheduler continues. Set one explicitly:
 
 ```rust,ignore
 use horus::prelude::*;
 
-// UltraFast and Fast tiers default to Fatal - the system stops if they fail
+// Control-loop node: any failure must stop the system
 scheduler.add(critical_pid)
-    .tier(NodeTier::UltraFast)
-    .done();
+    .failure_policy(FailurePolicy::Fatal)
+    .build()?;
 
-// Normal tier defaults to Restart with 5 attempts and 100ms delay
+// Recoverable node: re-init with backoff, escalate after 3 restarts
 scheduler.add(planner)
-    .tier(NodeTier::Normal)
-    .done();
+    .compute()
+    .failure_policy(FailurePolicy::restart(3, 50_u64.ms()))
+    .build()?;
 ```
+
+The four policies are `FailurePolicy::Fatal`, `FailurePolicy::restart(max_restarts, initial_backoff)`, `FailurePolicy::skip(max_failures, cooldown)`, and `FailurePolicy::Ignore`. `restart` and `skip` take their parameters explicitly — there are no built-in values to fall back on.
 
 ## Best Practices
 
 ### 1. Start Simple
 
-Most nodes work fine without tier annotations (defaults to `Fast`):
+Most nodes need no execution-class annotation — they default to best-effort scheduling in the main tick loop. Add `.rate()`, `.compute()`, `.on()`, or `.async_io()` only when the node needs a dedicated execution group.
 
 ```rust,ignore
-// Good: Let HORUS use the default tier
-scheduler.add(my_node).done();
+// Good: let HORUS tick it in the main loop
+scheduler.add(my_node).build()?;
 
-// Only annotate when you have specific performance needs
-scheduler.add(critical_pid).tier(NodeTier::UltraFast).done();
+// Only annotate when the node needs its own execution group
+scheduler.add(critical_pid).rate(1000_u64.hz()).build()?;
 ```
 
-### 2. Match Tier to Actual Performance
+### 2. Match the Class to the Workload
 
-Choose tiers based on measured execution time:
+Choose the builder method that matches what the node actually does:
 
 ```rust,ignore
-// <1μs: Simple math, PID loops, state checks
-scheduler.add(pid_node).tier(NodeTier::UltraFast).done();
+// Fixed-rate control loop: dedicated RT thread, spin-wait timing
+scheduler.add(pid_node).rate(1000_u64.hz()).build()?;
 
-// <10μs: Sensor reading, filtering, encoding
-scheduler.add(sensor_node).tier(NodeTier::Fast).done();
+// Data-triggered processing: wakes when the topic is updated
+scheduler.add(detector).on("camera.rgb").build()?;
 
-// >10μs: Path planning, ML inference, file I/O
-scheduler.add(planner_node).tier(NodeTier::Normal).done();
+// CPU-bound work — planning, ML inference, SLAM: parallel thread pool
+scheduler.add(planner_node).compute().build()?;
+
+// Blocking I/O — network, disk, database: tokio blocking pool
+scheduler.add(telemetry).async_io().rate(1_u64.hz()).build()?;
 ```
 
-### 3. Use Tiers for Deterministic Execution
+### 3. Reproducible Runs Need `.deterministic(true)`
 
-Tiers are explicit annotations — no runtime profiling needed, so execution is fully deterministic. This makes them ideal for [deterministic execution](/advanced/deterministic-execution) scenarios.
+Execution class and reproducibility are separate concerns. By default the main-loop group is driven by the ready-dispatch executor: it honours topic dependencies and `.order()` tiers, but nodes in the same tier with no dependency between them run in parallel — and `.rate()`, `.compute()`, `.on()`, or `.async_io()` hands the node to its own executor thread on top of that. `Scheduler::new().deterministic(true)` spawns no executor threads at all: every node, whatever its execution class, ticks sequentially on the main thread. See [deterministic execution](/advanced/deterministic-execution).
 
 ## See Also
 

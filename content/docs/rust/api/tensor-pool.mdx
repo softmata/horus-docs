@@ -27,10 +27,10 @@ Most users should use `Image`, `PointCloud`, or `DepthImage` instead of working 
 use horus::prelude::*;
 
 // Create an image — pool allocation is automatic
-let mut img = Image::new(480, 640, ImageEncoding::Rgb8)?;
+let mut img = Image::new(640, 480, ImageEncoding::Rgb8)?;
 img.fill(&[255, 0, 0]); // Red
 
-// Send via topic — zero-copy, only 168-byte descriptor travels
+// Send via topic — zero-copy, only the 224-byte ImageDescriptor travels
 let topic: Topic<Image> = Topic::new("camera/rgb")?;
 topic.send(&img);
 
@@ -43,17 +43,18 @@ if let Some(img) = topic.recv() {
 ```rust
 // Point clouds work the same way
 let pc = PointCloud::new(10000, 3, TensorDtype::F32)?;
-let depth = DepthImage::new(480, 640, TensorDtype::F32)?;
+let depth = DepthImage::new(640, 480, TensorDtype::F32)?;
 ```
 
 See [Basic Examples — Camera Image Pipeline](/rust/examples/basic-examples#6-camera-image-pipeline) for complete send/recv examples.
 
 ## Auto-Managed Pools (Advanced)
 
-The simplest way to use tensor pools is through `Topic<Tensor>`, which auto-manages a pool per topic:
+If you need raw tensors rather than a domain type, the simplest path is `Topic<Tensor>`, which auto-manages a pool per topic:
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::types::Tensor;
 
 let topic: Topic<Tensor> = Topic::new("camera.rgb")?;
 
@@ -89,6 +90,7 @@ For advanced use cases requiring direct pool control.
 
 ```rust
 use horus::prelude::*;
+use horus::memory::{PoolAllocator, TensorPool, TensorPoolConfig};
 use std::sync::Arc;
 
 // Create with default config (1024 slots, 1GB pool)
@@ -110,6 +112,8 @@ let pool = Arc::new(TensorPool::new(1, config)?);
 
 ```rust
 use horus::prelude::*;
+use horus::memory::TensorHandle;
+use horus::horus_core::types::Tensor;
 
 // Allocate a 1080p RGB image
 let handle = TensorHandle::alloc(
@@ -174,18 +178,21 @@ println!("Pool: {}/{} slots used, {}/{} bytes",
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::types::Tensor;
 
 let mut tensor = Tensor::default();
-tensor.set_device(Device::cuda(0));
+let dev = Device::cuda(0);
+tensor.device_type = dev.device_type;
+tensor.device_id = dev.device_id;
 assert!(tensor.device().is_cuda());
 ```
 
 **No pool can back that device today.** `PoolAllocator` has one variant, `Mmap`, so allocating from a pool with a CUDA device fails:
 
 ```text
-Allocation failed: device mismatch: requested cuda:0 but pool backend
-targets cpu (backend: mmap). Use a pool created with the matching backend,
-or pass Device::cpu() to alloc().
+Memory error: Allocation failed: device mismatch: requested cuda:0 but pool
+backend targets cpu (backend: mmap). Use a pool created with the matching
+backend, or pass Device::cpu() to alloc().
 ```
 
 There is no `cuda_available()` or `cuda_device_count()` function in the crate, and no `CudaTensorPool`. Keep tensors on the CPU as the transport, and do device placement inside your inference framework (torch, ONNX Runtime, TensorRT) after reading the pool memory.
@@ -195,15 +202,16 @@ There is no `cuda_available()` or `cuda_device_count()` function in the crate, a
 `Tensor` is a 168-byte `Pod` descriptor that acts as a lightweight handle to tensor data in shared memory. Only the descriptor travels through the ring buffer — the actual data stays in-place.
 
 ```rust
-// Key methods on Tensor:
+// Key fields and methods on Tensor:
 let shape = tensor.shape();         // &[u64] - dimensions
-let dtype = tensor.dtype();         // TensorDtype
+let dtype = tensor.dtype;           // TensorDtype (pub field)
 let dev = tensor.device();          // Device (cpu or cuda)
 let size = tensor.size;             // Total size in bytes (pub field)
-tensor.set_device(Device::cuda(0)); // Set device location
+tensor.device_type = Device::cuda(0).device_type; // pub field
+tensor.device_id   = Device::cuda(0).device_id;   // pub field
 ```
 
-Use `Device::cpu()`, `Device::cuda(0)`, `Device::cuda(1)`, etc. for device placement. `Device` supports unlimited GPU indices.
+`Device::cpu()`, `Device::cuda(0)`, `Device::cuda(1)`, etc. describe *where* the data lives; `device_id` is a `u32`, so any GPU index fits in the descriptor. As the GPU section above notes, allocating from a pool still only succeeds with `Device::cpu()` — a CUDA device on a descriptor is metadata for your own code to act on.
 
 ## Python API
 
@@ -231,22 +239,25 @@ There is no `horus.cuda_is_available()` and no `horus.ai` module; model loading 
 
 | Operation | Latency |
 |-----------|---------|
-| Slot allocation | ~100ns |
+| Slot alloc + release, 64 B | ~1.1 µs |
+| Slot alloc + release, 6 MB (1080p RGB) | ~3.1 ms |
 | Cross-process access | Zero-copy via mmap |
+
+These come from the repo's own `benchmarks/benches/tensor_pool.rs` and are hardware-dependent — they are not part of the published figures in `benchmarks/README.md`, which covers topic/IPC latency only. Allocation cost scales with tensor size because `return_slot()` zeroes the data region before the slot returns to the free list.
 
 Regardless of tensor size, only the 168-byte descriptor travels through the ring buffer — the data stays in the mmap and is read in place by the receiver. There are no GPU pool figures to quote: there is no GPU allocator in the crate.
 
 ## Best Practices
 
-1. **Use auto-managed pools**: Prefer `Topic<Tensor>` with `alloc_tensor()`/`send_handle()`/`recv_handle()` — the framework handles pool lifecycle
+1. **Use auto-managed pools for raw tensors**: Prefer `Topic<Tensor>` with `alloc_tensor()`/`send_handle()`/`recv_handle()` — the framework handles pool lifecycle
 2. **Wrap in Arc**: When using manual pools, TensorPool doesn't implement Clone — use `Arc<TensorPool>` for sharing
 3. **Reuse pools**: Create pools once at startup, not per-tensor
 4. **Use TensorHandle**: Prefer `TensorHandle` over manual `retain`/`release` for automatic refcounting
 5. **Match dtypes**: Ensure sender and receiver use same dtype
 6. **Keep tensors on the CPU**: The pool cannot allocate on `Device::cuda(N)`; move batches to the GPU inside your inference framework
-7. **Watch `allocated_slots`**: `max_slots`, not `pool_size`, is usually the limit a leaking pipeline hits first
+7. **Watch both pool limits**: `stats()` reports `allocated_slots` and `used_bytes` — which one a leaking pipeline exhausts first depends on tensor size. With the 1GB/1024-slot default, leaked 1080p RGB frames run the data region out after ~170 allocations (173 slots used); small tensors hit `max_slots` first
 
 ## See Also
 
 - [Tensor Messages](/rust/api/tensor-messages) - Tensor, TensorDtype, Device types and domain wrappers
-- [Topic & Shared Memory](/concepts/core-concepts-topic#shared-memory-details) - How HORUS achieves zero-copy IPC
+- [Topic & Shared Memory](/concepts/core-concepts-topic) - How HORUS achieves zero-copy IPC

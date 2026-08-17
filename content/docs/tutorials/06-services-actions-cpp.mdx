@@ -25,7 +25,10 @@ A service is like a function call across processes. Client sends a request, serv
 #include <horus/horus.hpp>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
+#include <optional>
+#include <string>
 #include <thread>
 #include <chrono>
 using namespace horus::literals;
@@ -34,48 +37,65 @@ int main() {
     // ── Server: listens for requests, computes response ─────────
     horus::ServiceServer server("add_two_ints");
 
-    // Handler receives raw bytes, writes response
+    // Handler receives raw bytes, writes response. `res_len` is IN/OUT: on
+    // entry it holds the capacity of `res` in bytes; on return, set it to the
+    // number of bytes written. Never assume a capacity — read the one you're
+    // given (today it is JsonWireMessage::MAX_PAYLOAD = 3968).
     server.set_handler([](const uint8_t* req, size_t req_len,
                           uint8_t* res, size_t* res_len) -> bool {
-        // Parse request JSON
+        const size_t cap = *res_len;  // IN: real buffer capacity
+
+        // Copy the request out as a NUL-terminated string
         char json[4096] = {};
+        if (req_len >= sizeof(json)) return false;
         std::memcpy(json, req, req_len);
-        // Simple parsing (production: use a JSON library)
+
+        // Simple whitespace-tolerant parsing (production: use a JSON library).
+        // The request crosses the wire verbatim, spaces and all.
         int a = 0, b = 0;
-        std::sscanf(json, R"({"a":%d,"b":%d})", &a, &b);
+        if (const char* p = std::strstr(json, "\"a\":")) a = std::atoi(p + 4);
+        if (const char* p = std::strstr(json, "\"b\":")) b = std::atoi(p + 4);
 
         // Compute response
         int sum = a + b;
-        *res_len = std::snprintf(reinterpret_cast<char*>(res), 4096,
-                                  R"({"sum":%d})", sum);
+        int n = std::snprintf(reinterpret_cast<char*>(res), cap,
+                              R"({"sum":%d})", sum);
+        if (n < 0 || static_cast<size_t>(n) >= cap) return false;
+        *res_len = static_cast<size_t>(n);  // OUT: bytes written
         return true;
-    });
-
-    // The server must be driven to answer requests. Pump process() on a
-    // background thread here; in a real app you'd call it from your main loop
-    // (or a scheduled node tick), typically in the server's own process.
-    std::atomic<bool> running{true};
-    std::thread server_thread([&] {
-        while (running.load()) {
-            server.process();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
     });
 
     // ── Client: sends request, waits for response ───────────────
     horus::ServiceClient client("add_two_ints");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let SHM settle
 
-    auto response = client.call(R"({"a": 3, "b": 4})",
-                                std::chrono::milliseconds(1000));
+    // The server must be driven to answer requests, and process() may only be
+    // called from the thread that constructed the server. Since call() blocks,
+    // run the call on a worker thread and pump process() here on main; in a
+    // real app the server lives in its own process and process() is just part
+    // of its main loop (or a scheduled node tick).
+    std::atomic<bool> done{false};
+    std::optional<std::string> response;
+    std::thread caller([&] {
+        response = client.call(R"({"a": 3, "b": 4})",
+                               std::chrono::milliseconds(1000));
+        done.store(true);
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!done.load()) {
+        server.process();
+        if (std::chrono::steady_clock::now() > deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    caller.join();
+
     if (response) {
         std::printf("Response: %s\n", response->c_str());
         // Output: Response: {"sum":7}
     } else {
         std::printf("Service call timed out\n");
     }
-
-    running.store(false);
-    server_thread.join();
 }
 ```
 
@@ -101,6 +121,12 @@ Actions are for tasks that take time — navigating to a goal, calibrating a sen
 
 ### Example: Navigate to Goal
 
+This is the **client half only**. Feedback and results reach a client solely
+because some `ActionServer` is being driven — `process()` is what publishes onto
+the client's feedback/result topics. Build the [Action Server](#action-server)
+shown below into its own binary and start it first, or the poll loop has
+nothing to receive.
+
 ```cpp
 #include <horus/horus.hpp>
 #include <cstdio>
@@ -110,6 +136,7 @@ using namespace horus::literals;
 
 int main() {
     // ── Client: send goal, monitor progress ─────────────────────
+    // Requires the "navigate" action server (shown below) running elsewhere.
     horus::ActionClient client("navigate");
 
     auto goal = client.send_goal(R"({"target_x": 5.0, "target_y": 3.0})");
@@ -126,11 +153,18 @@ int main() {
     std::string result_json;
     uint64_t fb_id;
     std::string fb_json;
+    // Always bound the poll loop: with no server driving process(), no result
+    // is ever published and an unbounded loop would spin forever.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!client.poll_result(goal.id(), status, result_json)) {
         if (client.poll_feedback(fb_id, fb_json)) {
             std::printf("  feedback: %s\n", fb_json.c_str());
         }
         // client.cancel(goal.id());  // request cancellation at any time
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::printf("No result — is the 'navigate' action server running?\n");
+            return 1;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
@@ -207,13 +241,14 @@ Services work across processes — client and server can be separate binaries:
 ./my_service_client
 ```
 
-Both connect through SHM. The topic names must match.
+Both connect through SHM. The service names must match — the underlying
+`{name}.request` / `{name}.response.{pid}` topics are derived from them.
 
 ## When To Use What
 
 | Pattern | Use Case | Latency |
 |---------|----------|---------|
-| **Topic** | Continuous data (sensor readings, commands) | ~15 ns |
+| **Topic** | Continuous data (sensor readings, commands) | ~20 ns same-process / ~200 ns cross-process SHM |
 | **Service** | One-shot query (get parameter, check status) | ~5 us (JSON round-trip) |
 | **Action** | Long task with progress (navigate, calibrate) | ~5 us + task duration |
 

@@ -6,7 +6,7 @@ order: 13
 
 # Troubleshooting
 
-HORUS includes utility scripts to help you update, recover from broken installations, and verify your setup.
+HORUS ships two utility scripts, `install.sh` and `uninstall.sh`. This page covers updating, recovering from a broken installation, and debugging HORUS applications at runtime.
 
 ## Quick Reference
 
@@ -19,10 +19,10 @@ HORUS includes utility scripts to help you update, recover from broken installat
 
 When your HORUS application isn't working:
 
-1. **Check the Monitor**: Run `horus monitor` to see active nodes, topics, and message flow
+1. **Check the Monitor**: Run `horus monitor` to see active nodes, topics, and message flow. The monitor ships as a plugin — if it reports "The monitor plugin is not installed", run `horus install horus-monitor` first.
 2. **Examine Logs**: Look for error messages in your terminal output
 3. **Verify Topics**: Ensure publisher and subscriber use exact same topic names
-4. **Check Shared Memory**: Look in `/dev/shm/horus/` for stale HORUS memory regions
+4. **Check Shared Memory**: Look in `/dev/shm/horus_default/` (or `/dev/shm/horus_*/`) for stale HORUS memory regions
 5. **Test Individually**: Run nodes one at a time to isolate the problem
 
 ---
@@ -115,9 +115,9 @@ rm -rf ~/.horus/cache
 - Installed libraries
 - Cached dependencies
 
-**Never removed (safe):**
-- `~/.horus/config` (user settings)
-- `~/.horus/credentials` (registry auth)
+**Never removed by the steps above (safe):**
+- `~/.horus/config.toml` (user settings)
+- `~/.config/horus/auth.json` (registry auth, on Linux)
 - Project-local `.horus/` directories
 - Your source code
 
@@ -129,6 +129,8 @@ If the quick steps don't work, do a complete reset:
 # Remove everything HORUS-related
 cargo clean
 rm -rf ~/.horus
+rm -rf ~/.config/horus   # registry credentials live here, not under ~/.horus
+rm -rf ~/.cache/horus    # installer's XDG source cache (horus@<version>)
 rm -f ~/.cargo/bin/horus
 
 # Fresh install
@@ -274,13 +276,14 @@ but `horus_core 0.1.3` is installed
 - Your project's `.horus/` directory still has cached dependencies from the old version
 - The cached `Cargo.lock` references incompatible library versions
 
-**Solution (Recommended - Fast & Easy):**
+**Option 1: `horus run --clean` (recommended - fast & easy)**
 ```bash
 # Clean cached build artifacts and dependencies
 horus run --clean
 
-# This removes .horus/target/ and forces a fresh build
-# with the new version
+# This clears .horus/cache/, .horus/bin/ and any top-level target/,
+# forcing a fresh build with the new version.
+# Note: it does NOT remove .horus/target/ — see Option 2 for that.
 ```
 
 **Alternative Solutions:**
@@ -310,10 +313,15 @@ find ~/your-projects -type d -name ".horus" -exec rm -rf {}/target/ \;
 
 ---
 
-### "HORUS source directory not found" (Rust projects)
+### "HORUS source not found" (Rust projects)
 
 ```
-Error: HORUS source directory not found. Please set HORUS_SOURCE environment variable.
+Error: HORUS source not found. This can happen after running 'horus clean -a'.
+
+To fix this, either:
+ 1. Re-run the install script: ./install.sh (or curl the installer)
+ 2. Set HORUS_SOURCE environment variable to your HORUS source directory
+ 3. Clone HORUS to ~/softmata/horus or ~/horus
 ```
 
 **Solution:**
@@ -323,11 +331,16 @@ export HORUS_SOURCE=/path/to/horus
 echo 'export HORUS_SOURCE=/path/to/horus' >> ~/.bashrc
 
 # Option 2: Install HORUS to a standard location
-# The CLI checks these paths automatically:
-#   - ~/softmata/horus
+# The CLI checks these paths automatically, in order:
 #   - /horus
+#   - ~/softmata/horus
+#   - ~/horus
 #   - /opt/horus
 #   - /usr/local/horus
+#
+# It also falls back to the installer's source cache:
+#   - ~/.cache/horus/horus@<version>
+#   - ~/.horus/cache/horus@<version>
 
 # Verify HORUS source is found
 horus build
@@ -351,24 +364,25 @@ thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value'
 **Common Causes:**
 
 1. **Stale Shared Memory from Previous Run**
-   - HORUS uses `/dev/shm/horus/` directory for communication
+   - HORUS uses the `/dev/shm/horus_<namespace>/` directory for communication
+     (`horus_default` unless `HORUS_NAMESPACE` is set)
    - If your app crashes, these files persist
 
    **Fix**: Clean shared memory:
    ```bash
-   # Remove all HORUS shared memory
-   rm -rf /dev/shm/horus/
+   # Remove all HORUS shared memory (scans every horus_* namespace)
+   horus clean --shm
    ```
 
 2. **Insufficient Permissions on `/dev/shm`**
 
    **Fix**: Check permissions:
    ```bash
-   ls -la /dev/shm/horus/topics/
+   ls -la /dev/shm/horus_default/topics/
    # Should show your user as owner
 
    # If not, remove with sudo
-   sudo rm -rf /dev/shm/horus/
+   sudo rm -rf /dev/shm/horus_default/
 
    # Fix permissions (if needed)
    sudo chmod 1777 /dev/shm
@@ -414,11 +428,11 @@ thread 'main' panicked at 'Failed to create publisher 'camera': No such file or 
 
 **Cause**: You're using **slashes (`/`)** in your topic name. While slashes work on Linux (parent directories are created automatically), they fail on **macOS** where shared memory uses `shm_open()` which doesn't support embedded slashes.
 
-HORUS topic names map to files under `/dev/shm/horus/topics/` on Linux:
+HORUS topic names map to files under `/dev/shm/horus_<namespace>/topics/` on Linux (the namespace is `default` unless `HORUS_NAMESPACE` is set):
 
 ```
-Topic: "sensors.camera"  →  /dev/shm/horus/topics/horus_sensors.camera  (cross-platform)
-Topic: "sensors/camera"  →  Works on Linux only, fails on macOS
+Topic: "sensors.camera"  →  /dev/shm/horus_default/topics/sensors.camera  (cross-platform)
+Topic: "sensors/camera"  →  /dev/shm/horus_default/topics/sensors/camera  (Linux only, fails on macOS)
 ```
 
 **Fix**: Use dots instead of slashes for cross-platform compatibility:
@@ -470,23 +484,7 @@ if let Some(data) = self.data_sub.recv() {
    ```
    Check the "Topics" section to see active topic names.
 
-2. **Type Mismatch**
-   - Publisher and subscriber use different message types
-
-   **Fix**: Ensure both use same type:
-   ```rust
-   // Publisher
-   let pub_topic: Topic<f32> = Topic::new("data")?;
-   pub_topic.send(3.14);
-
-   // Subscriber (WRONG TYPE)
-   let sub_topic: Topic<f64> = Topic::new("data")?;  // f64 != f32
-
-   // CORRECT:
-   let sub_topic: Topic<f32> = Topic::new("data")?;  // Same type
-   ```
-
-3. **Publisher Hasn't Sent Yet**
+2. **Publisher Hasn't Sent Yet**
    - Subscriber starts before publisher sends first message
    - This is normal! First `recv()` will return `None`
 
@@ -503,7 +501,7 @@ if let Some(data) = self.data_sub.recv() {
    }
    ```
 
-4. **Wrong Priority Order**
+3. **Wrong Priority Order**
    - Subscriber runs before publisher in same tick
 
    **Fix**: Set priorities correctly:
@@ -514,6 +512,36 @@ if let Some(data) = self.data_sub.recv() {
    // Subscriber runs after (higher order number)
    scheduler.add(SubscriberNode::new()?).order(1).done();
    ```
+
+---
+
+### "Type mismatch on topic ..."
+
+A type mismatch is **not** a cause of silence — it fails loudly, at construction,
+before `recv()` is ever reached. It gets its own section because it is easy to
+mistake for a delivery problem.
+
+**Symptom**: `Topic::new()` returns an error on startup:
+```
+Type mismatch on topic 'data': existing type 'f32', attempted 'f64'.
+Two processes opened the same topic with different message types.
+Fix: use distinct topic names for different message types.
+```
+
+**Cause**: A topic's message type is fixed by whichever process creates it first. Opening the same name with a different type is rejected, so you get an error rather than zero messages.
+
+**Fix**: Use the same type on both sides, or pick distinct topic names:
+```rust
+// Publisher
+let pub_topic: Topic<f32> = Topic::new("data")?;
+pub_topic.send(3.14);
+
+// Subscriber (WRONG TYPE) — Topic::new returns Err here
+let sub_topic: Topic<f64> = Topic::new("data")?;  // f64 != f32
+
+// CORRECT:
+let sub_topic: Topic<f32> = Topic::new("data")?;  // Same type
+```
 
 ---
 
@@ -555,7 +583,7 @@ Starting application...
    fn tick(&mut self) {
        self.tick_count += 1;
 
-       // Execute every 10 ticks (~167ms at 60 FPS)
+       // Execute every 10 ticks (~100ms at the default 100 Hz tick rate)
        if self.tick_count % 10 == 0 {
            self.slow_operation();
        }
@@ -612,46 +640,75 @@ Starting application...
 
 **Symptom**: Publisher sends messages but subscriber never receives them, and no error is reported.
 
-**Cause**: For non-POD (serialized) messages, the serialized data exceeds the slot size (default 8KB). The `send()` method is lossy — it retries briefly then drops the message, incrementing an internal failure counter.
+**Cause**: `send()` is lossy. The usual cause is a full ring buffer — the subscriber isn't draining it fast enough. When the ring is full, `send()` retries briefly (one immediate retry, then 64 spins and 4 yields) and then drops the message, incrementing the topic's drop counter.
+
+Message size alone rarely causes drops: serialized payloads larger than 4KB are spilled to a shared TensorPool automatically, and a payload that still exceeds the current slot (default 8KB) triggers an automatic slot grow followed by a retry.
 
 **Fix**:
 
-**1. Check Message Size:**
+**1. Confirm the drops and count them:**
+```rust
+// dropped_count() = send() calls that gave up after the bounded retry
+if self.topic.dropped_count() > 0 {
+    hlog!(warn, "{} messages dropped on '{}'",
+          self.topic.dropped_count(), self.topic.name());
+}
+```
+This counter is per-process and lives in the publishing process — it is not
+written to shared memory, so read it from the node that owns the topic rather
+than looking for it in `horus monitor`. (From Python: `topic.stats()["send_failures"]`.)
+
+**2. Let the subscriber drain the ring:**
+
+Give the subscriber a tick rate at least as high as the publisher's:
+```rust
+scheduler.add(PublisherNode::new()?).order(0).rate(50_u64.hz()).done()?;
+scheduler.add(SubscriberNode::new()?).order(1).rate(200_u64.hz()).done()?;
+```
+
+Or drain everything queued on each tick instead of a single message:
+```rust
+fn tick(&mut self) {
+    while let Some(msg) = self.topic.recv() {
+        self.process(msg);
+    }
+}
+```
+
+**3. Give a bursty publisher a deeper ring:**
+```rust
+// Default capacity is one 4KB page worth of slots, clamped to 16..=1024
+// and rounded up to a power of two. Ask for more explicitly:
+let topic: Topic<SensorData> = Topic::with_capacity("sensor_data", 1024, None)?;
+```
+
+**4. For messages you cannot afford to lose, use `send_blocking()`:**
+```rust
+use std::time::Duration;
+
+// Waits for space instead of dropping; Err(SendBlockingError::Timeout)
+// if the ring stayed full for the whole timeout
+if let Err(e) = self.cmd_topic.send_blocking(cmd, Duration::from_millis(5)) {
+    hlog!(error, "cmd_vel send timed out: {}", e);
+}
+```
+
+**If you suspect an oversized payload instead**, message size rarely causes drops (see above), but you can check it directly:
 ```rust
 use std::mem::size_of;
 
 // POD messages always fit (slot = size_of::<T>())
-// Non-POD messages must serialize within the slot size (default 8KB)
+// Non-POD messages are serialized; payloads over 4KB are spilled to a TensorPool
 println!("Message size: {} bytes", size_of::<MyMessage>());
 ```
 
-**2. Keep Messages Reasonably Sized:**
+A `#[repr(C)] #[derive(Clone, Copy)]` POD message bypasses serialization entirely and needs no serde derives. If you keep a serde message with a large fixed array, note that serde only derives for arrays up to length 32 — longer ones need `serde_arrays` (add `serde_arrays = "0.2"` to your dependencies):
 ```rust
-// BAD: Variable size — may exceed limit
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LargeMessage {
-    pub data: Vec<u8>,
-}
-
-// GOOD: Fixed size
-#[derive(Clone, Serialize, Deserialize)]
-pub struct LargeMessage {
+    #[serde(with = "serde_arrays")]
     pub data: [u8; 4096],  // Fixed 4KB
 }
-
-// BETTER: Split into multiple messages
-#[derive(Clone, Serialize, Deserialize)]
-pub struct MessageChunk {
-    pub chunk_id: u32,
-    pub total_chunks: u32,
-    pub data: [u8; 1024],
-}
-```
-
-**3. Use Monitor to Check:**
-```bash
-# The monitor shows send failure counts per topic
-horus monitor
 ```
 
 ---
@@ -662,12 +719,11 @@ horus monitor
 
 **Symptom**: Code won't compile, missing types or functions.
 
-**Fix**: Add HORUS to `horus.yaml`:
+**Fix**: Add HORUS to `horus.toml`:
 
-```yaml
-dependencies:
-  - horus
-  - horus_library  # For standard messages (CmdVel, Twist, etc.)
+```toml
+[dependencies]
+horus = "*"
 ```
 
 Import the prelude:
@@ -675,13 +731,18 @@ Import the prelude:
 use horus::prelude::*;  // Provides Twist, LaserScan, CmdVel, etc.
 ```
 
+`horus::prelude::*` re-exports the standard robotics messages (CmdVel, Twist, Imu,
+LaserScan, BatteryState, …), so `horus` is the only dependency you need — there is no
+separate message crate to add.
+
 ### "trait bound ... is not satisfied"
 
 **Symptom**: Compiler says your message doesn't implement required traits.
 
 **Fix**: Add required derives:
 ```rust
-// Add these three derives to all messages
+// Clone + Serialize + Deserialize are required on every message
+// (Debug is optional, but worth having)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MyMessage {
     pub field: f32,
@@ -726,10 +787,9 @@ cargo cache --autoclean
 **Solution:**
 ```bash
 # Clean build artifacts in current project
+# (no built-in command reclaims .horus/target/ —
+#  neither `horus run --clean` nor `horus clean` touches it)
 rm -rf .horus/target/
-
-# Or use horus clean flag (next build will be slower)
-horus run --clean
 
 # Regular cleanup (if working on multiple projects)
 find . -type d -name ".horus" -exec rm -rf {}/target/ \;
@@ -762,6 +822,8 @@ horus run
 # Terminal 2: Start monitor
 horus monitor
 ```
+
+The monitor ships as a plugin. If `horus monitor` reports "The monitor plugin is not installed", install it first with `horus install horus-monitor`.
 
 **Monitor Features:**
 
@@ -989,10 +1051,10 @@ If you're still having issues:
    df -h /dev/shm
 
    # Check HORUS files
-   ls -lh /dev/shm/horus/topics/
+   ls -lh /dev/shm/horus_default/topics/
 
-   # Clean if needed
-   rm -rf /dev/shm/horus/
+   # Clean if needed (scans every horus_* namespace)
+   horus clean --shm
    ```
 
 5. **Report the issue:**

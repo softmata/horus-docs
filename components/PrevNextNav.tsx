@@ -29,7 +29,7 @@ const allPages: DocLink[] = [
   { title: "Nodes", href: "/concepts/core-concepts-nodes" },
   { title: "Communication Patterns", href: "/concepts/communication-overview" },
   { title: "Topic (Pub/Sub)", href: "/concepts/core-concepts-topic" },
-  { title: "PodTopic (Ultra-Fast)", href: "/concepts/core-concepts-podtopic" },
+  { title: "POD Types", href: "/concepts/core-concepts-podtopic" },
   { title: "Services (Beta)", href: "/concepts/services" },
   { title: "Actions (Beta)", href: "/concepts/actions" },
   { title: "Scheduler", href: "/concepts/core-concepts-scheduler" },

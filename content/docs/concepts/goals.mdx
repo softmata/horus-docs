@@ -12,13 +12,13 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 
 ### Core Objectives
 
-**Sub-Microsecond Communication**: Achieve ~85ns-500ns latency for robotics messages, enabling real-time control loops at 1kHz+ frequencies
+**Sub-Microsecond Communication**: Achieve ~75ns median latency for small control messages (16B `CmdVel`) and sub-microsecond latency for larger sensor messages, enabling real-time control loops at 1kHz+ frequencies
 
-**Zero Compromise Performance**: Deliver 100-270x faster performance than traditional frameworks without sacrificing safety or ease of use
+**Zero Compromise Performance**: Deliver 550-875x faster message passing than ROS2 (DDS) without sacrificing safety or ease of use
 
 **Memory Safety by Default**: Leverage Rust's type system to eliminate entire classes of bugs common in C++ robotics frameworks
 
-**Unified High-Level Workflow**: Single command for build, run, and deployment across Rust and Python with minimal configuration (simple horus.yaml vs complex ROS XML)
+**Unified High-Level Workflow**: Single command for build, run, and deployment across Rust, Python, and C++ with minimal configuration (simple horus.toml vs complex ROS XML)
 
 **Dependency Isolation**: Solve dependency hell with portable, isolated environments and reproducible builds
 
@@ -32,9 +32,9 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 
 **HORUS Solution**:
 - Shared memory architecture with zero-copy semantics
-- ~85ns (Topic SPSC) / ~500ns (Topic MPMC) for CmdVel (16B messages)
-- ~900ns (Topic SPSC) / ~2.2µs (Topic MPMC) for LaserScan (1.5KB messages)
-- Linear scaling with message size
+- ~75ns median (135ns p99) for CmdVel (16B messages), with the shared-memory backend selected automatically per topic
+- ~210ns median (283ns p99) for LaserScan (1.5KB messages)
+- Sub-microsecond latency for typical robotics messages, benchmarked over an 8B-64KB size sweep
 
 **Impact**: Enables 1kHz+ control loops for precise manipulation, high-speed drones, and real-time sensor fusion.
 
@@ -58,8 +58,7 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 **Problem**: Managing dependencies across teams is a nightmare. Different Python versions, missing system libraries, incompatible package versions - research code rarely runs on production machines without hours of debugging.
 
 **HORUS Solution**:
-- `.horus` environment files for exact dependency snapshots
-- `horus env freeze` captures your entire working environment
+- `horus.lock` pins exact dependency versions for reproducible builds (`horus lock`)
 - Portable environments that work identically across machines
 - Isolated dependency resolution prevents version conflicts
 - Package registry with automatic dependency installation
@@ -76,8 +75,8 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 - **Single unified command**: `horus run` for everything
 - **Auto-detection**: Automatically detects project language and type
 - **Auto-install**: Missing dependencies? Installed automatically
-- **Minimal configuration**: Simple horus.yaml (no makefiles, no build scripts, no setup.py)
-- **Multi-language support**: Same workflow for Rust and Python
+- **Minimal configuration**: Simple horus.toml (no makefiles, no build scripts, no setup.py)
+- **Multi-language support**: Same workflow for Rust, Python, and C++
 
 **Impact**: Developers focus on robotics, not build systems. Instant iteration cycles. No more "how do I run this?"
 
@@ -91,7 +90,7 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 - Simple `tick()` method with `init()` and `shutdown()` lifecycle
 - Minimal boilerplate with the `Node` trait
 - Built-in logging with automatic pub/sub tracking
-- Real-time monitor with CPU, memory, and message flow tracking
+- Real-time monitor plugin (`horus install horus-monitor`) with CPU, memory, and message flow tracking
 - Interactive CLI with smart templates and package search
 
 **Impact**: Developers can focus on robot logic instead of framework complexity.
@@ -103,7 +102,7 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 **Problem**: Robotics teams waste countless hours rewriting the same components - IMU drivers, PID controllers, path planners, sensor filters. Every project starts from scratch because sharing code across teams and organizations is too difficult.
 
 **HORUS Solution**:
-- **Built-in horus_library**: Pre-built message types and utilities for common robotics tasks
+- **Built-in message library**: `horus_types` (universal IPC types) and `horus_robotics` (standard robotics messages), both re-exported through `horus::prelude`
 - **Standard messages**: `Imu`, `LaserScan`, `CmdVel`, `Image`, `PointCloud`, and more — ready to use
 - **Easy customization**: Override just the `tick()` method to customize behavior
 - **Registry for sharing**: Publish and reuse custom nodes across teams
@@ -113,20 +112,22 @@ HORUS aims to become the **de facto standard for real-time robotics communicatio
 
 Instead of writing yet another message serializer, use the built-in message types in Python:
 ```python
-from horus import Node, Scheduler, Topic, Imu, LaserScan, CmdVel
+from horus import Node, Scheduler, Imu, CmdVel
 
 def sensor_tick(node):
     if node.has_msg("imu.data"):
-        imu = node.recv("imu.data")
-        # Process IMU data directly — no custom parsing needed
+        imu: Imu = node.recv("imu.data")
+        # Standard fields, ready to read — no custom parsing needed
+        if abs(imu.accel_z) > 12.0:
+            node.send("cmd_vel", CmdVel.zero())  # emergency stop
 
-sensor = Node(name="sensor", subs=["imu.data"], pubs=["cmd_vel"], tick=sensor_tick)
+sensor = Node(name="sensor", subs=["imu.data"], pubs=["cmd_vel"], tick=sensor_tick, order=0)
 scheduler = Scheduler()
-scheduler.add(sensor, order=0)
+scheduler.add(sensor)
 scheduler.run()
 ```
 
-Or compose Rust nodes using the standard message library:
+Or use the same standard messages from Rust:
 ```rust
 use horus::prelude::*;
 
@@ -136,11 +137,15 @@ let scan_topic: Topic<LaserScan> = Topic::new("lidar.scan")?;
 let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 ```
 
-**Impact**: Transform robotics from "build everything from scratch" to "compose from proven components". Teams ship faster, researchers focus on novel algorithms instead of infrastructure, and knowledge compounds across the community through horus_library and the registry.
+**Impact**: Transform robotics from "build everything from scratch" to "compose from proven components". Teams ship faster, researchers focus on novel algorithms instead of infrastructure, and knowledge compounds across the community through the built-in message library (`horus_types`, `horus_robotics`) and the registry.
+
+---
 
 ### Sharing Across Developers & Organizations
 
-Built your own IMU driver for a specific sensor? **Share it with the community through the HORUS Registry**:
+**Problem**: Useful nodes stay locked inside the team that wrote them - there is no common way to package, publish, or discover robotics components across organizations.
+
+**HORUS Solution**: Built your own IMU driver for a specific sensor? **Share it with the community through the HORUS Registry**:
 
 ```bash
 # Publish your package to the registry
@@ -155,12 +160,12 @@ horus install your-imu-driver
 
 **The Registry enables:**
 
-- **Discover packages**: Search thousands of community-contributed nodes
+- **Discover packages**: Search the registry for community-contributed nodes
 - **One-command install**: `horus install sensor-fusion` - no manual setup
 - **Semantic versioning**: Reliable dependency management with automatic updates
-- **Quality metrics**: Stars, downloads, documentation coverage help you choose
+- **Category filtering**: `horus search <query> --category lidar|camera|imu|motor|...` narrows results
 - **GitHub authentication**: Secure publishing with your GitHub account
-- **Share environments**: Publish complete `.horus` environments for reproducible setups
+- **Signed packages**: ed25519 publisher signatures verified at install (`horus auth trust-publisher`)
 
 **Real example - Cross-team collaboration:**
 ```bash
@@ -172,11 +177,17 @@ horus publish
 
 # Team B discovers and uses it weeks later
 horus search slam
-#  slam-cartographer  1.0.0  SLAM using cartographer  234  ⬇5.2k
+# Found 1 plugins matching 'slam':
+#
+#   slam-cartographer v1.0.0 [REGISTRY]
+#     SLAM using cartographer
 horus install slam-cartographer
+```
 
-# Use it directly in their code
+Then use it directly in their code:
+```rust
 use slam_cartographer::CartographerNode;
+
 scheduler.add(CartographerNode::new()?).order(2).done();
 ```
 
@@ -189,10 +200,10 @@ scheduler.add(CartographerNode::new()?).order(2).done();
 **Problem**: Switching between languages in robotics often requires multiple communication frameworks or language-specific bindings with performance penalties.
 
 **HORUS Solution**:
-- Native support for Rust and Python
+- Native support for Rust, Python, and C++
 - Unified workflow across all languages
 - Python bindings via PyO3 with shared memory access for near-native performance
-- Same `horus run` command works for both Rust and Python projects
+- Same `horus run` command works for Rust, Python, and C++ projects
 
 **Impact**: Teams can use the best language for each component without performance penalties or workflow friction.
 
@@ -204,13 +215,13 @@ scheduler.add(CartographerNode::new()?).order(2).done();
 
 **Configuration Complexity**: No XML files, no complex workspaces. Just `horus new`, write code, and `horus run`.
 
-**Debugging Black Holes**: Built-in monitoring, automatic logging, and performance metrics eliminate the need for external debugging tools.
+**Debugging Black Holes**: Automatic logging and performance metrics, plus the first-party `horus-monitor` plugin (`horus install horus-monitor`), eliminate the need for external debugging tools.
 
-**Unsafe Code**: Safe user-facing APIs with no exposed unsafe. Memory safety is not optional in HORUS.
+**Unsafe Code**: Safe user-facing APIs; `unsafe` stays confined to audited core internals with SAFETY comments. Memory safety is not optional in HORUS.
 
 **Version Conflicts**: Isolated environments prevent dependency version conflicts across projects.
 
-**Build System Hell**: One unified build system for all languages. Auto-detect, auto-install, minimal config (just horus.yaml).
+**Build System Hell**: One unified build system for all languages. Auto-detect, auto-install, minimal config (just horus.toml).
 
 ---
 
@@ -219,12 +230,12 @@ scheduler.add(CartographerNode::new()?).order(2).done();
 ### High-Speed Manipulation
 - **Use Case**: Pick-and-place robots, surgical robots, assembly line automation
 - **Why HORUS**: Sub-microsecond latency enables 1kHz+ control loops for precise trajectory following
-- **Performance**: ~85ns (Topic SPSC) / ~500ns (Topic MPMC) CmdVel latency for real-time control
+- **Performance**: ~75ns median (135ns p99) CmdVel latency for real-time control
 
 ### Drone Control & Stabilization
 - **Use Case**: Quadcopters, racing drones, delivery drones
-- **Why HORUS**: Fast IMU processing (~400ns SPSC / ~940ns MPMC for 304B IMU messages) enables real-time attitude control
-- **Performance**: 270x faster than traditional frameworks for sensor fusion pipelines
+- **Why HORUS**: Fast IMU processing (~121ns median for 304B IMU messages) enables real-time attitude control
+- **Performance**: 550-875x faster message passing than ROS2 (DDS) in measured pub/sub benchmarks
 
 ### Collaborative Robots (Cobots)
 - **Use Case**: Human-robot interaction, force-torque control, safe operation
@@ -233,8 +244,8 @@ scheduler.add(CartographerNode::new()?).order(2).done();
 
 ### Autonomous Vehicles
 - **Use Case**: Self-driving cars, mobile robots, warehouse robots
-- **Why HORUS**: Fast laser scan processing (~900ns SPSC / ~2.2µs MPMC for 1.5KB scans) enables real-time obstacle detection
-- **Performance**: Linear scaling from 16B to 120KB messages
+- **Why HORUS**: Fast laser scan processing (~210ns median for 1.5KB scans) enables real-time obstacle detection
+- **Performance**: Sub-microsecond latency for typical robotics messages, benchmarked over an 8B-64KB size sweep
 
 ### Industrial Automation
 - **Use Case**: Production lines, quality control, machine vision
@@ -249,12 +260,12 @@ scheduler.add(CartographerNode::new()?).order(2).done();
 ### Teleoperation & Haptics
 - **Use Case**: Remote surgery, VR robotics, haptic feedback systems
 - **Why HORUS**: Ultra-low latency eliminates perceptible lag in feedback loops
-- **Performance**: ~85ns-500ns message passing enables sub-millisecond end-to-end latency
+- **Performance**: ~75-210ns message passing (16B-1.5KB messages) enables sub-millisecond end-to-end latency
 
 ### Multi-Robot Systems
 - **Use Case**: Swarm robotics, warehouse fleets, distributed sensing
 - **Why HORUS**: Registry enables instant code sharing across robot fleets, isolated environments prevent conflicts
-- **Performance**: `.horus` environments isolate dependencies between robot types
+- **Isolation**: Per-project `.horus` build directories isolate dependencies between robot types
 - **Reusability**: Share swarm coordination nodes, formation controllers, and multi-agent algorithms through the registry
 
 ---

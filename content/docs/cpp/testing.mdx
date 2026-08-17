@@ -1,6 +1,6 @@
 ---
 title: "C++ Testing Guide"
-description: "Unit testing, ASAN, stress testing, and cross-process verification"
+description: "Unit testing, sanitizers, stress testing, and cross-process verification"
 order: 3
 ---
 
@@ -54,17 +54,81 @@ int main() {
 }
 ```
 
-## AddressSanitizer
+## Sanitizers
 
-Compile with ASAN to detect memory errors:
+Four of the CI gates are sanitizer runs. Each rebuilds the same sources with
+different flags, so reproduce a failing job locally by recompiling your test the
+same way.
+
+### AddressSanitizer
+
+Heap and stack overflows, use-after-free:
 
 ```bash
-g++ -std=c++17 -fsanitize=address -fno-omit-frame-pointer \
+g++ -std=c++17 -fsanitize=address -fno-omit-frame-pointer -g \
     -I horus_cpp/include \
     -o my_test_asan tests/my_test.cpp \
     -L target/debug -lhorus_cpp -lpthread -ldl -lm
 
 LD_LIBRARY_PATH=target/debug ASAN_OPTIONS=detect_leaks=0 ./my_test_asan
+```
+
+### UndefinedBehaviorSanitizer
+
+Integer overflow, misalignment, null deref, out-of-range enums:
+
+```bash
+g++ -std=c++17 -fsanitize=undefined -fno-sanitize-recover=all \
+    -fno-omit-frame-pointer -g \
+    -I horus_cpp/include \
+    -o my_test_ubsan tests/my_test.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
+
+LD_LIBRARY_PATH=target/debug \
+UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1:abort_on_error=1 ./my_test_ubsan
+```
+
+Rust exposes no `undefined` sanitizer, so this instruments the C++ side only and
+`libhorus_cpp` is built normally.
+
+### ThreadSanitizer
+
+Races across the FFI boundary only surface if both sides are instrumented, so
+the Rust library has to be rebuilt on nightly first:
+
+```bash
+RUSTFLAGS=-Zsanitizer=thread cargo +nightly build -Zbuild-std \
+    --target x86_64-unknown-linux-gnu \
+    --no-default-features -p horus_cpp
+
+g++ -std=c++17 -fsanitize=thread -fPIE -g -fno-omit-frame-pointer \
+    -I horus_cpp/include \
+    -o my_test_tsan tests/my_test.cpp \
+    -L target/x86_64-unknown-linux-gnu/debug -lhorus_cpp -lpthread -ldl -lm -pie
+
+LD_LIBRARY_PATH=target/x86_64-unknown-linux-gnu/debug \
+TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:history_size=7 ./my_test_tsan
+```
+
+ASAN and TSan cannot coexist in one build — that is why CI runs them as separate
+jobs.
+
+### Valgrind memcheck
+
+Uninitialized reads and heap-range errors ASAN misses, notably inside the
+`mmap`'d SHM regions. It is 10-50x slower than native, so CI points it at a
+single test:
+
+```bash
+g++ -std=c++17 -g -O0 -fno-omit-frame-pointer \
+    -I horus_cpp/include \
+    -o my_test_vg tests/my_test.cpp \
+    -L target/debug -lhorus_cpp -lpthread -ldl -lm
+
+LD_LIBRARY_PATH=target/debug valgrind --tool=memcheck --error-exitcode=1 \
+    --leak-check=full --show-leak-kinds=definite,indirect \
+    --errors-for-leak-kinds=definite,indirect \
+    --track-origins=yes ./my_test_vg
 ```
 
 ## Stress Testing
@@ -104,6 +168,25 @@ LD_LIBRARY_PATH=target/debug ./cross_process_pub "test.topic"
 
 The subscriber must start first — it creates the SHM ring buffer that both processes share.
 
+## Fuzzing and Coverage
+
+The four libFuzzer targets live in `horus_cpp/fuzz/fuzz_targets/`. CI gives each
+one 60 seconds; locally, run one for as long as you want:
+
+```bash
+cd horus_cpp
+cargo +nightly fuzz run fuzz_topic_send_recv -- -max_total_time=60
+```
+
+Coverage is measured twice: `cargo llvm-cov` for the Rust side, and `lcov` over
+a `--coverage` CMake build of the C++ tests for the headers. Both floors are
+70% lines. The Rust half reproduces in one command:
+
+```bash
+cargo llvm-cov --no-default-features -p horus_cpp \
+    --fail-under-lines 70 -- --test-threads=1
+```
+
 ## CI Integration
 
 The `.github/workflows/cpp-bindings.yml` pipeline runs:
@@ -112,5 +195,13 @@ The `.github/workflows/cpp-bindings.yml` pipeline runs:
 2. **C++ compilation** (15 binaries)
 3. **C++ unit tests** (e2e, ergonomic, full API, user API, stress)
 4. **Cross-process IPC** (CmdVel, JSON, Service, Action)
-5. **ASAN** (stress + full API under AddressSanitizer)
-6. **Benchmarks** (release-mode performance)
+5. **Cross-language IPC** (C++ ↔ Python, `horus_cpp/tests/cross_lang_tri_test.sh`)
+6. **ASAN** (stress + full API under AddressSanitizer)
+7. **TSan** (stress + ergonomic e2e; Rust rebuilt on nightly with `-Zbuild-std` and `RUSTFLAGS=-Zsanitizer=thread`)
+8. **UBSan** (full API + ergonomic e2e, `-fsanitize=undefined -fno-sanitize-recover=all`)
+9. **Valgrind memcheck** (ergonomic e2e, `--leak-check=full --track-origins=yes`)
+10. **libFuzzer smoke** (4 targets × 60 s: `fuzz_json_service`, `fuzz_params`, `fuzz_topic_send_recv`, `fuzz_service_roundtrip`)
+11. **Coverage** (`cargo llvm-cov` + lcov; 70% line floor for both Rust and C++, merged report uploaded to Codecov under flag `horus_cpp`)
+12. **Benchmarks** (release-mode Criterion, `cargo bench`)
+
+The `cpp-success` gate requires every job above except the benchmark, whose result is reported but not enforced. (Items 2 and 3 are two halves of the same `cpp-compile-test` job, so the workflow file defines 11 jobs plus the gate.)

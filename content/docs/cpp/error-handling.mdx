@@ -31,7 +31,7 @@ auto pub2 = std::move(pub);   // OK — transfer ownership
 
 ## Null Safety
 
-All C API functions handle null gracefully:
+Every C API function null-checks its **handle** argument, and most also null-check their string arguments:
 
 ```cpp
 horus_scheduler_destroy(nullptr);      // no-op
@@ -39,6 +39,18 @@ horus_image_width(nullptr);            // returns 0
 horus_params_has(nullptr, nullptr);    // returns false
 horus_action_client_send_goal(nullptr, nullptr);  // returns nullptr
 ```
+
+<Callout type="warning">
+A handful of functions dereference a `const char*` argument *before* checking it — passing `nullptr` there is undefined behavior, not a graceful no-op:
+
+- `horus_node_builder_new(name)`
+- `horus_node_builder_on_topic(builder, topic)`
+- `horus_scheduler_name(sched, name)`
+- every `horus_publisher_*_new(name)` and `horus_subscriber_*_new(name)`
+- `horus_service_client_new`, `horus_service_server_new`, `horus_action_client_new`, `horus_action_server_new`
+
+Always pass a valid NUL-terminated string for names and topics. (The C++ wrappers in `horus/*.hpp` always do.)
+</Callout>
 
 C++ wrappers check validity:
 
@@ -56,18 +68,20 @@ if (!img) {
 
 ## Exception Safety
 
-The FFI boundary uses `catch_unwind` to prevent Rust panics from crossing into C++:
+The Rust scheduler calls into your C++ tick, not the other way round, and wraps each call in `std::panic::catch_unwind` on the Rust side:
 
 ```
-C++ tick lambda
-  └─ extern "C" trampoline function
-      └─ CppNode::tick() in Rust
-          └─ std::panic::catch_unwind
-              └─ your callback
-                  └─ if panic → caught, node marked failed, continues
+Rust scheduler
+  └─ CppNode::tick()                  // no-op if the node already failed
+      └─ std::panic::catch_unwind
+          └─ Rust closure `move || cb()`
+              └─ extern "C" trampoline
+                  └─ your C++ tick lambda
 ```
 
-If a C++ exception is thrown inside a tick callback, it **must be caught before returning**. Unwinding through `extern "C"` is undefined behavior.
+`catch_unwind` catches Rust panics raised inside the closure; the node is then marked failed and later ticks are skipped. It does **not** protect the `extern "C"` boundary itself — a panic raised across that boundary aborts the process.
+
+For the same reason, a C++ exception thrown inside a tick callback **must be caught before returning**; unwinding through `extern "C"` is undefined behavior.
 
 ```cpp
 sched.add("safe_node")

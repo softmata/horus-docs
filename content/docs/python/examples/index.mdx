@@ -12,13 +12,14 @@ Complete Python examples demonstrating HORUS capabilities.
 
 | Example | Description | Key Features |
 |---------|-------------|--------------|
-| [Basic Node](#basic-node) | Simple sensor-to-motor node | Node, `get()`, `send()` |
+| [Basic Node](#basic-node) | Simple sensor-to-motor node | Node, `recv()`, `send()` |
 | [Typed Topics](#typed-pub-sub) | Direct pub/sub with typed messages | Topic, CmdVel, LaserScan |
 | [Async Node](#async-node) | I/O-bound work with async/await | `Node(tick=async def)`, `asyncio` |
 | [ML Inference](#ml-inference) | ONNX inference over a Tensor topic | `horus.Tensor`, `onnxruntime` |
 | [Cross-Language](#cross-language-communication) | Python-Rust communication | Typed topics, shared memory |
 | [Multi-Node System](#multi-node-system) | Scheduler with multiple nodes | Scheduler, run() |
 | [Sensor Processing](#sensor-processing-pipeline) | LaserScan obstacle avoidance | Topic, LaserScan, CmdVel |
+| [Camera Images](#camera-image-pipeline) | Send and receive frames | `horus.Image`, numpy/torch interop |
 
 ---
 
@@ -68,23 +69,30 @@ cmd_topic.send(CmdVel(linear=1.0, angular=0.0))
 # Receive laser scan (returns None if no message)
 scan = scan_topic.recv()
 if scan:
-    print(f"Got {len(scan)} range readings")
-    min_dist = min(scan.ranges) if scan.ranges else float('inf')
-    print(f"Closest obstacle: {min_dist:.2f}m")
+    print(f"Got {len(scan)} valid range readings")
+    # scan.ranges is a fixed 360-slot array, so min() over it would pick up
+    # unfilled slots — min_range() returns the nearest *valid* reading.
+    print(f"Closest obstacle: {scan.min_range():.2f}m")
 ```
 
-**With backend hints for performance tuning:**
+**Backend selection is automatic — there is no `backend=` argument.** Every topic is
+shared-memory backed; HORUS reads the topic's publisher/subscriber counts and whether the
+message is a fixed-size POD, then picks the ring: `SpscShm` (~85ns) for one publisher and
+one subscriber, `MpscShm` (~65ns) for many publishers into one subscriber, `PodShm`
+(~50ns) to broadcast a POD type to many subscribers, and `FanoutShm` (~40ns) for non-POD
+broadcast and many-to-many. The only tuning knobs are `capacity` and `endpoint`:
+
 ```python
 from horus import Topic, CmdVel
 
-# Same-thread callbacks (~3ns)
-fast_topic = Topic(CmdVel, backend="direct")
+# Deeper ring buffer
+buffered_topic = Topic(CmdVel, capacity=2048)
 
-# Single producer/consumer intra-process (~18ns)
-spsc_topic = Topic(CmdVel, backend="spsc")
+# Explicit endpoint — reach a topic on another machine
+remote_topic = Topic(CmdVel, endpoint="cmd_vel@192.168.1.5:9000")
 
-# Cross-process shared memory (~167ns)
-shm_topic = Topic(CmdVel, backend="mpmc_shm")
+# Read back which backend was chosen
+print(buffered_topic.backend_type)
 ```
 
 ---
@@ -133,7 +141,13 @@ data. Use `horus.Tensor` so frames cross shared memory without a copy.
 import numpy as np
 import horus
 
-session = None  # your onnxruntime.InferenceSession, loaded in init
+session = None
+
+def load_model(node):
+    """Runs once, before the first tick."""
+    global session
+    import onnxruntime
+    session = onnxruntime.InferenceSession("pose.onnx")
 
 def estimate(node):
     frame = node.recv("camera.raw")
@@ -147,20 +161,22 @@ def estimate(node):
 node = horus.Node(
     name="pose_estimation",
     tick=estimate,
-    subs="camera.raw",
-    pubs="poses",
+    init=load_model,
+    subs=[horus.Sub("camera.raw", horus.Tensor)],
+    pubs=[horus.Pub("poses", horus.Tensor)],
     rate=30,
     compute=True,   # inference is CPU-bound
 )
 ```
 
-<Callout type="warn">
-Run the subscriber at the publisher's rate. A Tensor topic drops everything
-for a subscriber ticking slower than the publisher — at 20 Hz publish / 10 Hz
-subscribe, measured delivery is zero. See
+<Callout type="warning">
+Run the subscriber at the publisher's rate. A Tensor topic drops almost
+everything for a subscriber ticking slower than the publisher — at 30 Hz
+publish / 10 Hz subscribe, `recv()` returns `None` on every tick. See
 [Python Tensors for ML](/python/library/ml-utilities).
 </Callout>
 
+---
 
 ## Cross-Language Communication
 
@@ -224,15 +240,15 @@ def logger_tick(node):
         cmd = node.recv("cmd_vel")
         print(f"Command: {cmd}")
 
-sensor = Node(name="sensor", pubs=["sensor.distance"], tick=sensor_tick, rate=30)
-controller = Node(name="controller", subs=["sensor.distance"], pubs=["cmd_vel"], tick=controller_tick, rate=30)
-logger = Node(name="logger", subs=["cmd_vel"], tick=logger_tick, rate=10)
+# Execution order is set on the Node, not on scheduler.add()
+sensor = Node(name="sensor", pubs=["sensor.distance"], tick=sensor_tick, rate=30, order=0)
+controller = Node(name="controller", subs=["sensor.distance"], pubs=["cmd_vel"], tick=controller_tick, rate=30, order=1)
+logger = Node(name="logger", subs=["cmd_vel"], tick=logger_tick, rate=10, order=2)
 
-# Create scheduler with execution order
 scheduler = Scheduler()
-scheduler.add(sensor, order=0)
-scheduler.add(controller, order=1)
-scheduler.add(logger, order=2)
+scheduler.add(sensor)
+scheduler.add(controller)
+scheduler.add(logger)
 scheduler.run()
 ```
 
@@ -244,7 +260,7 @@ node = Node(
     name="echo",
     subs=["input"],
     pubs=["output"],
-    tick=lambda n: n.send("output", n.get("input")) if n.has_msg("input") else None,
+    tick=lambda n: n.send("output", n.recv("input")) if n.has_msg("input") else None,
     rate=30
 )
 
@@ -283,11 +299,12 @@ node = Node(
     name="obstacle_avoider",
     tick=obstacle_avoidance,
     init=init,
-    rate=10
+    rate=10,
+    order=0
 )
 
 scheduler = Scheduler()
-scheduler.add(node, order=0)
+scheduler.add(node)
 scheduler.run()
 ```
 
@@ -306,13 +323,13 @@ import numpy as np
 # Create a 480x640 RGB8 image backed by shared memory
 img = horus.Image(480, 640, "rgb8")
 
-# Fill from a NumPy array (zero-copy when possible)
+# Or build one from a NumPy array (copies the pixels into shared memory)
 pixels = np.zeros((480, 640, 3), dtype=np.uint8)
 pixels[:, :, 2] = 255  # Blue channel
 img = horus.Image.from_numpy(pixels)
 
 # Send over a topic
-topic = horus.Topic("camera/rgb")
+topic = horus.Topic(horus.Image, endpoint="camera/rgb")
 topic.send(img)
 ```
 
@@ -321,7 +338,7 @@ topic.send(img)
 ```python
 import horus
 
-topic = horus.Topic("camera/rgb")
+topic = horus.Topic(horus.Image, endpoint="camera/rgb")
 
 img = topic.recv()
 if img is not None:
@@ -329,15 +346,15 @@ if img is not None:
     arr = img.to_numpy()
     print(f"Received {arr.shape[1]}x{arr.shape[0]} image")
 
-    # Convert to PyTorch tensor (zero-copy via DLPack)
-    tensor = img.to_torch()
+    # Convert to PyTorch tensor (zero-copy via the array interface)
+    tensor = img.as_tensor().torch()
     print(f"Torch tensor: {tensor.shape}, {tensor.dtype}")
 ```
 
 **Key Concepts**:
 - `horus.Image(height, width, encoding)` — allocates from shared memory
-- `Image.from_numpy(arr)` — wrap a NumPy array as a HORUS Image
-- `img.to_numpy()` / `img.to_torch()` — zero-copy conversion to frameworks
+- `Image.from_numpy(arr)` — copy a NumPy array into a new shared-memory Image
+- `img.to_numpy()` / `img.as_tensor().torch()` — zero-copy conversion to frameworks
 - Same `Topic` API as Rust — Python and Rust processes share topics automatically
 
 ---

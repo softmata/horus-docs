@@ -7,8 +7,7 @@ order: 1
 # horus_core
 
 > **New to HORUS?** This is the API reference - detailed documentation for experienced users. If you're just getting started, check out:
-> - [Quick Start Guide](/getting-started/quick-start) - Build your first application
-> - [Quick Start](/getting-started/quick-start) - Learn the basics
+> - [Quick Start](/getting-started/quick-start) - Build your first application
 > - [node! Macro](/concepts/node-macro) - Write nodes with minimal code
 
 The core runtime crate for the HORUS robotics framework. Provides the fundamental building blocks for creating distributed real-time robotics systems.
@@ -36,18 +35,21 @@ pub trait Node: Send {
     fn shutdown(&mut self) -> Result<()> { Ok(()) }
     fn on_error(&mut self, error: &str) { hlog!(error, "Node error: {}", error); }
 
-    // Optional metadata
-    fn publishers(&self) -> Vec<TopicMetadata> { Vec::new() }
-    fn subscribers(&self) -> Vec<TopicMetadata> { Vec::new() }
-    fn rate_hz(&self) -> Option<f64> { None }
-    fn is_healthy(&self) -> bool { true }
+    // Safety hooks
+    fn is_safe_state(&self) -> bool { true }
+    fn enter_safe_state(&mut self) {}
 
-    // Optional checkpoint/restore
-    fn checkpoint_state(&self) -> Option<Vec<u8>> { None }
-    fn restore_state(&mut self, _data: &[u8]) -> Result<()> { Ok(()) }
-    fn supports_checkpointing(&self) -> bool { false }
+    // Runtime parameters (declared but not yet wired by the scheduler)
+    fn on_parameter_change(
+        &mut self,
+        key: &str,
+        old_value: Option<&serde_json::Value>,
+        new_value: &serde_json::Value,
+    ) -> Result<(), String> { Ok(()) }
 }
 ```
+
+That is the whole trait. There are no `publishers()`/`subscribers()` methods — topic associations are auto-detected — and no `rate_hz()`, `is_healthy()`, `checkpoint_state()`, `restore_state()` or `supports_checkpointing()` hooks.
 
 ### Required Methods
 
@@ -120,62 +122,27 @@ Called when an error occurs during tick execution.
 
 ---
 
-#### `rate_hz`
+#### `name`
 
 ```rust
-fn rate_hz(&self) -> Option<f64>
+fn name(&self) -> &str
 ```
 
-Returns the node's desired tick rate in Hz. Overrides the scheduler's global rate for this node.
+The node's name, which must be unique within a scheduler. String literals and `&self.name` both work.
 
-**Returns:** `Option<f64>` - Some(hz) for a custom rate, None for the scheduler default
+**Returns:** `&str`
 
-**Default:** Returns `None`
-
-**Example:**
-```rust
-fn rate_hz(&self) -> Option<f64> {
-    Some(100.0) // Run at 100 Hz
-}
-```
+**Default:** The struct's type name, e.g. `MotorController`
 
 ---
 
-#### `publishers`
+#### `is_safe_state`
 
 ```rust
-fn publishers(&self) -> Vec<TopicMetadata>
+fn is_safe_state(&self) -> bool
 ```
 
-Returns the list of topics this node publishes to. Override this if your node publishes to topics — the default returns empty, which may hide connectivity issues during debugging.
-
-**Returns:** `Vec<TopicMetadata>`
-
-**Default:** Returns empty `Vec`
-
----
-
-#### `subscribers`
-
-```rust
-fn subscribers(&self) -> Vec<TopicMetadata>
-```
-
-Returns the list of topics this node subscribes to. Override this if your node subscribes to topics.
-
-**Returns:** `Vec<TopicMetadata>`
-
-**Default:** Returns empty `Vec`
-
----
-
-#### `is_healthy`
-
-```rust
-fn is_healthy(&self) -> bool
-```
-
-Health check for the node. Override this for production nodes to report actual health status. The default always returns `true`, which may mask real issues.
+Reports whether the node is currently in a safe state. Queried by the safety monitor.
 
 **Returns:** `bool`
 
@@ -183,48 +150,43 @@ Health check for the node. Override this for production nodes to report actual h
 
 ---
 
-#### `checkpoint_state`
+#### `enter_safe_state`
 
 ```rust
-fn checkpoint_state(&self) -> Option<Vec<u8>>
+fn enter_safe_state(&mut self)
 ```
 
-Serializes node state for checkpointing. Override to save internal state during checkpoints.
+Transitions the node to its safe state. Called for emergency stop — e.g. zero the motor outputs and drop the enable line.
 
-**Returns:** `Option<Vec<u8>>` - `Some(bytes)` with serialized state, or `None` if no state to checkpoint
-
-**Default:** Returns `None`
+**Default:** No-op
 
 ---
 
-#### `restore_state`
+#### `on_parameter_change`
 
 ```rust
-fn restore_state(&mut self, data: &[u8]) -> Result<()>
+fn on_parameter_change(
+    &mut self,
+    key: &str,
+    old_value: Option<&serde_json::Value>,
+    new_value: &serde_json::Value,
+) -> Result<(), String>
 ```
 
-Restores node state from a checkpoint. Called during recovery after a crash.
+Intended to be called when a runtime parameter changes, letting the node inspect old/new values and return `Err` to reject the change.
 
-**Parameters:**
-- `data` - Serialized state previously returned by `checkpoint_state()`
+**Not yet wired:** the scheduler does not currently call this method. Attaching [`RuntimeParams`](/development/parameters) via the scheduler's `.with_params()` builder does not route `RuntimeParams::set()` to nodes, and there is no automatic rollback on reject — overriding this today has no effect. To react to parameter changes now, register a callback with `RuntimeParams::on_change()`.
 
-**Returns:** `Result<()>`
-
-**Default:** Returns `Ok(())`
+**Default:** Accepts all changes silently
 
 ---
 
-#### `supports_checkpointing`
+#### Rate and topic association
 
-```rust
-fn supports_checkpointing(&self) -> bool
-```
+Neither is a trait method:
 
-Returns whether this node supports checkpointing. Used by the scheduler to determine which nodes need state persistence.
-
-**Returns:** `bool`
-
-**Default:** Returns `false`
+- **Per-node rate** is set on the scheduler's node builder: `scheduler.add(node).rate(1000_u64.hz()).build()?`.
+- **Topic associations are automatic** — they are detected via the topic/node registry when `Topic::new()` is called during a tick. There is nothing to declare.
 
 ---
 
@@ -288,15 +250,16 @@ pub struct Topic<T> { /* fields omitted */ }
 
 ### Backend Selection
 
-Topic automatically selects the fastest backend for your use case — you never need to choose one manually:
+Topic automatically selects the backend for your topology — you never need to choose one manually, and the backend types are not public API.
+
+Every topic is shared-memory backed (a backing file is created and the creator PID stamped when the header is initialized), so every backend is cross-process; a consumer in another process that joins later reads published data immediately. The choice is a function of producer/consumer counts and whether the message type is POD:
 
 | Scenario | Latency | How It Works |
 |----------|---------|--------------|
-| Same thread, single pub+sub | ~3ns | Direct memory write |
-| Same process, 1:1 | ~18ns | Lock-free SPSC ring |
-| Same process, many-to-many | ~24–36ns | Lock-free MPMC ring |
-| Cross-process, POD types | ~50ns | Shared memory zero-copy |
-| Cross-process, general | ~65–167ns | Shared memory with serialization |
+| Many consumers, non-POD message | ~40ns | Contention-free fanout — one shared-memory SPSC lane per consumer |
+| Many consumers, POD message | ~50ns | Zero-copy broadcast on one shared-memory ring |
+| Many producers, at most one consumer | ~65ns | Multi-producer claim ring |
+| At most one producer and one consumer | ~85ns | Single-producer/single-consumer ring |
 
 ### Constructors
 
@@ -494,7 +457,7 @@ Returns the topic name.
 pub fn metrics(&self) -> TopicMetrics
 ```
 
-Returns current metrics snapshot (sent/received counts, failure counts, migration count).
+Returns current metrics snapshot (messages sent/received, send/recv failure counts).
 
 **Returns:** `TopicMetrics`
 
@@ -548,14 +511,14 @@ pub struct Scheduler { /* fields omitted */ }
 pub fn new() -> Self
 ```
 
-Creates a lightweight scheduler with default settings (~60 Hz tick rate). Detects runtime capabilities (~30-100us) but does **not** apply any OS-level features. Use builder methods to opt in to features.
+Creates a lightweight scheduler with default settings (100 Hz tick rate). Detects runtime capabilities (~30-100us) but does **not** apply any OS-level features. Use builder methods to opt in to features.
 
 **Returns:** `Scheduler`
 
 **Example:**
 ```rust
 let mut scheduler = Scheduler::new();
-scheduler.add(my_node).order(0).done();
+scheduler.add(my_node).order(0).build()?;
 scheduler.run()?;
 ```
 
@@ -563,84 +526,118 @@ scheduler.run()?;
 
 ### Builder Methods
 
-`Scheduler::new()` returns a builder. Chain methods to configure global behavior before adding nodes:
+`Scheduler::new()` returns a `Scheduler` that is configured fluently: each method below takes `self` and returns `Self`, so chain them to set global behavior before adding nodes.
 
-#### `tick_hz`
+#### `tick_rate`
 
 ```rust
-pub fn tick_hz(self, hz: f64) -> Self
+pub fn tick_rate(self, freq: Frequency) -> Self
 ```
 
-Sets the global tick rate in Hz.
+Sets the global tick rate.
 
 **Example:**
 ```rust
-let scheduler = Scheduler::new().tick_hz(1000.0); // 1 kHz
+let scheduler = Scheduler::new().tick_rate(1000_u64.hz()); // 1 kHz
 ```
 
 ---
 
-#### `with_name`
+#### `name`
 
 ```rust
-pub fn with_name(self, name: &str) -> Self
+pub fn name(self, name: &str) -> Self
 ```
 
-Sets the scheduler name for logging/monitoring.
+Sets the scheduler name for logging/monitoring. Defaults to `"Scheduler"`, overridable via the `HORUS_NODE_NAME` environment variable.
 
 ---
 
-#### `with_capacity`
+#### `deterministic`
 
 ```rust
-pub fn with_capacity(self, capacity: usize) -> Self
+pub fn deterministic(self, enabled: bool) -> Self
 ```
 
-Pre-allocates capacity for nodes (prevents runtime allocations).
+Runs all nodes sequentially on the main thread in registration order — no thread pools, no watcher threads, no executors. Intended for simulation and testing with `tick_once()`.
 
 ---
 
-#### `rt_scheduling`
+#### `prefer_rt`
 
 ```rust
-pub fn rt_scheduling(self, enabled: bool) -> Self
+pub fn prefer_rt(self) -> Self
 ```
 
-Enables real-time scheduling features (SCHED_FIFO, mlockall, CPU affinity). Features that cannot be applied are recorded as degradations, not errors.
+Opts in to OS-level RT features (SCHED_FIFO, mlockall). Features that cannot be applied are recorded as degradations, not errors — this never panics.
 
 **Example:**
 ```rust
-let scheduler = Scheduler::new().rt_scheduling(true);
+let scheduler = Scheduler::new().prefer_rt();
 ```
 
 ---
 
-#### `with_blackbox`
+#### `require_rt`
 
 ```rust
-pub fn with_blackbox(self, size_mb: usize) -> Self
+pub fn require_rt(self) -> Self
+```
+
+Same features as `prefer_rt()`, but fails loudly: **panics** if the system has neither `SCHED_FIFO` nor `mlockall` support.
+
+**Example:**
+```rust
+let scheduler = Scheduler::new().require_rt();
+```
+
+---
+
+#### `cores`
+
+```rust
+pub fn cores(self, cpu_ids: &[usize]) -> Self
+```
+
+Sets CPU affinity for the scheduler. This is a separate builder from the RT opt-in.
+
+**Example:**
+```rust
+let scheduler = Scheduler::new().prefer_rt().cores(&[2, 3]);
+```
+
+---
+
+#### `blackbox`
+
+```rust
+pub fn blackbox(self, size_mb: usize) -> Self
 ```
 
 Enables the BlackBox flight recorder with the given buffer size in megabytes.
 
 **Example:**
 ```rust
-let scheduler = Scheduler::new().with_blackbox(16); // 16 MB flight recorder
+let scheduler = Scheduler::new().blackbox(16); // 16 MB flight recorder
 ```
 
 ---
 
-#### `safety_monitor`
+#### `watchdog`
 
 ```rust
-pub fn safety_monitor(self, enabled: bool) -> Self
+pub fn watchdog(self, timeout: Duration) -> Self
 ```
 
-Enables the safety monitor (watchdog / WCET enforcement).
+Enables the watchdog, which detects frozen or unresponsive nodes. Setting it auto-creates the safety monitor: if a node does not tick within the timeout, the watchdog triggers graduated degradation (warn → reduce rate → isolate → safe state).
+
+Budget enforcement and deadline monitoring need no flag — they are always active for nodes that set `.rate()`.
+
+Sub-millisecond timeouts are rounded up to 1 ms with a warning (the config stores whole milliseconds). `Duration::ZERO` explicitly disables the watchdog.
 
 **Example:**
 ```rust
-let scheduler = Scheduler::new().safety_monitor(true);
+let scheduler = Scheduler::new().watchdog(500_u64.ms());
 ```
 
 ---
@@ -651,10 +648,10 @@ Chain builder methods for production deployments:
 
 ```rust
 let mut scheduler = Scheduler::new()
-    .tick_hz(1000.0)           // 1 kHz control loop
-    .rt_scheduling(true)       // RT priority, mlockall, CPU affinity
-    .with_blackbox(16)         // Flight recorder
-    .safety_monitor(true);     // Watchdog / WCET enforcement
+    .tick_rate(1000_u64.hz())  // 1 kHz control loop
+    .prefer_rt()               // RT priority + mlockall, degrade gracefully
+    .blackbox(16)              // 16 MB flight recorder
+    .watchdog(500_u64.ms());   // frozen-node watchdog
 ```
 
 ---
@@ -676,62 +673,67 @@ Adds a node using the fluent builder API. Returns a `NodeBuilder` for configurin
 | Method | Description |
 |--------|-------------|
 | `.order(n)` | Set execution order (lower = runs first) |
-| `.rate_hz(hz)` | Set node-specific tick rate in Hz |
-| `.rt()` | Mark as **real-time** execution class (pinned thread, FIFO scheduling) |
+| `.rate(freq)` | Set node-specific tick rate, e.g. `1000_u64.hz()`. Auto-derives budget (80% of period) and deadline (95% of period) |
+| `.budget(dur)` | Set the per-tick execution budget, e.g. `500.us()`. Without `.rate()`, implicitly enables RT scheduling |
+| `.deadline(dur)` | Set the per-tick deadline. Without `.rate()`, implicitly enables RT scheduling |
+| `.budget_policy(policy)` | How budget overruns are handled |
+| `.on_miss(policy)` | What to do when a deadline is missed |
+| `.deadline_scheduler()` | Use the earliest-deadline-first scheduler for this node |
+| `.no_alloc()` | Assert the node performs no heap allocation in `tick()` |
 | `.compute()` | Mark as **compute** execution class (thread-pool, CPU-bound work) |
 | `.on(topic)` | Mark as **event-driven** execution class (wakes on topic publish) |
 | `.async_io()` | Mark as **async I/O** execution class (tokio runtime, network/disk) |
-| `.wcet_us(n)` | Set WCET budget in microseconds (implies `.rt()`) |
-| `.deadline_us(n)` | Set deadline in microseconds (implies `.rt()`) |
-| `.deadline_ms(n)` | Set deadline in milliseconds (implies `.rt()`) |
-| `.tier(tier)` | Set explicit execution tier |
+| `.priority(n)` | Set the OS thread priority |
+| `.core(cpu_id)` | Pin the node to a specific CPU core |
+| `.watchdog(dur)` | Per-node watchdog timeout |
+| `.subscribe_with_timeout(...)` | Register a subscription with a staleness timeout |
 | `.failure_policy(policy)` | Override failure handling policy |
-| `.done()` | Finalize and register the node |
+| `.build()` | Finalize and register the node — returns `Result<&mut Scheduler>` |
+| `.done()` | Alias for `.build()` — also returns `Result<&mut Scheduler>` |
 
 **Execution Classes:**
 
 | Class | Method | Thread Model | Use Case |
 |-------|--------|-------------|----------|
-| Real-time | `.rt()` | Pinned thread, SCHED_FIFO | Safety monitors, motor control |
+| Real-time | `.rate()` / `.budget()` / `.deadline()` | Pinned thread, SCHED_FIFO | Safety monitors, motor control |
 | Compute | `.compute()` | Thread pool | Path planning, ML inference |
 | Event-driven | `.on("topic")` | Wakes on topic publish | Data-driven processing |
 | Async I/O | `.async_io()` | Tokio runtime | Network, disk, cloud APIs |
 
-If no execution class is specified, the node runs in the default scheduler loop (inline, sequential).
+There is no `.rt()` method — the real-time class is derived automatically from the timing you declare. `.rate()` sets the period and auto-derives a budget (80% of the period) and deadline (95% of the period); calling `.budget()` or `.deadline()` without `.rate()` implicitly enables RT scheduling.
 
-**NodeTier Options:**
-- `NodeTier::UltraFast` - Ultra-fast (&lt;1us), inline execution
-- `NodeTier::Fast` - Fast (&lt;10us), inline execution (default)
-- `NodeTier::Normal` - Standard scheduling (&lt;100us+)
+If no execution class is specified, the node runs in the default scheduler loop (inline, sequential).
 
 **Example:**
 ```rust
 use horus::prelude::*;
 
-scheduler.add(safety_monitor).order(0).rt().wcet_us(100).done();
-scheduler.add(motor_ctrl).order(5).rt().wcet_us(500).done();
-scheduler.add(path_planner).order(10).compute().done();
-scheduler.add(data_processor).order(20).on("sensor_data").done();
-scheduler.add(cloud_uploader).order(100).async_io().rate_hz(1.0).done();
-scheduler.add(sensor).order(50).rate_hz(1000.0).done();
-scheduler.add(logger).order(200).done();
+scheduler.add(safety_monitor).order(0).budget(100.us()).build()?;
+scheduler.add(motor_ctrl).order(5).rate(1000_u64.hz()).budget(500.us()).build()?;
+scheduler.add(path_planner).order(10).compute().build()?;
+scheduler.add(data_processor).order(20).on("sensor_data").build()?;
+scheduler.add(cloud_uploader).order(100).async_io().rate(1_u64.hz()).build()?;
+scheduler.add(sensor).order(50).rate(1000_u64.hz()).build()?;
+scheduler.add(logger).order(200).build()?;
 ```
+
+`DurationExt` — the trait behind `.us()`, `.ms()` and `.hz()` — and the `Frequency` type that `.hz()` returns both come from the prelude.
 
 ---
 
 #### `set_node_rate`
 
 ```rust
-pub fn set_node_rate(&mut self, name: &str, rate_hz: f64) -> &mut Self
+pub fn set_node_rate(&mut self, name: &str, rate: Frequency) -> &mut Self
 ```
 
-Sets per-node tick rate in Hz.
+Sets per-node tick rate after registration. This is `#[doc(hidden)]` internal API — prefer `.rate()` on the node builder.
 
 **Example:**
 ```rust
 scheduler
-    .set_node_rate("fast_sensor", 1000.0)  // 1 kHz
-    .set_node_rate("slow_logger", 1.0);    // 1 Hz
+    .set_node_rate("fast_sensor", 1000_u64.hz())  // 1 kHz
+    .set_node_rate("slow_logger", 1_u64.hz());    // 1 Hz
 ```
 
 ---
@@ -856,16 +858,16 @@ use std::time::Duration;
 fn main() -> Result<()> {
     // Configure for production: RT scheduling + flight recorder
     let mut scheduler = Scheduler::new()
-        .rt_scheduling(true)
-        .with_blackbox(16);
+        .prefer_rt()
+        .blackbox(16);
 
     // Add nodes with execution classes using fluent API
-    scheduler.add(EmergencyStop::new()?).order(0).rt().done();
-    scheduler.add(MotorController::new()?).order(5).rt().wcet_us(500).done();
-    scheduler.add(PathPlanner::new()?).order(10).compute().done();
-    scheduler.add(SensorReader::new()?).order(50).rate_hz(1000.0).done();
-    scheduler.add(CloudSync::new()?).order(100).async_io().rate_hz(1.0).done();
-    scheduler.add(DataLogger::new()?).order(200).rate_hz(10.0).done();
+    scheduler.add(EmergencyStop::new()?).order(0).budget(100.us()).build()?;
+    scheduler.add(MotorController::new()?).order(5).rate(2000_u64.hz()).budget(500.us()).build()?;
+    scheduler.add(PathPlanner::new()?).order(10).compute().build()?;
+    scheduler.add(SensorReader::new()?).order(50).rate(1000_u64.hz()).build()?;
+    scheduler.add(CloudSync::new()?).order(100).async_io().rate(1_u64.hz()).build()?;
+    scheduler.add(DataLogger::new()?).order(200).rate(10_u64.hz()).build()?;
 
     // Run for 60 seconds
     scheduler.run_for(Duration::from_secs(60))?;
@@ -911,49 +913,61 @@ fn init(&mut self) -> Result<()> {
 
 ## Error
 
-Unified error type for all HORUS operations. The prelude exports `Error` and `Result<T>` as short aliases (the long names `HorusError` and `HorusResult<T>` still work for backward compatibility).
+Unified error type for all HORUS operations. The prelude exports `Result<T>` and `Error` as short aliases, plus the `HorusError` name itself for matching on individual variants. `HorusResult<T>` still exists in `horus_core::error` but is **not** in the prelude — import it explicitly as `use horus::horus_core::HorusResult;` if you need the long name.
+
+Every payload is a structured sub-enum, not a bare `String`:
 
 ```rust
-use horus::prelude::*;  // Imports Error, Result
+use horus::prelude::*;  // Imports Error, HorusError, Result
 
+#[non_exhaustive]
 #[derive(Debug, Error)]
-pub enum Error {
+pub enum HorusError {   // `Error` is an alias for this
     Io(std::io::Error),
-    Config(String),
-    Communication(String),
-    Node { node: String, message: String },
-    Memory(String),
-    Serialization(String),
-    NotFound(String),
-    PermissionDenied(String),
-    InvalidInput(String),
-    AlreadyExists(String),
-    Parse(String),
-    Unsupported(String),
+    Config(ConfigError),
+    Communication(CommunicationError),
+    Node(NodeError),
+    Memory(MemoryError),
+    Serialization(SerializationError),
+    NotFound(NotFoundError),
+    Resource(ResourceError),        // AlreadyExists / PermissionDenied / Unsupported
+    InvalidInput(ValidationError),
+    Parse(ParseError),
+    InvalidDescriptor(String),
+    Transform(TransformError),
+    Timeout(TimeoutError),
     Internal { message: String, file: &'static str, line: u32 },
     Contextual { message: String, source: Box<dyn std::error::Error + Send + Sync> },
 }
 ```
 
-### Factory Methods
+Because the enum is `#[non_exhaustive]`, a `match` over it needs a `_ =>` catch-all arm.
+
+### Constructors and Helpers
 
 ```rust
-impl Error {
-    pub fn config<S: Into<String>>(msg: S) -> Self;
-    pub fn node<S: Into<String>, T: Into<String>>(node: S, message: T) -> Self;
-    pub fn communication<S: Into<String>>(msg: S) -> Self;
-    pub fn memory<S: Into<String>>(msg: S) -> Self;
-    pub fn invalid_input<S: Into<String>>(msg: S) -> Self;
-    pub fn internal<S: Into<String>>(msg: S) -> Self;
+impl HorusError {
+    pub fn config<S: Into<String>>(msg: S) -> Self;                             // → Config(ConfigError::Other)
+    pub fn node<S: Into<String>, T: Into<String>>(node: S, message: T) -> Self; // → Node(NodeError::Other)
+    pub fn network_fault<S: Into<String>, T: Into<String>>(peer: S, reason: T) -> Self;
+    pub fn help(&self) -> Option<&'static str>;
+    pub fn severity(&self) -> Severity;
 }
+```
+
+There are no `communication`, `memory`, `invalid_input` or `internal` constructors. Build those variants directly:
+
+```rust
+Error::InvalidInput(ValidationError::Other("speed must be positive".into()))
+horus_internal!("Unexpected state: {:?}", state)
 ```
 
 ### `horus_internal!` Macro
 
-For internal errors with automatic file/line capture:
+For internal errors with automatic file/line capture. It is not part of the prelude — import it explicitly:
 
 ```rust
-use horus::prelude::*;
+use horus::horus_core::horus_internal;
 return Err(horus_internal!("Unexpected state: {:?}", state));
 // Expands to: Error::Internal { message: "...", file: "src/foo.rs", line: 42 }
 ```
@@ -962,13 +976,12 @@ return Err(horus_internal!("Unexpected state: {:?}", state));
 
 ## Result
 
-Type alias for Results using `Error`. The prelude exports `Result<T>` as the short alias (the long name `HorusResult<T>` still works for backward compatibility).
+Type alias for Results using `Error`. It comes from the prelude; as noted under [Error](#error), the long name `HorusResult<T>` does not, so import that one explicitly if you prefer it.
 
 ```rust
 use horus::prelude::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
-// HorusResult<T> is also available as a backward-compatible alias
 ```
 
 ---
@@ -982,7 +995,6 @@ pub enum NodeState {
     Uninitialized,
     Initializing,
     Running,
-    Paused,
     Stopping,
     Stopped,
     Error(String),
@@ -995,7 +1007,6 @@ pub enum NodeState {
 | `Uninitialized` | Created but not yet added to scheduler |
 | `Initializing` | Running `init()` method |
 | `Running` | Actively executing `tick()` |
-| `Paused` | Temporarily suspended |
 | `Stopping` | Running `shutdown()` method |
 | `Stopped` | Clean shutdown complete |
 | `Error(String)` | Recoverable error with message |
@@ -1019,33 +1030,41 @@ pub enum HealthStatus {
 
 ### NodeMetrics
 
+Fields are private — read the values through the accessor methods:
+
 ```rust
-pub struct NodeMetrics {
-    pub name: String,
-    pub priority: u32,
-    pub total_ticks: u64,
-    pub successful_ticks: u64,
-    pub failed_ticks: u64,
-    pub avg_tick_duration_ms: f64,
-    pub max_tick_duration_ms: f64,
-    pub min_tick_duration_ms: f64,
-    pub last_tick_duration_ms: f64,
-    pub messages_sent: u64,
-    pub messages_received: u64,
-    pub errors_count: u64,
-    pub warnings_count: u64,
-    pub uptime_seconds: f64,
+pub struct NodeMetrics { /* fields private */ }
+
+impl NodeMetrics {
+    pub fn name(&self) -> &str;
+    pub fn order(&self) -> u32;
+    pub fn total_ticks(&self) -> u64;
+    pub fn successful_ticks(&self) -> u64;
+    pub fn failed_ticks(&self) -> u64;
+    pub fn avg_tick_duration_ms(&self) -> f64;
+    pub fn max_tick_duration_ms(&self) -> f64;
+    pub fn min_tick_duration_ms(&self) -> f64;
+    pub fn last_tick_duration_ms(&self) -> f64;
+    pub fn messages_sent(&self) -> u64;
+    pub fn messages_received(&self) -> u64;
+    pub fn errors_count(&self) -> u64;
+    pub fn warnings_count(&self) -> u64;
+    pub fn uptime_seconds(&self) -> f64;
 }
 ```
 
 ### TopicMetrics
 
+Fields are private — read the values through the accessor methods:
+
 ```rust
-pub struct TopicMetrics {
-    pub messages_sent: u64,
-    pub messages_received: u64,
-    pub send_failures: u64,
-    pub recv_failures: u64,
+pub struct TopicMetrics { /* fields private */ }
+
+impl TopicMetrics {
+    pub fn messages_sent(&self) -> u64;
+    pub fn messages_received(&self) -> u64;
+    pub fn send_failures(&self) -> u64;
+    pub fn recv_failures(&self) -> u64;
 }
 ```
 
@@ -1062,17 +1081,16 @@ pub struct TopicMetadata {
 
 ## Performance
 
+Every topic is shared-memory backed, so every figure below is a cross-process number — there is no same-thread or intra-process fast path.
+
 | Scenario | send() Latency |
 |----------|---------------|
-| Same thread, single pub+sub | ~3ns |
-| Same process, 1 producer + 1 consumer | ~18ns |
-| Same process, 1:many or many:1 | ~24–26ns |
-| Same process, many-to-many | ~36ns |
-| Cross-process, POD types | ~50ns |
-| Cross-process, 1:1 or 1:many | ~65–85ns |
-| Cross-process, many-to-many | ~167ns |
+| Many consumers, non-POD message | ~40ns |
+| Many consumers, POD message | ~50ns |
+| Many producers, at most one consumer | ~65ns |
+| At most one producer and one consumer | ~85ns |
 
-Topic automatically selects the fastest backend based on message type and detected topology.
+Topic automatically selects the backend based on message type and detected topology. These are the per-backend design figures for the topic backends themselves; for end-to-end measured latency see [Benchmarks](/performance/benchmarks).
 
 ---
 
@@ -1110,7 +1128,7 @@ impl LogSummary for Image {
 }
 ```
 
-Built-in implementations exist for `GenericMessage`, `HorusTensor`, `HealthStatus`, and all standard message types.
+Built-in implementations exist for `GenericMessage`, `Tensor`, `HealthStatus`, the primitive types (`f32`, `f64`, `i32`, `i64`, `u32`, `u64`, `usize`, `bool`, `String`), the image/pointcloud/depth descriptors, and all standard message types.
 
 ---
 

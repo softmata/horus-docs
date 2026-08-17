@@ -10,11 +10,11 @@ Guide to deploying HORUS applications on production robots with real-time constr
 
 ## Deployment Checklist
 
-Five steps to go from development to production.
+Four steps to go from development to production.
 
 ### 1. Enable Safety Monitoring
 
-The `.watchdog(Duration)` method enables frozen node detection and creates the safety monitor. Budget enforcement is implicit when nodes have `.rate()` set:
+The `.watchdog(Duration)` method registers every RT node with the safety monitor's frozen-node detector. (The safety monitor itself is created on every `run()` whether or not you call `.watchdog()`, so emergency stop always works -- but no node is watched for freezes until you set a timeout.) Budget enforcement is implicit when nodes have `.rate()` set. Set the watchdog timeout on the scheduler builder:
 
 ```rust
 use horus::prelude::*;
@@ -44,13 +44,15 @@ let mut scheduler = Scheduler::new()
     .tick_rate(1000_u64.hz());
 ```
 
-**Use `.prefer_rt()` in most cases.** It tries to enable RT features and records any that failed as degradations rather than errors. Use `.require_rt()` only when you need a hard guarantee that RT is active -- it panics if neither `SCHED_FIFO` nor `mlockall` is available.
+**Use `.prefer_rt()` in most cases.** It tries to enable RT features and records any that failed as degradations rather than errors.
+
+Use `.require_rt()` only for hard real-time deployments, where you need a guarantee that RT is actually active. It panics the moment you call it if the system offers neither `SCHED_FIFO` nor `mlockall`, and `run()` returns an error if either of those two features later fails to apply -- so a safety-critical system never runs in degraded mode silently.
 
 Even without `.prefer_rt()`, the scheduler auto-enables `mlockall` when RT nodes are present and the system permits it. This prevents 10-100 ms page fault spikes under memory pressure.
 
 ### 3. Set Node Budgets
 
-Assign tick budgets and deadlines to safety-critical nodes. Setting either `.budget()` or `.deadline()` automatically promotes the node to the RT execution class:
+Assign tick budgets and deadlines to safety-critical nodes. Setting either `.budget()` or `.deadline()` automatically promotes the node to the RT execution class -- but only when no execution class was set explicitly. Combining them with `.compute()`, `.async_io()` or `.on()` is a validation error and `.build()` fails:
 
 ```rust
 scheduler.add(motor_controller)
@@ -88,20 +90,6 @@ let mut scheduler = Scheduler::new()
 ```
 
 Data is written to `.horus/blackbox/` in the working directory. See the [Blackbox](/advanced/blackbox) page for analysis tools.
-
-### 5. Require Real-Time
-
-For hard real-time deployments, require RT capabilities:
-
-```rust
-let mut scheduler = Scheduler::new()
-    .require_rt()
-    .watchdog(500_u64.ms())
-    .blackbox(64)
-    .tick_rate(1000_u64.hz());
-```
-
-This panics if the system lacks `SCHED_FIFO` or `mlockall` capabilities, ensuring your safety-critical system never runs in degraded mode silently.
 
 ## RT Kernel Setup (Linux)
 
@@ -155,7 +143,7 @@ If any feature is unavailable with `.prefer_rt()`, it appears as a degradation w
 
 ## Example: Production Robot Configuration
 
-A complete production configuration combining all features:
+A production configuration combining every step of the checklist above:
 
 ```rust
 use horus::prelude::*;
@@ -172,6 +160,8 @@ fn main() -> Result<()> {
     scheduler.add(MotorController::new())
         .order(0)
         .rate(1000_u64.hz())
+        .budget(200_u64.us())
+        .deadline(800_u64.us())
         .on_miss(Miss::SafeMode)
         .build()?;
 
@@ -187,7 +177,6 @@ fn main() -> Result<()> {
         .order(200)
         .rate(10_u64.hz())
         .async_io()
-        .on_miss(Miss::Skip)
         .build()?;
 
     scheduler.run()?;
@@ -195,14 +184,15 @@ fn main() -> Result<()> {
 }
 ```
 
+`.on_miss()` applies only to RT nodes. A node that sets `.rate()`, `.budget()` or `.deadline()` without an explicit execution class -- like the motor and estimator nodes above -- is promoted to RT automatically, and whichever of budget and deadline you leave unset is derived from the rate (80% and 95% of the period), so its `.on_miss()` policy is live. On `.compute()`/`.async_io()`/`.on()` nodes there is no deadline to miss, so the telemetry node above omits it.
+
 ## Graceful Degradation
 
-When `.prefer_rt()` is used and a feature cannot be applied, it is recorded as a degradation, not an error. The four RT features that can degrade independently are:
+When `.prefer_rt()` is used and a feature cannot be applied, it is recorded as a degradation, not an error. The RT features that can degrade independently are:
 
-- **RT Priority** -- `SCHED_FIFO` scheduling
+- **RT Priority** -- `SCHED_FIFO` scheduling (also covers a missing `PREEMPT_RT` kernel and a clamped priority)
 - **Memory Locking** -- `mlockall()` to prevent page faults
-- **CPU Affinity** -- pinning to specific cores
-- **NUMA Pinning** -- memory locality on multi-socket systems
+- **CPU Affinity** -- pinning to specific cores (set via `.cores(&[..])` or `HORUS_RT_CORES`)
 
 The scheduler continues running with whichever features succeeded. This lets you develop on a laptop (no RT kernel) and deploy on a production system (full RT) without changing code.
 
@@ -229,13 +219,13 @@ Get per-node performance data:
 
 ```rust
 for m in scheduler.metrics() {
-    println!("{}: avg={:?}", m.name, m.avg_tick);
+    println!("{}: avg={:.3} ms", m.name(), m.avg_tick_duration_ms());
 }
 ```
 
 ### Blackbox for Post-Mortem
 
-After an incident, the blackbox contains a timestamped log of scheduler events including start/stop, budget violations, deadline misses, and watchdog expirations. See [Blackbox](/advanced/blackbox) for details.
+After an incident, the blackbox contains a timestamped log of scheduler events including scheduler start/stop, budget violations, deadline misses, node errors, and emergency stops (a watchdog escalation shows up as an `EmergencyStop` event, not as its own event type). See [Blackbox](/advanced/blackbox) for details.
 
 ## See Also
 

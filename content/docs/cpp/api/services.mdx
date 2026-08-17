@@ -9,8 +9,8 @@ order: 54
 
 HORUS provides two communication patterns beyond pub/sub topics: **services** for synchronous request/response RPC, and **actions** for long-running tasks with progress feedback and cancellation. Both use JSON as the wire format over shared memory topics, so they work same-process and cross-process with zero configuration.
 
-> **Rust**: See [Services](/rust/api/services) and [Actions](/rust/api/actions) for the Rust API.
-> **Python**: Services and actions are available via the Python bindings.
+> **Rust**: See [Services](/concepts/services) and [Actions](/concepts/actions) for the Rust API.
+> **Python**: services and actions are not exposed by the Python bindings -- use the Rust or C++ API.
 
 ```cpp
 // simplified
@@ -43,6 +43,9 @@ HORUS provides two communication patterns beyond pub/sub topics: **services** fo
 |--------|---------|-------------|
 | `ActionClient(name)` | -- | Construct a client for the named action |
 | `.send_goal(json)` | `GoalHandle` | Send a goal and get a handle to track it |
+| `.poll_feedback(id&, json&)` | `bool` | Non-blocking; fills the args if feedback is available |
+| `.poll_result(id, status&, json&)` | `bool` | Non-blocking; true once the goal reached a terminal status |
+| `.cancel(goal_id)` | `void` | Request cancellation of a goal by id |
 | `operator bool()` | `bool` | Check if the client handle is valid |
 
 ## Quick Reference -- ActionServer
@@ -60,9 +63,9 @@ HORUS provides two communication patterns beyond pub/sub topics: **services** fo
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `.status()` | `GoalStatus` | Current status of the goal |
+| `.status()` | `GoalStatus` | Local handle view only -- always `Pending`; use `ActionClient::poll_result()` for the real status |
 | `.id()` | `uint64_t` | Unique goal identifier |
-| `.is_active()` | `bool` | True if Pending or Active |
+| `.is_active()` | `bool` | Local handle view only -- always `true` while the handle is valid |
 | `.cancel()` | `void` | Request cancellation of the goal |
 | `operator bool()` | `bool` | Check if the handle is valid |
 
@@ -145,9 +148,11 @@ server.set_handler([](const uint8_t* req, size_t req_len,
     // For this example, assume req is: {"a": 3, "b": 4}
     int a = 3, b = 4;  // parsed from req
 
-    // Write response
-    int written = snprintf(reinterpret_cast<char*>(res), 4096,
+    // Write response. *res_len arrives holding the buffer capacity -- never
+    // hard-code a size here.
+    int written = snprintf(reinterpret_cast<char*>(res), *res_len,
                            R"({"sum": %d})", a + b);
+    if (written < 0 || static_cast<size_t>(written) >= *res_len) return false;
     *res_len = static_cast<size_t>(written);
     return true;  // true = success, false = error
 });
@@ -168,7 +173,7 @@ using Handler = bool(*)(const uint8_t* req, size_t req_len,
 ```
 
 - `req` / `req_len`: Request payload (JSON bytes)
-- `res` / `res_len`: Response buffer (4096 bytes max) -- write your response here
+- `res` / `res_len`: Response buffer. `*res_len` is **IN/OUT** -- on entry it holds the buffer capacity (3968 bytes, `JsonWireMessage::MAX_PAYLOAD`); write at most that many bytes, then set `*res_len` to the number written. Reporting more than the capacity discards the response
 - Return `true` for success, `false` for error
 
 ---
@@ -183,6 +188,10 @@ Create a client, send a goal as JSON, and track it via `GoalHandle`:
 
 ```cpp
 #include <horus/action.hpp>
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <thread>
 
 horus::ActionClient client("navigate_to_pose");
 if (!client) return;
@@ -192,13 +201,30 @@ if (!goal) return;
 
 printf("Goal %lu submitted\n", goal.id());
 
-// Poll until complete
-while (goal.is_active()) { /* do other work or sleep */ }
+// Drain feedback and poll the result topic until the goal reaches a terminal status
+horus::GoalStatus status = horus::GoalStatus::Pending;
+std::string result_json;
+uint64_t fb_id = 0;
+std::string fb_json;
+auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+while (std::chrono::steady_clock::now() < deadline) {
+    // One feedback topic per client, not per goal -- fb_id says which goal it is
+    while (client.poll_feedback(fb_id, fb_json)) {
+        printf("goal %lu feedback: %s\n", fb_id, fb_json.c_str());
+    }
+    if (client.poll_result(goal.id(), status, result_json)) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
 
-if (goal.status() == horus::GoalStatus::Succeeded) {
-    printf("Navigation complete!\n");
+if (status == horus::GoalStatus::Succeeded) {
+    printf("Navigation complete: %s\n", result_json.c_str());
 }
 ```
+
+`GoalHandle::status()` and `GoalHandle::is_active()` report only the handle's local
+view -- the status is fixed at `Pending` when the handle is created and is never
+updated, so `is_active()` is always `true`. The terminal status comes from
+`ActionClient::poll_result()`, which reads the `{name}.result.{client_pid}` topic.
 
 ### Canceling a Goal
 
@@ -206,12 +232,13 @@ Call `cancel()` on the `GoalHandle` to request cancellation:
 
 ```cpp
 auto goal = client.send_goal(R"({"x": 10.0, "y": 0.0})");
-// Cancel after 5 seconds if not done
+// Cancel after 5 seconds. There is no client-side liveness check to gate this on:
+// `goal.is_active()` is always true (see above), so just publish the cancel.
 std::this_thread::sleep_for(std::chrono::seconds(5));
-if (goal.is_active()) goal.cancel();
+goal.cancel();
 ```
 
-### GoalHandle Lifecycle
+### Goal Lifecycle (Server Side)
 
 ```
 send_goal() --> Pending --> Active --> Succeeded
@@ -222,7 +249,7 @@ send_goal() --> Pending --> Active --> Succeeded
                   +--> Rejected (server rejects)
 ```
 
-The `is_active()` method returns `true` for `Pending` and `Active` states, `false` for all terminal states.
+This diagram is the server-side lifecycle. The client's `GoalHandle` does not follow it: its `status()` is a local field fixed at `Pending` when `send_goal()` returns, so `is_active()` stays `true` for as long as the handle is valid. Use `ActionClient::poll_result()` to observe the terminal status.
 
 ### ActionServer
 
@@ -251,11 +278,15 @@ server.set_accept_handler([](const uint8_t* goal_data, size_t len) -> uint8_t {
 server.set_execute_handler([](HorusActionGoalHandle* h,
                               const uint8_t* goal_data, size_t len) {
     horus::ActionGoalHandle g(h);
+    bool done = false;
     while (!g.is_cancel_requested()) {
         g.publish_feedback(R"({"progress": 0.5})");
-        // ... do work; break when done ...
-        g.succeed(R"({"arrived": true})");
-        return;
+        // ... do a slice of work; set done = true when finished ...
+        if (done) {
+            g.succeed(R"({"arrived": true})");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     g.canceled(R"({"arrived": false})");
 });
@@ -288,7 +319,7 @@ using ExecuteHandler = void(*)(HorusActionGoalHandle* handle, const uint8_t* goa
 Services and actions use JSON as the wire format, serialized into `JsonWireMessage` Pod structs (4 KB each) transported over SHM topics. This design means:
 
 - **No code generation**: No `.srv` or `.action` IDL files. Just send/receive JSON strings
-- **Cross-language**: A Rust service server can handle requests from a C++ client (and vice versa)
+- **C++-only wire format**: the JSON wire format is shared by all C++ service/action clients and servers. It is *not* wire-compatible with the Rust `horus_core::services`/`actions` API, which uses typed `ServiceRequest<Req>`/`ServiceResponse<Res>` messages -- opening the same topic name from both fails with a topic type-mismatch error
 - **Cross-process**: Uses the same SHM transport as topics -- works across processes automatically
 - **Debugging**: JSON payloads are human-readable in `horus monitor` and BlackBox recordings
 
@@ -301,13 +332,13 @@ Each service creates two internal topics:
 {name}.response.{client_pid}      -- server sends response here (per-client)
 ```
 
-Each action creates five internal topics:
+Each action creates three shared topics (`goal`, `cancel`, `status`) plus a per-client `feedback` and `result` topic:
 
 ```
 {name}.goal                       -- client sends goals here
 {name}.cancel                     -- client requests cancellation here
-{name}.feedback                   -- server publishes progress here
-{name}.result                     -- server publishes final result here
+{name}.feedback.{client_pid}      -- server publishes progress here (per-client)
+{name}.result.{client_pid}        -- server publishes final result here (per-client)
 {name}.status                     -- server publishes lifecycle status here
 ```
 
@@ -315,7 +346,7 @@ These are standard HORUS topics -- you can monitor them with `horus topic list` 
 
 ## Ownership and Move Semantics
 
-All service and action types are **move-only**. Copy is deleted:
+The owning handles -- `ServiceClient`, `ServiceServer`, `ActionClient`, `ActionServer` and `GoalHandle` -- are **move-only**. Copy is deleted:
 
 ```cpp
 horus::ServiceClient a("my_svc");
@@ -328,6 +359,8 @@ horus::GoalHandle g2 = std::move(g);     // OK
 ```
 
 Resources are released in destructors via the C FFI (`horus_*_destroy` functions). Use RAII -- do not call destroy manually.
+
+`ActionGoalHandle` is the exception: it owns nothing, has no destructor, and is freely copyable. It is a **non-owning view** of a handle that lives on the goal thread's stack, valid *only* for the duration of the execute call. Do not stash it (or a copy of it) and call `succeed()` / `publish_feedback()` after the handler returns -- that is a use-after-free.
 
 ---
 
@@ -360,6 +393,7 @@ server.set_handler([](const uint8_t* req, size_t req_len,
     };
 
     std::string resp_str = response.dump();
+    if (resp_str.size() > *res_len) return false;  // *res_len = buffer capacity
     std::memcpy(res, resp_str.data(), resp_str.size());
     *res_len = resp_str.size();
     return true;
@@ -372,12 +406,16 @@ Services work across processes with no extra configuration. Start the server in 
 
 ```cpp
 // Process A: server
+std::atomic<bool> running{true};  // cleared from your shutdown path
+
 horus::ServiceServer server("robot.status");
 server.set_handler([](const uint8_t*, size_t,
                       uint8_t* res, size_t* res_len) -> bool {
     const char* s = R"({"battery": 85, "state": "idle"})";
-    std::memcpy(res, s, strlen(s));
-    *res_len = strlen(s);
+    size_t n = strlen(s);
+    if (n > *res_len) return false;   // *res_len arrives holding the capacity
+    std::memcpy(res, s, n);
+    *res_len = n;
     return true;
 });
 while (running) {          // drive the server to answer requests
@@ -451,9 +489,9 @@ sched.add("nav_executor").rate(50_hz)
 
 ## See Also
 
-- [Scheduler API](/cpp/api/scheduler) -- Where services and actions are registered alongside nodes
+- [Scheduler API](/cpp/api/scheduler) -- Drive `process()` from a scheduled node tick
 - [Node API](/cpp/api/node) -- Node lifecycle for hosting service/action servers
 - [Publisher and Subscriber API](/cpp/api/topic) -- The underlying SHM transport
 - [C++ API Overview](/cpp/api) -- All classes at a glance
-- [Rust Services API](/rust/api/services) -- Equivalent Rust service API
-- [Rust Actions API](/rust/api/actions) -- Equivalent Rust action API
+- [Rust Services API](/concepts/services) -- Equivalent Rust service API
+- [Rust Actions API](/concepts/actions) -- Equivalent Rust action API

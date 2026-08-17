@@ -6,7 +6,7 @@ order: 25
 
 # POD Types and Zero-Serialization
 
-When you use `Topic<T>`, HORUS **automatically detects** whether your message type is POD (Plain Old Data). POD types bypass serialization entirely — messages are transferred as raw bytes via direct memory copy, achieving **~50ns latency** instead of ~167ns with bincode serialization.
+When you use `Topic<T>`, HORUS **automatically detects** whether your message type is POD (Plain Old Data). POD types bypass serialization entirely — messages are transferred as raw bytes via direct memory copy, achieving **~50ns latency** on the POD shared-memory backend instead of paying a bincode encode and decode on every message.
 
 You don't need a separate API. The same `Topic::new()` call automatically selects the fastest path for your type.
 
@@ -15,7 +15,7 @@ You don't need a separate API. The same `Topic::new()` call automatically select
 At topic creation time, HORUS checks whether your type is POD:
 
 - **No destructor** — The type has no `Drop` impl (no heap pointers like `String`, `Vec`, `Box`)
-- **Non-zero size** — Not a zero-sized type
+- **Larger than one byte** — `size_of::<T>() > 1`. This excludes zero-sized types and single-byte types such as `bool` and single-byte enums, which have validity invariants that make raw shared-memory bytes unsafe to reinterpret.
 
 If both are true, HORUS uses the zero-copy memcpy path. If not, it falls back to bincode serialization. This happens transparently — you always use the same `Topic<T>` API:
 
@@ -26,7 +26,7 @@ use horus::prelude::*;
 let cmd_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 cmd_topic.send(CmdVel::new(1.0, 0.5));
 
-// Non-POD type - auto-detected, uses bincode serialization (~167ns cross-process)
+// Non-POD type - auto-detected, uses bincode serialization (encode/decode per message)
 let log_topic: Topic<String> = Topic::new("log")?;
 log_topic.send("Motor started".to_string());
 ```
@@ -38,13 +38,15 @@ POD detection affects cross-process performance:
 | Type | Cross-Process Latency | Notes |
 |------|----------------------|-------|
 | POD (e.g. `CmdVel`, `Imu`) | ~50-85ns | Zero-serialization, raw memory copy |
-| Non-POD (e.g. `String`, `Vec`) | ~167ns | Bincode serialization |
+| Non-POD (e.g. `String`, `Vec`) | Not benchmarked | Same shared-memory ring, plus bincode encode/decode per message |
 
-Same-process communication is fast for both POD and non-POD types since no shared memory serialization is needed.
+The POD range is the per-backend design figure for the shared-memory backends the selector can pick for a POD type (~50ns broadcast, ~85ns single-producer/single-consumer). The measured end-to-end median for a 16-byte `CmdVel` on the reference machine is 75 ns — see [Benchmarks](/performance/benchmarks).
+
+A single `Topic` instance that both sends and receives (`role = Both`) takes an inlined fast path: it moves the value with a plain typed write into the ring, skipping the backend's function-pointer dispatch and the per-slot sequence flags, so nothing is serialized for either kind of type. The ring itself is still shared memory — every HORUS topic is SHM-backed. Communication between two separate `Topic` instances — even inside the same process — goes through the full backend path, so the POD/non-POD difference applies there too.
 
 ## Built-in POD Messages
 
-All standard HORUS message types implement `PodMessage` and automatically use the fast path:
+Most standard HORUS message types implement `PodMessage` and automatically use the fast path:
 
 ### Geometry
 
@@ -65,7 +67,7 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 | `Imu` | Inertial measurement unit data |
 | `LaserScan` | 2D laser range data |
 | `Odometry` | Position/velocity estimate |
-| `Range` | Single distance measurement |
+| `RangeSensor` | Single distance measurement |
 | `BatteryState` | Battery level and status |
 | `NavSatFix` | GPS position |
 
@@ -77,8 +79,6 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 | `DifferentialDriveCommand` | Differential drive control |
 | `ServoCommand` | Servo position/velocity |
 | `JointCommand` | Joint-level control |
-| `PwmCommand` | PWM signal output |
-| `StepperCommand` | Stepper motor control |
 | `TrajectoryPoint` | Trajectory waypoint |
 | `PidConfig` | PID controller parameters |
 
@@ -88,7 +88,7 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 |---------|-------------|
 | `Heartbeat` | Liveness signal |
 | `NodeHeartbeat` | Per-node health status |
-| `Status` | General status report |
+| `DiagnosticStatus` | General status report |
 | `EmergencyStop` | Emergency stop signal |
 | `SafetyStatus` | Safety system state |
 | `ResourceUsage` | CPU/memory usage |
@@ -99,10 +99,10 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 
 | Message | Description |
 |---------|-------------|
-| `Goal` | Navigation goal |
+| `NavGoal` | Navigation goal |
 | `GoalResult` | Goal completion result |
 | `Waypoint` | Navigation waypoint |
-| `Path` | Sequence of waypoints |
+| `NavPath` | Sequence of waypoints |
 | `PathPlan` | Planned path |
 | `VelocityObstacle` | Velocity obstacle for avoidance |
 | `VelocityObstacles` | Set of velocity obstacles |
@@ -113,7 +113,6 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 |---------|-------------|
 | `WrenchStamped` | Force/torque measurement |
 | `ForceCommand` | Force control command |
-| `TactileArray` | Tactile sensor array |
 | `ImpedanceParameters` | Impedance control config |
 | `ContactInfo` | Contact detection data |
 | `HapticFeedback` | Haptic output command |
@@ -129,12 +128,12 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 
 | Message | Description |
 |---------|-------------|
-| `HorusTensor` | Fixed-size tensor descriptor |
+| `Tensor` | Fixed-size tensor descriptor |
 
 ```rust
 use horus::prelude::*;
 
-// All built-in messages are POD — fast path is automatic
+// These built-in messages are POD — fast path is automatic
 let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;
 let pose: Topic<Pose2D> = Topic::new("robot_pose")?;
 let imu: Topic<Imu> = Topic::new("imu_data")?;
@@ -143,19 +142,20 @@ let estop: Topic<EmergencyStop> = Topic::new("emergency_stop")?;
 
 ## Custom POD Messages
 
-To make your own types use the fast path, implement the `PodMessage` trait:
+Any `#[repr(C)]` type with no `Drop` impl and a size greater than one byte already takes the fast path automatically — no trait needed. Implementing `PodMessage` is optional: it adds bytemuck-backed layout guarantees plus the `as_bytes()`, `from_bytes()` and `zeroed()` helpers. It does not change which path `Topic<T>` picks — auto-detection alone decides that — but it is worth adding for types whose validity invariants auto-detection cannot see (enums with limited discriminants, `NonZeroU32`): those slip past auto-detection onto the raw-byte path regardless, and the trait's required `bytemuck::Pod` bound is what turns the mistake into a compile error instead of silent UB. Most users should reach for the [`message!` macro](/rust-guide/topics#custom-message-types) instead of implementing it by hand.
 
-### Requirements
+### Requirements for Implementing `PodMessage`
 
 1. **`#[repr(C)]`** — C-compatible memory layout (prevents Rust from reordering fields)
 2. **`Copy + Clone`** — Bitwise copyable, no heap allocations
 3. **`Pod + Zeroable`** — Safe to cast to/from bytes (from `bytemuck` crate)
 4. **Fixed size** — Size known at compile time (no `Vec`, `String`, or other dynamic types)
 
-### Example
+### Example: Implementing `PodMessage` by Hand
 
 ```rust
 use horus::prelude::*;
+use horus::communication::PodMessage;
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -175,7 +175,8 @@ unsafe impl Pod for MotorFeedback {}
 // HORUS PodMessage trait for ultra-fast IPC
 unsafe impl PodMessage for MotorFeedback {}
 
-// Now Topic<MotorFeedback> automatically uses the POD fast path
+// Topic<MotorFeedback> takes the POD fast path either way — auto-detection
+// already accepts this struct; the impls above just make the guarantees explicit
 let feedback: Topic<MotorFeedback> = Topic::new("motor.feedback")?;
 feedback.send(MotorFeedback {
     timestamp_ns: 0,
@@ -192,7 +193,8 @@ feedback.send(MotorFeedback {
 
 The `PodMessage` trait is `unsafe` because incorrect implementations can cause data corruption. Ensure:
 
-- **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`, `bool`) and fixed-size arrays of primitives
+- **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`) and fixed-size arrays of primitives
+- **No `bool`** — Use `u8` (0/1) instead. `bool` has a validity invariant (only 0 and 1 are valid bit patterns), so reading arbitrary shared-memory bytes into a `bool` is UB. All built-in HORUS POD messages use `u8` for flags.
 - **No enums with discriminants** — Unless `#[repr(C)]` or `#[repr(u8)]` with explicit values
 - **Consistent layout** — The struct must have the same binary layout on all target platforms
 - **No implicit padding** — Use explicit padding fields (`_pad: [u8; N]`) if needed
@@ -208,7 +210,9 @@ Topic<Vec<f32>>      // Vec has Drop (heap-allocated)
 Topic<HashMap<K,V>>  // HashMap has Drop
 ```
 
-Non-POD types use bincode serialization through shared memory. This is still fast (~167ns cross-process) but ~3x slower than the POD path. For most applications, this difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
+A few built-in messages fall in this group for the same reason — `TactileArray`, for example, carries a `Vec<f32>` of taxel readings, so it travels the serialization path rather than the raw-memory one.
+
+Non-POD types use bincode serialization through shared memory. The transport is the same shared-memory ring; the extra cost is an encode on every `send()` and a decode on every `recv()`, so the serialized path is slower than the POD path. HORUS's latency suite times POD messages only, so there is no published figure for it — treat it as "slower, unmeasured" rather than assuming a fixed number. For most applications the difference is negligible — only optimize to POD for control loops running at 1kHz+ where every nanosecond matters.
 
 ## See Also
 

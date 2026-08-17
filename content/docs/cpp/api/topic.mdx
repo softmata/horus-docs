@@ -1,6 +1,6 @@
 ---
 title: "Publisher & Subscriber API"
-description: "Complete API reference for HORUS C++ zero-copy IPC — Publisher, Subscriber, LoanedSample, BorrowedSample, and all 51 message types"
+description: "Complete API reference for HORUS C++ zero-copy IPC — Publisher, Subscriber, LoanedSample, BorrowedSample, and all 63 message types"
 sidebar_section: "C++"
 order: 53
 ---
@@ -127,7 +127,7 @@ sched.add("localizer")
     .build();
 ```
 
-After `publish()`, the `LoanedSample` is consumed (moved). Attempting to use it after publish is a compile error.
+After `publish()`, the `LoanedSample` is consumed (moved). `publish()` takes the sample by rvalue reference and consumes it by convention -- treat the sample as dead afterwards. This is an ownership contract, not something the compiler currently enforces.
 
 ### LoanedSample Access Patterns
 
@@ -160,7 +160,7 @@ auto pub = sched.advertise<horus::msg::CmdVel>("motor.cmd");
 pub.send(horus::msg::CmdVel{0, 0.5f, 0.1f});
 ```
 
-This is equivalent to `loan()` + write + `publish()` but performs one copy. For small messages like `CmdVel` (16 bytes), the overhead is negligible. For large messages like `LaserScan` (1468 bytes) or `Odometry`, prefer the loan pattern.
+This is equivalent to `loan()` + write + `publish()` but performs one copy. For small messages like `CmdVel` (16 bytes), the overhead is negligible. For large messages like `LaserScan` (1480 bytes) or `Odometry`, prefer the loan pattern.
 
 | Pattern | Copy Count | Best For |
 |---------|-----------|----------|
@@ -184,12 +184,14 @@ sched.add("processor")
         auto scan = sub.recv();
         if (!scan) return;  // no message this tick
 
-        // Access fields through arrow operator (read-only)
-        float front_range = scan->ranges[0];
-        float min_range = scan->min_range;
+        // Access fields through arrow operator (read-only).
+        // `scan` is an optional, so unwrap it first: (*scan) is the
+        // BorrowedSample, and its own -> reaches the message.
+        float front_range = (*scan)->ranges[0];
+        float min_range = (*scan)->range_min;
 
         // Dereference
-        const horus::msg::LaserScan& data = *scan;
+        const horus::msg::LaserScan& data = **scan;
 
         // Raw pointer
         const horus::msg::LaserScan* ptr = scan->get();
@@ -217,15 +219,15 @@ sched.add("conditional_processor")
 
 ### BorrowedSample Lifetime
 
-The `BorrowedSample` is valid until it goes out of scope. RAII releases the SHM slot automatically:
+The `BorrowedSample` owns the message `recv()` handed it and is valid until it goes out of scope. It holds no shared-memory handle, so there is no SHM slot to free -- its destructor simply destroys the message:
 
 ```cpp
 {
     auto scan = sub.recv();
     if (scan) {
-        process(*scan);   // valid here
+        process(**scan);   // valid here
     }
-}   // BorrowedSample released here -- SHM slot freed
+}   // BorrowedSample destroyed here -- the message it held is gone
 ```
 
 ---
@@ -242,14 +244,14 @@ auto pub2 = std::move(pub);         // OK: ownership transferred
 auto sample = pub2.loan();
 // auto sample2 = sample;           // COMPILE ERROR: copy deleted
 pub2.publish(std::move(sample));     // OK: consumed by publish
-// sample->linear = 1.0;            // COMPILE ERROR: sample was moved
+// sample->linear = 1.0;            // DON'T: sample was consumed by publish()
 ```
 
 ---
 
-## Supported Message Types (51)
+## Supported Message Types (63)
 
-All message types live in the `horus::msg` namespace. They are `#[repr(C)]` compatible with Rust for zero-copy SHM IPC. Each type gets a `Publisher<T>` and `Subscriber<T>` template specialization generated internally via `HORUS_TOPIC_IMPL` in `impl/topic_impl.hpp`.
+All message types live in the `horus::msg` namespace. They are `#[repr(C)]` compatible with Rust for zero-copy SHM IPC. Almost all of them get their `Publisher<T>` and `Subscriber<T>` template specialization generated internally via `HORUS_TOPIC_IMPL` in `impl/topic_impl.hpp`; `CmdVel` is the exception -- its specialization is hand-written against the typed `HorusCmdVel` C struct for backward compatibility.
 
 **Geometry (12):** `Point3`, `Vector3`, `Quaternion`, `Twist`, `Pose2D`, `TransformStamped`, `Pose3D`, `PoseStamped`, `PoseWithCovariance`, `TwistWithCovariance`, `Accel`, `AccelStamped`
 
@@ -261,15 +263,19 @@ All message types live in the `horus::msg` namespace. They are `#[repr(C)]` comp
 
 **Diagnostics (8):** `Heartbeat`, `DiagnosticStatus`, `EmergencyStop`, `ResourceUsage`, `NodeHeartbeat`, `SafetyStatus`, `DiagnosticValue`, `DiagnosticReport`
 
-**Detection (12):** `BoundingBox2D`, `BoundingBox3D`, `Detection`, `Detection3D`, `Landmark`, `Landmark3D`, `LandmarkArray`, `TrackedObject`, `TrackingHeader`, `PlaneDetection`, `SegmentationMask`, `PointField`
-
-**Vision (3):** `CameraInfo`, `RegionOfInterest`, `StereoInfo`
+**Detection (10):** `BoundingBox2D`, `BoundingBox3D`, `Detection`, `Detection3D`, `Landmark`, `Landmark3D`, `LandmarkArray`, `TrackedObject`, `TrackingHeader`, `SegmentationMask`
 
 **Force (5):** `WrenchStamped`, `ImpedanceParameters`, `ForceCommand`, `ContactInfo`, `HapticFeedback`
 
-**Time (4):** `Clock`, `TimeReference`, `SimSync`, `RateRequest`
+**Time (2):** `Clock`, `TimeReference`
 
 **Input (3):** `KeyboardInput`, `JoystickInput`, `AudioFrame`
+
+### Not available as C++ topics
+
+Vision types (`CameraInfo`, `RegionOfInterest`, `StereoInfo`) are **not available from C++** -- they are `repr(Rust)` upstream and have been withdrawn from the C ABI (see `horus_cpp/include/horus/msg/vision.hpp`).
+
+`SimSync` and `RateRequest` are declared as plain structs in `<horus/msg/time.hpp>` but have no `Publisher`/`Subscriber` specialization, so they cannot be used with `advertise` / `subscribe`.
 
 ---
 
@@ -293,16 +299,16 @@ sched.add("fusion_controller")
 
         if (imu && odom) {
             auto cmd = cmd_pub.loan();
-            cmd->linear = compute_speed(*odom);
-            cmd->angular = compute_turn(*imu);
+            cmd->linear = compute_speed(**odom);
+            cmd->angular = compute_turn(**imu);
             cmd_pub.publish(std::move(cmd));
         }
 
         // Always publish heartbeat
-        uint64_t seq = 0;
+        static uint64_t seq = 0;
         diag_pub.send(horus::msg::Heartbeat{
-            {}, seq++, true, 0.0f, 0.0f, 0
-        });
+            {}, 0, seq++, 1, 0.0, 0
+        });   // node_name, node_id, sequence, alive, uptime, timestamp_ns
     })
     .build();
 ```
@@ -324,7 +330,7 @@ sched.add("filter")
         auto raw = raw_sub.recv();
         if (!raw) return;
         auto filtered = filt_pub.loan();
-        *filtered = *raw;  // copy, then modify in place
+        *filtered = **raw;  // copy, then modify in place
         for (int i = 0; i < 360; ++i) {
             if (filtered->ranges[i] < 0.05f)
                 filtered->ranges[i] = 0.0f;

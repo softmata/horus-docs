@@ -1,6 +1,6 @@
 ---
 title: "Logging & BlackBox API"
-description: "Structured logging visible in the CLI and persistent blackbox recording for post-mortem analysis"
+description: "Structured logging visible in the CLI and blackbox-tagged incident entries in the HORUS log buffer"
 sidebar_section: "C++"
 order: 58
 ---
@@ -10,11 +10,14 @@ order: 58
 HORUS provides two complementary recording mechanisms:
 
 - **`horus::log`** -- Structured log messages visible in the `horus log` CLI. Use for operational status, warnings, and errors during normal operation.
-- **`horus::blackbox`** -- Persistent flight recorder for post-mortem analysis. Use for events that matter after a crash or anomaly.
+- **`horus::blackbox`** -- Warn-level entries tagged `[blackbox] ` in the same log buffer, dual-written to the longer-retention error buffer. Use for incident events you want to pick out of the log later.
 
 ```cpp
-#include <horus/log.hpp>
+#include <horus/log.hpp>       // horus::log::info/warn/error
+#include <horus/blackbox.hpp>  // horus::blackbox::record
 ```
+
+`#include <horus/horus.hpp>` pulls in both.
 
 ---
 
@@ -32,7 +35,7 @@ HORUS provides two complementary recording mechanisms:
 
 | Function | Purpose |
 |----------|---------|
-| `horus::blackbox::record(category, message)` | Record an event to the flight recorder |
+| `horus::blackbox::record(category, message)` | Publish a Warn-level entry tagged `[blackbox] ` to the log buffer |
 
 ---
 
@@ -104,8 +107,11 @@ The log level is passed internally as an integer to the C FFI layer (`horus_log(
 All log messages are visible in the `horus log` command:
 
 ```bash
-# Stream all logs
+# Show recent log entries (last 100)
 horus log
+
+# Stream new entries in real time
+horus log -f
 
 # Filter by node
 horus log motor_ctrl
@@ -117,7 +123,7 @@ horus log --level warn
 horus log --level error safety
 ```
 
-Logs appear in real-time as nodes emit them. The CLI connects to the same SHM transport that nodes use for IPC.
+With `-f/--follow`, logs appear in real time as nodes emit them; without it, `horus log` prints the most recent entries (default 100, override with `-n/--count`) and exits. The CLI reads the same shared-memory log ring buffer that nodes publish into -- a dedicated global buffer, separate from the per-topic segments used for message IPC.
 
 ---
 
@@ -150,7 +156,18 @@ horus::log::info("arm", msg);
 
 ## BlackBox Recording
 
-The blackbox is a persistent flight recorder. Unlike logs, blackbox entries survive crashes and are designed for post-mortem analysis. Think of it as the "black box" on an aircraft.
+`horus::blackbox::record` publishes a Warn-level entry into the HORUS shared-memory
+log buffer, using `category` as the node name and prefixing the message with
+`[blackbox] `. Because it is Warn level it is also dual-written to the dedicated
+error buffer (500 slots, days of retention at typical rates), so a tagged entry
+outlives the process that wrote it and survives flooding by ordinary log traffic.
+
+It is still a bounded ring buffer: entries are evicted as it wraps, and nothing is
+written to disk unless `HORUS_LOG_FILE=true` enables the log-file drain. These
+entries are **not** written to the scheduler's BlackBox and do not appear in
+`horus blackbox`. For a persistent, on-disk flight recorder, enable the scheduler's
+own recorder with `sched.blackbox(size_mb)`, which writes
+`.horus/blackbox/blackbox.wal`.
 
 ### record()
 
@@ -159,7 +176,8 @@ void horus::blackbox::record(const char* category, const char* message);
 void horus::blackbox::record(const std::string& category, const std::string& message);
 ```
 
-Records an event to the flight recorder.
+Publishes a Warn-level entry into the HORUS log buffer with `category` as the node
+name and the message prefixed `[blackbox] `.
 
 **Parameters**
 
@@ -179,17 +197,48 @@ horus::blackbox::record("nav",
     "goal_reached: {\"goal\": \"charging_station\", \"error_m\": 0.02}");
 ```
 
-### Viewing BlackBox Data
+### Viewing Recorded Entries
+
+`record()` entries land in the shared-memory log buffer at Warn level, so they are
+read back with `horus log` -- not `horus blackbox`:
 
 ```bash
-# Dump all blackbox entries
+# Recent warn-and-above entries -- record() entries appear here
+horus log --level warn
+
+# Filter by the category passed to record()
+horus log --level warn safety
+
+# Stream them as they arrive
+horus log --level warn -f
+```
+
+Every message is prefixed `[blackbox] `, so piping through `grep '\[blackbox\]'`
+isolates them from ordinary warnings.
+
+### The Scheduler's BlackBox
+
+`horus blackbox` reads a different store: the scheduler's on-disk flight recorder
+at `.horus/blackbox/blackbox.wal`, enabled with `sched.blackbox(size_mb)` from
+`<horus/scheduler.hpp>`. It contains scheduler-generated events only --
+`blackbox::record()` entries never appear there.
+
+```bash
+# Dump scheduler flight-recorder events
 horus blackbox
 
-# Filter by node
-horus blackbox --node safety
+# Only anomalies (errors, deadline misses, budget violations, e-stops)
+horus blackbox --anomalies
 
-# Filter by event type
-horus blackbox --event collision
+# Filter by event type -- an exact (case-insensitive) match against one of
+# SchedulerStart, SchedulerStop, NodeAdded, NodeTick, NodeError, DeadlineMiss,
+# BudgetViolation, LearningComplete, EmergencyStop, NetPeerDiscovered,
+# NetPeerLost, NetReplicationStarted, NetImportRejected, Custom
+horus blackbox --event DeadlineMiss
+
+# Filter by node -- matches node-scoped events only (SchedulerStart, NodeAdded,
+# NodeTick, NodeError, DeadlineMiss, BudgetViolation)
+horus blackbox --node motor_ctrl
 
 # Export for analysis
 horus blackbox --json > crash_report.json
@@ -201,21 +250,21 @@ horus blackbox --json > crash_report.json
 
 | Scenario | Use | Why |
 |----------|-----|-----|
-| "Motor initialized at 1000Hz" | `log::info` | Operational status, no post-mortem value |
-| "IMU drift exceeds 1 deg/s" | `log::warn` | Operator should see it, but not a crash event |
-| "Emergency stop triggered" | Both | Operator sees it now (log), investigators see it later (blackbox) |
-| "Joint hit limit at 2.35 rad" | `blackbox::record` | Critical for root-cause analysis after incident |
-| "Collision detected, force=45N" | `blackbox::record` | Physical event that must be preserved |
-| "Starting path to waypoint 3" | `log::info` | Operational, no forensic value |
-| "Motor overcurrent: 12.5A" | Both | Safety event visible now and preserved |
+| "Motor initialized at 1000Hz" | `log::info` | Operational status, evicted quickly from the main buffer -- that is fine |
+| "IMU drift exceeds 1 deg/s" | `log::warn` | Operator should see it; Warn already lands in the error buffer |
+| "Emergency stop triggered" | Both | Operator sees the error now; the `[blackbox]`-tagged copy is easy to grep out later |
+| "Joint hit limit at 2.35 rad" | `blackbox::record` | Tagged for triage and retained in the longer-lived error buffer |
+| "Collision detected, force=45N" | `blackbox::record` | Physical event worth marking as an incident record |
+| "Starting path to waypoint 3" | `log::info` | Operational, no triage value |
+| "Motor overcurrent: 12.5A" | Both | Safety event visible now and tagged for triage |
 
-**Rule of thumb**: If you would want to see it when investigating why a robot stopped working 3 hours ago, record it in the blackbox.
+**Rule of thumb**: If you would want to pick it out of `horus log --level warn` while investigating why a robot stopped working, record it with `blackbox::record`. If it must survive on disk for a genuine post-mortem, enable the scheduler's BlackBox with `sched.blackbox(size_mb)` (or set `HORUS_LOG_FILE=true` to drain the log buffer to `.horus/logs/`).
 
 ---
 
 ## Example: Structured Diagnostics
 
-A motor controller that logs operational status and records safety events for post-mortem analysis.
+A motor controller that logs operational status and tags safety events for later triage.
 
 ```cpp
 #include <horus/log.hpp>
@@ -249,7 +298,7 @@ struct MotorDiagnostics {
                 motor_id, current_a, current_limit);
             horus::log::error("motor_diag", buf);
 
-            // Blackbox: structured data for post-mortem
+            // Blackbox: structured data tagged for later triage
             char event_data[512];
             std::snprintf(event_data, sizeof(event_data),
                 "overcurrent: {\"motor\": %d, \"current_a\": %.2f, \"limit_a\": %.2f, "
