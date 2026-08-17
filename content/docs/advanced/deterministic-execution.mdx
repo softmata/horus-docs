@@ -18,32 +18,33 @@ HORUS supports deterministic execution where the same inputs produce identical o
 
 ## Determinism Levels
 
-HORUS offers different levels of deterministic guarantees:
+HORUS offers increasing levels of execution control. Only the last of them gives run-to-run reproducibility:
 
 | Level | Config | What You Get | Use Case |
 |-------|--------|--------------|----------|
-| **Basic** | `Scheduler::new()` | `.order()` sequence for main-loop nodes, no learning | Most applications |
-| **+ Performance** | `.order(n)` + `.rate()` / `.compute()` / `.on()` / `.async_io()` | Basic + an explicit execution class per node | Speed + determinism |
-| **+ Safety** | `.watchdog(Duration)` | Basic + watchdogs, budget and deadline monitoring | Medical, industrial |
+| **Basic** | `Scheduler::new()` | `.order()` tiers and topic dependencies respected, no learning | Most applications |
+| **+ Performance** | `.order(n)` + `.rate()` / `.compute()` / `.on()` / `.async_io()` | Basic + an explicit execution class per node | Speed + explicit ordering |
+| **+ Safety** | `.watchdog(Duration)` | Basic + watchdog and graduated degradation | Medical, industrial |
 | **+ Full** | `.deterministic(true)` | Virtual time, sequential main-thread execution, no executor threads | Formal verification |
 
 ### Level 1: Basic Ordering (Default)
 
-`Scheduler::new()` on its own is **not** guaranteed to be order-deterministic. By default the scheduler groups nodes by execution class and dispatches them to dedicated executor threads, so any node configured with `.compute()`, `.on()`, `.async_io()`, or a `.rate()` leaves the main loop:
+`Scheduler::new()` on its own is **not** guaranteed to be order-deterministic. By default the scheduler groups nodes by execution class and dispatches them to dedicated executor threads, so any node configured with `.compute()`, `.on()`, `.async_io()`, or a `.rate()` leaves the main loop. A scheduler with only plain main-loop nodes looks like this:
 
 ```rust,ignore
 use horus::prelude::*;
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
-    scheduler.add(my_node).order(0).done();
+    scheduler.add(my_node).order(0).done()?;
     scheduler.run()?;
     Ok(())
 }
 ```
 
 **Guarantees:**
-- A scheduler whose nodes all stay on the main loop runs them in `.order()` sequence, the same order every tick
+- Nodes that stay on the main loop are driven by the ready-dispatch executor: it honours publisher → subscriber dependencies, and falls back to `.order()` tiers when there is no topic metadata
+- Within one step — nodes sharing an `.order()` value with no dependency between them — execution is parallel, so their interleaving is not fixed
 - No learning phase (no runtime profiling)
 - Reproducible ordering across runs requires `.deterministic(true)` — see Level 4
 
@@ -56,9 +57,9 @@ use horus::prelude::*;
 
 let mut scheduler = Scheduler::new();
 
-scheduler.add(pid_controller).order(0).rate(1000_u64.hz()).done();  // real-time, 1 kHz
-scheduler.add(sensor_reader).order(10).rate(200_u64.hz()).done();   // real-time, 200 Hz
-scheduler.add(data_logger).order(100).done();                       // main-loop, best effort
+scheduler.add(pid_controller).order(0).rate(1000_u64.hz()).done()?;  // real-time, 1 kHz
+scheduler.add(sensor_reader).order(10).rate(200_u64.hz()).done()?;   // real-time, 200 Hz
+scheduler.add(data_logger).order(100).done()?;                       // main-loop, best effort
 
 scheduler.run()?;
 ```
@@ -79,7 +80,7 @@ Order is explicit — no runtime profiling needed. Note that reproducible orderi
 
 Failure handling is not derived from order or execution class — there is no default policy. Opt in per node with `.failure_policy(...)`: `FailurePolicy::Fatal`, `FailurePolicy::restart(3, 50_u64.ms())`, `FailurePolicy::skip(10, 60_u64.secs())`, or `FailurePolicy::Ignore`.
 
-### Level 3: Determinism + Safety
+### Level 3: Safety Monitoring
 
 Use builder methods to enable safety monitoring:
 
@@ -136,7 +137,7 @@ scheduler.add(motor_controller)
     .budget(500_u64.us())      // 500μs max execution time
     .deadline(900_u64.us())    // 900μs deadline
     .budget_policy(BudgetPolicy::EmergencyStop)
-    .done();
+    .done()?;
 
 scheduler.run()?;
 ```
@@ -186,7 +187,7 @@ Run 2: Node B → Node A → Node C  (thread scheduling varies)
 
 ### Use Deterministic Seeds
 
-For any randomness in your nodes:
+For randomness you manage yourself — HORUS's own per-tick `horus::rng` is already deterministic, see Level 4:
 
 ```rust,ignore
 impl Node for RandomNode {
@@ -216,6 +217,8 @@ fn tick(&mut self) {
 }
 ```
 
+When you do need a timestamp, use `horus::now()` — it reads the scheduler's clock, which is the virtual `SimClock` under `.deterministic(true)`, so it replays identically.
+
 ### Control External Inputs
 
 ```rust,ignore
@@ -234,7 +237,7 @@ impl Node for SensorNode {
 |----------|--------|
 | General robotics | `Scheduler::new()` |
 | Unit testing / debugging | `Scheduler::new().deterministic(true)` |
-| Performance + deterministic | `.order(n)` + an execution class per node |
+| Performance with explicit ordering | `.order(n)` + an execution class per node |
 | Medical / surgical robots | `Scheduler::new().watchdog(500_u64.ms()).prefer_rt()` |
 | Formal verification | `Scheduler::new().deterministic(true)` |
 | Max throughput (non-deterministic) | `Scheduler::new()` + `.compute()` per node |

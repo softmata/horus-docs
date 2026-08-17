@@ -34,6 +34,8 @@ fn main() -> Result<()> {
 | `.tick_rate(freq)` | Global scheduler tick rate (`Frequency`) | `100.0` Hz |
 | `.name(name)` | Human-readable scheduler name | `"Scheduler"` |
 
+These are the two knobs used most often. The remaining global flags — `.prefer_rt()`, `.require_rt()`, and `.blackbox(mb)` — are covered under [Global Configuration with Builder Methods](#global-configuration-with-builder-methods) below.
+
 ## Adding Nodes
 
 Add nodes with `scheduler.add(n)`, then chain configuration calls, and finalize with `.done()`:
@@ -96,6 +98,8 @@ Every node belongs to exactly one execution class. Set it in the builder chain:
 
 There is no `.rt()` method — the RT class is entered implicitly. If no execution class is specified, the node defaults to the **BestEffort** class and runs sequentially in the main tick loop. Calling `.rate()`, `.budget()`, or `.deadline()` on a BestEffort node auto-promotes it to the Rt class.
 
+On a node that already has an explicit class, `.rate()` does **not** promote it — it only rate-limits. `.rate(10_u64.hz()).async_io()` stays an Async I/O node, and `.rate(n).compute()` stays a Compute node.
+
 ### When to Use Each Class
 
 - **`.rate(freq)`** — Motor controllers, safety monitors, sensor fusion, anything that must run every tick with bounded latency.
@@ -116,7 +120,7 @@ There is no `.rt()` method — the RT class is entered implicitly. If no executi
 
 `.budget()` and `.deadline()` are RT-only. Combining either with `.compute()`, `.on(topic)`, or `.async_io()` is rejected at `.done()` as a conflicting configuration.
 
-### Failure Policy
+### Failure Policy and Finalization
 
 | Method | Description |
 |--------|-------------|
@@ -197,7 +201,7 @@ scheduler = Scheduler(tick_rate=1000.0, rt=True, blackbox_mb=64)
 
 ## Execution Modes
 
-HORUS supports sequential and parallel execution. You configure this through `Scheduler::new()` and per-node execution classes.
+HORUS supports sequential and parallel execution. There is no mode argument to `Scheduler::new()` — the mode follows from the execution classes you give individual nodes.
 
 <Callout type="info" title="Quick Answer">
 
@@ -218,16 +222,18 @@ Nodes execute one-by-one in priority order — same execution order every tick. 
 ```rust,ignore
 use horus::prelude::*;
 
-// Safety-critical robot controller — 1 kHz tick, RT execution class
+// Safety-critical robot controller — 1 kHz tick, everything on the main loop
 let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz());
-scheduler.add(safety_monitor).rate(1000_u64.hz()).order(0).done();
-scheduler.add(controller).rate(1000_u64.hz()).order(1).done();
+scheduler.add(safety_monitor).order(0).done();
+scheduler.add(controller).order(1).done();
 scheduler.run()?;
 ```
 
+Nodes with no execution class stay BestEffort, so they run in `order` sequence on the main thread. Adding `.deterministic(true)` to `Scheduler::new()` goes further and keeps *every* node on the main thread — no executor threads are spawned at all, even for nodes that declare an RT or compute class.
+
 ### Parallel Mode
 
-Parallelism is opt-in per node, through the execution class — not through `order`. A node leaves the main tick loop only when you call `.compute()` (parallel thread pool), `.on(topic)` (per-node watcher thread), or `.async_io()` (tokio blocking pool). `.order(n)` is a sequencing hint inside the main tick loop; nodes sharing an `order` value do **not** become concurrent, and a node with no execution class stays BestEffort and runs sequentially.
+Concurrency is opt-in per node, through the execution class — not through `order`. A node leaves the main tick loop as soon as it has an execution class: RT (`.rate()` / `.budget()` / `.deadline()`) moves to a dedicated RT thread, `.compute()` to the parallel thread pool, `.on(topic)` to a per-node watcher thread, and `.async_io()` to the tokio blocking pool. `.order(n)` is a sequencing hint inside the main tick loop; nodes sharing an `order` value do **not** become concurrent, and a node with no execution class stays BestEffort and runs sequentially.
 
 | Metric | Value |
 |--------|-------|

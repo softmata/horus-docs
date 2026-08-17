@@ -1,13 +1,13 @@
 ---
 title: Real-Time Configuration (RtConfig)
-description: Configure system-level real-time settings for deterministic execution with sub-100ns latency
+description: Configure system-level real-time settings for deterministic execution with sub-100ns intra-process IPC latency
 order: 15
 category: "advanced"
 ---
 
 # Real-Time Configuration (RtConfig)
 
-HORUS provides `RtConfig`, a builder API for configuring system-level real-time settings. This enables deterministic execution with sub-100ns IPC latency for hard real-time robotics applications.
+HORUS provides `RtConfig`, a builder API for configuring system-level real-time settings. It gives hard real-time robotics applications deterministic execution on top of HORUS IPC, which measures in the tens of nanoseconds intra-process (see [Performance Impact](#performance-impact)).
 
 ## Cross-Platform Support
 
@@ -22,7 +22,7 @@ RtConfig is designed for **development on any OS** with **production deployment 
 On non-Linux platforms, `RtConfig::apply()` returns a degraded result and your code continues running normally - just without kernel-level RT guarantees. This allows you to develop and test on any OS.
 
 ```rust
-use horus::core::rt_config::RtApplyResult;
+use horus::prelude::*;
 
 let config = RtConfig::builder()
     .memory_locked(true)
@@ -34,7 +34,8 @@ let config = RtConfig::builder()
 match config.apply() {
     Ok(RtApplyResult::FullSuccess) => println!("Full RT enabled (Linux)"),
     Ok(RtApplyResult::Degraded(reasons)) => {
-        // On macOS/Windows: continues running without RT
+        // macOS/Windows, and also Linux without PREEMPT_RT or without
+        // the required capabilities: keeps running, minus the RT guarantees
         println!("Running in degraded mode: {:?}", reasons);
     }
     Err(e) => eprintln!("Error: {}", e),
@@ -67,13 +68,13 @@ let config = RtConfig::builder()
 config.apply()?;
 
 // Now all HORUS operations run with RT guarantees
-let link: Topic<CmdVel> = Topic::new("cmd_vel")?;  // <100ns latency
+let link: Topic<CmdVel> = Topic::new("cmd_vel")?;  // see Performance Impact below
 ```
 
 ## Common Configurations
 
-There are no preset constructors - every configuration is built with
-`RtConfig::builder()`.
+Every configuration is built with `RtConfig::builder()` - HORUS ships no preset
+constructors, so the chains below are the recipes to copy.
 
 ### Hard Real-Time
 
@@ -119,11 +120,10 @@ config.apply()?;  // No RT modifications
 
 ## Builder API
 
-For fine-grained control:
+Every setter in one chain:
 
 ```rust
 use horus::prelude::*;
-use horus::core::rt_config::RtScheduler;
 
 let config = RtConfig::builder()
     .memory_locked(true)           // mlockall()
@@ -150,17 +150,12 @@ You must call `.priority(n)` for `.scheduler(RtScheduler::Fifo)` to take effect 
 
 ### Scheduling Classes
 
-Available via `use horus::core::rt_config::RtScheduler`:
+`RtScheduler` comes from the prelude (`use horus::prelude::*;`):
 
-| Variant | Linux Scheduler | Description |
-|---------|----------------|-------------|
-| `Normal` | `SCHED_OTHER` | Default Linux scheduler |
-| `Fifo` | `SCHED_FIFO` | First-in-first-out RT |
-
-| Class | Preemption | Use Case |
-|-------|------------|----------|
-| `Normal` | Time-sliced | General applications |
-| `Fifo` | Highest-priority-first | Hard RT control loops |
+| Variant | Linux Scheduler | Preemption | Use Case |
+|---------|----------------|------------|----------|
+| `Normal` | `SCHED_OTHER` | Time-sliced | General applications |
+| `Fifo` | `SCHED_FIFO` | Highest-priority-first | Hard RT control loops |
 
 `RtScheduler` has exactly these two variants. `SCHED_DEADLINE` is reachable, but
 only per-node via `NodeBuilder::deadline_scheduler()` - not through `RtScheduler`.
@@ -196,7 +191,7 @@ your_user  hard  memlock  unlimited
 
 ## PREEMPT_RT Kernel
 
-For guaranteed sub-100ns latency, use a PREEMPT_RT kernel:
+For a bounded worst case under load, use a PREEMPT_RT kernel:
 
 ### Ubuntu/Debian
 
@@ -293,7 +288,7 @@ own worst case on your own kernel and hardware.
 `RtConfig` degrades gracefully when features aren't available:
 
 ```rust
-use horus::core::rt_config::RtApplyResult;
+use horus::prelude::*;
 
 let config = RtConfig::builder()
     .memory_locked(true)
@@ -401,7 +396,8 @@ cat /sys/devices/system/cpu/isolated
 1. **Isolate CPU cores** - Use kernel `isolcpus` parameter
 2. **Use PREEMPT_RT kernel** - Essential for hard RT guarantees
 3. **Pin to isolated cores** - Avoid contention with system tasks
-4. **Pre-fault everything** - Memory, stack, and shared memory
+4. **Pre-fault everything** - `memory_locked(true)` covers the heap; the stack is
+   separate and pre-faulted via `Scheduler::prefault_stack(bytes)`, not `RtConfig`
 5. **Monitor worst-case latency** - Not just average
 6. **Test under load** - RT violations often appear under stress
 
@@ -431,7 +427,9 @@ fn main() -> Result<()> {
     let producer: Topic<CmdVel> = Topic::new("motor_cmd")?;
     let consumer: Topic<CmdVel> = Topic::new("motor_cmd")?;
 
-    // Now IPC runs with <100ns latency and minimal jitter
+    // Both endpoints live in this process, so this is the intra-process
+    // path (tens of ns) - RT config is what keeps the tail flat
+
     loop {
         let cmd = CmdVel::new(1.0, 0.5);
         producer.send(cmd);

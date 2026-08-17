@@ -23,8 +23,10 @@ There is no separate real-time trait. Nodes implement the standard `Node` trait,
 a node becomes real-time when it is registered with timing constraints:
 
 ```rust
-use horus::prelude::*; // Provides {Scheduler, Node, Miss, RtStats, DurationExt, RtConfig, RtScheduler}
+use horus::prelude::*; // Provides {Scheduler, Node, Miss, RtStats, DurationExt, FailurePolicy, RtConfig, RtScheduler}
 use std::time::Duration;
+
+let mut scheduler = Scheduler::new();
 
 scheduler.add(YourControlNode::new())
     .order(0)                            // Runs first in the tick sequence
@@ -74,6 +76,10 @@ The safety monitor provides comprehensive runtime protection:
 - **Watchdog Timers**: Detects hung or crashed nodes
 - **Emergency Stop**: Immediate shutdown for critical failures
 
+Budget and deadline monitoring are active for any node registered with `.rate()`,
+`.budget()` or `.deadline()` — no flag needed. Watchdog timers additionally require
+`Scheduler::watchdog(Duration)`, shown under [Safety-Critical Configuration](#safety-critical-configuration).
+
 ## Basic Usage
 
 ### Adding RT Nodes
@@ -100,7 +106,7 @@ scheduler.add(MotorControlNode::new())
 // Mix with regular nodes
 scheduler.add(SensorNode::new()).order(10).build()?;
 
-scheduler.run();
+scheduler.run()?;
 ```
 
 ### Safety-Critical Configuration
@@ -152,8 +158,8 @@ scheduler.add(TractionControl::new())
 
 ### Safe-State Hooks
 
-The `Node` trait has two safety hooks. They are ordinary runtime methods — there are
-no `debug_assert!`-gated pre/post-condition contracts:
+The `Node` trait has two safety hooks. Both are ordinary runtime methods with
+default implementations, so override only the ones you need:
 
 ```rust
 impl Node for SafetyCriticalNode {
@@ -192,10 +198,10 @@ scheduler.add(encoder).rate(30_u64.hz()).on_miss(Miss::Skip).build()?;
 scheduler.add(estop_monitor).rate(100_u64.hz()).on_miss(Miss::Stop).build()?;
 ```
 
-### Redundancy and Degradation
+### Failure Handling and Degradation
 
 HORUS has no automatic fallback-node substitution. Degradation is expressed with
-two real knobs: a failure policy for nodes that error out, and `Miss::SafeMode`
+two knobs: a failure policy for nodes that error out, and `Miss::SafeMode`
 for nodes that overrun their timing.
 
 ```rust
@@ -219,14 +225,15 @@ scheduler.add(MotorControl::new())
     .build()?;
 ```
 
-## Robot Presets
+## Starting Points by Robot Type
 
-Quick configurations for common robot types:
+HORUS has no preset constructors — each robot type is just a different scheduler
+tick rate plus the per-node constraints described above:
 
 ### Standard Industrial Robot
 ```rust
 let mut scheduler = Scheduler::new();
-// 60Hz control, fault tolerance, monitoring enabled
+// Default 100Hz tick; add .watchdog() and per-node .failure_policy() as needed
 ```
 
 ### Medical/Surgical Robot
@@ -265,7 +272,8 @@ One scheduler-side resolution limit is worth knowing:
 
 ## Mixed RT and Normal Nodes
 
-HORUS supports mixed criticality systems through priority-based scheduling:
+HORUS supports mixed criticality systems by ordering nodes in the tick sequence and
+attaching timing constraints only to the ones that need them:
 
 ```rust
 use horus::prelude::*;
@@ -328,12 +336,9 @@ scheduler.add(MotorControl::new())
 
 ### Priority Assignment
 
-Reserve `.order()` ranges:
-- **0-9**: Critical real-time (motor control, safety)
-- **10-49**: High priority (sensors, fast control loops)
-- **50-99**: Normal priority (processing, planning)
-- **100-199**: Low priority (logging, diagnostics)
-- **200+**: Background (telemetry, non-essential)
+Reserve the `.order()` ranges listed under [Priority Levels](#priority-levels), and
+keep `.priority()` (the OS thread priority) for nodes that genuinely need to preempt
+others on the CPU.
 
 ### Testing Under Load
 
@@ -353,6 +358,7 @@ fn test_wcet_compliance() -> Result<()> {
 
     scheduler.run_for(Duration::from_millis(500))?;
 
+    // The lookup key is the node's Node::name(), which defaults to the type name
     let stats = scheduler.rt_stats("motor_control").unwrap();
     assert_eq!(stats.budget_violations(), 0);
     Ok(())
@@ -392,7 +398,8 @@ scheduler.add(node)
 let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz()).prefer_rt();
 ```
 
-3. Test with monitoring enabled
+3. Test under load and check `rt_stats()` for budget violations — see
+   [Testing Under Load](#testing-under-load)
 
 ## Troubleshooting
 
@@ -423,7 +430,7 @@ let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz()).prefer_rt();
 **Solutions**:
 - Review safety monitor logs
 - Check critical node health
-- Increase max_deadline_misses
+- Raise the emergency-stop threshold with `Scheduler::max_deadline_misses(n)` (default 100)
 - Verify WCET budgets
 
 ### Watchdog Timeouts
@@ -491,7 +498,7 @@ fn main() -> Result<()> {
         .budget(Duration::from_micros(100))
         .deadline(Duration::from_millis(1))
         .on_miss(Miss::SafeMode)
-        .done()?;
+        .build()?;
 
     // Run the system
     scheduler.run()

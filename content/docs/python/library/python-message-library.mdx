@@ -33,7 +33,6 @@ Two names on this page exist only in Rust and are **not** exposed to Python:
 - **Cross-language compatible** - Binary-compatible with Rust message types
 - **Nanosecond timestamps** - Most message types carry a `timestamp_ns` field. Geometry value types (`Point3`, `Vector3`, `Quaternion`, `Transform`), bounding boxes (`BoundingBox2D`, `BoundingBox3D`), `Waypoint`, `Detection` and `CostMap` do not
 - **Typed Topic support** - Use `Topic(CmdVel)` for type-safe pub/sub
-- **Pickle support** - Can be serialized for Python-only communication
 
 ---
 
@@ -184,7 +183,7 @@ cmd = topic.recv()  # Returns CmdVel or None
 
 ### LaserScan
 
-2D LIDAR scan data (variable-length range array).
+2D LIDAR scan data (fixed 360-entry range array).
 
 ```python
 from horus import LaserScan
@@ -196,27 +195,32 @@ scan = LaserScan(
     angle_increment=0.01745,  # Angular resolution (radians)
     range_min=0.1,            # Minimum valid range (meters)
     range_max=10.0,           # Maximum valid range (meters)
-    ranges=[1.0, 1.1, 1.2],  # Distance measurements
+    ranges=[1.0, 1.1, 1.2],  # Distance measurements (zero-padded to 360 entries)
 )
 
 # Properties (read/write)
-scan.ranges = [1.0] * 360  # Variable-length list of floats
+scan.ranges = [1.0] * 360  # Always stored as 360 floats
 scan.angle_min = -1.57
 
-# Length
-length = len(scan)  # Number of range measurements
+# Length = readings inside [range_min, range_max], not the array size
+length = len(scan)
 
 print(scan)  # LaserScan(angle=[-3.14, 3.14], range=[0.10, 10.00], 360 points, timestamp_ns=0)
 ```
 
 **Fields:**
-- `ranges` (list[f32]): Distance readings in meters (variable length)
+- `ranges` (list[f32]): Distance readings in meters — always 360 entries; a longer list is
+  truncated and a shorter one is zero-filled
 - `angle_min` (f32): Start angle in radians
 - `angle_max` (f32): End angle in radians
 - `range_min` (f32): Minimum valid range in meters
 - `range_max` (f32): Maximum valid range in meters
 - `angle_increment` (f32): Angular resolution in radians
 - `timestamp_ns` (u64): Nanosecond timestamp
+
+Because the array is zero-padded, `min(scan.ranges)` is usually `0.0`. Use `scan.min_range()`
+for the nearest valid reading (`None` if there is none), `scan.is_range_valid(i)` for a single
+index, and `len(scan)` for the count of valid readings.
 
 **Use with Topic:**
 ```python
@@ -231,102 +235,7 @@ topic.send(scan)
 # Receive
 scan = topic.recv()  # Returns LaserScan or None
 if scan:
-    print(f"Got {len(scan)} range readings")
-```
-
----
-
-## Cross-Language Compatibility
-
-The Python message types are **binary-compatible with Rust** via shared memory. The Rust
-side reaches them through `horus::prelude`:
-
-| Python Class | Rust Type | Defining Crate |
-|--------------|-----------|----------------|
-| `CmdVel` | `horus::prelude::CmdVel` | `horus_robotics` |
-| `Pose2D` | `horus::prelude::Pose2D` | `horus_types` |
-| `Imu` | `horus::prelude::Imu` | `horus_robotics::messages::sensor` |
-| `Odometry` | `horus::prelude::Odometry` | `horus_robotics::messages::sensor` |
-| `LaserScan` | `horus::prelude::LaserScan` | `horus_robotics::messages::sensor` |
-| `Twist` | `horus::prelude::Twist` | `horus_types` |
-| `Transform` | `horus_tf::Transform` | `horus_tf` (separate crate) |
-| `Image` | `horus::prelude::Image` | `horus_core::memory` |
-| `PointCloud` | `horus::prelude::PointCloud` | `horus_core::memory` |
-| `DepthImage` | `horus::prelude::DepthImage` | `horus_core::memory` |
-| `NavGoal` | `horus::prelude::NavGoal` | `horus_robotics::messages::navigation` |
-
-**Example - Python to Rust:**
-
-```python
-# Python sender
-from horus import Topic, CmdVel
-
-topic = Topic(CmdVel)  # Typed topic
-topic.send(CmdVel(linear=1.0, angular=0.5))
-```
-
-```rust
-// Rust receiver
-use horus::prelude::*;
-
-let topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
-if let Some(cmd) = topic.recv() {
-    println!("Received: linear={}, angular={}", cmd.linear, cmd.angular);
-}
-```
-
----
-
-## Usage Patterns
-
-### Robot Controller with Multiple Sensors
-
-```python
-from horus import Node, Topic, CmdVel, LaserScan
-
-# Create topics outside tick function
-scan_topic = Topic(LaserScan)
-cmd_topic = Topic(CmdVel)
-
-def controller_tick(node):
-    scan = scan_topic.recv()
-    if scan:
-        # Simple obstacle avoidance
-        min_dist = min(scan.ranges) if scan.ranges else None
-        if min_dist and min_dist < 0.5:
-            # Too close - stop
-            cmd_topic.send(CmdVel(0.0, 0.0))
-        else:
-            # Safe - move forward
-            cmd_topic.send(CmdVel(linear=0.5, angular=0.0))
-
-node = Node(name="controller", tick=controller_tick, rate=10)
-```
-
-### Pose Tracking
-
-```python
-import math
-from horus import Topic, Pose2D
-
-# Track robot pose
-pose_topic = Topic(Pose2D)
-
-current_pose = Pose2D(0.0, 0.0, 0.0)
-
-def update_pose(delta_x, delta_y, delta_theta):
-    global current_pose
-    current_pose.x += delta_x
-    current_pose.y += delta_y
-    current_pose.theta += delta_theta
-
-    # Normalize angle to [-pi, pi]
-    current_pose.theta = math.atan2(
-        math.sin(current_pose.theta),
-        math.cos(current_pose.theta)
-    )
-
-    pose_topic.send(current_pose)
+    print(f"Got {len(scan)} valid range readings")
 ```
 
 ---
@@ -873,9 +782,107 @@ cmd.timeout_seconds = 0.5
 
 ---
 
-## Complete Message Reference
+## Cross-Language Compatibility
 
-**Available now** (via `from horus import <Type>`):
+The Python message types are **binary-compatible with Rust** via shared memory. The Rust
+side reaches them through `horus::prelude`:
+
+| Python Class | Rust Type | Defining Crate |
+|--------------|-----------|----------------|
+| `CmdVel` | `horus::prelude::CmdVel` | `horus_robotics` |
+| `Pose2D` | `horus::prelude::Pose2D` | `horus_types` |
+| `Imu` | `horus::prelude::Imu` | `horus_robotics::messages::sensor` |
+| `Odometry` | `horus::prelude::Odometry` | `horus_robotics::messages::sensor` |
+| `LaserScan` | `horus::prelude::LaserScan` | `horus_robotics::messages::sensor` |
+| `Twist` | `horus::prelude::Twist` | `horus_types` |
+| `Transform` | `horus_tf::Transform` | `horus_tf` (separate crate) |
+| `Image` | `horus::prelude::Image` | `horus_core::memory` |
+| `PointCloud` | `horus::prelude::PointCloud` | `horus_core::memory` |
+| `DepthImage` | `horus::prelude::DepthImage` | `horus_core::memory` |
+| `NavGoal` | `horus::prelude::NavGoal` | `horus_robotics::messages::navigation` |
+
+**Example - Python to Rust:**
+
+```python
+# Python sender
+from horus import Topic, CmdVel
+
+topic = Topic(CmdVel)  # Typed topic
+topic.send(CmdVel(linear=1.0, angular=0.5))
+```
+
+```rust
+// Rust receiver
+use horus::prelude::*;
+
+let topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
+if let Some(cmd) = topic.recv() {
+    println!("Received: linear={}, angular={}", cmd.linear, cmd.angular);
+}
+```
+
+---
+
+## Usage Patterns
+
+### Robot Controller with Multiple Sensors
+
+```python
+from horus import Node, Topic, CmdVel, LaserScan
+
+# Create topics outside tick function
+scan_topic = Topic(LaserScan)
+cmd_topic = Topic(CmdVel)
+
+def controller_tick(node):
+    scan = scan_topic.recv()
+    if scan:
+        # Simple obstacle avoidance — min_range() skips the zero padding
+        min_dist = scan.min_range()  # nearest valid reading, or None
+        if min_dist and min_dist < 0.5:
+            # Too close - stop
+            cmd_topic.send(CmdVel(0.0, 0.0))
+        else:
+            # Safe - move forward
+            cmd_topic.send(CmdVel(linear=0.5, angular=0.0))
+
+node = Node(name="controller", tick=controller_tick, rate=10)
+```
+
+### Pose Tracking
+
+```python
+import math
+from horus import Topic, Pose2D
+
+# Track robot pose
+pose_topic = Topic(Pose2D)
+
+current_pose = Pose2D(0.0, 0.0, 0.0)
+
+def update_pose(delta_x, delta_y, delta_theta):
+    global current_pose
+    current_pose.x += delta_x
+    current_pose.y += delta_y
+    current_pose.theta += delta_theta
+
+    # Normalize angle to [-pi, pi]
+    current_pose.theta = math.atan2(
+        math.sin(current_pose.theta),
+        math.cos(current_pose.theta)
+    )
+
+    pose_topic.send(current_pose)
+```
+
+---
+
+## Message Reference
+
+The types documented on this page, all importable via `from horus import <Type>`. The
+extension ships more than these — around 75 message classes in total, including
+`TransformStamped`, `BoundingBox2D`, `Detection3D`, `JointState` and `PoseStamped`;
+`dir(horus)` lists every name:
 
 | Category | Python Classes |
 |----------|---------------|

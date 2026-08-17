@@ -11,7 +11,7 @@ order: 5
 After reading this guide, you will understand:
 - How nodes are self-contained units of computation that run in the scheduler
 - The Node trait's lifecycle methods (init, tick, shutdown) and when each is called
-- How NodeInfo provides logging, metrics, and timing context to your nodes
+- How the scheduler tracks per-node metrics and timing, and how `hlog!` handles logging
 - When to use different priority levels (0 for safety-critical, 100 for background logging)
 - Communication patterns (publisher, subscriber, pipeline, aggregator) for building node graphs
 
@@ -228,18 +228,18 @@ hlog!(error, "Sensor disconnected");
 hlog!(debug, "Position: ({}, {})", x, y);
 ```
 
-### Pub/Sub Logging
+### Sending and Receiving
 
-With the zero-overhead IPC, `send()` and `recv()` no longer take `ctx`, and topics do not log their traffic:
+With the zero-overhead IPC, `send()` and `recv()` no longer take a context parameter, and topics do not log their traffic:
 
 ```rust
 let velocity_pub: Topic<f32> = Topic::new("cmd_vel")?;
 
 fn tick(&mut self) {
-    // The only send method
+    // Non-blocking send
     self.velocity_pub.send(1.5);
 
-    // The only recv method
+    // Non-blocking receive: None when no message is waiting
     if let Some(scan) = self.lidar_sub.recv() {
         self.process(scan);
     }
@@ -250,7 +250,7 @@ For introspection, use the CLI: `horus topic echo`, `horus topic hz`, `horus mon
 
 ### Performance Metrics
 
-NodeInfo tracks detailed performance metrics:
+The scheduler records detailed performance metrics for every node:
 
 ```rust
 pub struct NodeMetrics {
@@ -273,17 +273,12 @@ pub struct NodeMetrics {
 
 Fields are private — read them via accessors: `m.name()`, `m.order()`, `m.total_ticks()`, `m.avg_tick_duration_ms()`, etc. Get a snapshot of all nodes with `Scheduler::metrics() -> Vec<NodeMetrics>`.
 
-Access metrics via the scheduler:
+For example, from your application after the scheduler has run:
 
 ```rust
-fn init(&mut self) -> Result<()> {
-    hlog!(info, "Node initializing");
-    Ok(())
-}
-
-fn tick(&mut self) {
-    // Track state internally if needed
-    self.tick_count += 1;
+for m in scheduler.metrics() {
+    hlog!(info, "{}: {} ticks, avg {:.3} ms",
+        m.name(), m.total_ticks(), m.avg_tick_duration_ms());
 }
 ```
 
@@ -707,7 +702,7 @@ fn init(&mut self) -> Result<()> {
 
 ### Use hlog! for Logging in tick()
 
-Since `tick()` no longer receives `ctx`, use the `hlog!` macro for logging:
+`tick()` takes no logging context — use the `hlog!` macro instead:
 
 ```rust
 fn tick(&mut self) {
@@ -947,7 +942,7 @@ impl Node for MyMotorController {
 
         // Close hardware connections
         if let Some(port) = self.serial_port.take() {
-            port.close();
+            drop(port);  // Closes the port
         }
 
         hlog!(info, "All motors stopped safely");
