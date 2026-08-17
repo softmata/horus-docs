@@ -8,9 +8,7 @@ weight: 51
 
 HORUS provides message types for force/torque sensors, tactile arrays, impedance control, and haptic feedback systems commonly used in manipulation tasks.
 
-**Re-exported types** (available via `use horus::prelude::*`): `WrenchStamped`, `TactileArray`, `ImpedanceParameters`, `ForceCommand`.
-
-**Non-re-exported types** (require direct import): `ContactInfo`, `ContactState`, `HapticFeedback` — import from `horus_library::messages::force::*`.
+All force types — `WrenchStamped`, `TactileArray`, `ImpedanceParameters`, `ForceCommand`, `ContactInfo`, `ContactState`, `HapticFeedback` — are re-exported through `horus::prelude`; `use horus::prelude::*;` is all you need.
 
 ## WrenchStamped
 
@@ -73,80 +71,62 @@ current.filter(&previous_wrench, 0.1);  // alpha = 0.1 (heavy filtering)
 
 ## TactileArray
 
-Pressure/force array from tactile sensors (fingertip sensors, skin patches). Implements `PodMessage` for zero-copy transfer.
+Pressure/force array from tactile sensors (fingertip sensors, skin patches). Serde-serialized message (not POD — it holds a `Vec<f32>`, so it uses the serialization path rather than zero-copy shared memory).
 
 ```rust
 use horus::prelude::*;
 
 // Create 8x8 grid tactile array
-let mut tactile = TactileArray::new(64, TactileArray::ARRANGEMENT_GRID);
-tactile.grid_width = 8;
-tactile.grid_height = 8;
-tactile.sensor_spacing = 2.0;  // 2mm between sensors
-tactile.sensitivity = 0.1;     // N per unit
+let mut tactile = TactileArray::new(8, 8);  // 8 rows x 8 cols
+tactile.physical_size = [0.016, 0.016];  // 16mm x 16mm pad
 
-// Set and get sensor readings
-tactile.set_sensor(0, 1.5);
-tactile.set_sensor(1, 2.0);
-if let Some(reading) = tactile.get_sensor(0) {
-    println!("Sensor 0: {:.1}", reading);
+// Set and get taxel readings
+tactile.set_force(0, 0, 1.5);
+tactile.set_force(0, 1, 2.0);
+if let Some(reading) = tactile.get_force(0, 0) {
+    println!("Taxel (0,0): {:.1} N", reading);
 }
 
-// Get active sensors
-let readings = tactile.get_active_sensors();
+// Get raw taxel readings
+let readings = &tactile.forces;  // row-major, len = rows * cols
 
-// Calculate total force
-let total = tactile.total_force();
-println!("Total force: {:.2} N", total);
+// Total contact force
+let total = tactile.total_force;  // [fx, fy, fz] in Newtons
+println!("Total force: [{:.2}, {:.2}, {:.2}] N", total[0], total[1], total[2]);
 
 // Detect contact
-if tactile.detect_contact(0.5) {  // threshold
+if tactile.in_contact {
     println!("Contact detected!");
 }
 
-// Calculate center of pressure (grid arrangement only)
-if let Some((cx, cy)) = tactile.center_of_pressure() {
-    println!("Center of pressure: ({:.2}, {:.2})", cx, cy);
-}
+// Center of pressure
+let cop = tactile.center_of_pressure;  // [row, col] normalized 0.0-1.0
+println!("Center of pressure: ({:.2}, {:.2})", cop[0], cop[1]);
 
 // Get contact pattern
-let pattern = tactile.contact_pattern(0.5);  // Returns Vec<bool>
+let pattern: Vec<bool> = tactile.forces.iter().map(|f| *f > 0.5).collect();
 ```
-
-**Arrangement Types:**
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `ARRANGEMENT_GRID` | 0 | 2D grid layout |
-| `ARRANGEMENT_LINEAR` | 1 | Linear array |
-| `ARRANGEMENT_CIRCULAR` | 2 | Circular arrangement |
 
 **Fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `sensors` | `[f32; 64]` | Sensor readings |
-| `sensor_count` | `u8` | Number of active sensors |
-| `arrangement` | `u8` | Layout type |
-| `grid_width` | `u8` | Grid columns |
-| `grid_height` | `u8` | Grid rows |
-| `sensor_spacing` | `f32` | Spacing in mm |
-| `sensitivity` | `f32` | N per unit |
-| `frame_id` | `[u8; 32]` | Reference frame |
+| `rows` | `u32` | Number of taxel rows |
+| `cols` | `u32` | Number of taxel columns |
+| `forces` | `Vec<f32>` | Taxel force readings in Newtons (row-major, len = rows × cols) |
+| `total_force` | `[f32; 3]` | Total contact force [fx, fy, fz] in Newtons |
+| `center_of_pressure` | `[f32; 2]` | Center of pressure, normalized 0.0-1.0 (row, col) |
+| `in_contact` | `bool` | Whether any contact is detected |
+| `physical_size` | `[f32; 2]` | Physical sensor size [width_m, height_m] |
 | `timestamp_ns` | `u64` | Nanoseconds since epoch |
 
 **Methods:**
 
 | Method | Description |
 |--------|-------------|
-| `new(sensor_count, arrangement)` | Create a new tactile array |
-| `get_active_sensors()` | Get slice of active sensor readings |
-| `set_sensor(index, value)` | Set sensor reading (returns `bool`) |
-| `get_sensor(index)` | Get sensor reading as `Option<f32>` |
-| `total_force()` | Calculate total force from all sensors |
-| `center_of_pressure()` | Calculate center of pressure (grid only) |
-| `detect_contact(threshold)` | Check if any sensor exceeds threshold |
-| `contact_pattern(threshold)` | Get contact pattern as `Vec<bool>` |
+| `new(rows, cols)` | Allocate a rows × cols taxel grid |
+| `get_force(row, col)` | Get taxel reading as `Option<f32>` (`None` if out of bounds) |
+| `set_force(row, col, force)` | Set taxel reading (silently ignored if out of bounds) |
 
 ## ImpedanceParameters
 
@@ -254,10 +234,8 @@ let cmd_with_timeout = force_cmd.with_timeout(5.0);  // 5 second timeout
 
 Contact detection and classification. Implements `PodMessage` for zero-copy transfer.
 
-> **Note:** `ContactInfo` and `ContactState` are not re-exported in the prelude. Import directly: `use horus_library::messages::force::{ContactInfo, ContactState};`
-
 ```rust
-use horus_library::messages::force::{ContactInfo, ContactState};
+use horus::prelude::*;
 
 // Create contact info
 let contact = ContactInfo::new(ContactState::StableContact, 15.0);  // 15N force
@@ -308,11 +286,8 @@ if contact.is_in_contact() {
 
 Haptic feedback commands for user interfaces. Implements `PodMessage` for zero-copy transfer.
 
-> **Note:** `HapticFeedback` is not re-exported in the prelude. Import directly: `use horus_library::messages::force::HapticFeedback;`
-
 ```rust
 use horus::prelude::*;
-use horus_library::messages::force::HapticFeedback;
 
 // Vibration feedback
 let vibration = HapticFeedback::vibration(

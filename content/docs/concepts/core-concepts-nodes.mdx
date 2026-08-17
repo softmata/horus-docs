@@ -50,20 +50,21 @@ pub trait Node: Send {
     fn shutdown(&mut self) -> Result<()> { Ok(()) }
     fn on_error(&mut self, error: &str) { /* logs error */ }
 
-    // Optional metadata
-    fn publishers(&self) -> Vec<TopicMetadata> { Vec::new() }
-    fn subscribers(&self) -> Vec<TopicMetadata> { Vec::new() }
-    fn rate_hz(&self) -> Option<f64> { None }
-    fn is_healthy(&self) -> bool { true }
+    // Safety hooks
+    fn is_safe_state(&self) -> bool { true }
+    fn enter_safe_state(&mut self) { /* no-op */ }
 
-    // Optional checkpoint/restore
-    fn checkpoint_state(&self) -> Option<Vec<u8>> { None }
-    fn restore_state(&mut self, _data: &[u8]) -> Result<()> { Ok(()) }
-    fn supports_checkpointing(&self) -> bool { false }
+    // Optional: runtime parameter hook (NOTE: not yet wired by the scheduler)
+    fn on_parameter_change(
+        &mut self,
+        key: &str,
+        old: Option<&serde_json::Value>,
+        new: &serde_json::Value,
+    ) -> Result<(), String> { Ok(()) }
 }
 ```
 
-> **Note:** See the [API Reference](/rust/api/core) for complete method documentation including checkpoint/restore support.
+> **Note:** See the [API Reference](/rust/api/core) for complete method documentation.
 
 ### Required Methods
 
@@ -85,7 +86,7 @@ fn name(&self) -> &str {
 }
 ```
 
-When using the `node!` macro, the name is auto-generated from the struct name.
+When using the `node!` macro, the name is auto-generated as the **snake_case** form of the struct name (`SensorNode` → `"sensor_node"`). Override it with a `name: "MyName"` section in the macro body.
 
 **init()**: Called once during node startup (default: no-op)
 
@@ -107,15 +108,13 @@ fn shutdown(&mut self) -> Result<()> {
 }
 ```
 
-**rate_hz()**: Optional tick rate for this node (default: None = use scheduler's global rate)
+**Per-node rate**: set the tick rate at registration time, not on the trait:
 
 ```rust
-fn rate_hz(&self) -> Option<f64> {
-    Some(100.0)  // This node runs at 100Hz
-}
+scheduler.add(sensor_node).order(50).rate(100_u64.hz()).build()?;  // this node runs at 100 Hz
 ```
 
-When set, the scheduler will tick this node at the specified rate instead of the global rate. Can be overridden at runtime via `Scheduler::set_node_rate()`.
+If no rate is set, the node ticks at the scheduler's global rate. The scheduler raises its own tick period automatically to satisfy the fastest registered node.
 
 ## Node Lifecycle
 
@@ -183,7 +182,7 @@ impl Node for LifecycleDemo {
     }
 
     fn tick(&mut self) {
-        // Called REPEATEDLY in main loop (~60 FPS default)
+        // Called REPEATEDLY in main loop (100 Hz default)
         self.counter += 1;
 
         hlog!(debug, "Tick #{}", self.counter);
@@ -231,18 +230,14 @@ hlog!(debug, "Position: ({}, {})", x, y);
 
 ### Pub/Sub Logging
 
-With the zero-overhead IPC, `send()` and `recv()` no longer take `ctx`. For introspection, enable logging at construction time with `.with_logging()`:
+With the zero-overhead IPC, `send()` and `recv()` no longer take `ctx`, and topics do not log their traffic:
 
 ```rust
-// Construction: choose zero-overhead or with logging
-let velocity_pub: Topic<f32> = Topic::new("cmd_vel")?;                  // Zero-overhead (default)
-let velocity_pub_logged: Topic<f32> = Topic::new("cmd_vel")?.with_logging(); // With logging (requires T: LogSummary)
+let velocity_pub: Topic<f32> = Topic::new("cmd_vel")?;
 
 fn tick(&mut self) {
-    // The only send method — logging depends on how the topic was constructed
+    // The only send method
     self.velocity_pub.send(1.5);
-    // If constructed with .with_logging():
-    // Output: [12:34:56.789] MyNode --PUB--> 'cmd_vel' = 1.5
 
     // The only recv method
     if let Some(scan) = self.lidar_sub.recv() {
@@ -251,7 +246,7 @@ fn tick(&mut self) {
 }
 ```
 
-For monitoring without code changes, use CLI tools: `horus topic echo`, `horus topic hz`, `horus monitor`.
+For introspection, use the CLI: `horus topic echo`, `horus topic hz`, `horus monitor`. Use `hlog!` inside `tick()` when you need application-level logging.
 
 ### Performance Metrics
 
@@ -259,22 +254,24 @@ NodeInfo tracks detailed performance metrics:
 
 ```rust
 pub struct NodeMetrics {
-    pub name: String,
-    pub priority: u32,
-    pub total_ticks: u64,
-    pub successful_ticks: u64,
-    pub failed_ticks: u64,
-    pub avg_tick_duration_ms: f64,
-    pub max_tick_duration_ms: f64,
-    pub min_tick_duration_ms: f64,
-    pub last_tick_duration_ms: f64,
-    pub messages_sent: u64,
-    pub messages_received: u64,
-    pub errors_count: u64,
-    pub warnings_count: u64,
-    pub uptime_seconds: f64,
+    name: String,
+    order: u32,
+    total_ticks: u64,
+    successful_ticks: u64,
+    failed_ticks: u64,
+    avg_tick_duration_ms: f64,
+    max_tick_duration_ms: f64,
+    min_tick_duration_ms: f64,
+    last_tick_duration_ms: f64,
+    messages_sent: u64,
+    messages_received: u64,
+    errors_count: u64,
+    warnings_count: u64,
+    uptime_seconds: f64,
 }
 ```
+
+Fields are private — read them via accessors: `m.name()`, `m.order()`, `m.total_ticks()`, `m.avg_tick_duration_ms()`, etc. Get a snapshot of all nodes with `Scheduler::metrics() -> Vec<NodeMetrics>`.
 
 Access metrics via the scheduler:
 
@@ -413,6 +410,8 @@ The macro generates:
 - Constructor function (`SensorNode::new()`)
 - Topic metadata methods
 
+The metadata methods are inherent `publishers()` and `subscribers()` methods on the generated struct, each returning `Vec<TopicMetadata>` — they are not `Node` trait methods, so hand-written nodes cannot override them. Hand-written nodes do not declare topics at all: the scheduler auto-detects them via `TopicNodeRegistry` when `Topic::new()` is called.
+
 ## Node Communication Patterns
 
 ### Publisher Pattern
@@ -527,7 +526,7 @@ fn init(&mut self) -> Result<()> {
     // 1. Open hardware connections
     self.serial_port = serialport::new("/dev/ttyUSB0", 115200)
         .open()
-        .map_err(|e| Error::driver(format!("Failed to open serial: {}", e)))?;
+        .map_err(|e| Error::node("MyMotorNode", format!("Failed to open serial: {}", e)))?;
 
     // 2. Pre-allocate buffers (avoid allocation in tick)
     self.command_buffer = vec![0u8; 256];
@@ -635,7 +634,7 @@ impl Node for MyMotorController {
             serialport::new("/dev/ttyUSB0", 115200)
                 .timeout(std::time::Duration::from_millis(100))
                 .open()
-                .map_err(|e| Error::driver(format!("Serial open failed: {}", e)))?
+                .map_err(|e| Error::node("MyMotorController", format!("Serial open failed: {}", e)))?
         );
 
         // Initialize motor to stopped state
@@ -700,7 +699,7 @@ Return errors from init() and shutdown():
 ```rust
 fn init(&mut self) -> Result<()> {
     if !self.sensor.is_available() {
-        return Err(Error::internal("Sensor not found"));
+        return Err(Error::node("MyNode", "Sensor not found"));
     }
     Ok(())
 }
@@ -738,7 +737,7 @@ static mut COUNTER: u32 = 0;  // Unsafe global state
 ```rust
 fn init(&mut self) -> Result<()> {
     self.device = Device::open().map_err(|e| {
-        Error::internal(format!("Failed to open device: {}", e))
+        Error::node("MyNode", format!("Failed to open device: {}", e))
     })?;
 
     hlog!(info, "Device opened successfully");

@@ -103,12 +103,14 @@ To test with the actual `horus` CLI, install the binary where HORUS can find it:
 
 ```bash
 # Option A: Copy to global plugin bin directory
-mkdir -p ~/.horus/bin
-cp target/release/mycommand ~/.horus/bin/horus-mycommand
+mkdir -p ~/.config/horus/bin
+cp target/release/mycommand ~/.config/horus/bin/horus-mycommand
 
 # Option B: Install via horus from the registry (once published)
 horus install --plugin horus-mycommand
 ```
+
+On macOS the global plugin bin directory is `~/Library/Application Support/horus/bin`; on either platform it honours `$XDG_CONFIG_HOME` when that is set.
 
 `horus install` resolves package names from the registry &mdash; it has no local-path or `--local` mode, so Option A is the way to test an unpublished build.
 
@@ -125,17 +127,27 @@ HORUS sets these environment variables when executing plugins:
 
 Your plugin inherits the user's `stdin`, `stdout`, and `stderr`, so interactive prompts and colored output work normally.
 
+## Sandbox
+
+On Linux, foreground plugins run under a sandbox applied between fork and exec: `RLIMIT_CPU` 300 cumulative CPU-seconds (hard limit equal to soft, so overrun is an uncatchable `SIGKILL`), `RLIMIT_FSIZE` 256 MiB, `RLIMIT_NOFILE` 64, every inherited file descriptor above stderr closed, and `PR_SET_NO_NEW_PRIVS`.
+
+A seccomp-BPF filter returns `EPERM` for the socket syscalls (`socket`, `connect`, `bind`, `listen`, `accept`, `accept4`, `sendmsg`, `sendto`, `recvmsg`, `recvfrom`, `getsockopt`, `setsockopt`) &mdash; so a CLI plugin cannot open network connections &mdash; and kills the process outright for `ptrace`, `chroot`, `pivot_root`, `mount`, `umount2`, `setuid`, `setgid`, `setreuid`, `setregid`, `setresuid`, `setresgid`, `capset`, `mknod`, `mknodat`, and `perf_event_open`.
+
+Syscall filtering applies only on x86-64 Linux; the resource limits and file-descriptor closure apply on all Linux architectures. Long-lived (background) plugins get only the file-descriptor closure and `PR_SET_NO_NEW_PRIVS` &mdash; no resource caps and no network restriction.
+
 ## Plugin Discovery
 
 HORUS discovers plugin binaries in this order:
 
 1. **Project `plugins.lock`** &mdash; `.horus/plugins.lock` in the current project
-2. **Global `plugins.lock`** &mdash; `~/.horus/plugins.lock`
+2. **Global `plugins.lock`** &mdash; `~/.config/horus/plugins.lock`
 3. **Project bin directory** &mdash; `.horus/bin/horus-*`
-4. **Global bin directory** &mdash; `~/.horus/bin/horus-*`
+4. **Global bin directory** &mdash; `~/.config/horus/bin/horus-*` (`$XDG_CONFIG_HOME/horus/bin`; `~/Library/Application Support/horus/bin` on macOS)
 5. **System PATH** &mdash; Any `horus-*` binary in `$PATH`
 
-The first match wins. This means project-level plugins always override global ones.
+The first match wins, in exactly this order &mdash; so a project `plugins.lock` entry beats everything, but a globally registered plugin (2) still beats a project bin-directory binary (3). A project registry with `inherit_global = false` skips the global registry entirely.
+
+Plugins found in the project `.horus/` (entries 1 and 3) are treated as attacker-controlled &mdash; they are part of any cloned checkout &mdash; and are refused unless their content hash is recorded in the machine-local trust store. Run `horus plugin trust <command>` once to allow one (`horus plugin trusted` lists them, `horus plugin untrust <command>` revokes).
 
 ## Plugin Detection
 
@@ -146,7 +158,7 @@ HORUS discovers plugins by scanning for packages named `horus-*`. The discovery 
 When a plugin is installed through the registry, HORUS records a SHA-256 checksum of the binary. Before each execution, the checksum is verified:
 
 - If the binary has been modified, HORUS refuses to run it
-- Run `horus verify` to check all plugin integrity
+- Run `horus plugin verify` to check all plugin integrity (or `horus plugin verify <name>` for one; add `--json` for machine-readable output)
 - Reinstall a plugin with `horus install --plugin <name>` if verification fails
 
 ## Example: A Complete Plugin
@@ -160,8 +172,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "topic-stats", about = "Show topic statistics summary")]
 struct Cli {
-    /// Shared memory directory
-    #[arg(long, default_value = "/dev/shm/horus")]
+    /// Shared memory topics directory
+    #[arg(long, default_value = "/dev/shm/horus_default/topics")]
     shm_dir: PathBuf,
 
     /// Output as JSON
@@ -199,6 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Topic backing files live in `/dev/shm/horus_<namespace>/topics/`, where the namespace defaults to the literal `default` and is overridden with `$HORUS_NAMESPACE` &mdash; pass `--shm-dir` to inspect another namespace. Because a topic name may contain `/`, namespaced topics such as `lidar/scan` are stored as subdirectories of `topics/`; the `is_file()` filter above lists only flat topic names, so recurse one level if you need the namespaced ones.
 
 **Cargo.toml:**
 

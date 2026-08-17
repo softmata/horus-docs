@@ -22,14 +22,14 @@ HORUS offers different levels of deterministic guarantees:
 
 | Level | Config | What You Get | Use Case |
 |-------|--------|--------------|----------|
-| **Basic** | `Scheduler::new()` | Sequential execution, no learning | Most applications |
-| **+ Performance** | `.tier(NodeTier::*)` | Basic + explicit optimization tiers | Speed + determinism |
-| **+ Safety** | `.safety_monitor(true)` | Basic + watchdogs, WCET enforcement | Medical, industrial |
-| **+ Full** | `.deterministic(42)` | Virtual time, seeded RNG, execution tracing | Formal verification |
+| **Basic** | `Scheduler::new()` | `.order()` sequence for main-loop nodes, no learning | Most applications |
+| **+ Performance** | `.order(n)` + `.rate()` / `.compute()` / `.on()` / `.async_io()` | Basic + an explicit execution class per node | Speed + determinism |
+| **+ Safety** | `.watchdog(Duration)` | Basic + watchdogs, budget and deadline monitoring | Medical, industrial |
+| **+ Full** | `.deterministic(true)` | Virtual time, sequential main-thread execution, no executor threads | Formal verification |
 
-### Level 1: Basic Determinism (Default)
+### Level 1: Basic Ordering (Default)
 
-`Scheduler::new()` is deterministic out of the box:
+`Scheduler::new()` on its own is **not** guaranteed to be order-deterministic. By default the scheduler groups nodes by execution class and dispatches them to dedicated executor threads, so any node configured with `.compute()`, `.on()`, `.async_io()`, or a `.rate()` leaves the main loop:
 
 ```rust,ignore
 use horus::prelude::*;
@@ -43,35 +43,41 @@ fn main() -> Result<()> {
 ```
 
 **Guarantees:**
-- Sequential execution (same order every tick)
+- A scheduler whose nodes all stay on the main loop runs them in `.order()` sequence, the same order every tick
 - No learning phase (no runtime profiling)
-- Reproducible runs with same inputs
+- Reproducible ordering across runs requires `.deterministic(true)` — see Level 4
 
-### Level 2: Determinism + Performance Tiers
+### Level 2: Explicit Order + Execution Class
 
-Use `.tier()` to get deterministic execution with explicit performance tiers:
+Use `.order()` to fix the tick sequence, and pick each node's execution class explicitly:
 
 ```rust,ignore
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new();
 
-scheduler.add(pid_controller).order(0).tier(NodeTier::UltraFast).done();  // <1μs inline
-scheduler.add(sensor_reader).order(1).tier(NodeTier::Fast).done();        // <10μs inline
-scheduler.add(data_logger).order(5).tier(NodeTier::Normal).done();        // Standard scheduling
+scheduler.add(pid_controller).order(0).rate(1000_u64.hz()).done();  // real-time, 1 kHz
+scheduler.add(sensor_reader).order(10).rate(200_u64.hz()).done();   // real-time, 200 Hz
+scheduler.add(data_logger).order(100).done();                       // main-loop, best effort
 
 scheduler.run()?;
 ```
 
-**Node tiers:**
+**Order guidelines:**
 
-| Tier | Description | Default Failure Policy |
-|------|-------------|----------------------|
-| `NodeTier::UltraFast` | Ultra-fast inline (&lt;1μs) | Fatal (stop on failure) |
-| `NodeTier::Fast` | Inline execution (&lt;10μs) | Fatal |
-| `NodeTier::Normal` | Standard scheduling (&lt;100μs+) | Restart (5 attempts, 100ms delay) |
+| Order | Use for |
+|-------|---------|
+| 0-9 | Critical real-time (motor control, safety) |
+| 10-49 | High priority (sensors, fast control loops) |
+| 50-99 | Normal priority (processing, planning) |
+| 100-199 | Low priority (logging, diagnostics) |
+| 200+ | Background (telemetry, non-essential) |
 
-Tiers are explicit — no runtime profiling needed, so execution is fully deterministic.
+Execution class is separate from order: `.rate()` makes a node real-time, `.compute()` sends it to the parallel thread pool, `.on(topic)` makes it data-triggered, `.async_io()` puts it on the async pool. A node with none of these stays on the main loop.
+
+Order is explicit — no runtime profiling needed. Note that reproducible ordering *across runs* still requires `.deterministic(true)` (see Level 4), since `.rate()`, `.compute()`, `.on()` and `.async_io()` each hand the node to an executor thread.
+
+Failure handling is not derived from order or execution class — there is no default policy. Opt in per node with `.failure_policy(...)`: `FailurePolicy::Fatal`, `FailurePolicy::restart(3, 50_u64.ms())`, `FailurePolicy::skip(10, 60_u64.secs())`, or `FailurePolicy::Ignore`.
 
 ### Level 3: Determinism + Safety
 
@@ -81,93 +87,96 @@ Use builder methods to enable safety monitoring:
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .safety_monitor(true)
-    .watchdog(Duration::from_millis(100))
-    .memory_locked(true);
+    .watchdog(500_u64.ms())
+    .prefer_rt();
 ```
 
 **Adds:**
-- Watchdog timers (100ms timeout)
-- WCET enforcement
-- Deadline monitoring
-- Memory locking (mlockall)
-- Real-time scheduling class (SCHED_FIFO)
-- Safety monitor with zero tolerance for deadline misses
+- Watchdog timers (500ms timeout for frozen nodes)
+- Graduated degradation when the watchdog trips (warn → reduce rate → isolate → safe state)
+- Memory locking (mlockall) and the real-time scheduling class (SCHED_FIFO) — these come from `.prefer_rt()`, which warns and degrades gracefully if the system lacks RT capabilities. Use `.require_rt()` instead to panic loudly.
+
+Setting `.watchdog(...)` auto-creates a safety monitor that watches all registered nodes. Budget enforcement and deadline monitoring are always active for nodes that have `.rate()` set — no flag needed.
 
 ### Level 4: Full Deterministic Mode
 
-Use the `.deterministic(seed)` builder method for full reproducibility with virtual time:
+Use the `.deterministic(true)` builder method to force sequential main-thread execution with a virtual `SimClock`:
 
 ```rust,ignore
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .deterministic(42)
-    .with_blackbox(100);
+    .deterministic(true)
+    .blackbox(100);
 ```
 
 **Adds:**
-- Virtual time (deterministic clock instead of wall clock)
-- Seeded RNG (all randomness derived from seed 42)
-- Execution tracing via the built-in recording system
+- Virtual time (a `SimClock` replaces the wall clock)
+- Deterministic per-tick RNG via `horus::rng(|r| ...)` — the seed is derived from the tick number plus the node name (`tick_number * 0x517cc1b727220a95 + hash(node_name)`), so the same tick on the same node always produces the same sequence. There is no user-supplied seed.
+- Execution tracing — opt in separately with `.with_recording()`
 - BlackBox flight recorder (100MB)
-- Static execution order (no per-node rates)
+- Static execution order — all nodes stay on the main thread, no executor threads are spawned
 
-The deterministic config is managed internally — the scheduler creates the virtual clock and trace infrastructure automatically.
+`.deterministic(true)` installs the virtual `SimClock` and forces sequential main-thread execution. Recording is separate: chain `.with_recording()` if you want a replayable trace.
 
-## WCET Monitoring
+## Tick Budget Monitoring
 
-HORUS tracks Worst-Case Execution Time through the real-time node system. When a node's tick exceeds its WCET budget, a `WCETViolation` is recorded:
+HORUS tracks per-node tick execution time. When a node's tick exceeds its budget, a `BudgetViolation` is recorded and surfaced via `RtStats::budget_violations()`. Budgets are auto-derived as 80% of the period from `.rate()` (and deadlines as 95% of the period), or set explicitly:
 
 ```rust,ignore
 use horus::prelude::*;
+use horus::scheduling::BudgetPolicy;
 
-// Set WCET budget when adding an RT node
 let mut scheduler = Scheduler::new()
-    .safety_monitor(true);
+    .watchdog(500_u64.ms());
 
 scheduler.add(motor_controller)
     .order(0)
-    .rt()
-    .wcet_us(500)      // 500μs max execution time
-    .deadline_us(1000)  // 1ms deadline
+    .rate(1000_u64.hz())
+    .budget(500_u64.us())      // 500μs max execution time
+    .deadline(900_u64.us())    // 900μs deadline
+    .budget_policy(BudgetPolicy::EmergencyStop)
     .done();
 
 scheduler.run()?;
 ```
 
-When a WCET budget is exceeded, the node's `on_wcet_violation` callback is invoked. For critical nodes, this triggers an emergency stop. For non-critical nodes, the violation is logged and recorded in the [BlackBox](/advanced/blackbox).
+A node does not implement a violation callback — overruns are handled by the scheduler according to the node's `.budget_policy()`:
 
-RT nodes can handle violations in their implementation:
+| Policy | Behaviour |
+|--------|-----------|
+| `BudgetPolicy::Warn` | Default. The violation is logged and recorded in the [BlackBox](/advanced/blackbox); no corrective action. |
+| `BudgetPolicy::Enforce` | Stops the node once a tick exceeds **twice** its budget. The 2x threshold is deliberate hysteresis — an occasional 1.0–2.0x tick under RT jitter is normal, a sustained 2x overrun is not. The node gets `shutdown()` and is permanently removed. |
+| `BudgetPolicy::EmergencyStop` | Triggers an emergency stop on any budget violation. Use for critical nodes. |
+
+`BudgetPolicy` is not in `horus::prelude` — import it with `use horus::scheduling::BudgetPolicy;`.
+
+A node becomes real-time by builder configuration, not by implementing a different trait — `.rate()`, `.budget()` or `.deadline()` make a node RT. There is a single node trait, `Node`, whose tick method is `fn tick(&mut self)`:
 
 ```rust,ignore
-// Inside an RtNode implementation
-fn tick_rt(&mut self) -> Result<()> {
-    // ... your time-critical logic ...
-    Ok(())
-}
-
-fn on_wcet_violation(&mut self, violation: &WCETViolation) {
-    eprintln!("WCET violation: budget exceeded by {:?}", violation.overrun);
+impl Node for MotorController {
+    fn tick(&mut self) {
+        // ... your time-critical logic ...
+    }
 }
 ```
 
 ## Deterministic vs Non-Deterministic
 
-**Default (Sequential, Deterministic):**
+**`.deterministic(true)` (sequential, main thread only):**
 ```
 Run 1: Node A → Node B → Node C
 Run 2: Node A → Node B → Node C  (identical)
 Run 3: Node A → Node B → Node C  (identical)
 ```
 
-**Parallel Mode (Non-Deterministic):**
+**Default (nodes dispatched to executor threads by class):**
 ```
 Run 1: Node A → Node B → Node C
 Run 2: Node B → Node A → Node C  (thread scheduling varies)
 ```
 
-| Metric | Sequential (Deterministic) | Parallel |
+| Metric | `.deterministic(true)` | Default (executors) |
 |--------|---------------------------|----------|
 | Consistency | Perfect | Variable |
 | Multi-core | No | Yes |
@@ -224,10 +233,10 @@ impl Node for SensorNode {
 | Use Case | Config |
 |----------|--------|
 | General robotics | `Scheduler::new()` |
-| Unit testing / debugging | `Scheduler::new()` |
-| Performance + deterministic | `.tier(NodeTier::*)` |
-| Medical / surgical robots | `Scheduler::new().safety_monitor(true)` |
-| Formal verification | `Scheduler::new().deterministic(42)` |
+| Unit testing / debugging | `Scheduler::new().deterministic(true)` |
+| Performance + deterministic | `.order(n)` + an execution class per node |
+| Medical / surgical robots | `Scheduler::new().watchdog(500_u64.ms()).prefer_rt()` |
+| Formal verification | `Scheduler::new().deterministic(true)` |
 | Max throughput (non-deterministic) | `Scheduler::new()` + `.compute()` per node |
 
 ## Next Steps

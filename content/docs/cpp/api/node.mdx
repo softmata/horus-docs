@@ -55,7 +55,7 @@ Every component in a HORUS system -- sensor drivers, controllers, planners, logg
 
 ## Lifecycle
 
-The scheduler manages the node lifecycle in a strict order, regardless of which node style you use:
+The scheduler manages the node lifecycle in a strict order:
 
 ```
 Construction --> Registration --> Init --> Tick Loop --> Shutdown
@@ -68,7 +68,9 @@ Construction --> Registration --> Init --> Tick Loop --> Shutdown
 4. **Tick Loop** -- Each cycle: feed watchdog, call `tick()`, measure timing, check budget/deadline
 5. **Shutdown** -- On Ctrl+C, SIGTERM, or `sched.stop()`: `on_shutdown()` called on each node
 
-If `tick()` throws an exception, HORUS catches it (`catch_unwind` equivalent via the FFI boundary). The node is marked unhealthy but the scheduler continues running other nodes.
+**Exception -- `LambdaNode`:** its `on_init` callback runs immediately inside `sched.add(node)`, not at first `spin()`. `LambdaNode` also has no safe-state or shutdown hook -- `Scheduler::add(LambdaNode&)` wires only `tick`. Use a `horus::Node` subclass or `NodeBuilder::init()`/`.safe_state()`/`.shutdown()` if you need scheduler-driven lifecycle callbacks.
+
+`tick()` must not let an exception escape. C++ exceptions cannot unwind through the `extern "C"` FFI boundary -- doing so is undefined behaviour. Catch everything inside `tick()`. (The runtime's `catch_unwind` guard covers Rust panics only; a node that trips it is marked failed and its later ticks are skipped while other nodes keep running.)
 
 ---
 
@@ -107,7 +109,7 @@ public:
     void enter_safe_state() override {
         // Called by watchdog on timeout -- publish emergency alert
         auto alert = alert_pub_->loan();
-        alert->level = 3;  // CRITICAL
+        alert->level = 3;  // FATAL
         alert_pub_->publish(std::move(alert));
     }
 
@@ -188,13 +190,13 @@ sched.add("reactive_driver")
     .build();
 ```
 
-Lambda nodes capture topics from the enclosing scope by reference. Topics must outlive the scheduler. Since topics are created on the scheduler, this is guaranteed.
+Lambda nodes capture topics from the enclosing scope by reference, so the topic objects must outlive `sched.spin()`. `sched.advertise()`/`sched.subscribe()` return owning RAII handles **by value** -- the scheduler does not keep them alive. Declare them in the same scope as the `Scheduler` (or at a longer-lived scope); if the handle is destroyed the captured reference dangles.
 
 ---
 
 ## Style 3: LambdaNode (Declarative Builder)
 
-`LambdaNode` combines topic declaration and callbacks in a single builder chain. It is the C++ equivalent of Python's `horus.Node(name, pubs, subs, tick)`:
+`LambdaNode` combines topic declaration and callbacks in a single builder chain. It is the C++ equivalent of Python's `horus.Node(name=..., tick=..., pubs=[...], subs=[...])`:
 
 ```cpp
 auto controller = horus::LambdaNode("controller")
@@ -260,32 +262,36 @@ auto node = horus::LambdaNode("nav")
 // node.subscriptions() -> ["odom"]
 ```
 
-The scheduler uses these lists for the topic graph, `horus monitor`, and BlackBox flight recorder.
+These lists are local bookkeeping for your own monitoring and debugging code -- the scheduler does not read them. The topic graph shown by `horus monitor` and recorded by the BlackBox flight recorder comes from the runtime topic registry, which each node populates lazily on its first send/recv of a topic.
 
 ---
 
 ## Panic Safety and Error Handling
 
-HORUS wraps every `tick()` call at the FFI boundary. If a C++ node throws an unhandled exception:
+C++ exceptions **cannot** cross the FFI boundary. Your `tick` callback is invoked through an `extern "C"` function pointer; if an exception unwinds out of it, behaviour is undefined (the process typically aborts). You **must** catch every exception inside `tick()`.
 
-1. The exception is caught at the FFI boundary (equivalent to Rust's `catch_unwind`)
-2. The node is marked as **unhealthy**
+The `std::panic::catch_unwind` in the runtime's node wrapper protects only against *Rust* panics originating below the boundary -- it does not and cannot catch a C++ exception. When a Rust panic is caught:
+
+1. The panic is logged and the node is marked as **failed**
+2. Subsequent ticks on that node become no-ops
 3. Other nodes continue running normally
-4. The watchdog may call `enter_safe_state()` depending on configuration
 
-This means a bug in one node does not crash the entire system:
+So the isolation you want for your own code has to be written by you:
 
 ```cpp
 void tick() override {
     auto scan = scan_sub_->recv();
     if (!scan) return;
 
-    // If this throws, the node is isolated -- other nodes keep running
-    process_scan(*scan);
+    try {
+        process_scan(*scan);
+    } catch (const std::exception& e) {
+        printf("[%s] scan processing failed: %s\n", name().c_str(), e.what());
+    }
 }
 ```
 
-Best practice: handle errors locally within `tick()` rather than letting exceptions propagate.
+Requirement, not a suggestion: handle errors locally within `tick()`. Never let an exception propagate out of a node callback.
 
 ---
 

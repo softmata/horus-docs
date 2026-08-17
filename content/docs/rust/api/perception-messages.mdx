@@ -86,14 +86,21 @@ println!("Field: {}, size: {} bytes", intensity.name_str(), intensity.field_size
 
 ## Pod Point Types (Zero-Copy)
 
-Fixed-size point types suitable for zero-copy shared memory transport via `PodTopic`.
+Fixed-size element types used inside `PointCloud` buffers for zero-copy shared memory
+transport. There is no separate POD topic type — IPC always goes through `Topic<T>`,
+and POD-ness is a property of the message type itself.
+
+The extension methods shown below (`distance`, `distance_to`, `from_xyz`, `rgb_packed`,
+`xyz`) come from the `PointXYZExt` / `PointXYZRGBExt` / `PointXYZIExt` traits, which are
+not in the prelude — import the trait you need explicitly, as each example shows.
 
 ### PointXYZ
 
-Basic 3D point (12 bytes, `#[repr(C, packed)]`).
+Basic 3D point (12 bytes, `#[repr(C)]`).
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::types::point::PointXYZExt;
 
 let point = PointXYZ::new(1.0, 2.0, 3.0);
 
@@ -115,6 +122,7 @@ println!("Distance between: {:.2}m", point.distance_to(&other));
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::types::point::PointXYZRGBExt;
 
 let point = PointXYZRGB::new(1.0, 2.0, 3.0, 255, 0, 0); // Red point
 
@@ -141,6 +149,7 @@ let xyz_only = point.xyz();
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::types::point::PointXYZIExt;
 
 let point = PointXYZI::new(1.0, 2.0, 3.0, 128.0);
 
@@ -154,33 +163,37 @@ let with_intensity = PointXYZI::from_xyz(xyz);
 | `x`, `y`, `z` | `f32` | Coordinates (meters) |
 | `intensity` | `f32` | Reflectance (typically 0-255) |
 
-### PointCloudHeader
+### Transmitting Point Clouds
 
-Header for array transmission of point clouds (64 bytes, `#[repr(C)]`). Sent before the point data array via IPC.
+There is no separate point-cloud header type. Framing metadata (frame id, timestamp,
+point count, fields per point) lives on [`PointCloud`](#pointcloud) itself, which is what
+you send over a topic. Build one from coordinate arrays with the `from_xyz()` /
+`from_xyzi()` / `from_xyzrgb()` constructors:
 
 ```rust
 use horus::prelude::*;
 
-// Create header for different point types
-let header = PointCloudHeader::xyz(10000)
-    .with_frame_id("lidar_front")
-    .with_timestamp(timestamp_ns);
+// Plain XYZ cloud
+let points = vec![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]];
+let mut cloud = PointCloud::from_xyz(&points)?;
+cloud.set_frame_id("lidar_front").set_timestamp_ns(1234567890);
 
-// Or for colored points
-let header = PointCloudHeader::xyzrgb(5000);
+println!("Points: {}, bytes: {}", cloud.point_count(), cloud.data().len());
 
-// Calculate total data size
-println!("Data size: {} bytes", header.data_size());
+// LiDAR returns: [x, y, z, intensity]
+let returns = vec![[1.0f32, 2.0, 3.0, 0.8]];
+let intensity_cloud = PointCloud::from_xyzi(&returns)?;
+
+// Colored points: [x, y, z, r, g, b]
+let colored = vec![[1.0f32, 2.0, 3.0, 255.0, 0.0, 0.0]];
+let rgb_cloud = PointCloud::from_xyzrgb(&colored)?;
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `num_points` | `u64` | Number of points |
-| `point_type` | `u32` | 0=XYZ, 1=XYZRGB, 2=XYZI |
-| `point_stride` | `u32` | Bytes per point |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
-| `seq` | `u64` | Sequence number |
-| `frame_id` | `[u8; 32]` | Sensor/coordinate frame |
+| Constructor | Fields per point | Element layout |
+|-------------|------------------|----------------|
+| `PointCloud::from_xyz(&[[f32; 3]])` | 3 | `[x, y, z]` |
+| `PointCloud::from_xyzi(&[[f32; 4]])` | 4 | `[x, y, z, intensity]` |
+| `PointCloud::from_xyzrgb(&[[f32; 6]])` | 6 | `[x, y, z, r, g, b]` |
 
 ## DepthImage
 
@@ -204,16 +217,17 @@ if let Some(d) = depth.get_depth(320, 240) {
 }
 
 // Set depth at pixel (value in meters)
-depth.set_depth(100, 100, 1.5);
+depth.set_depth(100, 100, 1.5)?;
 
 // Get raw U16 value for millimeter-format images
 if let Some(mm) = depth_u16.get_depth_u16(320, 240) {
     println!("Raw depth: {}mm", mm);
 }
 
-// Get statistics (min, max, mean in meters)
-let (min, max, mean) = depth.depth_statistics();
-println!("Depth range: {:.2}-{:.2}m, mean: {:.2}m", min, max, mean);
+// Get statistics (min, max, mean in meters); None if no valid pixels
+if let Some((min, max, mean)) = depth.depth_statistics() {
+    println!("Depth range: {:.2}-{:.2}m, mean: {:.2}m", min, max, mean);
+}
 
 // Zero-copy data access
 let data: &[u8] = depth.data();
@@ -230,9 +244,9 @@ DepthImage is an RAII type — fields are private, accessed through methods. Mut
 | `data()` | `&[u8]` | Zero-copy access to raw depth data |
 | `data_mut()` | `&mut [u8]` | Mutable access to depth data |
 | `get_depth(x, y)` | `Option<f32>` | Get depth in meters at pixel |
-| `set_depth(x, y, value)` | `&mut Self` | Set depth in meters at pixel |
+| `set_depth(x, y, value)` | `Result<&mut Self>` | Set depth in meters at pixel; errors for U16 images when the value is outside `u16` millimeter range (> 65.535m at default scale) |
 | `get_depth_u16(x, y)` | `Option<u16>` | Get raw U16 value (millimeter format only) |
-| `depth_statistics()` | `(f32, f32, f32)` | Get (min, max, mean) of valid depths in meters |
+| `depth_statistics()` | `Option<(f32, f32, f32)>` | Get (min, max, mean) of valid depths in meters; `None` if no valid pixels |
 | `width()` | `u32` | Image width in pixels |
 | `height()` | `u32` | Image height in pixels |
 | `set_frame_id(id)` | `&mut Self` | Set camera frame identifier |
@@ -387,7 +401,7 @@ Multi-object tracking result with Kalman filter prediction. Pod type (96 bytes).
 use horus::prelude::*;
 
 // Create tracked object
-let bbox = TrackingBBox::new(100.0, 100.0, 50.0, 50.0);
+let bbox = BoundingBox2D::new(100.0, 100.0, 50.0, 50.0);
 let mut track = TrackedObject::new(1, bbox, 0, 0.95);
 track.set_class_name("person");
 
@@ -398,7 +412,7 @@ track.confirm();                 // Promote to confirmed
 assert!(track.is_confirmed());
 
 // Update with new detection
-track.update(TrackingBBox::new(110.0, 105.0, 50.0, 50.0), 0.93);
+track.update(BoundingBox2D::new(110.0, 105.0, 50.0, 50.0), 0.93);
 println!("Velocity: ({}, {})", track.velocity_x, track.velocity_y);
 println!("Speed: {:.1}", track.speed());
 println!("Heading: {:.2} rad", track.heading());
@@ -413,8 +427,8 @@ println!("Predicted position: ({}, {})",
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `bbox` | `TrackingBBox` | Current bounding box |
-| `predicted_bbox` | `TrackingBBox` | Predicted next position (Kalman) |
+| `bbox` | `BoundingBox2D` | Current bounding box |
+| `predicted_bbox` | `BoundingBox2D` | Predicted next position (Kalman) |
 | `track_id` | `u64` | Persistent tracking ID |
 | `confidence` | `f32` | Detection confidence (0.0-1.0) |
 | `class_id` | `u32` | Class ID |
@@ -426,7 +440,7 @@ println!("Predicted position: ({}, {})",
 | `state` | `u32` | 0=tentative, 1=confirmed, 2=deleted |
 | `class_name` | `[u8; 16]` | Class name (max 15 chars) |
 
-**TrackingBBox fields (16 bytes):**
+**BoundingBox2D fields (16 bytes):**
 
 | Field | Type | Description |
 |-------|------|-------------|

@@ -144,7 +144,7 @@ let topic: Topic<SensorData> = Topic::new("sensors")?;
 **Use case**: All nodes on same machine
 **Pros**: Ultra-fast, deterministic, zero-copy
 
-For multi-machine communication, HORUS supports zero-configuration peer discovery via mDNS (requires the `mdns` feature flag).
+For multi-machine communication, HORUS supports zero-configuration peer discovery over UDP multicast (group 224.0.69.72, port 9100). Enable it with the `net` feature flag: `horus = { version = "0.2", features = ["net"] }`. Override discovery with `HORUS_NET_MULTICAST`, `HORUS_NET_PORT`, or `HORUS_NET_PEER=ip1,ip2` for direct unicast.
 
 ## API Reference
 
@@ -156,10 +156,10 @@ For multi-machine communication, HORUS supports zero-configuration peer discover
 pub fn send(&self, msg: T)
 ```
 
-Publishes a message to the topic. Infallible — uses "keep last" ring buffer semantics where the oldest message is overwritten when full.
+Publishes a message to the topic. Fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (1 publisher, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead. Use `try_send()` to detect the drop, or `send_blocking(msg, timeout)` for guaranteed delivery on critical topics.
 
 ```rust
-// send() always succeeds — no error handling needed
+// send() returns no Result — but the message can still be dropped
 topic.send(data);
 ```
 
@@ -183,7 +183,7 @@ if let Some(data) = topic.recv() {
 pub fn try_send(&self, msg: T) -> Result<(), T>
 ```
 
-Attempts to send a message, returning it on failure. Unlike `send()` which silently handles errors, `try_send()` gives you explicit control over failure cases.
+Attempts to send a message, returning it on failure. Unlike `send()`, which silently drops the message after a brief retry, `try_send()` gives you explicit control over failure cases.
 
 ```rust
 match topic.try_send(data) {
@@ -198,7 +198,7 @@ match topic.try_send(data) {
 pub fn try_recv(&self) -> Option<T>
 ```
 
-Attempts to receive a message. Functionally identical to `recv()` for most use cases — both are non-blocking and return `Option<T>`.
+Low-level receive that bypasses the logging and recording hooks. Marked `#[doc(hidden)]` — intended for internal and test use. Prefer `recv()`, which also takes the same-instance fast path and participates in runtime debug logging.
 
 ### read_latest()
 
@@ -262,15 +262,15 @@ let topic: Topic<f32> = Topic::with_capacity("velocity", 256, None)?;
 
 ## Type-Safe Topic Descriptors
 
-The `topics!` macro defines compile-time topic descriptors that prevent topic name typos and type mismatches across your codebase.
+The `topics!` macro defines compile-time topic descriptors that prevent topic name typos and keep topic names consistent across your codebase.
 
 ### Defining Topics
 
 ```rust
 use horus::prelude::*;
 
-// Define topics with compile-time type checking
-topics! {
+// `topics!` is not in the prelude — invoke it through the re-exported crate
+horus::horus_core::topics! {
     pub CMD_VEL: CmdVel = "cmd_vel",
     pub SENSOR_DATA: SensorReading = "sensor.data",
     pub MOTOR_STATUS: MotorState = "motor.status",
@@ -280,11 +280,11 @@ topics! {
 ### Using Descriptors
 
 ```rust
-// Publisher — type is enforced at compile time
+// Publisher — the descriptor supplies the name; the message type is chosen here
 let pub_topic: Topic<CmdVel> = Topic::new(CMD_VEL.name())?;
 pub_topic.send(CmdVel::new(1.0, 0.5));
 
-// Subscriber — same type enforced
+// Subscriber — the descriptor supplies the name; the message type is chosen here
 let sub_topic: Topic<CmdVel> = Topic::new(CMD_VEL.name())?;
 if let Some(cmd) = sub_topic.recv() {
     // cmd is guaranteed to be CmdVel
@@ -293,8 +293,10 @@ if let Some(cmd) = sub_topic.recv() {
 
 This prevents common errors like:
 - Typos in topic names (caught at compile time)
-- Type mismatches between publishers and subscribers
+- Inconsistent topic names between publisher and subscriber
 - Inconsistent topic names across modules
+
+The declared message type in `topics!` is documentation only — `TopicDescriptor<T>` carries `T` as `PhantomData` and `name()` returns a plain `&'static str`, so each call site still picks its own `Topic<T>`.
 
 ## Communication Patterns
 
@@ -398,14 +400,14 @@ struct Agent2 {
 let topic = Topic::new("sensors.lidar");
 let topic = Topic::new("robot.cmd_vel");
 
-// WRONG - Do NOT use slashes
-let topic = Topic::new("sensors/lidar");   // Will cause errors!
-let topic = Topic::new("robot/cmd_vel");   // Will cause errors!
+// DISCOURAGED - slashes work, but break the convention
+let topic = Topic::new("sensors/lidar");   // Discouraged — works, but breaks the dot convention
+let topic = Topic::new("robot/cmd_vel");   // Discouraged — works, but breaks the dot convention
 ```
 
 **Why dots instead of slashes?**
 
-Slashes in topic names cause errors because they conflict with the underlying storage format. Always use dots.
+Dots are the HORUS convention; slashes are accepted but produce nested directories under `/dev/shm/horus_<ns>/topics/`. A *leading* slash (ROS-style `/sensor/lidar`) is rejected as an absolute path.
 
 **Coming from ROS?**
 
@@ -431,18 +433,17 @@ let topic = Topic::new("diagnostics.cpu");   // Categorized
 
 Avoid using these patterns:
 - Topics starting with `_` (internal use)
-- Topics containing `/` (causes file path errors)
-- Topics containing `/dev/` (conflicts with paths)
+- Topic names beginning with `/` (rejected as an absolute path)
 - Topics with special characters: `!@#$%^&*()`
 
 ## Error Handling
 
 ### Send Behavior
 
-`send()` is infallible — it uses ring buffer "keep last" semantics. When the buffer is full, the oldest message is overwritten:
+`send()` is fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (1 publisher, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead.
 
 ```rust
-// send() always succeeds — no error handling needed
+// send() returns no Result — but the message can still be dropped
 topic.send(data);
 ```
 
@@ -623,8 +624,10 @@ By default, `Topic::new()` auto-sizes capacity based on message type size:
 | `f32` (4 bytes) | 1024 slots | ~73 KB |
 | `CmdVel` (16 bytes) | 256 slots | ~19 KB |
 | `Pose2D` (32 bytes) | 128 slots | ~10 KB |
-| `Twist` (56 bytes) | 73 slots | ~6 KB |
-| `Imu` (~300 bytes) | 16 slots | ~129 KB |
+| `Twist` (56 bytes) | 128 slots | ~10 KB |
+| `Imu` (304 bytes) | 16 slots | ~5.5 KB |
+
+Auto capacity is always clamped to `[16, 1024]` and rounded up to the next power of two — so it is never an odd number like 73. Slot size tracks the message size for simple fixed-size types; only non-POD (heap-owning) types fall back to the 8 KB default slot.
 
 For most robotics applications, memory usage per topic is under 1 MB.
 
@@ -674,14 +677,9 @@ let sub_topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 
 ### Latency by Message Size (cross-process)
 
-| Message Type | Size | Latency |
-|--------------|------|---------|
-| CmdVel | 16B | ~167ns |
-| IMU | 304B | ~940ns |
-| LaserScan | 1.5KB | ~2.2µs |
-| PointCloud | 120KB | ~360µs |
+The only per-message-type figure HORUS publishes is `CmdVel` (16B): **~20ns median / ~29ns p99** intra-process. Cross-process latency is measured per backend rather than per message type — SpmcShm is ~198ns p50 (1 publisher / 2 subscribers) rising to ~276ns p50 (1 publisher / 8 subscribers), against a raw shared-memory atomic floor of ~167ns.
 
-Latency scales linearly with message size.
+Latency scales linearly with message size, with one exception: `Image`, `PointCloud`, `DepthImage`, `OccupancyGrid` and `CostMap` are pool-backed — only a small descriptor (~288-336 bytes) crosses the ring, so their latency is independent of payload size.
 
 ### Throughput
 
@@ -710,13 +708,13 @@ fn tick(&mut self) {
 
 **Use topics! macro** for shared topic definitions across modules:
 ```rust
-topics! {
+horus::horus_core::topics! {
     pub CMD_VEL: CmdVel = "cmd_vel",
     pub ODOM: Odometry = "odom",
 }
 ```
 
-**send() is infallible** — no error handling needed:
+**send() returns no `Result`** — but delivery is not guaranteed, so reach for `try_send()` or `send_blocking()` on critical topics:
 ```rust
 self.pub_topic.send(data);
 ```

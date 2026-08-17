@@ -56,7 +56,7 @@ The quaternion convention is Hamilton (scalar-last): `qx, qy, qz` are the imagin
 horus::TransformFrame tf;
 ```
 
-Creates a frame tree with default capacity. Suitable for most robots.
+Creates a frame tree with default capacity. Suitable for most robots. The default constructor starts at 256 frames and auto-grows on demand up to a hard ceiling of 1024 frames.
 
 ### With Capacity
 
@@ -64,7 +64,7 @@ Creates a frame tree with default capacity. Suitable for most robots.
 horus::TransformFrame tf(size_t max_frames);
 ```
 
-Pre-allocates storage for `max_frames` frames. Use when you know the frame count ahead of time to avoid reallocation.
+`max_frames` is a hard cap, not just a pre-allocation hint: auto-growth is disabled, so registering frame number `max_frames + 1` fails and `register_frame()` returns `-1`. Use when you know the frame count ahead of time and want predictable memory usage.
 
 ```cpp
 // Robot with 20 joints + 5 sensors + world + base = 27 frames
@@ -90,11 +90,11 @@ Adds a frame to the tree under the specified parent.
 | `name` | `const char*` | Unique name for this frame (e.g., `"base_link"`, `"camera_optical"`). |
 | `parent` | `const char*` | Parent frame name, or `nullptr`/`""` for a root frame. |
 
-**Returns** the frame ID (non-negative) on success, or `-1` on error (duplicate name, parent not found).
+**Returns** the frame ID (non-negative) on success, or `-1` on error (duplicate name, parent not found, capacity exhausted).
 
 **Rules**:
-- The first frame registered with no parent becomes the root.
-- Every subsequent frame must have a parent that already exists in the tree.
+- Any frame registered with `nullptr`/`""` as parent becomes a root. Multiple roots are allowed, but frames in different roots are not connected -- `lookup()` between them returns `std::nullopt`.
+- A frame registered with a named parent requires that parent to already exist, otherwise `register_frame()` returns `-1`.
 - Frame names must be unique within the tree.
 
 ```cpp
@@ -159,7 +159,7 @@ Computes the transform that converts a point in the `source` frame to the `targe
 | `source` | `const char*` | Frame to transform from. |
 | `target` | `const char*` | Frame to transform to. |
 
-**Returns** `std::optional<Transform>` -- the transform if a path exists, `std::nullopt` if either frame is unknown or they are in disconnected subtrees.
+**Returns** `std::optional<Transform>` -- the transform if it can be resolved, `std::nullopt` if either frame is unknown, if they are in disconnected subtrees, or if any frame on the path between them has not been `update()`d yet.
 
 ```cpp
 auto result = tf.lookup("camera", "world");
@@ -192,9 +192,11 @@ Returns `true` if a path exists between the two frames in the tree. Use this to 
 ```cpp
 if (tf.can_transform("lidar", "base_link")) {
     auto t = tf.lookup("lidar", "base_link");
-    // guaranteed to succeed
+    if (t) { /* use *t */ }
 }
 ```
+
+`can_transform()` checks only that a path exists in the tree. It does not check that data has arrived -- `lookup()` still returns `std::nullopt` if any dynamic frame on the path has never been `update()`d. Always check the optional.
 
 ---
 
@@ -280,9 +282,13 @@ struct SensorFusion {
         uint64_t now = get_monotonic_ns();
         tf.update("odom", {odom_x, odom_y, 0}, {0, 0, odom_qz, odom_qw}, now);
 
+        // base_link must have data too, or the lidar -> world chain
+        // resolves to std::nullopt
+        tf.update("base_link", {0.0, 0.0, 0.0}, {0, 0, 0, 1}, now);
+
         // Fuse lidar points into world frame
-        if (tf.can_transform("lidar", "world")) {
-            auto t = tf.lookup("lidar", "world");
+        auto t = tf.lookup("lidar", "world");
+        if (t) {
             // t->translation = lidar position in world coordinates
         }
     }

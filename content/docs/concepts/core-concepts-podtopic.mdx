@@ -15,7 +15,7 @@ You don't need a separate API. The same `Topic::new()` call automatically select
 At topic creation time, HORUS checks whether your type is POD:
 
 - **No destructor** — The type has no `Drop` impl (no heap pointers like `String`, `Vec`, `Box`)
-- **Non-zero size** — Not a zero-sized type
+- **Larger than one byte** — `size_of::<T>() > 1`. This excludes zero-sized types and single-byte types such as `bool` and single-byte enums, which have validity invariants that make raw shared-memory bytes unsafe to reinterpret.
 
 If both are true, HORUS uses the zero-copy memcpy path. If not, it falls back to bincode serialization. This happens transparently — you always use the same `Topic<T>` API:
 
@@ -40,11 +40,11 @@ POD detection affects cross-process performance:
 | POD (e.g. `CmdVel`, `Imu`) | ~50-85ns | Zero-serialization, raw memory copy |
 | Non-POD (e.g. `String`, `Vec`) | ~167ns | Bincode serialization |
 
-Same-process communication is fast for both POD and non-POD types since no shared memory serialization is needed.
+A single `Topic` instance that both sends and receives (`role = Both`) uses an in-process fast path that skips shared memory entirely. Communication between two separate `Topic` instances — even inside the same process — still goes through the shared-memory ring, so the POD/non-POD difference applies there too.
 
 ## Built-in POD Messages
 
-All standard HORUS message types implement `PodMessage` and automatically use the fast path:
+Most standard HORUS message types implement `PodMessage` and automatically use the fast path:
 
 ### Geometry
 
@@ -65,7 +65,7 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 | `Imu` | Inertial measurement unit data |
 | `LaserScan` | 2D laser range data |
 | `Odometry` | Position/velocity estimate |
-| `Range` | Single distance measurement |
+| `RangeSensor` | Single distance measurement |
 | `BatteryState` | Battery level and status |
 | `NavSatFix` | GPS position |
 
@@ -77,8 +77,6 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 | `DifferentialDriveCommand` | Differential drive control |
 | `ServoCommand` | Servo position/velocity |
 | `JointCommand` | Joint-level control |
-| `PwmCommand` | PWM signal output |
-| `StepperCommand` | Stepper motor control |
 | `TrajectoryPoint` | Trajectory waypoint |
 | `PidConfig` | PID controller parameters |
 
@@ -88,7 +86,7 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 |---------|-------------|
 | `Heartbeat` | Liveness signal |
 | `NodeHeartbeat` | Per-node health status |
-| `Status` | General status report |
+| `DiagnosticStatus` | General status report |
 | `EmergencyStop` | Emergency stop signal |
 | `SafetyStatus` | Safety system state |
 | `ResourceUsage` | CPU/memory usage |
@@ -99,10 +97,10 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 
 | Message | Description |
 |---------|-------------|
-| `Goal` | Navigation goal |
+| `NavGoal` | Navigation goal |
 | `GoalResult` | Goal completion result |
 | `Waypoint` | Navigation waypoint |
-| `Path` | Sequence of waypoints |
+| `NavPath` | Sequence of waypoints |
 | `PathPlan` | Planned path |
 | `VelocityObstacle` | Velocity obstacle for avoidance |
 | `VelocityObstacles` | Set of velocity obstacles |
@@ -113,7 +111,6 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 |---------|-------------|
 | `WrenchStamped` | Force/torque measurement |
 | `ForceCommand` | Force control command |
-| `TactileArray` | Tactile sensor array |
 | `ImpedanceParameters` | Impedance control config |
 | `ContactInfo` | Contact detection data |
 | `HapticFeedback` | Haptic output command |
@@ -129,12 +126,12 @@ All standard HORUS message types implement `PodMessage` and automatically use th
 
 | Message | Description |
 |---------|-------------|
-| `HorusTensor` | Fixed-size tensor descriptor |
+| `Tensor` | Fixed-size tensor descriptor |
 
 ```rust
 use horus::prelude::*;
 
-// All built-in messages are POD — fast path is automatic
+// These built-in messages are POD — fast path is automatic
 let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;
 let pose: Topic<Pose2D> = Topic::new("robot_pose")?;
 let imu: Topic<Imu> = Topic::new("imu_data")?;
@@ -143,7 +140,7 @@ let estop: Topic<EmergencyStop> = Topic::new("emergency_stop")?;
 
 ## Custom POD Messages
 
-To make your own types use the fast path, implement the `PodMessage` trait:
+Any `#[repr(C)]` type with no `Drop` impl and a size greater than one byte already takes the fast path automatically — no trait needed. Implementing `PodMessage` is optional: it adds bytemuck-backed layout guarantees plus the `as_bytes()`, `from_bytes()` and `zeroed()` helpers, and is the right choice for types whose validity invariants auto-detection cannot see (enums with limited discriminants, `NonZeroU32`). Most users should reach for the `message!` macro instead of implementing it by hand.
 
 ### Requirements
 
@@ -156,6 +153,7 @@ To make your own types use the fast path, implement the `PodMessage` trait:
 
 ```rust
 use horus::prelude::*;
+use horus::communication::PodMessage;
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -192,7 +190,8 @@ feedback.send(MotorFeedback {
 
 The `PodMessage` trait is `unsafe` because incorrect implementations can cause data corruption. Ensure:
 
-- **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`, `bool`) and fixed-size arrays of primitives
+- **No pointers or references** — Only use primitive types (`u8`..`u64`, `f32`, `f64`) and fixed-size arrays of primitives
+- **No `bool`** — Use `u8` (0/1) instead. `bool` has a validity invariant (only 0 and 1 are valid bit patterns), so reading arbitrary shared-memory bytes into a `bool` is UB. All built-in HORUS POD messages use `u8` for flags.
 - **No enums with discriminants** — Unless `#[repr(C)]` or `#[repr(u8)]` with explicit values
 - **Consistent layout** — The struct must have the same binary layout on all target platforms
 - **No implicit padding** — Use explicit padding fields (`_pad: [u8; N]`) if needed

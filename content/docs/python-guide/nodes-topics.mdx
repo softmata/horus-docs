@@ -6,7 +6,7 @@ order: 2
 
 # Nodes & Topics in Python
 
-Python nodes run at full shared-memory speed (~500ns latency) and can communicate seamlessly with Rust nodes on the same topics.
+Python nodes run over the same shared memory as Rust nodes (~1.5μs per message on the typed zero-copy path, ~5–50μs for untyped topics) and can communicate seamlessly with Rust nodes on the same topics.
 
 ## Creating a Node
 
@@ -66,14 +66,17 @@ horus.run(sensor, duration=30)
 from horus import Topic, CmdVel, LaserScan, Image
 
 # Typed topic (validates message types)
-cmd = Topic("cmd_vel", CmdVel)
+cmd = Topic(CmdVel)
 
 # Untyped topic (accepts any serializable data)
 data = Topic("raw_data")
 
 # Large data types use zero-copy automatically
-camera = Topic("camera/rgb", Image)
+camera = Topic(Image, endpoint="camera.rgb")
 ```
+
+A typed topic takes its name from the type — `CmdVel` → `"cmd_vel"`, `LaserScan` → `"scan"`.
+Pass `endpoint="my_name"` to override it (as `Image` does above, since it has no default name of its own).
 
 The topic name is the connection key. Any node (Python or Rust) publishing to `"cmd_vel"` connects to any subscriber on `"cmd_vel"`.
 
@@ -82,7 +85,7 @@ The topic name is the connection key. Any node (Python or Rust) publishing to `"
 ```python
 from horus import Topic, CmdVel
 
-cmd = Topic("cmd_vel", CmdVel)
+cmd = Topic(CmdVel)
 
 # Send a typed message
 cmd.send(CmdVel(linear=1.0, angular=0.5))
@@ -97,7 +100,7 @@ def my_tick(node):
 ```python
 from horus import Topic, LaserScan
 
-scan = Topic("scan", LaserScan)
+scan = Topic(LaserScan)
 
 # Get next message (returns None if empty)
 msg = scan.recv()
@@ -147,16 +150,25 @@ pose = Pose2D(x=1.0, y=2.0, theta=0.5)
 Define your own message types with `horus.msggen`:
 
 ```python
-from horus.msggen import define_message
+from horus.msggen import register_message, build_messages
 
-MotorStatus = define_message('MotorStatus', 'motor.status', [
+register_message('MotorStatus', 'motor.status', [
     ('motor_id', 'u32'),
     ('velocity', 'f32'),
     ('temperature', 'f32'),
 ])
 
+build_messages()  # Generates Rust code + runs maturin develop
+```
+
+`register_message()` only queues the definition — `build_messages()` compiles it.
+After the build, the type is importable from `horus` like any built-in:
+
+```python
+from horus import MotorStatus, Topic
+
 status = MotorStatus(motor_id=1, velocity=3.14, temperature=45.0)
-topic = Topic("motor.status")
+topic = Topic(MotorStatus)  # Bound to "motor.status", zero-copy
 topic.send(status)
 ```
 
@@ -169,14 +181,14 @@ Rust and Python nodes share the same shared memory. A topic name connects them a
 use horus::prelude::*;
 
 let topic = Topic::<CmdVel>::new("cmd_vel")?;
-topic.send(CmdVel { linear: 1.0, angular: 0.0 });
+topic.send(CmdVel::new(1.0, 0.0));
 ```
 
 **Python subscriber:**
 ```python
 from horus import Topic, CmdVel
 
-cmd = Topic("cmd_vel", CmdVel)
+cmd = Topic(CmdVel)
 msg = cmd.recv()
 if msg is not None:
     print(f"linear={msg.linear}, angular={msg.angular}")
@@ -188,7 +200,7 @@ Run them together:
 horus run motor_control.rs planner.py logger.py
 ```
 
-All processes communicate through shared memory with sub-microsecond latency.
+All processes communicate through shared memory — sub-microsecond between Rust nodes (198–304ns p50 cross-process), a few microseconds once Python is in the path.
 
 ## Complete Example: Sensor Pipeline
 
@@ -196,8 +208,8 @@ All processes communicate through shared memory with sub-microsecond latency.
 import horus
 from horus import LaserScan, CmdVel, Topic
 
-scan_topic = Topic("scan", LaserScan)
-cmd_topic = Topic("cmd_vel", CmdVel)
+scan_topic = Topic(LaserScan)
+cmd_topic = Topic(CmdVel)
 
 def avoider_tick(node):
     scan = scan_topic.recv()

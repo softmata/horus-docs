@@ -20,32 +20,33 @@ The Scheduler manages the safety monitor internally — you enable it via builde
 
 ## Enabling Safety Monitoring
 
-Use builder methods on `Scheduler::new()` to enable safety monitoring:
+The `.watchdog()` builder method on `Scheduler::new()` is what arms safety monitoring — it registers watchdogs and tick budgets for your nodes:
 
 ```rust
 use horus::prelude::*;
+use std::time::Duration;
 
 // Zero tolerance for deadline misses (surgical / medical)
 let mut scheduler = Scheduler::new()
-    .safety_monitor(true)
     .watchdog(Duration::from_millis(100))
-    .memory_locked(true);
+    .max_deadline_misses(1)
+    .prefer_rt();
 
 // Tolerates a few deadline misses (industrial / CNC)
 let mut scheduler = Scheduler::new()
-    .safety_monitor(true)
     .watchdog(Duration::from_millis(10))
-    .memory_locked(true);
+    .max_deadline_misses(10)
+    .prefer_rt();
 ```
 
 ### Safety Builder Methods
 
 | Method | Description | Example |
 |--------|-------------|---------|
-| `.safety_monitor(true)` | Enable safety monitoring | `.safety_monitor(true)` |
-| `.watchdog(duration)` | Set watchdog timeout | `.watchdog(Duration::from_millis(100))` |
-| `.memory_locked(true)` | Enable `mlockall()` | `.memory_locked(true)` |
-| `.rt_scheduling(true)` | Enable RT scheduling (SCHED_FIFO) | `.rt_scheduling(true)` |
+| `.watchdog(duration)` | Arm the watchdogs and set the default timeout | `.watchdog(Duration::from_millis(100))` |
+| `.max_deadline_misses(n)` | Emergency stop after `n` deadline misses | `.max_deadline_misses(10)` |
+| `.prefer_rt()` | Try `mlockall()` + SCHED_FIFO, warn on failure | `.prefer_rt()` |
+| `.require_rt()` | Require `mlockall()` + SCHED_FIFO; panics if unavailable | `.require_rt()` |
 
 ## Configuring Critical Nodes
 
@@ -56,44 +57,41 @@ use horus::prelude::*;
 use std::time::Duration;
 
 let mut scheduler = Scheduler::new()
-    .safety_monitor(true);
+    .watchdog(Duration::from_millis(100));
 
-// RT node with WCET budget and deadline
+// RT node with WCET budget, deadline and its own watchdog
 scheduler.add(motor_controller)
     .order(0)
-    .rt()
-    .wcet_us(500)       // 500μs max execution time
-    .deadline_us(1000)   // 1ms deadline
-    .done();
+    .rate(1000_u64.hz())      // 1 kHz → RT class
+    .budget(500_u64.us())     // 500μs max execution time
+    .deadline(1000_u64.us())  // 1ms deadline
+    .watchdog(50_u64.ms())    // registers this node as critical
+    .build()?;
 
 scheduler.add(sensor_fusion)
     .order(1)
-    .rt()
-    .wcet_us(2000)
-    .deadline_us(5000)
-    .done();
-
-// Register critical nodes with watchdog timeouts
-scheduler.add_critical_node("motor_controller", Duration::from_millis(50))?;
-scheduler.add_critical_node("sensor_fusion", Duration::from_millis(100))?;
-
-// Set WCET budgets
-scheduler.set_wcet_budget("motor_controller", Duration::from_micros(500))?;
-scheduler.set_wcet_budget("sensor_fusion", Duration::from_micros(2000))?;
+    .rate(200_u64.hz())       // 200 Hz → RT class
+    .budget(2000_u64.us())
+    .deadline(5000_u64.us())
+    .watchdog(100_u64.ms())   // registers this node as critical
+    .build()?;
 
 scheduler.run()?;
 ```
 
 ## Watchdogs
 
-Watchdogs monitor node liveness. The scheduler automatically feeds watchdogs on successful node ticks. If a critical node fails to execute within the watchdog timeout, an emergency stop is triggered.
+Watchdogs monitor node liveness. The scheduler automatically feeds watchdogs on successful node ticks. The response to a missed heartbeat is **graduated** — a single expiry only warns; an emergency stop is triggered for a critical node once it is 3× past its watchdog timeout.
 
 ```
 Normal operation:
   Node tick → success → watchdog fed → timer reset
 
 Failure scenario:
-  Node hangs → watchdog timeout expires → EMERGENCY STOP
+  1× timeout → Warning   (logged, node keeps ticking)
+  2× timeout → Unhealthy (node skipped in the tick loop)
+  3× timeout → Critical  (node isolated + safe state;
+                          EMERGENCY STOP for critical nodes)
 ```
 
 ### Timeout Guidelines
@@ -101,12 +99,13 @@ Failure scenario:
 ```
 Watchdog timeout should be:
   - Longer than expected execution time
-  - Shorter than safety-critical response time
+  - At most one third of the safety-critical response time
+    (emergency stop fires at 3× the configured timeout)
 
 Example:
   Expected tick period:  10ms
   Safety deadline:      100ms
-  Watchdog timeout:      50ms  (5× period)
+  Watchdog timeout:      30ms  (3× period; e-stop at ~90ms)
 ```
 
 ## WCET Enforcement
@@ -116,10 +115,10 @@ Worst-Case Execution Time (WCET) budgets ensure nodes complete within time limit
 ```rust,ignore
 scheduler.add(motor_controller)
     .order(0)
-    .rt()
-    .wcet_us(500)      // 500μs max execution time
-    .deadline_us(1000)  // 1ms deadline
-    .done();
+    .rate(1000_u64.hz())      // 1 kHz → RT class
+    .budget(500_u64.us())     // 500μs max execution time
+    .deadline(1000_u64.us())  // 1ms deadline
+    .build()?;
 ```
 
 For critical nodes, WCET violations trigger an emergency stop. For non-critical nodes, violations are logged and recorded in the [BlackBox](/advanced/blackbox).
@@ -127,7 +126,7 @@ For critical nodes, WCET violations trigger an emergency stop. For non-critical 
 ## Emergency Stop
 
 Emergency stop is triggered automatically by:
-- Critical node watchdog expiration
+- Critical node watchdog reaching 3× its timeout
 - Critical node WCET violation
 - Critical node deadline miss
 - Exceeding the `max_deadline_misses` threshold
@@ -143,13 +142,16 @@ When emergency stop triggers:
 use horus::prelude::*;
 
 let mut scheduler = Scheduler::new()
-    .safety_monitor(true);
+    .watchdog(100_u64.ms())
+    .blackbox(64);   // 64 MB flight recorder — without it there is nothing to inspect
 
 // ... application runs and hits emergency stop ...
 
-// Inspect what happened via BlackBox
-if let Some(bb) = scheduler.blackbox() {
-    let anomalies = bb.anomalies();
+// Inspect what happened via BlackBox.
+// `get_blackbox()` is a `#[doc(hidden)]` internal and returns `None`
+// unless `.blackbox(size_mb)` was set on the builder above.
+if let Some(bb) = scheduler.get_blackbox() {
+    let anomalies = bb.lock().expect("blackbox mutex poisoned").anomalies();
     println!("=== SAFETY EVENTS ({}) ===", anomalies.len());
     for record in &anomalies {
         println!("[tick {}] {:?}", record.tick, record.event);
@@ -165,10 +167,10 @@ Set generous WCET budgets initially, then tighten after profiling:
 
 ```rust,ignore
 // Start: 3× expected execution time
-scheduler.set_wcet_budget("motor", Duration::from_micros(1500))?;
+scheduler.add(motor).budget(1500_u64.us()).build()?;
 
 // After profiling: 2× measured worst case
-scheduler.set_wcet_budget("motor", Duration::from_micros(1000))?;
+scheduler.add(motor).budget(1000_u64.us()).build()?;
 ```
 
 ### 2. Layer Safety Checks
@@ -177,18 +179,21 @@ Use watchdogs (liveness) and WCET budgets (timing) together:
 
 ```rust,ignore
 // Both work together to catch different failure modes
-scheduler.add_critical_node("motor", Duration::from_millis(50))?;  // Liveness
-scheduler.set_wcet_budget("motor", Duration::from_micros(500))?;   // Timing
+scheduler.add(motor)
+    .rate(1000_u64.hz())
+    .watchdog(50_u64.ms())   // Liveness — also registers `motor` as critical
+    .budget(500_u64.us())    // Timing
+    .build()?;
 ```
 
 ### 3. Choose the Right Configuration
 
 | Use Case | Configuration |
 |----------|---------------|
-| Medical / surgical robots | `Scheduler::new().safety_monitor(true)` |
-| Industrial control | `Scheduler::new().safety_monitor(true)` |
-| CNC / aerospace | `Scheduler::new().safety_monitor(true)` |
-| General production | `Scheduler::new()` + per-node `.rt()` / `.compute()` |
+| Medical / surgical robots | `Scheduler::new().watchdog(100_u64.ms()).max_deadline_misses(1).require_rt()` |
+| Industrial control | `Scheduler::new().watchdog(10_u64.ms()).max_deadline_misses(10).prefer_rt()` |
+| CNC / aerospace | `Scheduler::new().watchdog(10_u64.ms()).max_deadline_misses(1).require_rt()` |
+| General production | `Scheduler::new()` + per-node `.rate()` / `.compute()` |
 
 ### 4. Test Emergency Stop
 
@@ -198,15 +203,14 @@ Verify your system handles emergency stop correctly:
 #[test]
 fn test_safety_critical_setup() {
     let mut scheduler = Scheduler::new()
-        .safety_monitor(true);
+        .watchdog(100_u64.ms());
 
     scheduler.add(test_node)
         .order(0)
-        .rt()
-        .wcet_us(100)
-        .done();
-
-    scheduler.add_critical_node("test_node", Duration::from_millis(10))
+        .rate(1000_u64.hz())
+        .budget(100_u64.us())
+        .watchdog(10_u64.ms())   // registers this node as critical
+        .build()
         .expect("should register critical node");
 }
 ```

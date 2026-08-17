@@ -6,14 +6,15 @@ order: 20
 
 # Communication Patterns Overview
 
-HORUS provides two communication primitives that cover all robotics messaging needs:
+HORUS provides three communication primitives that cover all robotics messaging needs:
 
 | Pattern | Purpose | Example |
 |---------|---------|---------|
 | **Topic** | Streaming data (pub/sub) | Sensor readings, motor commands, video frames |
 | **Action** | Long-running tasks (goal/feedback/result) | Navigation, arm motion, calibration |
+| **Service** | Request/response RPC (blocking call) | Query state, trigger a one-shot command, config get/set |
 
-Both work locally (shared memory) and across machines (network transport via configuration).
+Topics and Actions work locally (shared memory) and across machines (network transport via configuration).
 
 ## Topic: Streaming Pub/Sub
 
@@ -49,9 +50,9 @@ The communication path can change at runtime — if a second subscriber joins, H
 
 ### Key Characteristics
 
-- **Infallible send**: `send()` always succeeds. Overwrites oldest message when full ("keep last" semantics).
+- **Non-blocking send**: `send()` returns `()` — it never returns an error. On a full ring it retries briefly (spin + yield) and then drops the **newest** message, preserving the queued oldest ones in FIFO order (drop-newest). Broadcast paths (`PodShm`/fanout) instead overwrite the oldest slot. Use `try_send()` to get the message back on failure, or `send_blocking(msg, timeout)` when loss is unacceptable.
 - **Non-blocking recv**: `recv()` returns `Option<T>`. Returns `None` if no message available.
-- **Zero introspection overhead**: No timing, logging, or tracing in the default path. Opt-in via `with_logging()`.
+- **Zero introspection overhead**: No timing, logging, or tracing in the default path. Content logging is off by default and is toggled by the topic's verbose header flag (`horus_core::communication::set_topic_verbose`), not by a builder method.
 
 For full Topic API details, see [Topic Communication](/concepts/core-concepts-topic).
 
@@ -63,6 +64,7 @@ Actions handle tasks that take time to complete and benefit from progress feedba
 
 ```rust
 use horus::prelude::*;
+use serde::{Serialize, Deserialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, LogSummary)]
 pub struct NavigateGoal {
@@ -119,7 +121,7 @@ let server = ActionServerBuilder::<NavigateToGoal>::new()
             let distance = compute_distance(goal);
             handle.publish_feedback(NavigateFeedback {
                 distance_remaining: distance,
-                progress_percent: (1.0 - distance / initial_distance) * 100.0,
+                progress_percent: ((1.0 - distance / initial_distance) * 100.0) as f32,
             });
 
             if handle.is_cancel_requested() {
@@ -204,9 +206,7 @@ Configure how the server handles new goals while one is active:
 
 ## Network Communication
 
-By default, Topics and Actions use shared memory for ultra-fast communication between processes on the same machine. HORUS also supports zero-configuration peer discovery via mDNS (requires the `mdns` feature flag), allowing robots on the same local network to discover each other automatically.
-
-For multi-machine communication, HORUS supports zero-configuration peer discovery via mDNS (requires the `mdns` feature flag).
+By default, Topics and Actions use shared memory for ultra-fast communication between processes on the same machine. HORUS also supports zero-configuration peer discovery over UDP multicast (group `224.0.69.72`, port `9100`), letting robots on the same local network find each other automatically. Build with `--features net` — LAN replication is opt-in and off by default. Tune it with `[network]` in `horus.toml` or the `HORUS_NET_*` env vars.
 
 ## When to Use What
 
@@ -220,6 +220,7 @@ For multi-machine communication, HORUS supports zero-configuration peer discover
 | Calibration routine | **Action** | Takes time, reports progress |
 | Emergency stop | **Topic** | Must be instantaneous, no handshake |
 | Diagnostics broadcast | **Topic** | Many publishers, flexible topology |
+| Query a parameter / one-shot command | **Service** | Caller needs an answer before continuing |
 
 **Rule of thumb**: If it's a continuous stream of data, use **Topic**. If it's a task you'd want to start, monitor, and potentially cancel, use **Action**.
 
@@ -235,7 +236,7 @@ struct NavigationSystem {
 
     // Topics for publishing commands
     cmd_vel_pub: Topic<Twist>,
-    status_pub: Topic<Status>,
+    status_pub: Topic<DiagnosticStatus>,
 
     // Action server for goal-based navigation
     nav_server: ActionServerNode<NavigateToGoal>,
@@ -247,3 +248,4 @@ The navigation action server subscribes to sensor topics internally, computes a 
 ## Next Steps
 
 - [Topic Details](/concepts/core-concepts-topic) - Full Topic API reference
+- [Services](/concepts/services) - Request/response RPC

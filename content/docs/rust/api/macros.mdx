@@ -24,7 +24,6 @@ Declarative macro for creating HORUS nodes with minimal boilerplate.
 node! {
     NodeName {
         name: "custom_name",  // Custom node name (optional)
-        rate 100.0     // Tick rate in Hz (optional)
         pub { ... }    // Publishers (optional)
         sub { ... }    // Subscribers (optional)
         data { ... }   // Internal state (optional)
@@ -88,7 +87,7 @@ data {
 
 #### `tick` - Main Loop
 
-**Required.** Called every scheduler cycle (~60 Hz by default).
+**Required.** Called every scheduler cycle (100 Hz by default; override with `Scheduler::new().tick_rate(500_u64.hz())` or per-node `.rate(...)`).
 
 ```rust
 tick {
@@ -151,9 +150,10 @@ The macro generates:
 
 1. **`pub struct NodeName`** with `Topic<T>` fields for publishers/subscribers and your data fields
 2. **`impl NodeName { pub fn new() -> Self }`** constructor that creates all Topics
-3. **`impl Node for NodeName`** with `name()`, `tick()`, optional `init()`, `shutdown()`, `publishers()`, `subscribers()`, and `rate_hz()`
-4. **`impl Default for NodeName`** that calls `Self::new()`
-5. **`impl NodeName { ... }`** for any methods from the `impl` section
+3. **`impl Node for NodeName`** with `name()`, `tick()`, and optional `init()` / `shutdown()`
+4. **`impl NodeName`** also gains `publishers()` and `subscribers()` returning `Vec<TopicMetadata>` (inherent methods, not trait methods) when a `pub`/`sub` section is present
+5. **`impl Default for NodeName`** that calls `Self::new()`
+6. **`impl NodeName { ... }`** for any methods from the `impl` section
 
 ```rust
 // This macro call:
@@ -317,10 +317,12 @@ node! {
 
 fn main() -> Result<()> {
     let mut scheduler = Scheduler::new();
-    scheduler.add(MyNode::new()).order(0).done();
+    scheduler.add(MyNode::new()).order(0).rate(100_u64.hz()).done();
     scheduler.run()
 }
 ```
+
+Tick rate is no longer a `node!` section — set it per-node with `.rate(100_u64.hz())` on the scheduler builder (`Frequency`/`DurationExt` are in the prelude).
 
 ---
 
@@ -330,7 +332,7 @@ Derive macro for implementing the `LogSummary` trait with default `Debug` format
 
 ### When to Use
 
-Use `#[derive(LogSummary)]` when you need `Topic::with_logging()` on a custom message type. `LogSummary` is **not** required for basic `Topic::new()` — only for the opt-in introspection mode.
+`LogSummary` produces the one-line summary used by `hlog!` and by verbose content logging. Verbose content logging is toggled per-topic at runtime from the `horus monitor` TUI — it is not enabled from code. `LogSummary` is never required for `Topic::new()`; the only bound `Topic<T>` needs is `Clone + Send + Sync + Serialize + DeserializeOwned` (satisfied by the blanket `TopicMessage` impl).
 
 The derive requires `Debug` on the type since it generates a `Debug`-based implementation.
 
@@ -343,8 +345,7 @@ pub struct MyStatus {
     pub voltage: f32,
 }
 
-// Now you can use with_logging()
-let topic: Topic<MyStatus> = Topic::new("status")?.with_logging();
+let topic: Topic<MyStatus> = Topic::new("status")?;
 ```
 
 The derive generates:
@@ -418,10 +419,16 @@ pub { x: f32 -> "data" }
 
 ```rust
 tick {
-    // send() is infallible — always succeeds
+    // send() returns () — there is no Result to handle.
     self.status.send("ok".to_string());
 
-    // No error handling needed — ring buffer overwrites oldest on full
+    // But send() is not lossless. On a full ring it retries briefly
+    // (immediate, then 64 spins, then 4 yields) and then gives up:
+    //   - point-to-point (1 pub / 1 sub, SpscShm): the NEW message is dropped
+    //     and counted by self.critical.dropped_count()
+    //   - broadcast (1 pub / N subs, Fanout/PodShm): the OLDEST slot is
+    //     overwritten and slow subscribers fast-forward to the newest window
+    // Where loss is unacceptable, use send_blocking(msg, timeout) instead.
     self.critical.send(data);
 }
 ```
@@ -494,7 +501,7 @@ hlog!(warn, "Battery low: {}%", battery_pct);
 hlog!(error, "Failed to read sensor: {}", err);
 ```
 
-Levels: `trace`, `debug`, `info`, `warn`, `error`
+Levels: `debug`, `info`, `warn`, `error`
 
 The scheduler automatically sets the current node context, so log messages include the node name:
 ```

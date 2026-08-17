@@ -17,7 +17,7 @@ horus new <name>           # Create a new project
 horus run [files...]       # Build and run your app
 horus build [files...]     # Build without running
 horus test [filter]        # Run tests
-horus check [path]         # Validate horus.yaml and workspace
+horus check [path]         # Validate horus.toml and workspace
 horus clean                # Clean build artifacts and shared memory
 
 # Monitoring & Debugging
@@ -32,7 +32,8 @@ horus frame <command>         # HORUS Frames (list, echo, tree, info, can, hz)
 
 # Package Management
 horus install <name>       # Install a package, driver, or plugin (smart detection)
-horus remove <name>        # Remove package, driver, or plugin
+horus remove <name>        # Remove a dependency from horus.toml
+horus uninstall <name>     # Uninstall an installed package or plugin
 horus list [query]         # List/search packages
 horus update [package]     # Update packages
 horus publish              # Publish current package to registry
@@ -85,7 +86,7 @@ Options:
 ```bash
 cd ~/my-robot-code
 horus init
-# Creates horus.yaml with project configuration
+# Creates horus.toml with project configuration
 ```
 
 **Initialize with specific name**:
@@ -96,7 +97,8 @@ horus init --name sensor_array
 ### What Gets Created
 
 Running `horus init` creates:
-- `horus.yaml` - Project manifest with name and version
+- `horus.toml` - Project manifest with a `[package]` table (name and version)
+- `.horus/` - Build environment directory
 
 This is useful when you have existing code and want to add HORUS support, or when setting up a workspace that will contain multiple HORUS projects.
 
@@ -146,7 +148,7 @@ horus run
 ```bash
 horus new sensor_test --python
 cd sensor_test
-python main.py
+python src/main.py
 ```
 
 **Put it somewhere specific**:
@@ -160,7 +162,7 @@ horus new robot_controller --output ~/projects/robots
 
 **What it does**: Compiles your code and runs it. Handles all the build tools for you.
 
-**Why it's useful**: One command works for Rust and Python. For Rust, it auto-generates `Cargo.toml` from `horus.yaml` and uses Cargo for compilation. For Python, it handles the appropriate tooling.
+**Why it's useful**: One command works for Rust and Python. For Rust, it auto-generates `Cargo.toml` from `horus.toml` and uses Cargo for compilation. For Python, it handles the appropriate tooling.
 
 ### Basic Usage
 
@@ -189,13 +191,14 @@ Options:
                            Example: --drivers camera,lidar,imu
   -e, --enable <LIST>      Enable capabilities (comma-separated)
                            Example: --enable cuda,editor,python
+  -p, --package <NAME>     Run a specific workspace member by name
       --record <NAME>      Enable recording for this session
   -- <ARGS>                Arguments for your program
 ```
 
 ### Using --enable for Capabilities
 
-The `--enable` flag lets you quickly enable features without editing `horus.yaml`:
+The `--enable` flag lets you quickly enable features without editing `horus.toml`:
 
 ```bash
 # Enable CUDA GPU acceleration
@@ -203,9 +206,6 @@ horus run --enable cuda
 
 # Enable multiple capabilities
 horus run --enable cuda,editor,python
-
-# Combine with hardware features
-horus run --enable gpio,i2c --release
 ```
 
 **Available capabilities:**
@@ -214,19 +214,27 @@ horus run --enable gpio,i2c --release
 |------------|-------------|
 | `cuda`, `gpu` | CUDA GPU acceleration |
 | `editor` | Scene editor UI |
+| `visual` | Visualization support |
 | `python`, `py` | Python bindings |
 | `headless` | No rendering (for training) |
-| `gpio`, `i2c`, `spi`, `can`, `serial` | Hardware interfaces |
 | `opencv` | OpenCV backend |
-| `realsense` | Intel RealSense support |
+| `io-uring` | io_uring networking backend |
+| `ultra-low-latency` | Ultra-low-latency tuning |
+| `sim`, `simulation` | Simulation mode (no hardware features) |
 | `full` | All features |
 
-**Or configure in horus.yaml:**
+Anything not in this list is passed straight through to `cargo --features`, so an
+unrecognised name fails the build. **Hardware backends are not capabilities** —
+select those with `-d/--drivers`:
 
-```yaml
-enable:
-  - cuda
-  - editor
+```bash
+horus run -d camera,lidar,imu --release
+```
+
+**Or configure in horus.toml:**
+
+```toml
+enable = ["cuda", "editor"]
 ```
 
 ### Why --release Matters
@@ -235,26 +243,19 @@ Debug builds have significantly higher overhead than release builds due to runti
 
 **Debug mode** (default): Fast compilation, slower execution
 - Use case: Development iteration
-- Typical tick time: 60-200μs
 - Includes overflow checks, bounds checking, assertions
 
 **Release mode** (`--release`): Slower compilation, optimized execution
 - Use case: Performance testing, benchmarks, production deployment
-- Typical tick time: 1-3μs
 - Full compiler optimizations enabled
 
-**Common Mistake:**
-```bash
-horus run  # Debug mode
-# You see: [IPC: 1862ns | Tick: 87μs] - Looks slow!
+**Common Mistake:** measuring performance from a debug build. Debug builds carry
+overflow and bounds checks and are typically one to two orders of magnitude slower
+per tick, so a debug run looks slow even when the system is healthy. Always use
+`--release` before you draw any conclusion from a timing number.
 
-horus run --release  # Release mode
-# You see: [IPC: 947ns | Tick: 2μs] - Actually fast!
-```
-
-**The tick time difference is dramatic:**
-- Debug: 60-200μs per tick (too slow for real-time control)
-- Release: 1-3μs per tick (production-ready performance)
+For real, measured IPC latencies, see the benchmark tables in the HORUS repository's
+`benchmarks/README.md` rather than numbers printed by a debug run.
 
 **Rule of thumb:** Always use `--release` when:
 - Measuring performance
@@ -265,7 +266,7 @@ horus run --release  # Release mode
 
 ### Why --clean Matters
 
-The `--clean` flag removes the `.horus/target/` directory, which contains cached build artifacts and dependencies.
+The `--clean` flag throws away cached build artifacts so the next build starts fresh.
 
 **When to use `--clean`:**
 
@@ -288,21 +289,21 @@ The `--clean` flag removes the `.horus/target/` directory, which contains cached
 
 3. **Dependencies changed**
    ```bash
-   # You modified horus.yaml dependencies
+   # You modified horus.toml dependencies
    horus run --clean
    ```
 
 **What it does:**
-- Removes `.horus/target/` (build artifacts)
-- Removes `.horus/Cargo.lock` (dependency lock file)
-- Forces fresh dependency resolution
+- Empties `.horus/cache/` and `.horus/bin/` (compiled binaries)
+- Removes the project-root `target/` and `__pycache__/` directories
+- For projects with a root `Cargo.toml`, also runs `cargo clean` against `.horus/target/`
 - Next build rebuilds everything from scratch
 
 **Trade-off:**
 - First build after `--clean` is slower (5-30 seconds)
 - Subsequent builds are fast again (incremental compilation)
 
-**Note:** The `--clean` flag only affects the current project's `.horus/` directory, not the global `~/.horus/` cache.
+**Note:** The `--clean` flag only affects the current project, not the global HORUS package cache. Use `horus clean --all` to clear that too.
 
 ### Examples
 
@@ -330,7 +331,7 @@ horus run --clean --release
 
 **After updating HORUS CLI** (fixes version mismatch errors):
 ```bash
-# Clean removes cached dependencies from .horus/target/
+# Clean removes cached build artifacts and forces a fresh build
 horus run --clean
 ```
 
@@ -339,27 +340,31 @@ horus run --clean
 horus run -- --config robot.yaml --verbose
 ```
 
-### Important: Single-File Projects Only
+### What `horus run` Detects
 
-`horus run` is designed for **single-file HORUS projects** (main.rs or main.py). It creates a temporary workspace in `.horus/` and automatically handles dependencies.
+With no arguments, `horus run` figures out what to build:
 
-**What works with `horus run`:**
-- Single main.rs with all nodes defined in one file
-- Simple Python scripts (main.py)
+- A single entrypoint — `main.rs`, `main.py`, or `main.cpp`, at the project root or under `src/`
+- A glob of files (see [Concurrent Multi-Process Execution](#concurrent-multi-process-execution) below)
+- A **workspace**, declared with a `[workspace]` section in `horus.toml` — it generates a workspace `Cargo.toml` plus per-member manifests and builds with `cargo build --workspace`
+- A project with its own root `Cargo.toml`, built directly from it with `CARGO_TARGET_DIR=.horus/target`
 
-**What doesn't work:**
-- Multi-crate Cargo workspaces
-- Projects with multiple Cargo.toml files
-- Complex module structures with separate crate directories
-
-**For multi-crate projects**, use `cargo` directly:
+**Multi-crate workspaces:**
 ```bash
-cd your_multi_crate_project
-cargo build --release
-cargo run --release
+# Scaffold a workspace
+horus new my_robot --workspace
+
+# Build every member (builds only — nothing is executed)
+horus run
+
+# Build and run a single member
+horus run -p sensor_driver
+
+# Build a single member without running it
+horus build -p sensor_driver
 ```
 
-**Example of a proper single-file structure:**
+**Example of a single-file structure:**
 ```rust
 // main.rs - everything in one file
 use horus::prelude::*;
@@ -434,13 +439,13 @@ $ horus run "nodes/*.py"
 - Projects requiring deterministic scheduling across all nodes
 - Maximum performance with minimal overhead
 
-**Important:** Each process runs its own scheduler. Nodes communicate through HORUS shared memory topics (`/dev/shm/horus/`), not direct function calls.
+**Important:** Each process runs its own scheduler. Nodes communicate through HORUS shared memory topics (`/dev/shm/horus_<namespace>/`), not direct function calls.
 
 ---
 
 ## `horus check` - Validate Project
 
-**What it does**: Validates `horus.yaml`, source files, and the workspace configuration.
+**What it does**: Validates `horus.toml`, source files, and the workspace configuration.
 
 **Why it's useful**: Quickly diagnose configuration issues, missing dependencies, or environment problems before building.
 
@@ -475,7 +480,7 @@ Options:
 **Validate before building**:
 ```bash
 horus check
-# Validates horus.yaml, dependencies, and environment
+# Validates horus.toml, dependencies, and environment
 ```
 
 **CI/CD validation**:
@@ -495,6 +500,8 @@ horus build --release
 **What it does**: Opens a visual monitor showing all your running nodes, messages, and performance.
 
 **Why it's useful**: Debug problems visually. See message flow in real-time. Monitor performance.
+
+> **Prerequisite**: `horus monitor` is provided by the `horus-monitor` plugin. Install it once with `horus install horus-monitor`; all arguments are forwarded to the plugin. Without it the command exits with "The monitor plugin is not installed."
 
 ### Basic Usage
 
@@ -560,8 +567,11 @@ See [Monitor Guide](/development/monitor) for detailed features.
 # Install a package
 horus install <package>
 
-# Remove a package
-horus remove <package>
+# Remove a dependency from horus.toml
+horus remove <name>
+
+# Uninstall an installed package or plugin
+horus uninstall <name>
 
 # List packages
 horus list [query]
@@ -588,7 +598,7 @@ horus install pid-controller
 
 **Install specific version**:
 ```bash
-horus install pid-controller --ver 1.2.0
+horus install pid-controller@1.2.0
 ```
 
 **Install for every project** (installs are global by default):
@@ -606,9 +616,14 @@ horus list
 horus search sensor
 ```
 
-**Remove a package**:
+**Drop a dependency** (edits `horus.toml`):
 ```bash
 horus remove pid-controller
+```
+
+**Uninstall an installed package**:
+```bash
+horus uninstall pid-controller
 ```
 
 **Publish your package to registry**:
@@ -742,6 +757,7 @@ Options:
   -q, --quiet              Suppress progress indicators
   -d, --drivers <LIST>     Override detected drivers (comma-separated)
   -e, --enable <LIST>      Enable capabilities (comma-separated)
+  -p, --package <NAME>     Build a specific workspace member by name
   -h, --help               Print help
 ```
 
@@ -798,8 +814,9 @@ Options:
       --nocapture          Show test output
   -j, --test-threads <N>   Number of test threads (default: 1)
       --no-build           Skip the build step
-      --no-cleanup         Skip shared memory cleanup after tests
-  -v, --verbose            Verbose output
+      --json               Output test results as JSON (for CI tooling)
+      --no-hooks           Skip [hooks] execution
+      --verbose            Verbose output
   -d, --drivers <LIST>     Override detected drivers (comma-separated)
   -e, --enable <LIST>      Enable capabilities (comma-separated)
   -h, --help               Print help
@@ -1040,7 +1057,7 @@ horus param set <key> <value>     # Set parameter value
 horus param delete <key>          # Delete a parameter
 horus param reset                 # Reset all parameters to defaults
 horus param load <file>           # Load parameters from YAML file
-horus param save [-o <file>]      # Save parameters to YAML file
+horus param save [<file>]         # Save parameters to YAML file (default: .horus/config/params.yaml)
 horus param dump                  # Dump all parameters as YAML to stdout
 ```
 
@@ -1058,8 +1075,8 @@ horus param list
 
 **Tune a controller at runtime**:
 ```bash
-horus param set ControllerNode kp 2.0
-horus param set ControllerNode ki 0.2
+horus param set /ControllerNode/kp 2.0
+horus param set /ControllerNode/ki 0.2
 ```
 
 **Save and restore configuration**:
@@ -1137,21 +1154,26 @@ horus msg hash <type>        # Show definition hash (for compatibility checking)
 ```bash
 horus msg list
 # Output:
-# CmdVel (horus_library::messages::cmd_vel)
-# LaserScan (horus_library::messages::sensor)
-# Odometry (horus_library::messages::sensor)
-# Image (horus_library::messages::vision)
+#   MESSAGE TYPE                   MODULE            FIELDS
+#   -------------------------------------------------------
+#   Heartbeat                      diagnostics            6
+#   GenericMessage                 generic                6
+#   Pose2D                         math                   4
+#   Twist                          math                   3
+#   Clock                          time                   6
 ```
 
 **Show message definition**:
 ```bash
-horus msg info CmdVel
+horus msg info Twist
 # Output:
-# struct CmdVel {
-#   stamp_nanos: u64,  // nanoseconds
-#   linear: f32,       // m/s forward velocity
-#   angular: f32,      // rad/s turning velocity
-# }
+#   Type: Twist
+#   Module: math
+#
+#   Fields:
+#      linear: [f64; 3]        Linear velocity [x, y, z] in m/s
+#      angular: [f64; 3]       Angular velocity [roll, pitch, yaw] in rad/s
+#      timestamp_ns: u64       Timestamp in nanoseconds since epoch
 ```
 
 ---
@@ -1192,27 +1214,38 @@ Options:
 
 ### Launch File Format
 
+Every node must specify either `command` (a program to execute) or `package` (a
+HORUS package to run). A node with neither is rejected at launch time.
+
 ```yaml
 # robot.yaml
 nodes:
   - name: sensor_node
-    file: src/sensor.rs
-    rate: 100
+    command: ./target/release/sensor
+    rate_hz: 100
     params:
       sample_rate: 100
 
   - name: controller
-    file: src/controller.rs
-    rate: 50
+    package: my_robot
+    rate_hz: 50
     depends_on: [sensor_node]
     params:
       kp: 1.5
       ki: 0.1
 
   - name: logger
-    file: src/logger.py
-    rate: 10
+    command: python3 src/logger.py
+    rate_hz: 10
 ```
+
+**Node fields**: `name`, `package`, `command`, `args`, `rate_hz`, `params`, `env`,
+`namespace`, `depends_on`, `start_delay`, `restart` (`never`, `always`, `on-failure`),
+and `priority`.
+
+> **Note**: `priority` is currently inert — it is exported to the child process but
+> nothing reads it. Set priority with `.priority()` on the Rust builder or `priority=`
+> on the Python `Node` instead, both of which reach the scheduler.
 
 ### Examples
 
@@ -1280,17 +1313,18 @@ horus deploy pi@raspberrypi.local --arch aarch64
 horus deploy ubuntu@jetson.local --arch aarch64 --run
 ```
 
-**Configure named targets in horus.yaml**:
+**Configure named targets in `.horus/deploy.yaml`**:
 ```yaml
-deploy:
-  targets:
-    jetson:
-      host: ubuntu@192.168.1.50
-      arch: aarch64
-    pi:
-      host: pi@192.168.1.51
-      arch: aarch64
+targets:
+  jetson:
+    host: ubuntu@192.168.1.50
+    arch: aarch64
+  pi:
+    host: pi@192.168.1.51
+    arch: aarch64
 ```
+
+Each target takes `host` plus optional `arch`, `dir`, `port`, and `identity`.
 
 Then deploy with:
 ```bash
@@ -1312,7 +1346,7 @@ horus deploy jetson --run
 horus install pid-controller
 
 # Install with specific version
-horus install sensor-fusion --ver 1.2.0
+horus install sensor-fusion@1.2.0
 
 # Install a driver (drivers install by package name)
 horus install camera-driver
@@ -1330,19 +1364,21 @@ Arguments:
   <NAME>  Package/driver/plugin name to install
 
 Options:
-  -v, --ver <VER>        Specific version (optional)
       --plugin           Force install as plugin
   -t, --target <NAME>    Install into a specific workspace/project
-      --no-system        Skip installing system dependencies
+      --json             Output as JSON
   -h, --help             Print help
 ```
+
+Pin a version with the `name@version` argument syntax. (A hidden legacy `--ver <VER>`
+alias still exists, but it has no `-v` short form — `-v` is the global `--verbose`.)
 
 ### Examples
 
 **Install common packages**:
 ```bash
 horus install kalman-filter
-horus install pid-controller --ver 2.0.0
+horus install pid-controller@2.0.0
 ```
 
 **Install hardware drivers**:
@@ -1353,19 +1389,19 @@ horus install rplidar-driver
 
 ---
 
-## `horus remove` - Remove Package/Driver/Plugin
+## `horus remove` - Remove a Dependency from horus.toml
 
-**What it does**: Removes installed packages, drivers, or plugins.
+**What it does**: Removes a dependency entry from your project's `horus.toml`.
 
-**Why it's useful**: Clean up unused dependencies, switch to alternative implementations.
+**Why it's useful**: Drop a dependency you no longer need, or switch to an alternative implementation.
 
 ### Basic Usage
 
 ```bash
-# Remove a package
+# Remove a dependency from horus.toml
 horus remove pid-controller
 
-# Remove and purge unused dependencies
+# Remove and also clean unused packages from the cache
 horus remove sensor-fusion --purge
 ```
 
@@ -1375,10 +1411,41 @@ horus remove sensor-fusion --purge
 horus remove [OPTIONS] <NAME>
 
 Arguments:
-  <NAME>  Package/driver/plugin name to remove
+  <NAME>  Dependency name
 
 Options:
-      --purge    Also remove unused dependencies
+      --purge    Also clean unused packages from the cache
+  -h, --help     Print help
+```
+
+---
+
+## `horus uninstall` - Uninstall an Installed Package or Plugin
+
+**What it does**: Uninstalls a standalone package or plugin that was installed globally with `horus install`.
+
+**Why it's useful**: `horus remove` only edits `horus.toml`; use `horus uninstall` to actually remove something installed on the machine.
+
+### Basic Usage
+
+```bash
+# Uninstall a package or plugin
+horus uninstall horus-visualizer
+
+# Uninstall and purge cached files
+horus uninstall sensor-fusion --purge
+```
+
+### All Options
+
+```bash
+horus uninstall [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Package or plugin name
+
+Options:
+      --purge    Also purge cached files
   -h, --help     Print help
 ```
 
@@ -1400,7 +1467,7 @@ horus plugin enable <plugin>   # Enable a disabled plugin
 horus plugin disable <plugin>  # Disable a plugin
 horus plugin verify [plugin]   # Verify plugin integrity
 horus install <plugin>         # Install a plugin from registry
-horus remove <plugin>          # Remove an installed plugin
+horus uninstall <plugin>       # Uninstall an installed plugin
 ```
 
 ### Examples
@@ -1444,10 +1511,9 @@ horus cache purge              # Remove ALL cached packages (-y to skip confirma
 ```bash
 horus cache info
 # Output:
-# Location: ~/.horus/cache
+# Cache directory: ~/.cache/horus
 # Total size: 1.2 GB
 # Packages: 45
-# Last cleaned: 7 days ago
 ```
 
 **Clean unused packages**:
@@ -1667,8 +1733,13 @@ Topic name conflict. Try a unique name or clean up stale shared memory.
 
 ```bash
 # Clean all HORUS shared memory (if needed after crashes)
-rm -rf /dev/shm/horus/
+horus clean --shm
+
+# Add --force if HORUS processes are still running
+horus clean --shm --force
 ```
+
+Shared memory is namespaced (`/dev/shm/horus_<namespace>/` on Linux), so `horus clean --shm` is the supported way to clear it — it enumerates every namespace.
 
 ---
 
@@ -1683,10 +1754,9 @@ export HORUS_REGISTRY_URL=https://your-company-registry.com
 # Debug mode (see what's happening). horus installs its own log bridge in
 # place of env_logger, so the usual Rust log variable has no effect.
 horus run --verbose
-
-# CI/CD authentication
-export HORUS_API_KEY=your-key-here
 ```
+
+> **CI/CD authentication**: there is deliberately no `HORUS_API_KEY` variable — nothing reads it. Registry credentials are read from `~/.horus/auth.json`, so write that file from your secret store. Generate the key with `horus auth api-key --name ci --environment ci-cd`.
 
 ---
 

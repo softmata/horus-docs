@@ -1,108 +1,92 @@
 ---
 title: "Network Backends"
-description: "Communication backends in HORUS — automatic local IPC with planned network transport"
+description: "Communication backends in HORUS — automatic shared-memory IPC with opt-in LAN replication"
 weight: 40
 ---
 
 # Communication Backends
 
-HORUS automatically selects the optimal communication backend based on topology — no configuration needed. All current backends are **local** (same-machine), using shared memory or in-process channels.
+HORUS automatically selects the optimal communication backend based on topology — no configuration needed. Every topic is shared-memory backed. HORUS picks one of five SHM backends — FanoutShm, PodShm, MpscShm, SpmcShm, SpscShm — from the publisher/subscriber topology and whether the message type is POD. Cross-machine replication is available separately via the opt-in `net` feature.
 
-<Callout type="warn" title="Network Transport Not Yet Available">
+<Callout type="info" title="Network Transport Is Opt-In, Not Absent">
 
-HORUS currently operates as a **local shared memory IPC framework only**. Network transport (Zenoh, UDP, etc.) is planned but no network backend code exists yet. All topics created with `Topic::new("name")` use local shared memory or in-process channels. This page documents the existing backends and the planned network direction.
+HORUS ships transparent LAN replication over UDP in the `horus_net` crate. It is opt-in, not absent: build the `horus` crate with `--features net`, or run `horus run --net`. Replication auto-starts on `scheduler.run()`, discovers peers by UDP multicast (default group `224.0.69.72`, port `9100`), and costs ~50μs across the LAN. Configure it with `[network]` in `horus.toml` or `HORUS_NET_*` env vars; disable it with `.network(false)` or `HORUS_NO_NETWORK=1`. Zenoh is **not** the transport — it is an optional bridge package for cross-subnet/WiFi (`horus install horus-zenoh`).
 
 </Callout>
 
 ## Automatic Backend Selection
 
-When you call `Topic::new("name")`, HORUS automatically detects the optimal backend based on the number of publishers, subscribers, and whether they're in the same process:
+When you call `Topic::new("name")`, HORUS automatically detects the optimal backend based on the number of publishers, subscribers, and whether the message type is POD:
 
 ```rust,ignore
 use horus::prelude::*;
 
 // Just create a topic — backend is auto-selected
 let topic = Topic::<CmdVel>::new("motors.cmd_vel")?;
-topic.send(CmdVel { linear: 1.0, angular: 0.0 });
+topic.send(CmdVel::new(1.0, 0.0));
 ```
 
 No configuration needed. The backend upgrades and downgrades dynamically as participants join and leave.
 
 ## Communication Paths
 
-HORUS selects the optimal path based on where your nodes are running and how many publishers/subscribers are involved:
+Every topic is shared-memory backed, so every backend is cross-process. HORUS picks one of five SHM backends from the publisher/subscriber topology and whether the message type is POD:
 
-### Same-Process Communication
+| Backend | Latency | Detection Criteria |
+|---------|---------|-------------------|
+| FanoutShm | ~40ns | pubs>1, subs>1, !is_pod (broadcast) |
+| PodShm | ~50ns | 1→many / 0→many, is_pod (broadcast) |
+| MpscShm | ~65ns | pubs>1, subs<=1 |
+| SpmcShm | ~70ns | multi-consumer, non-POD |
+| SpscShm | ~85ns | pubs<=1, subs<=1 |
 
-| Scenario | Latency |
-|----------|---------|
-| Same thread, 1 publisher → 1 subscriber | ~3ns |
-| 1 publisher → 1 subscriber | ~18ns |
-| 1 publisher → many subscribers | ~24ns |
-| Many publishers → 1 subscriber | ~26ns |
-| Many publishers → many subscribers | ~36ns |
-
-### Cross-Process Communication (Shared Memory)
-
-| Scenario | Latency |
-|----------|---------|
-| 1 publisher → 1 subscriber (simple types) | ~50ns |
-| Many publishers → 1 subscriber | ~65ns |
-| 1 publisher → many subscribers | ~70ns |
-| 1 publisher → 1 subscriber | ~85ns |
-| Many publishers → many subscribers | ~167ns |
-
-The path is selected based on:
-- **Process locality**: Same thread → same process → cross-process
+The backend is selected based on:
 - **Topology**: Number of publishers and subscribers
-- **Data type**: Simple fixed-size types get the fastest cross-process path
+- **Data type**: POD (fixed-size, memcpy-able) types get the dedicated zero-copy path; variable-size types are serialized (~167ns)
+
+Cross-machine replication is available separately via the opt-in `net` feature.
 
 ## Dynamic Migration
 
 HORUS dynamically migrates between backends as topology changes:
 
 ```
-Single publisher + single subscriber (same process)
-  → ~18ns
+Single publisher + single subscriber
+  → SpscShm, ~85ns
 
-Second subscriber joins (same process)
-  → ~24ns
+Second subscriber joins (non-POD payload)
+  → SpmcShm, ~70ns
 
-Subscriber in different process joins
-  → ~70ns
+A second publisher joins as well
+  → FanoutShm, ~40ns
 
-All subscribers disconnect except one in-process
-  → ~18ns
+All but one publisher and one subscriber disconnect
+  → SpscShm, ~85ns
 ```
 
 Migration is transparent — `send()` and `recv()` calls are unaffected.
 
 ## Performance Characteristics
 
-| Metric | In-Process | Shared Memory |
-|--------|-----------|---------------|
-| Latency | 3-36ns | 50-167ns |
-| Throughput | Millions msg/s | Millions msg/s |
-| Zero-copy | Yes | Yes (via mmap) |
-| Cross-machine | No | No |
+| Metric | Shared Memory |
+|--------|---------------|
+| Latency | 40-85ns |
+| Throughput | Millions msg/s |
+| Zero-copy | Yes (via mmap) |
+| Cross-machine | Yes — opt-in via the `net` feature / `horus run --net`, ~50μs over LAN |
 
-## Planned: Network Transport (Zenoh)
+## Network Transport (LAN replication)
 
-Future versions of HORUS will add Zenoh-based network transport for:
-
-- **Multi-robot communication** across machines
-- **Cloud connectivity** for telemetry and remote monitoring
-- **ROS2 interoperability** via Zenoh DDS bridge
-
-The planned architecture adds network backends alongside the existing local backends:
+Cross-machine topics ship today as the `horus_net` UDP replicator. It is opt-in — build the `horus` crate with `--features net`, or run `horus run --net`:
 
 | Transport | Latency | Use Case |
 |-----------|---------|----------|
-| In-process | 3-36ns | Same-process nodes |
-| Shared Memory | 50-167ns | Same-machine IPC |
-| Zenoh (planned) | ~100μs+ | Multi-robot, cloud, ROS2 |
+| Shared Memory | 40-85ns | Same-machine IPC |
+| UDP LAN replication (`net` feature) | ~50μs | Multi-robot, cross-machine topics |
 
-When network transport is implemented, `Topic::new()` will continue to auto-select the optimal backend. Network transport will only be used when topics are explicitly configured for remote communication.
+`Topic::new()` continues to auto-select the optimal SHM backend either way. With the `net` feature enabled, replication activates automatically whenever remote horus peers are found on the LAN; topics you subscribe to but do not publish are imported by default (`import = "auto"`). Opt out with `.network(false)`, `HORUS_NO_NETWORK=1`, or `[network] enabled = false`; narrow the surface with `[network] import` / `HORUS_NET_IMPORT` and `[network] deny_export`.
+
+Zenoh is not the transport. It is an optional bridge package (`horus install horus-zenoh`) for cases UDP multicast cannot reach — cross-subnet or WiFi links.
 
 ## See Also
 

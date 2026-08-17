@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 // ============================================================================
 
 struct SensorNode {
-    temp_pub: Topic<f32>,
+    temp_pub: Option<Topic<f32>>,
     last_publish: Instant,
     reading: f32,
 }
@@ -65,7 +65,7 @@ struct SensorNode {
 impl SensorNode {
     fn new() -> Result<Self> {
         Ok(Self {
-            temp_pub: Topic::new("raw_temp")?,
+            temp_pub: None,
             last_publish: Instant::now(),
             reading: 20.0,
         })
@@ -78,6 +78,11 @@ impl Node for SensorNode {
     }
 
     fn init(&mut self) -> Result<()> {
+        // Build topics here, not in new(): the scheduler only sets the node
+        // context around init()/tick(), and Topic::new() uses it to record which
+        // node owns the topic. Topics built in main() have no owner, so they
+        // never show up under a node in `horus monitor`.
+        self.temp_pub = Some(Topic::new("raw_temp")?);
         hlog!(info, "Temperature sensor initialized");
         Ok(())
     }
@@ -94,7 +99,9 @@ impl Node for SensorNode {
             let temperature = base_temp + noise;
 
             // Publish raw temperature
-            self.temp_pub.send(temperature);
+            if let Some(ref temp_pub) = self.temp_pub {
+                temp_pub.send(temperature);
+            }
 
             hlog!(info, "Published raw temp: {:.2}°C", temperature);
 
@@ -114,8 +121,8 @@ impl Node for SensorNode {
 // ============================================================================
 
 struct FilterNode {
-    raw_sub: Topic<f32>,
-    filtered_pub: Topic<f32>,
+    raw_sub: Option<Topic<f32>>,
+    filtered_pub: Option<Topic<f32>>,
     filtered_value: Option<f32>,
     alpha: f32,  // Smoothing factor (0.0 - 1.0)
 }
@@ -123,8 +130,8 @@ struct FilterNode {
 impl FilterNode {
     fn new() -> Result<Self> {
         Ok(Self {
-            raw_sub: Topic::new("raw_temp")?,
-            filtered_pub: Topic::new("filtered_temp")?,
+            raw_sub: None,
+            filtered_pub: None,
             filtered_value: None,
             alpha: 0.3,  // 30% new data, 70% previous (smooth but responsive)
         })
@@ -137,13 +144,15 @@ impl Node for FilterNode {
     }
 
     fn init(&mut self) -> Result<()> {
+        self.raw_sub = Some(Topic::new("raw_temp")?);
+        self.filtered_pub = Some(Topic::new("filtered_temp")?);
         hlog!(info, "Filter initialized (alpha = {:.2})", self.alpha);
         Ok(())
     }
 
     fn tick(&mut self) {
         // Check for new temperature reading
-        if let Some(raw_temp) = self.raw_sub.recv() {
+        if let Some(raw_temp) = self.raw_sub.as_ref().and_then(|s| s.recv()) {
             // Apply exponential moving average filter
             let filtered = match self.filtered_value {
                 Some(prev) => self.alpha * raw_temp + (1.0 - self.alpha) * prev,
@@ -153,7 +162,9 @@ impl Node for FilterNode {
             self.filtered_value = Some(filtered);
 
             // Publish filtered temperature
-            self.filtered_pub.send(filtered);
+            if let Some(ref filtered_pub) = self.filtered_pub {
+                filtered_pub.send(filtered);
+            }
 
             hlog!(info, "Filtered: {:.2}°C -> {:.2}°C (removed {:.2}°C noise)",
                     raw_temp, filtered, raw_temp - filtered);
@@ -171,14 +182,14 @@ impl Node for FilterNode {
 // ============================================================================
 
 struct DisplayNode {
-    filtered_sub: Topic<f32>,
+    filtered_sub: Option<Topic<f32>>,
     display_counter: u32,
 }
 
 impl DisplayNode {
     fn new() -> Result<Self> {
         Ok(Self {
-            filtered_sub: Topic::new("filtered_temp")?,
+            filtered_sub: None,
             display_counter: 0,
         })
     }
@@ -190,6 +201,7 @@ impl Node for DisplayNode {
     }
 
     fn init(&mut self) -> Result<()> {
+        self.filtered_sub = Some(Topic::new("filtered_temp")?);
         hlog!(info, "Display initialized");
         println!("\n========================================");
         println!("  Temperature Monitor - Press Ctrl+C to stop");
@@ -198,7 +210,7 @@ impl Node for DisplayNode {
     }
 
     fn tick(&mut self) {
-        if let Some(temp) = self.filtered_sub.recv() {
+        if let Some(temp) = self.filtered_sub.as_ref().and_then(|s| s.recv()) {
             self.display_counter += 1;
 
             // Display temperature with visual indicator
@@ -273,14 +285,19 @@ All nodes initialized. Running...
   Temperature Monitor - Press Ctrl+C to stop
 ========================================
 
-[Reading #1] Temperature: 23.4°C - Status: NORMAL
-[Reading #2] Temperature: 24.1°C - Status: NORMAL
-[Reading #3] Temperature: 25.8°C - Status: NORMAL
-[Reading #4] Temperature: 27.2°C - Status: NORMAL
-[Reading #5] Temperature: 28.6°C - Status: HOT
-[Reading #6] Temperature: 27.9°C - Status: NORMAL
-[Reading #7] Temperature: 26.3°C - Status: NORMAL
+[Reading #1] Temperature: 31.5°C - Status: HOT
+[Reading #2] Temperature: 31.4°C - Status: HOT
+[Reading #3] Temperature: 30.9°C - Status: HOT
+[Reading #4] Temperature: 30.0°C - Status: HOT
+[Reading #5] Temperature: 29.0°C - Status: HOT
+[Reading #6] Temperature: 28.1°C - Status: HOT
+[Reading #7] Temperature: 27.6°C - Status: NORMAL
 ```
+
+The simulation is deterministic, so these values are exactly what you'll see. Only
+`println!` output is shown above - `hlog!` writes to stderr, so the terminal also
+interleaves `[INFO] [SensorNode] Published raw temp: ...` and
+`[INFO] [FilterNode] Filtered: ...` lines, plus the scheduler's own startup output.
 
 Press **Ctrl+C** to stop:
 
@@ -313,7 +330,7 @@ The monitor will show:
 - **filtered_temp** (f32): Smooth temperature readings
 
 ### Metrics Tab
-- **IPC Latency**: ~85ns-437ns (sub-microsecond!)
+- **IPC Latency**: ~10ns p50 for these 1-pub/1-sub in-process topics (SpscIntra backend; sub-microsecond!)
 - **Tick Duration**: How long each node takes to execute
 - **Message Counts**: Total messages sent/received
 
@@ -325,7 +342,9 @@ The monitor will show:
 // Publish every 1 second
 if self.last_publish.elapsed() >= Duration::from_secs(1) {
     let temperature = 25.0 + noise;
-    self.temp_pub.send(temperature);
+    if let Some(ref temp_pub) = self.temp_pub {
+        temp_pub.send(temperature);
+    }
 }
 ```
 
@@ -339,7 +358,9 @@ if self.last_publish.elapsed() >= Duration::from_secs(1) {
 ```rust
 // Exponential moving average filter
 let filtered = self.alpha * raw_temp + (1.0 - self.alpha) * prev;
-self.filtered_pub.send(filtered);
+if let Some(ref filtered_pub) = self.filtered_pub {
+    filtered_pub.send(filtered);
+}
 ```
 
 **Key Points:**
@@ -354,7 +375,7 @@ self.filtered_pub.send(filtered);
 ### DisplayNode
 
 ```rust
-if let Some(temp) = self.filtered_sub.recv() {
+if let Some(temp) = self.filtered_sub.as_ref().and_then(|s| s.recv()) {
     println!("[Reading #{}] Temperature: {:.1}°C", count, temp);
 }
 ```
@@ -422,7 +443,7 @@ error[E0433]: failed to resolve: use of undeclared type `Topic`
 **Fix:**
 - Ensure HORUS is installed: `horus --help`
 - Check import: `use horus::prelude::*;`
-- Run from project directory (where `horus.yaml` is)
+- Run from project directory (where `horus.toml` is)
 
 ## Experiments to Try
 
@@ -464,12 +485,42 @@ writeln!(file, "{:.1}", temp).ok();
 
 ### 4. Add Multiple Sensors
 
-Create a second sensor node:
+Create a second sensor node. Node names are the identity key for the watchdog, the
+shared-memory registry slot and the pause/kill control flags, so the scheduler refuses
+duplicate names - `run()` returns an error before the first tick. Give `SensorNode` a
+name of its own first:
 
 ```rust
-// In main()
-scheduler.add(SensorNode::new()?).order(0).done();  // Sensor 1
-scheduler.add(SensorNode::new()?).order(0).done();  // Sensor 2
+// 1. Make the name configurable
+struct SensorNode {
+    name: String,
+    temp_pub: Option<Topic<f32>>,
+    last_publish: Instant,
+    reading: f32,
+}
+
+impl SensorNode {
+    fn new(name: &str) -> Result<Self> {
+        Ok(Self {
+            name: name.to_string(),
+            temp_pub: None,
+            last_publish: Instant::now(),
+            reading: 20.0,
+        })
+    }
+}
+
+impl Node for SensorNode {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    // init(), tick() and shutdown() are unchanged
+}
+
+// 2. In main(), add two sensors with distinct names
+scheduler.add(SensorNode::new("Sensor1")?).order(0).done();
+scheduler.add(SensorNode::new("Sensor2")?).order(0).done();
 ```
 
 Both will publish to the same topic, and FilterNode will process both!

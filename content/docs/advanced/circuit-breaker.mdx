@@ -6,7 +6,7 @@ weight: 32
 
 # Circuit Breaker
 
-The circuit breaker pattern prevents cascading failures by temporarily disabling failing nodes. When a node fails repeatedly, the circuit "opens" to stop calling it, giving it time to recover.
+The circuit breaker pattern prevents cascading failures by temporarily disabling failing nodes. When a node fails repeatedly, the scheduler stops ticking it — skipping it for a cooldown, or restarting it with backoff — giving it time to recover.
 
 ## Overview
 
@@ -15,73 +15,79 @@ Circuit breakers protect against:
 - Resource exhaustion from repeated retry attempts
 - System-wide slowdowns from blocked calls
 
-The Scheduler manages circuit breakers automatically — they are enabled by default with `Scheduler::new()`, and the scheduler handles state transitions, timeouts, and recovery.
+Horus implements this with per-node **failure policies**, and failure handling is opt-in: a node with no `.failure_policy(...)` logs the failure and keeps running. Set a policy explicitly on each node that needs one, and the scheduler then handles the cooldowns, backoffs, and recovery for it.
 
 ## States
 
-| State | Description | Behavior |
-|-------|-------------|----------|
-| **Closed** | Normal operation | All requests allowed |
-| **Open** | Too many failures | Node temporarily disabled |
-| **Half-Open** | Testing recovery | Limited requests allowed |
+A node only has a failure handler if a policy was set for it. The state the handler reports depends on that policy:
+
+| Policy | State | Behavior |
+|--------|-------|----------|
+| `Fatal` | **armed** | Ticking; the first failure stops the scheduler |
+| `Restart` | **healthy** | Ticking; no restarts yet |
+| `Restart` | **backoff (n/m)** | Re-initialized after a failure; skipped until the backoff expires |
+| `Restart` | **recovered (n/m)** | Ticking again after `n` restarts |
+| `Skip` | **active** | Ticking; consecutive failures are counted |
+| `Skip` | **suppressed** | `max_failures` reached; skipped until the cooldown expires |
+| `Ignore` | **active** | Always ticking, failures are discarded |
+
+There is no half-open state and no success threshold.
 
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 20}}}%%
 stateDiagram-v2
-    [*] --> Closed
-    Closed --> Open : failure threshold
-    Open --> HalfOpen : timeout
-    HalfOpen --> Closed : success threshold
-    HalfOpen --> Open : failure
+    [*] --> active
+    active --> suppressed : max_failures consecutive failures
+    suppressed --> active : cooldown elapsed
+    active --> active : successful tick resets failure_count
 `}
-  caption="Circuit breaker state transitions"
+  caption="Skip policy state transitions"
 />
 
 ## How It Works
 
-### Closed → Open
+### Skip: active → suppressed
 
-When a node's failures reach the threshold, the circuit opens and the node is temporarily disabled:
-
-```
-Node fails repeatedly:
-  failure_count = 1 → Closed (keep trying)
-  failure_count = 2 → Closed (keep trying)
-  failure_count = 3 → Open (stop calling node)
-```
-
-### Open → Half-Open
-
-After the timeout elapses, the scheduler allows a single trial execution:
+Each failed tick increments `failure_count`. When it reaches `max_failures`, the node is suppressed for `cooldown` and the counter resets:
 
 ```
-Circuit open → wait timeout → Half-Open (try one call)
+FailurePolicy::skip(3, 30_u64.secs()):
+  failure_count = 1 → active (keep ticking)
+  failure_count = 2 → active (keep ticking)
+  failure_count = 3 → suppressed for 30s (node is skipped)
 ```
 
-### Half-Open → Closed
+### Suppressed → active
 
-If the trial succeeds enough times, the circuit closes and the node resumes normal operation:
+Once the cooldown expires the node is scheduled normally again — there is no probationary single-call phase. `FailureHandler::should_allow()` returns true as soon as `Instant::now() >= suppressed_until`.
+
+### Recovery
+
+One successful tick clears the failure state. `FailureHandler::record_success()` resets `failure_count` to 0 and clears the suppression window — there is no success threshold.
+
+### Restart: healthy → backoff
+
+A failed tick increments `restart_count`, re-runs the node's `init()`, and holds the node in backoff for `initial_backoff * 2^(restart_count - 1)`. A successful tick clears the backoff. Once `restart_count` exceeds `max_restarts` the policy escalates to a fatal stop: the faulted node is put into its safe state and the scheduler stops.
 
 ```
-Half-Open:
-  success_count = 1 → Half-Open (keep testing)
-  success_count = 2 → Half-Open (keep testing)
-  success_count = 3 → Closed (fully recovered)
+FailurePolicy::restart(3, 100_u64.ms()):
+  failure 1 → restart, backoff 100ms
+  failure 2 → restart, backoff 200ms
+  failure 3 → restart, backoff 400ms
+  failure 4 → restart_count > max_restarts → fatal stop
 ```
 
-## Enabling Circuit Breakers
+## Enabling Failure Handling
 
-Circuit breakers are enabled by default with `Scheduler::new()`. Customize thresholds via builder methods:
+There is no scheduler-level switch and no default policy. `Scheduler::new()` creates no failure handlers — a node registered without `.failure_policy(...)` gets none, and a panicking tick is logged while the scheduler keeps running. Set a policy on each node that needs one:
 
-```rust
+```rust,ignore
 use horus::prelude::*;
 
-// Default: circuit breakers enabled (5 failures, 5s timeout)
-let scheduler = Scheduler::new();
-
-// Custom: enable circuit breaker explicitly
-let scheduler = Scheduler::new()
-    .circuit_breaker(true);
+let mut scheduler = Scheduler::new();
+scheduler.add(logger)
+    .failure_policy(FailurePolicy::skip(5, 30_u64.secs()))
+    .done()?;
 ```
 
 ## Per-Node Failure Policies
@@ -99,10 +105,10 @@ scheduler.add(motor_controller)
     .failure_policy(FailurePolicy::Fatal)
     .done();
 
-// Sensor node: restart up to 5 times with 100ms delay
+// Sensor node: restart up to 5 times, 100ms initial backoff
 scheduler.add(sensor_reader)
     .order(1)
-    .failure_policy(FailurePolicy::restart(5, 100))
+    .failure_policy(FailurePolicy::restart(5, 100_u64.ms()))
     .done();
 
 // Logging node: ignore failures entirely
@@ -117,18 +123,20 @@ scheduler.add(data_logger)
 | Policy | Behavior |
 |--------|----------|
 | `FailurePolicy::Fatal` | Stop the scheduler immediately |
-| `FailurePolicy::restart(max_restarts, backoff_ms)` | Restart the node up to N times with exponential backoff |
+| `FailurePolicy::restart(max_restarts: u32, initial_backoff: Duration)` | Re-init the node with exponential backoff (`initial_backoff * 2^(n-1)`); after `max_restarts` is exceeded, escalate to a fatal stop |
+| `FailurePolicy::skip(max_failures: u32, cooldown: Duration)` | After `max_failures` consecutive failures, skip the node for `cooldown`, then resume |
 | `FailurePolicy::Ignore` | Log the failure, continue running |
 
-When circuit breakers are enabled, nodes use their tier's default failure policy unless overridden.
+A node with no `.failure_policy(...)` has no failure handler; its panics are logged and execution continues. `.order()` tiers affect execution order only, never failure handling.
 
 ## Monitoring
 
-Circuit breaker state changes are automatically recorded in the [BlackBox](/advanced/blackbox) flight recorder. After a failure, inspect the blackbox to see state transitions:
+Enable the [BlackBox](/advanced/blackbox) flight recorder with `Scheduler::new().blackbox(64)` (size in MB) — it is off by default. Node failures surface as `BlackBoxEvent::NodeError { name, error, severity }`; there is no dedicated failure-policy state-change event. After a failure, inspect the recorded anomalies:
 
 ```rust,ignore
-if let Some(bb) = scheduler.blackbox() {
-    for record in &bb.anomalies() {
+if let Some(bb) = scheduler.get_blackbox() {
+    let bb = bb.lock().unwrap();
+    for record in bb.anomalies() {
         println!("[tick {}] {:?}", record.tick, record.event);
     }
 }
@@ -136,14 +144,14 @@ if let Some(bb) = scheduler.blackbox() {
 
 ## Best Practices
 
-1. **Use builder methods**: `Scheduler::new()` enables circuit breakers by default. Customize with `.circuit_breaker(true)` when needed.
+1. **Set a failure policy explicitly**: nodes have none by default. A node registered without `.failure_policy(...)` logs its failures and keeps running.
 
 2. **Set failure policies per node**: Critical nodes should use `FailurePolicy::Fatal`, non-critical nodes can use `Restart` or `Ignore`.
 
-3. **Test failure scenarios**: Verify your system behaves correctly when nodes are temporarily disabled by the circuit breaker.
+3. **Test failure scenarios**: Verify your system behaves correctly when nodes are temporarily disabled by a `Skip` cooldown or a `Restart` backoff.
 
 ## See Also
 
-- [BlackBox Flight Recorder](/advanced/blackbox) - Event logging including circuit breaker changes
+- [BlackBox Flight Recorder](/advanced/blackbox) - Event logging including node errors
 - [Safety Monitor](/advanced/safety-monitor) - Real-time safety monitoring
 - [Scheduler Configuration](/advanced/scheduler-configuration) - SchedulerConfig and node configuration

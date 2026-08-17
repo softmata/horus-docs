@@ -39,28 +39,46 @@ All performance features use **graceful degradation** - your code runs everywher
 
 ### Optimized Data Structures
 
-HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — single-producer paths achieve ~87ns, multi-producer paths achieve ~313ns.
+HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — cross-process single-producer paths measure ~198ns p50, contended multi-producer paths ~304ns p50.
 
 ## Benchmark Results
 
 ### Measured Latency
 
-> **Measurement Note**: All latencies are **send-only** (one-direction publish). For round-trip (send+receive), approximately double these values.
+> **Measurement Note**: These are the HORUS repository's own published results (Intel Core i7-10750H @ 2.60 GHz, `powersave` governor, 100K iterations per scenario, RDTSC timing with Tukey IQR outlier removal). All latencies are **one-way** (publish → receive). For round-trip, approximately double these values.
 
-| Message Type | Size | MPMC (send-only) | SPSC (send-only) | ROS2 DDS | Speedup |
-|--------------|------|-------------|--------------|----------|---------|
-| CmdVel | 16B | ~313ns | 87ns | 50-100µs | **230-575x** |
-| IMU | 304B | ~500ns | ~160ns | 80-150µs | **160-940x** |
-| LaserScan | 1.5KB | ~2.2µs | ~400ns | 150-300µs | **68-750x** |
-| PointCloud | 120KB | ~360µs | ~120µs | 500µs-1ms | **1.4-8x** |
+**Intra-process** (same process, heap ring buffers):
 
-**Key insight**: Latency scales linearly with message size.
+| Scenario | Backend | p50 | p99 |
+|----------|---------|-----|-----|
+| 1 pub, 1 sub | SpscIntra | 10ns | 19ns |
+| 1 pub, N sub | SpmcIntra | 3ns | 10ns |
+| N pub, N sub (contended) | MpmcIntra | 100ns | 643ns |
+
+**Cross-process** (shared memory):
+
+| Scenario | Backend | p50 | p99 |
+|----------|---------|-----|-----|
+| 1 pub, 2 sub | SpmcShm | 198ns | 298ns |
+| 1 pub, 8 sub | SpmcShm | 276ns | 510ns |
+| 4 pub, 4 sub | PodShm | 304ns | 1.5µs |
+| Raw SHM atomic (hardware floor) | — | 167ns | 319ns |
+
+**Real message types** (intra-process):
+
+| Message | Size | Median | p99 |
+|---------|------|--------|-----|
+| CmdVel | 16B | 20ns | 29ns |
+
+**Key insight**: cross-process shared memory adds only ~31ns of framework overhead over the raw shared-memory hardware floor.
+
+Reproduce these numbers yourself with `cargo run --release -p horus_benchmarks --bin all_paths_latency`; the full result set and methodology live in `benchmarks/README.md` in the HORUS repository.
 
 ### Throughput
 
 HORUS can handle:
-- **12M+ messages/second** for small messages (16B) with Topic
-- **3M+ messages/second** for small messages (16B) with Topic
+- **12M+ messages/second** for small messages (16B), 1 publisher : 1 subscriber
+- **3M+ messages/second** for small messages (16B), many publishers : many subscribers
 - **1M+ messages/second** for medium messages (1KB)
 - **100K+ messages/second** for large messages (100KB)
 
@@ -138,8 +156,8 @@ pub struct BadLaserScan {
 ```rust
 // FAST: Small, fixed-size struct
 let topic: Topic<Pose2D> = Topic::new("pose")?;
-topic.send(Pose2D { x: 1.0, y: 2.0, theta: 0.5 });
-// IPC latency: ~87-313ns depending on topology
+topic.send(Pose2D::new(1.0, 2.0, 0.5));
+// Cross-process IPC latency: ~198-304ns p50 depending on topology
 
 // SLOWER: Larger struct with more data
 let topic: Topic<SensorBundle> = Topic::new("sensors")?;
@@ -296,14 +314,14 @@ fn tick(&mut self) {
 
 ### Understanding Tick Rate
 
-The default scheduler runs at 60 Hz (16ms per tick). Use `.tick_hz()` to change it:
+The default scheduler runs at 100 Hz (10ms per tick). Use `.tick_rate()` to change it:
 
 ```rust
-// Default: 60 Hz
+// Default: 100 Hz
 let scheduler = Scheduler::new();
 
 // 10kHz for high-performance control loops
-let scheduler = Scheduler::new().tick_hz(10000.0);
+let scheduler = Scheduler::new().tick_rate(10_000_u64.hz());
 ```
 
 **Key Point**: Keep individual node tick() methods fast (ideally &lt;1ms) to maintain the target tick rate.
@@ -334,55 +352,31 @@ scheduler.add(AggregatedNode::new()).order(50).done();
 
 **Fewer nodes** = less scheduling overhead.
 
-## Ultra-Low-Latency Networking (Linux)
+## Transports
 
-HORUS provides optional kernel bypass networking for sub-microsecond latency requirements.
+Local communication goes through shared memory; cross-machine communication goes through UDP in `horus_net`.
 
 ### Transport Options
 
-| Transport | Latency (send-only) | Throughput | Requirements |
-|-----------|---------|------------|--------------|
-| Shared Memory (Topic, 1:1) | ~87ns | 12M+ msg/s | Local only |
-| Shared Memory (Topic, many:many) | ~313ns | 3M+ msg/s | Local only |
-| io_uring | 2-3µs | 500K+ msg/s | Linux 5.1+ |
-| Batch UDP | 3-5µs | 300K+ msg/s | Linux 3.0+ |
-| Standard UDP | 5-10µs | 200K+ msg/s | Cross-platform |
+| Transport | Latency (one-way, p50) | Requirements |
+|-----------|------------------------|--------------|
+| Shared Memory (Topic, 1 pub : N sub) | ~198ns | Local only |
+| Shared Memory (Topic, N pub : N sub) | ~304ns | Local only |
+| UDP (`horus_net`, cross-machine) | Network-bound | `net` feature |
 
-### Enable io_uring Transport
+### Enable Cross-Machine Networking
 
-io_uring eliminates syscalls on the send path using kernel-side polling:
+LAN replication is opt-in — HORUS ships minimal by default (fast IPC via shared memory). Build with the `net` feature to enable transparent cross-machine topic sharing:
 
 ```bash
-# Build with io_uring support (Cargo feature flag)
-cargo build --release --features io-uring-net
+cargo build --release --features net
 ```
 
-**Requirements:**
-- Linux 5.1+ (5.6+ recommended for SQ polling)
-- CAP_SYS_NICE capability for SQ_POLL mode
+When enabled, replication auto-starts on `scheduler.run()`. Disable it at runtime with `.network(false)` or `HORUS_NET_ENABLED=false`.
 
-### Enable Batch UDP (Linux)
+### Network Topics
 
-Batch UDP uses `sendmmsg`/`recvmmsg` syscalls for efficient batched network I/O:
-
-```bash
-# Batch UDP is automatically enabled on Linux - no extra dependencies needed
-cargo build --release
-```
-
-**Requirements:**
-- Linux 3.0+ (available on virtually all modern Linux systems)
-
-### Enable All Ultra-Low-Latency Features
-
-```bash
-# Build with all ultra-low-latency features (io_uring)
-cargo build --release --features ultra-low-latency
-```
-
-### Smart Transport Selection
-
-For network topics, HORUS automatically selects the best transport based on available system features and kernel version. Configure network endpoints through topic configuration rather than the `Topic::new()` API (which creates local shared memory topics). See [Network Backends](/advanced/network-backends) for details.
+The UDP transport sends one datagram per syscall (`send_to`/`recv_from`) on every platform. Configure network endpoints through topic configuration rather than the `Topic::new()` API (which creates local shared memory topics). See [Network Backends](/advanced/network-backends) for details.
 
 ## Shared Memory Optimization
 
@@ -408,25 +402,26 @@ sudo mount -o remount,size=4G /dev/shm
 **Note**: HORUS automatically cleans up sessions after each run. Manual cleanup is rarely needed.
 
 ```bash
-# Clean all HORUS shared memory (if needed after crashes)
-rm -rf /dev/shm/horus/
+# Clean HORUS shared memory (if needed after crashes)
+horus clean --shm
 ```
 
 **Stale topics** from crashes can waste space, but auto-cleanup prevents this in normal operation.
 
 ### Topic Memory Usage
 
-Topics use shared memory slots proportional to message size. Keep messages small to reduce memory footprint:
+Topics carrying inline (Pod) messages use shared memory slots proportional to message size. Keep those messages small to reduce memory footprint:
 
 ```rust
-// Small messages use less shared memory
+// Inline (Pod) messages: the ring slot holds the whole struct
 let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;       // 16B per slot
 
-// Large messages use more shared memory
-let cloud: Topic<PointCloud> = Topic::new("cloud")?;    // 120KB per slot
+// Pool-backed types are zero-copy: the ring slot holds a fixed-size
+// descriptor, the point data lives in the shared TensorPool
+let cloud: Topic<PointCloud> = Topic::new("cloud")?;    // 272B descriptor per slot
 ```
 
-**Balance**: Message size directly affects shared memory consumption.
+**Balance**: For inline Pod messages, message size directly affects shared memory consumption. Pool-backed types (`Image`, `PointCloud`, `DepthImage`, `OccupancyGrid`, `CostMap`) keep only a fixed-size descriptor in the ring, so their slot cost does not grow with the payload.
 
 ## Profiling and Measurement
 
@@ -520,16 +515,16 @@ fn init(&mut self) -> Result<()> {
 ### Pitfall: Excessive Logging
 
 ```rust
-// BAD: 60 logs per second
+// BAD: 100 logs per second
 fn tick(&mut self) {
-    hlog!(debug, "Tick");  // Every 16ms!
+    hlog!(debug, "Tick");  // Every 10ms!
 }
 
 // GOOD: 1 log per second
 fn tick(&mut self) {
     self.tick_count += 1;
-    if self.tick_count % 60 == 0 {
-        hlog!(info, "60 ticks completed");
+    if self.tick_count % 100 == 0 {
+        hlog!(info, "100 ticks completed");
     }
 }
 ```
@@ -646,14 +641,16 @@ For hard real-time applications requiring deterministic latency, HORUS provides 
 use horus::prelude::*;
 
 // Configure for hard real-time operation
-let config = RtConfig::hard_realtime(Some(&[2, 3]));  // Pin to isolated cores
-config.apply()?;
+let config = RtConfig::builder()
+    .memory_locked(true)          // mlockall() - No page faults
+    .scheduler(RtScheduler::Fifo) // SCHED_FIFO - Preempts normal processes
+    .priority(80)                 // RT priority (1-99)
+    .cpu_affinity(&[2, 3])        // Pin to isolated cores - No migration jitter
+    .warn_on_degradation(true)
+    .build();
 
-// This enables:
-// - mlockall() - No page faults
-// - SCHED_FIFO priority 80 - Preempts normal processes
-// - CPU affinity - No migration jitter
-// - Stack prefaulting - No lazy allocation
+// apply() returns RtApplyResult - inspect it to see what was degraded
+config.apply()?;
 ```
 
 For detailed configuration options, see the [Real-Time Configuration Guide](/advanced/rt-config).

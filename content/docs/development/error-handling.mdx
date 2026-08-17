@@ -22,8 +22,15 @@ fn my_function() -> Result<()> {
 The prelude exports these error types:
 - `Error` - The main error enum (short alias for `HorusError`)
 - `Result<T>` - Alias for `std::result::Result<T, Error>` (short alias for `HorusResult<T>`)
+- `HorusError` - The same enum under its long name, for exhaustive pattern matching
+- The structured sub-errors every variant carries: `CommunicationError`, `ConfigError`,
+  `MemoryError`, `NodeError`, `NotFoundError`, `ParseError`, `ResourceError`,
+  `SerializationError`, `TimeoutError`, `TransformError`, `ValidationError`
+- Helpers: `HorusContext`, `retry_transient`, `RetryConfig`, `Severity`
 
-The long names `HorusError` and `HorusResult<T>` still work for backward compatibility, but new code should prefer the short aliases.
+`HorusResult<T>` still exists in `horus_core::error` but is **not** in the prelude — import it
+explicitly with `use horus::horus_core::error::HorusResult;` if you need it. New code should use
+`Result<T>`.
 
 ## Core Error Types
 
@@ -35,29 +42,36 @@ The main error type for all HORUS operations (also available as `HorusError` for
 
 | Variant | Description |
 |---------|-------------|
-| `Io` | File system and I/O errors (`#[from] std::io::Error`) |
-| `Config` | Configuration parsing/validation |
-| `Communication` | IPC and network errors |
-| `Node { node, message }` | Node-specific errors (named fields) |
-| `Memory` | Memory allocation errors |
-| `Serialization` | Serialization/deserialization errors |
-| `NotFound` | Resource not found |
-| `PermissionDenied` | Access denied |
-| `InvalidInput` | Invalid argument/input |
-| `AlreadyExists` | Resource already exists |
-| `Parse` | Parsing errors |
-| `Unsupported` | Operation not supported on this platform |
+| `Io(std::io::Error)` | File system and I/O errors (`#[from] std::io::Error`) |
+| `Config(ConfigError)` | Configuration parsing/validation |
+| `Communication(CommunicationError)` | IPC, topic, and network errors |
+| `Node(NodeError)` | Node lifecycle errors (tuple variant, not named fields) |
+| `Memory(MemoryError)` | Memory allocation and shared-memory errors |
+| `Serialization(SerializationError)` | Serialization/deserialization errors |
+| `NotFound(NotFoundError)` | Resource not found |
+| `Resource(ResourceError)` | Already exists, permission denied, or unsupported |
+| `InvalidInput(ValidationError)` | Invalid argument/input |
+| `Parse(ParseError)` | Parsing errors |
+| `InvalidDescriptor(String)` | Cross-process tensor descriptor validation failure |
+| `Transform(TransformError)` | Coordinate frame extrapolation or stale data |
+| `Timeout(TimeoutError)` | Operation exceeded its time limit |
 | `Internal { message, file, line }` | Internal errors with source location |
 | `Contextual { message, source }` | Error with preserved source chain |
+
+There is no flat `PermissionDenied`, `AlreadyExists`, or `Unsupported` variant on `Error` —
+those live under `Resource(ResourceError)`. The enum is also `#[non_exhaustive]`, so any
+`match` on it needs a `_` arm.
 
 ## Creating Errors
 
 ### Using Constructors
 
-`Error` provides convenience constructors for the most common variants:
+`Error` provides exactly three convenience constructors — `config`, `node`, and `network_fault`.
+Every other variant is built by naming its structured sub-error:
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::horus_internal;
 
 // Configuration error
 let err = Error::config("Invalid frequency: must be positive");
@@ -65,14 +79,26 @@ let err = Error::config("Invalid frequency: must be positive");
 // Node error with context (takes node name + message)
 let err = Error::node("MotorController", "Failed to initialize PWM");
 
-// Communication error
-let err = Error::communication("Topic not found: /cmd_vel");
+// Network fault (takes peer + reason)
+let err = Error::network_fault("192.168.1.50:7447", "connection refused");
+
+// Communication error (no constructor — use the variant + sub-error)
+let err = Error::Communication(CommunicationError::TopicNotFound {
+    topic: "/cmd_vel".to_string(),
+});
 
 // Memory error
-let err = Error::memory("Failed to allocate 1GB for buffer");
+let err = Error::Memory(MemoryError::AllocationFailed {
+    reason: "Failed to allocate 1GB for buffer".to_string(),
+});
 
-// Invalid input (use variant directly)
-let err = Error::InvalidInput("Speed must be between 0 and 100".to_string());
+// Invalid input — a ValidationError, not a String
+let err = Error::InvalidInput(ValidationError::OutOfRange {
+    field: "speed".into(),
+    min: "0".into(),
+    max: "100".into(),
+    actual: "150".into(),
+});
 
 // Internal error (prefer horus_internal! macro for file/line capture)
 let err = horus_internal!("Unexpected state reached");
@@ -80,20 +106,38 @@ let err = horus_internal!("Unexpected state reached");
 
 ### Using Variants Directly
 
+Variants that have no named constructor are built from their structured sub-error:
+
 ```rust
 use horus::prelude::*;
 
-let err = Error::PermissionDenied("/dev/ttyUSB0".to_string());
-let err = Error::AlreadyExists("Session 'main' already exists".to_string());
-let err = Error::Parse("Invalid YAML syntax at line 5".to_string());
+let err = Error::Resource(ResourceError::PermissionDenied {
+    resource: "/dev/ttyUSB0".to_string(),
+    required_permission: "read-write".to_string(),
+});
+
+let err = Error::Resource(ResourceError::AlreadyExists {
+    resource_type: "Session".to_string(),
+    name: "main".to_string(),
+});
+
+let err = Error::Parse(ParseError::Custom {
+    type_name: "YAML".to_string(),
+    input: "robot.yaml".to_string(),
+    reason: "invalid syntax at line 5".to_string(),
+});
 ```
 
 ### Internal Errors with Source Location
 
-Use the `horus_internal!()` macro to create internal errors that automatically capture file and line number:
+Use the `horus_internal!()` macro to create internal errors that automatically capture file and line number.
+
+The macro is **not** re-exported by the prelude — import it explicitly with
+`use horus::horus_core::horus_internal;`:
 
 ```rust
 use horus::prelude::*;
+use horus::horus_core::horus_internal;
 
 // Captures file/line automatically
 return Err(horus_internal!("Unexpected state: {:?}", state));
@@ -141,17 +185,26 @@ fn load_robot_config(path: &str) -> Result<Config> {
 |-------------|----------------|
 | `std::io::Error` | `Error::Io` |
 | `serde_json::Error` | `Error::Serialization` |
-| `serde_yaml::Error` | `Error::Serialization` |
+| `serde_yaml_ng::Error` | `Error::Serialization` |
 | `toml::de::Error` | `Error::Config` |
 | `toml::ser::Error` | `Error::Serialization` |
 | `std::num::ParseIntError` | `Error::Parse` |
 | `std::num::ParseFloatError` | `Error::Parse` |
 | `std::str::ParseBoolError` | `Error::Parse` |
-| `uuid::Error` | `Error::Internal` |
+| `uuid::Error` | `Error::Contextual` |
 | `std::sync::PoisonError<T>` | `Error::Internal` |
 | `Box<dyn std::error::Error>` | `Error::Internal` |
 | `Box<dyn std::error::Error + Send + Sync>` | `Error::Contextual` |
-| `anyhow::Error` | `Error::Internal` |
+| `anyhow::Error` | `Error::Contextual` |
+
+<Callout type="info">
+
+HORUS depends on `serde_yaml_ng` (aliased internally as `serde_yaml`), not the unmaintained
+upstream `serde_yaml`. The `?` conversion only applies to `serde_yaml_ng::Error`. Rather than
+adding the crate to your own `Cargo.toml`, use the re-export — `use horus::horus_core::serde_yaml;` —
+which guarantees you get the exact version HORUS's `From` impl is written against.
+
+</Callout>
 
 ## Error Checking
 
@@ -165,8 +218,13 @@ match result {
     Err(Error::NotFound(resource)) => {
         eprintln!("Resource not found: {}", resource);
     }
-    Err(Error::Node { node, message }) => {
+    // `Node` is a tuple variant wrapping a `NodeError` — match the sub-variant
+    Err(Error::Node(NodeError::Other { node, message })) => {
         eprintln!("Node {} error: {}", node, message);
+    }
+    // ...or handle every node failure generically via Display
+    Err(Error::Node(e)) => {
+        eprintln!("Node error: {}", e);
     }
     Err(Error::Internal { message, file, line }) => {
         eprintln!("Internal error at {}:{}: {}", file, line, message);
@@ -176,6 +234,12 @@ match result {
     }
 }
 ```
+
+`NodeError::Other` is only the catch-all sub-variant. The lifecycle failures are separate:
+`InitFailed { node, reason }`, `TickFailed { node, reason }`, `InitPanic { node }`,
+`ReInitPanic { node }`, and `ShutdownPanic { node }`.
+
+Because `HorusError` is `#[non_exhaustive]`, the trailing `Err(e)` arm is required, not optional.
 
 ## Best Practices
 
@@ -340,37 +404,62 @@ fn horus_function() -> Result<Robot> {
 
 ## HorusError Variants Reference
 
-The `HorusError` enum (aliased as `Error`) contains all possible error types:
+The `HorusError` enum (aliased as `Error`) contains all possible error types. Note that
+almost every payload is a **structured sub-error**, not a `String`:
 
 | Variant | Description |
 |---------|-------------|
 | `Io(std::io::Error)` | File system, network, or other I/O errors |
-| `Config(String)` | Configuration parsing or validation failure |
-| `Communication(String)` | IPC or shared memory communication failure |
-| `Node { node, message }` | Node-specific error with node name and message |
-| `Memory(String)` | Shared memory allocation or mapping failure |
-| `Serialization(String)` | Message serialization/deserialization error |
-| `NotFound(String)` | Resource (topic, node, service) not found |
-| `PermissionDenied(String)` | Insufficient permissions (e.g., `/dev/shm` access) |
-| `InvalidInput(String)` | Invalid argument or parameter |
-| `AlreadyExists(String)` | Duplicate creation (topic name collision) |
-| `Parse(String)` | String/config parsing failure |
+| `Config(ConfigError)` | Configuration parsing or validation failure |
+| `Communication(CommunicationError)` | IPC, topic, or network communication failure |
+| `Node(NodeError)` | Node lifecycle error (init, tick, shutdown) |
+| `Memory(MemoryError)` | Shared memory allocation or mapping failure |
+| `Serialization(SerializationError)` | Message serialization/deserialization error |
+| `NotFound(NotFoundError)` | Resource (topic, node, service, frame) not found |
+| `Resource(ResourceError)` | Already exists, permission denied, or unsupported |
+| `InvalidInput(ValidationError)` | Invalid argument or parameter |
+| `Parse(ParseError)` | String/config parsing failure |
 | `InvalidDescriptor(String)` | Cross-process tensor descriptor validation failure |
-| `Unsupported(String)` | Platform or feature not supported |
-| `OutOfRange(String)` | Numeric overflow or value out of bounds |
-| `Timeout(String)` | Operation exceeded time limit |
+| `Transform(TransformError)` | Coordinate frame extrapolation or stale data |
+| `Timeout(TimeoutError)` | Operation exceeded time limit (resource, elapsed, optional deadline) |
 | `Internal { message, file, line }` | Internal error with source location |
 | `Contextual { message, source }` | Error chain wrapping an underlying cause |
+
+`HorusError` is `#[non_exhaustive]`, so every `match` on it must include a `_` (or `Err(e)`)
+arm — new variants may be added without a breaking change.
+
+### Sub-Error Variants
+
+These are what you actually pattern-match on. All of them are exported by the prelude, and
+every one of these enums is `#[non_exhaustive]`, so match arms over them also need a `_`:
+
+| Sub-error | Variants |
+|-----------|----------|
+| `ConfigError` | `ParseFailed { format, reason, source }`, `MissingField { field, context }`, `ValidationFailed { field, expected, actual }`, `InvalidValue { key, reason }`, `Other(String)` |
+| `CommunicationError` | `TopicFull { topic }`, `TopicNotFound { topic }`, `TopicCreationFailed { topic, reason }`, `NetworkFault { peer, reason }`, `SerializationFailed { reason }`, `ActionFailed { reason }` |
+| `NodeError` | `InitPanic { node }`, `ReInitPanic { node }`, `ShutdownPanic { node }`, `InitFailed { node, reason }`, `TickFailed { node, reason }`, `Other { node, message }` |
+| `MemoryError` | `PoolExhausted { reason }`, `AllocationFailed { reason }`, `ShmCreateFailed { path, reason }`, `MmapFailed { reason }`, `OffsetOverflow` |
+| `SerializationError` | `Json { source }`, `Yaml { source }`, `Toml { source }`, `Other { format, reason }` |
+| `NotFoundError` | `Frame { name }`, `ParentFrame { name }`, `Topic { name }`, `Node { name }`, `Service { name }`, `Action { name }`, `Parameter { name }`, `Other { kind, name }`, `WithSuggestion { kind, name, suggestion }` |
+| `ResourceError` | `AlreadyExists { resource_type, name }`, `PermissionDenied { resource, required_permission }`, `Unsupported { feature, reason }` |
+| `ValidationError` | `OutOfRange { field, min, max, actual }`, `InvalidFormat { field, expected_format, actual }`, `InvalidEnum { field, valid_options, actual }`, `MissingRequired { field }`, `ConstraintViolation { field, constraint }`, `InvalidValue { field, value, reason }`, `Conflict { field_a, field_b, reason }`, `Other(String)` |
+| `ParseError` | `Int { input, source }`, `Float { input, source }`, `Bool { input, source }`, `Custom { type_name, input, reason }` |
+| `TransformError` | `Extrapolation { frame, requested_ns, oldest_ns, newest_ns }`, `Stale { frame, age, threshold }` |
+| `TimeoutError` | A struct, not an enum: `resource: String`, `elapsed: Duration`, `deadline: Option<Duration>` |
 
 ### Constructing Errors
 
 ```rust
-// Named constructors
+// Named constructors — this is the complete set
 Error::config("Invalid YAML syntax")
 Error::node("SensorNode", "Sensor not responding")
-Error::communication("Topic not found")
+Error::network_fault("192.168.1.50:7447", "connection refused")
+
+// Every other variant is built from its structured sub-error
+Error::Communication(CommunicationError::TopicNotFound { topic: "/cmd_vel".into() })
 
 // Internal errors (captures file and line automatically)
+// Requires `use horus::horus_core::horus_internal;` — not in the prelude
 horus_internal!("Unexpected state: {:?}", state)
 
 // Contextual errors (wrapping another error)
@@ -383,7 +472,7 @@ Error::Contextual {
 ### Type Aliases
 
 ```rust
-pub type HorusResult<T> = Result<T, HorusError>;
+pub type HorusResult<T> = std::result::Result<T, HorusError>;
 pub type Result<T> = HorusResult<T>;  // Convenience alias
 pub type Error = HorusError;          // Short name
 ```
