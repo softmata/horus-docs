@@ -146,17 +146,42 @@ Priorities are `u32` values where **lower numbers = higher priority**:
 | 100-199 | Low | Logging, diagnostics, non-critical computation |
 | 200+ | Background | Telemetry, data recording |
 
-Nodes execute **in priority order** every tick:
+`order` sequences nodes that run on the **main tick loop** and have no topic
+relationship between them:
 
 ```rust
 let mut scheduler = Scheduler::new();
 
-// Execution order: Safety -> Controller -> Sensor -> Logger
+// Four BestEffort nodes with no shared topics — order decides the sequence
 scheduler.add(safety_monitor).order(0).done()?;    // Runs 1st
 scheduler.add(controller).order(10).done()?;        // Runs 2nd
 scheduler.add(sensor).order(50).done()?;            // Runs 3rd
 scheduler.add(logger).order(200).done()?;           // Runs 4th
 ```
+
+<Callout type="warning" title="`order` is not a global priority">
+
+Two things override it, and both are easy to hit:
+
+**An execution class takes the node off the main loop entirely.** `.rate()`,
+`.budget()`, `.deadline()`, `.compute()`, `.on(..)` and `.async_io()` each move a node to
+its own executor — RT nodes get one thread each — where `order` no longer sequences
+anything. A scheduler whose nodes all have `.rate()` reports *"no main-thread nodes (all
+nodes run on executors)"* and `order` has no effect at all.
+
+**Topic dependencies outrank it.** When main-loop nodes publish and subscribe to each
+other, the dispatch order comes from that graph, not from `order`. A subscriber runs
+after its publisher even if it has the lower number:
+
+```text
+TICK Sensor(order 50)  at  1.96ms
+TICK Safety(order 0)   at 32.18ms     # subscribes to Sensor's topic
+```
+
+`order` tiers are the fallback used when there is no topic metadata to build a graph
+from. If you need a strict sequence, use `.deterministic(true)`.
+
+</Callout>
 
 ## Running the Scheduler
 
@@ -308,15 +333,24 @@ When you call `run()`, the scheduler initializes all nodes by calling `init()`:
 
 ```
 1. Initialize all nodes (call init())
-2. Sort nodes by priority
-3. Main loop:
-   a. For each node (in priority order):
+2. Hand nodes with an execution class to their executors
+     - RT      -> one dedicated thread per node
+     - Compute -> parallel thread pool
+     - Event   -> per-node watcher thread
+     - AsyncIo -> tokio blocking pool
+   These run on their own schedules from here on.
+3. Build a dependency graph over the remaining (BestEffort) nodes
+     - from pub/sub topic metadata where it exists
+     - falling back to `order` tiers where it does not
+4. Main loop, for the BestEffort nodes only:
+   a. Dispatch each node as soon as its predecessors have finished
+      (in parallel; strictly sequential only under `.deterministic(true)`)
       - Check if node should tick (rate limiting)
       - Start tick timing
       - Call node.tick()
       - Record metrics, check budget/deadlines
    b. Sleep to maintain target tick rate
-4. On shutdown signal:
+5. On shutdown signal:
    a. Set running = false
    b. Call shutdown() on all nodes
 ```
