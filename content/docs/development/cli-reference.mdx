@@ -28,7 +28,8 @@ horus log [node]           # View and filter logs
 horus blackbox             # Inspect BlackBox flight recorder (alias: bb)
 
 # Coordinate Frames
-horus frame <command>      # HORUS Frames (list, echo, tree, info, can, hz)
+horus frame <command>      # HORUS Frames (list, echo, tree, info, can, hz,
+                           #   record, play, diff, tune, calibrate, hand-eye)
 
 # Package Management
 horus install <name>       # Install a package, driver, or plugin (smart detection)
@@ -145,7 +146,12 @@ Options:
   -w, --workspace          Create as a workspace with multiple crates
   -l, --lib                Create as a library crate (instead of binary)
   -o, --output <PATH>      Where to create it (default: current directory)
+  -y, --yes                Accept defaults without prompting
 ```
+
+Without a language flag, `horus new` asks two interactive questions. Pass `-y` to take
+the defaults instead — that is what makes the command usable in scripts, Dockerfiles and
+CI.
 
 ### Examples
 
@@ -1249,11 +1255,72 @@ payload against a message type, so the field names have to match what the
 subscriber expects. The fields above are `CmdVel`'s: `timestamp_ns: u64`,
 `linear: f32`, `angular: f32`.
 
-> **Note**: `CmdVel`, `LaserScan`, and `Odometry` come from the `horus-robotics`
-> package, not from the built-in types that `horus msg list` enumerates — that
-> command only reads HORUS's own `horus_types`, so these three will not appear in
-> its output. The built-in stand-in for `CmdVel` is `Twist` (`linear: [f64; 3]`,
-> `angular: [f64; 3]`, `timestamp_ns: u64`).
+> **Note**: `CmdVel`, `LaserScan` and `Odometry` come from the `horus-robotics`
+> package rather than HORUS's own `horus_types`, but `horus msg list` scans both,
+> so they appear in its output alongside the built-ins and `horus msg info CmdVel`
+> works as expected.
+
+---
+
+## `horus service` - Service Introspection
+
+**What it does**: List, inspect and call request/response services.
+
+**Why it's useful**: Exercise a service from the terminal without writing a client.
+
+### Subcommands
+
+```bash
+horus service list                  # List all active services
+horus service find <filter>         # Find services whose name contains <filter>
+horus service info <name>           # Show request/response type info
+horus service call <name> <json>    # Call a service with a JSON request
+```
+
+### Examples
+
+```bash
+horus service call add '{"a": 3, "b": 4}'
+horus service call slow_op '{}' --timeout 30      # default is 5s
+```
+
+<Callout type="info" title="`service call` reaches Rust servers only">
+
+The CLI delivers requests through a JSON file gateway under
+`/dev/shm/horus_default/topics/.service_gateway/`, and only the Rust `ServiceServer`
+polls it. `horus service list` will discover a C++ service — it finds them by scanning
+shared memory for the `.request` topic — but `horus service call` cannot invoke one. Use
+a `ServiceClient` for those.
+
+</Callout>
+
+---
+
+## `horus action` - Action Introspection
+
+**What it does**: List and inspect long-running actions, send goals, and cancel them.
+
+**Why it's useful**: Drive a goal-based behaviour by hand while debugging.
+
+### Subcommands
+
+```bash
+horus action list                        # List all active actions
+horus action info <name>                 # Show detailed info about an action
+horus action send-goal <name> <json>     # Send a goal (JSON)
+horus action cancel-goal <name>          # Cancel goals on an action server
+```
+
+### Examples
+
+```bash
+# Send a goal and block until the result arrives
+horus action send-goal navigate '{"x": 2.0, "y": 1.0}' --wait
+
+# Cancel one goal, or every goal if --goal-id is omitted
+horus action cancel-goal navigate --goal-id 7
+horus action cancel-goal navigate
+```
 
 ---
 
@@ -1280,11 +1347,16 @@ horus node resume <node>      # Resume a paused node
 ```bash
 horus node list
 # Output:
-# NAME              PID     RATE   CPU    MEMORY   STATUS
-# SensorNode        12345   100Hz  1.2%   10MB     Running
-# ControllerNode    12346   50Hz   2.5%   15MB     Running
-# LoggerNode        12347   10Hz   0.1%   5MB      Paused
+#   NAME                       STATUS   PRIORITY     RATE      TICKS   SOURCE
+#   ---------------------------------------------------------------------------
+#   SensorNode                Running         50    100Hz      12043   12345
+#   ControllerNode            Running         40     50Hz       6021   12346
+#   LoggerNode                 Paused          0     10Hz       1204   12347
 ```
+
+`SOURCE` carries the PID for a local node, or a marker such as `[bridged:…]` /
+`[horus_net:…]` for one reached through a bridge or the network. CPU and memory are not
+in this table — `horus node info <node>` reports those.
 
 **Get detailed node info**:
 ```bash
@@ -1390,11 +1462,20 @@ horus param dump                  # Dump all parameters as YAML to stdout
 ```bash
 horus param list
 # Output:
-# /SensorNode/sample_rate: 100
-# /SensorNode/filter_size: 5
-# /ControllerNode/kp: 1.5
-# /ControllerNode/ki: 0.1
+# Parameters:
+#   KEY                                           VALUE       TYPE
+#   ----------------------------------------------------------------
+#   /SensorNode/sample_rate                         100        int
+#   /SensorNode/filter_size                           5        int
+#   /ControllerNode/kp                              1.5      float
+#   /ControllerNode/ki                              0.1      float
+#
+# Total: 4 parameter(s)
+# Location: Stored in: .horus/config/params.yaml
 ```
+
+`--verbose` prints a `Key:` / `Value:` / `Type:` block per parameter instead of the
+table, and `--json` prints JSON for scripting.
 
 **Tune a controller at runtime**:
 ```bash
@@ -1428,6 +1509,16 @@ horus frame tree                    # Show frame tree hierarchy
 horus frame info <frame>            # Detailed frame information
 horus frame can <source> <target>   # Check if transform is possible
 horus frame hz                      # Monitor frame update rates
+
+# Recording and comparison
+horus frame record -o run.tfr       # Record transforms to a .tfr file
+horus frame play run.tfr            # Replay a recording (--speed 2.0 to fast-forward)
+horus frame diff a.tfr b.tfr        # Compare two recordings
+
+# Calibration
+horus frame tune <frame>            # Interactively nudge a static frame's offset
+horus frame calibrate --points-file pairs.csv        # Sensor-to-base by SVD registration
+horus frame hand-eye --robot-poses r.csv --sensor-poses s.csv   # Solve AX=XB
 ```
 
 ### Examples
@@ -1523,17 +1614,25 @@ horus launch robot.yaml --namespace robot1
 ### Options
 
 ```bash
-horus launch [OPTIONS] <FILE>
+horus launch [OPTIONS] [FILE]
 
 Arguments:
-  <FILE>  Path to launch file (YAML)
+  [FILE]  Path to launch file (YAML). Omit when using --status
 
 Options:
   -n, --dry-run                Show what would launch without actually launching
       --namespace <NAMESPACE>  Namespace prefix for all nodes
       --list                   List nodes in the launch file without launching
+      --status                 Show active launch sessions (no file needed)
+      --stop <STOP>            Stop a running launch session by name
+      --shutdown-timeout <N>   Seconds to wait for graceful shutdown before
+                               SIGKILL (default: 2)
   -h, --help                   Print help
 ```
+
+`--status` and `--stop` are how you manage a system after it is up: `--status` lists the
+running sessions, `--stop <name>` shuts one down, and `--shutdown-timeout` sets how long
+each node gets to exit cleanly before it is killed.
 
 ### Launch File Format
 
@@ -1607,12 +1706,14 @@ horus deploy robot@192.168.1.100 --arch aarch64
 ### Options
 
 ```bash
-horus deploy [OPTIONS] [TARGET]
+horus deploy [OPTIONS] [TARGETS]...
 
 Arguments:
-  [TARGET]  Target host (user@host or configured target name)
+  [TARGETS]...  Target(s) — named targets from deploy.yaml or direct user@host
 
 Options:
+      --all                  Deploy to ALL targets in deploy.yaml
+      --parallel             Deploy to multiple targets in parallel
   -d, --dir <REMOTE_DIR>     Remote directory (default: ~/horus_deploy)
   -a, --arch <ARCH>          Target architecture (aarch64, armv7, x86_64, native)
       --run                  Run the project after deploying
@@ -1877,10 +1978,22 @@ horus record inject <session>  # Inject recorded data into live scheduler
 ```bash
 horus record list
 # Output:
-# ID         DATE                 DURATION   NODES   SIZE
-# rec_001    2024-01-15 10:30:00  5m 23s     4       45MB
-# rec_002    2024-01-15 14:15:00  2m 10s     3       18MB
+# ✓ Found 2 recording session(s):
+#
+#   rec_001
+#   rec_002
+
+# With -l/--long, each line gains a file count and size:
+horus record list --long
+# Output:
+# ✓ Found 2 recording session(s):
+#
+#   rec_001 (4 files, 45.0 MB)
+#   rec_002 (3 files, 18.2 MB)
 ```
+
+There is no date, duration or node count in this listing — `--long` adds only the file
+count and total size.
 
 **Replay a session**:
 ```bash

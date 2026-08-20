@@ -12,7 +12,7 @@ order: 51
 
 - **Zero Boilerplate**: Working node in 10 lines
 - **Flexible API**: Functional style or class inheritance - your choice
-- **Production Performance**: ~40-85ns cross-process latency (same shared memory as Rust)
+- **Production Performance**: the same shared-memory transport Rust uses, reached across the PyO3 boundary — expect single-digit microseconds per send/recv from Python, not the 40-85ns the backend itself costs
 - **Per-Node Rate Control**: Different nodes at different frequencies (100Hz sensor, 10Hz logger)
 - **Message Timestamps**: most typed messages carry a nanosecond `timestamp_ns` field you set on publish
 - **Typed Messages**: Optional type-safe messages from Rust
@@ -596,7 +596,7 @@ named_topic = Topic(CmdVel, endpoint="cmdvel")
 | `topic.backend_type` | Property: the active backend name (e.g., `"PodShm"`, `"SpmcShm"`); `"Unknown"` until the backend resolves |
 | `topic.is_network_topic` | Property: `True` when the endpoint string contains an `@`. Cosmetic only — no topic uses a network transport (see above) |
 | `topic.endpoint` | Property: the endpoint string, or `None` for local topics |
-| `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `is_network`, `backend` |
+| `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `is_network`, `backend`. `messages_sent`/`messages_received` stay at `0` unless verbose content logging is on — use `horus topic hz` for traffic |
 | `topic.is_generic()` | Returns `True` if this is a generic (string-name) topic |
 
 **Example:**
@@ -675,6 +675,10 @@ big = Topic(CmdVel, capacity=4096)
 
 **Backends HORUS Can Select:**
 
+The latencies below are the backends' own transport cost, measured from Rust. A Python `send()`/`recv()` pays the PyO3 and GIL crossing on top, which dominates — budget microseconds, not nanoseconds, for Python-to-Python traffic.
+
+
+
 Every backend is shared memory and cross-process — there is no same-thread or intra-process path.
 
 | Backend | Latency | Description |
@@ -682,8 +686,12 @@ Every backend is shared memory and cross-process — there is no same-thread or 
 | `FanoutShm` | ~40ns | Cross-process, contention-free MPMC via a shared-memory SPSC matrix |
 | `PodShm` | ~50ns | Cross-process broadcast of a POD message type |
 | `MpscShm` | ~65ns | Cross-process, multiple producers, single consumer |
-| `SpmcShm` | ~70ns | Cross-process, single producer, multiple consumers |
 | `SpscShm` | ~85ns | Cross-process, single producer, single consumer |
+
+A single producer with several consumers gets `PodShm` (fixed-size messages) or
+`FanoutShm` (everything else), so each consumer sees the stream independently. `SpmcShm`
+exists in the enum but backend detection never chooses it — its consumers share one tail
+and compete for messages, which is queue semantics rather than pub/sub.
 
 `topic.backend_type` reports the resolved cross-process backend once it is known — one of
 `"Unknown"`, `"PodShm"`, `"SpscShm"`, `"SpmcShm"`, `"MpscShm"`, or `"FanoutShm"`.
@@ -692,7 +700,7 @@ Every backend is shared memory and cross-process — there is no same-thread or 
 
 | Transport | Latency | Use Case |
 |-----------|---------|----------|
-| Local (`Topic(CmdVel)`) | ~40-85ns | Same-machine communication (auto-detected backend) |
+| Local (`Topic(CmdVel)`) | ~40-85ns transport, µs from Python | Same-machine communication (auto-detected backend) |
 | Local SPSC (auto-selected `SpscShm`) | ~85ns | Same-machine, single producer/consumer |
 | Local MPMC (auto-selected `PodShm` for POD types, `FanoutShm` otherwise) | ~40-50ns | Same-machine, multiple producers/consumers |
 
@@ -718,6 +726,26 @@ and the peer filter.
 
 ## Integration with Python Ecosystem
 
+<Callout type="warning" title="Generic topics cap the payload at 4096 bytes">
+
+The examples in this section use bare-string topics (`subs="raw_data"`), which serialise
+through the generic path. That path rejects anything whose encoded form exceeds 4096
+bytes:
+
+```text
+ValueError: Invalid input: 'data' out of range: expected [0..4096], got 14619
+```
+
+That is roughly a thousand floats — fine for feature vectors, spectra and control
+values, and far too small for an image. A 480x640x3 frame is 921,600 values and cannot
+travel this way at all. For images use `horus.Image` with a typed topic, which is
+pool-backed and never goes through this encoder.
+
+Generic topics also carry only JSON-shaped values: dicts, lists, strings, numbers and
+booleans. `bytes` and `complex` both raise `TypeError`.
+
+</Callout>
+
 ### NumPy Integration
 
 ```python
@@ -731,7 +759,9 @@ def process_array(node):
         arr = np.array(data)
         # Process with NumPy
         result = np.fft.fft(arr)
-        node.send("fft_result", result.tolist())
+        # np.fft returns complex128 — a generic topic cannot carry Python
+        # `complex` ("unsupported type complex"), so send magnitudes instead
+        node.send("fft_result", np.abs(result).tolist())
 
 processor = horus.Node(
     subs="raw_data",
@@ -749,24 +779,28 @@ import numpy as np
 
 def process_image(node):
     if node.has_msg("camera"):
-        img_data = node.recv("camera")
-        # Convert to OpenCV format
-        img = np.array(img_data, dtype=np.uint8).reshape((480, 640, 3))
+        frame = node.recv("camera")          # horus.Image
+        img = frame.to_numpy()               # zero-copy view, (H, W, 3) uint8
 
         # Apply OpenCV processing
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150)
 
-        # Publish result
-        node.send("edges", edges.flatten().tolist())
+        # Publish result as an Image, not a list
+        node.send("edges", horus.Image.from_numpy(edges))
 
 vision = horus.Node(
-    subs="camera",
-    pubs="edges",
+    subs={"camera": {"type": horus.Image}},
+    pubs={"edges": {"type": horus.Image}},
     tick=process_image,
     rate=30
 )
 ```
+
+Images go over **typed** topics carrying `horus.Image`, which is pool-backed: the pixels
+stay in shared memory and only a descriptor moves. Flattening a frame to a list and
+sending it over a generic topic cannot work — a 480x640x3 frame is 921,600 values against
+a 4096-byte ceiling.
 
 ### scikit-learn Integration
 
@@ -925,7 +959,7 @@ def control_tick(node):
 ### 3. Use Dicts for Messages
 
 ```python
-# Send messages as Python dicts (automatically serialized to JSON)
+# Send messages as Python dicts (serialized via MessagePack)
 cmd = {"linear": 1.5, "angular": 0.8}
 node.send("cmd_vel", cmd)
 ```
@@ -1084,7 +1118,7 @@ if let Some(cmd) = topic.recv() {
 from horus import Topic
 
 topic = Topic("my_topic")  # Pass string for generic topic
-topic.send({"linear": 1.0, "angular": 0.5})  # Uses JSON serialization
+topic.send({"linear": 1.0, "angular": 0.5})  # JSON-shaped value, MessagePack on the wire
 ```
 
 **Typed topics:** Use `Topic(CmdVel)`, `Topic(Pose2D)` for cross-language communication.
