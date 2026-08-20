@@ -16,7 +16,14 @@ function args() {
 }
 
 const options = args();
-const extracted = JSON.parse(fs.readFileSync('extracted-code-blocks.json', 'utf8'));
+const extractedPath = 'extracted-code-blocks.json';
+if (!fs.existsSync(extractedPath)) {
+  // No longer committed — it is a build artifact. Say so, rather than failing
+  // with a bare ENOENT on a fresh clone.
+  console.error('extracted-code-blocks.json is missing. Run `npm run extract:code` first.');
+  process.exit(1);
+}
+const extracted = JSON.parse(fs.readFileSync(extractedPath, 'utf8'));
 const blocks = extracted.blocks.filter((block) =>
   block.language === 'python' && block.verifiable &&
   (!options.filter || options.filter.test(block.id))

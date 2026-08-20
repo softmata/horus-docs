@@ -93,9 +93,19 @@ const sections: SidebarSection[] = [
         ]
       },
       {
+        title: "Guide",
+        href: "/rust-guide",
+        order: 2,
+        children: [
+          { title: "Overview", href: "/rust-guide", order: 0 },
+          { title: "Topics & Communication", href: "/rust-guide/topics", order: 1 },
+        ]
+      },
+      { title: "Clock & Time API", href: "/rust/api/clock-api", order: 3 },
+      {
         title: "Examples",
         href: "/rust/examples",
-        order: 2,
+        order: 4,
         children: [
           { title: "Basic Examples", href: "/rust/examples/basic-examples", order: 1 },
           { title: "Advanced Examples", href: "/rust/examples/advanced-examples", order: 2 },
@@ -119,6 +129,15 @@ const sections: SidebarSection[] = [
         ]
       },
       {
+        title: "Guide",
+        href: "/python-guide",
+        order: 3,
+        children: [
+          { title: "Overview", href: "/python-guide", order: 0 },
+          { title: "Nodes & Topics", href: "/python-guide/nodes-topics", order: 1 },
+        ]
+      },
+      {
         title: "Library",
         href: "/python/library/python-message-library",
         order: 2,
@@ -131,9 +150,72 @@ const sections: SidebarSection[] = [
     ],
   },
   {
+    title: "C++",
+    links: [
+      { title: "API Reference", href: "/cpp/api", order: 0,
+        children: [
+          { title: "Overview", href: "/cpp/api", order: 0 },
+          { title: "Node", href: "/cpp/api/node", order: 1 },
+          { title: "Scheduler", href: "/cpp/api/scheduler", order: 2 },
+          { title: "Publisher & Subscriber", href: "/cpp/api/topic", order: 3 },
+          { title: "Services & Actions", href: "/cpp/api/services", order: 4 },
+          { title: "TransformFrame", href: "/cpp/api/transform", order: 5 },
+          { title: "Runtime Parameters", href: "/cpp/api/params", order: 6 },
+          { title: "TensorPool, Image & PointCloud", href: "/cpp/api/pool", order: 7 },
+          { title: "Logging & BlackBox", href: "/cpp/api/logging", order: 8 },
+          { title: "Duration & Frequency", href: "/cpp/api/duration", order: 9 },
+          {
+            title: "Messages",
+            href: "/cpp/api/sensor-messages",
+            order: 10,
+            children: [
+              { title: "Control", href: "/cpp/api/control-messages", order: 1 },
+              { title: "Detection & Vision", href: "/cpp/api/detection-messages", order: 2 },
+              { title: "Diagnostics", href: "/cpp/api/diagnostics-messages", order: 3 },
+              { title: "Force & Tactile", href: "/cpp/api/force-messages", order: 4 },
+              { title: "Geometry", href: "/cpp/api/geometry-messages", order: 5 },
+              { title: "Navigation", href: "/cpp/api/navigation-messages", order: 6 },
+              { title: "Sensor", href: "/cpp/api/sensor-messages", order: 7 },
+              { title: "Tracking & Perception", href: "/cpp/api/tracking-messages", order: 8 },
+            ]
+          },
+        ]
+      },
+      { title: "Examples", href: "/cpp/examples/basic", order: 1,
+        children: [
+          { title: "Basic Examples", href: "/cpp/examples/basic", order: 0 },
+          { title: "Advanced Examples", href: "/cpp/examples/advanced", order: 1 },
+        ]
+      },
+      { title: "Error Handling", href: "/cpp/error-handling", order: 2 },
+      { title: "Hardware Integration", href: "/cpp/hardware", order: 3 },
+      { title: "Real-Time Guide", href: "/cpp/realtime", order: 4 },
+      { title: "Performance Guide", href: "/cpp/performance", order: 5 },
+      { title: "Testing Guide", href: "/cpp/testing", order: 6 },
+    ],
+  },
+  {
+    title: "C++ Tutorials",
+    links: [
+      { title: "1. Sensor Node", href: "/tutorials/01-sensor-node-cpp", order: 0 },
+      { title: "2. Motor Controller", href: "/tutorials/02-motor-controller-cpp", order: 1 },
+      { title: "3. Full Robot", href: "/tutorials/03-full-robot-cpp", order: 2 },
+      { title: "4. Custom Messages", href: "/tutorials/04-custom-messages-cpp", order: 3 },
+      { title: "5. Hardware & Real-Time", href: "/tutorials/05-hardware-rt-cpp", order: 4 },
+      { title: "6. Services & Actions", href: "/tutorials/06-services-actions-cpp", order: 5 },
+      { title: "7. Parameters Deep Dive", href: "/tutorials/07-params-deep-dive-cpp", order: 6 },
+      { title: "8. Multi-Process", href: "/tutorials/08-multi-process-cpp", order: 7 },
+      { title: "9. Record & Replay", href: "/tutorials/09-record-replay-cpp", order: 8 },
+      { title: "10. Write a Driver", href: "/tutorials/10-write-a-driver-cpp", order: 9 },
+      { title: "Real-Time Control", href: "/tutorials/realtime-control-cpp", order: 10 },
+      { title: "Migrating from ROS 2", href: "/tutorials/migrating-from-ros2-cpp", order: 11 },
+    ],
+  },
+  {
     title: "Development",
     links: [
       { title: "CLI Reference", href: "/development/cli-reference", order: 1 },
+      { title: "Environment Variables", href: "/development/environment-variables", order: 15 },
       { title: "Monitor", href: "/development/monitor", order: 2 },
       { title: "Testing", href: "/development/testing", order: 3 },
       { title: "Parameters", href: "/development/parameters", order: 4 },
@@ -151,6 +233,8 @@ const sections: SidebarSection[] = [
       { title: "Network Backends", href: "/advanced/network-backends", order: 5 },
       { title: "Scheduling Intelligence", href: "/advanced/scheduling-intelligence", order: 6 },
       { title: "BlackBox Recorder", href: "/advanced/blackbox", order: 7 },
+      { title: "Production Deployment", href: "/advanced/deployment", order: 8 },
+      { title: "Recipe: ROS 2 Bridge", href: "/recipes/ros2-bridge", order: 12 },
       { title: "Circuit Breaker", href: "/advanced/circuit-breaker", order: 9 },
       { title: "Safety Monitor", href: "/advanced/safety-monitor", order: 10 },
       { title: "Record & Replay", href: "/advanced/record-replay", order: 12 },

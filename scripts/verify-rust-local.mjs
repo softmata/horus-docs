@@ -24,7 +24,14 @@ if (!fs.existsSync(path.join(horusCrate, 'Cargo.toml'))) {
   throw new Error(`HORUS crate not found at ${horusCrate}`);
 }
 
-const extracted = JSON.parse(fs.readFileSync(path.join(root, 'extracted-code-blocks.json'), 'utf8'));
+const extractedPath = path.join(root, 'extracted-code-blocks.json');
+if (!fs.existsSync(extractedPath)) {
+  // No longer committed — it is a build artifact. Say so, rather than failing
+  // with a bare ENOENT on a fresh clone.
+  console.error('extracted-code-blocks.json is missing. Run `npm run extract:code` first.');
+  process.exit(1);
+}
+const extracted = JSON.parse(fs.readFileSync(extractedPath, 'utf8'));
 const blocks = extracted.blocks.filter((block) =>
   block.language === 'rust' && block.verifiable &&
   !block.flags.includes('needs-wrapper') &&
