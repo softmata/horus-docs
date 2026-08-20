@@ -589,60 +589,105 @@ The Python distribution is published on PyPI as `horus-robotics` and imported as
 
 ### `[hardware]` (Optional)
 
-Declares the hardware nodes your robot has. Each entry names a driver; `horus run`
-starts them alongside your own nodes, so a driver you list here does not need to be
-constructed in your code.
+Declares the hardware nodes your robot has, so the driver for each one can be built from
+configuration instead of hand-written construction code.
 
-```toml
-[hardware]
-camera = "opencv"        # backend name
-lidar  = true            # enable with the default backend
-imu    = false           # declared, but not started
+<Callout type="warning" title="`horus run` does not start these for you">
+
+Listing a driver here does not run it. Nothing in the CLI instantiates `[hardware]`
+entries — your program has to ask for them:
+
+```rust
+use horus::prelude::*;
+
+let mut scheduler = Scheduler::new();
+for (_name, node) in horus::hardware::load()? {   // reads [hardware] from horus.toml
+    scheduler.add(node).build()?;
+}
 ```
 
-The three forms above are the shorthand. For anything that needs parameters, use a
-sub-table:
+A driver that is declared and never loaded simply does not run, and nothing reports it.
+
+</Callout>
+
+Every entry must be a **table**. Scalar shorthand is silently ignored — `load()` skips
+any value that is not a table, so `camera = "opencv"` or `lidar = true` under
+`[hardware]` does nothing at all:
+
+```toml
+# Does nothing — not a table
+[hardware]
+camera = "opencv"
+
+# Correct
+[hardware.camera]
+use = "opencv"
+```
+
+`use` names the node type to create. It is the unified source key, and it replaces the
+six legacy ones (`terra`, `package`, `node`, `crate`, `pip`, `exec`), which are still
+read as fallbacks in that order. An entry with none of them is **skipped with a warning**
+rather than failing the build.
 
 ```toml
 [hardware.arm]
-package = "ur5e-driver"        # registry package providing the driver
-node    = "ArmDriver"          # node inside that package
-topic_command = "arm/cmd"      # topic the driver subscribes to
-topic_state   = "arm/state"    # topic the driver publishes on
-sim     = true                 # use the simulated backend under `horus run --sim`
+use  = "ur5e-driver"       # node type to instantiate
+sim  = true                # substitute the sim stub under `horus run --sim`
 
-[hardware.arm.params]          # free-form; passed through to the driver
+# Everything below is a driver parameter — written inline, not in a sub-table
 port     = "/dev/ttyUSB0"
 baudrate = 115200
+topic_command = "arm/cmd"
+topic_state   = "arm/state"
 ```
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `package` | string | Registry package that provides the driver |
-| `node` | string | Node within that package |
-| `crate_name` | string | Rust crate name, when it differs from `package` |
-| `pip` | string | PyPI distribution, for Python drivers |
-| `source` | string | Where to resolve the package from |
-| `exec` | string | Run an external executable as the driver |
+| Reserved key | Type | Purpose |
+|-------------|------|---------|
+| `use` | string | Node type to instantiate — the key to prefer |
+| `sim` | bool | Substitute the simulated stub under `horus run --sim` |
 | `args` | array | Arguments passed to `exec` |
-| `topic` | string | Single topic, for drivers that only publish or only subscribe |
-| `topic_state` | string | Topic the driver publishes state on |
-| `topic_command` | string | Topic the driver takes commands from |
-| `use_name` | string | Node name to register under, if not the table key |
-| `sim` | bool | Substitute the simulated backend under `--sim` |
-| `params` | table | Driver-specific parameters, passed through untouched |
+| `package` | string | Legacy source key: registry package |
+| `node` | string | Legacy source key: node within a package |
+| `crate` | string | Legacy source key: Rust crate |
+| `pip` | string | Legacy source key: PyPI distribution |
+| `exec` | string | Legacy source key: run an external executable |
+| `terra` | string | Legacy source key: Terra driver shortname |
+| `source` | string | Where to resolve the package from |
+| `simulated` | bool | Parsed but never read — has no effect |
+
+<Callout type="info" title="There is no `params` sub-table">
+
+Driver parameters are the keys you write **directly in the entry**. The parameter map is
+`#[serde(flatten)]`, so every key not in the reserved list above becomes a parameter
+under its own name. Writing a `[hardware.arm.params]` sub-table does not spread its
+contents — it produces one parameter literally named `params` whose value is the whole
+table, and the driver never sees `port` or `baudrate`.
+
+This also means `topic`, `topic_state` and `topic_command` are ordinary parameters, not
+reserved keys: they reach the driver only if that driver reads them by those names.
+
+</Callout>
 
 ### `[drivers]` and `[sim-drivers]` (Deprecated)
 
-`[drivers]` is the former name of `[hardware]`, and `[sim-drivers]` the former way to
-override a driver for simulation. Both are still read, so existing projects keep
-working, but new projects should use `[hardware]` with `sim = true` on the entries that
-have a simulated backend. Keeping the real and simulated definition in one entry is
-what makes `horus run --sim` a flag rather than a second copy of the manifest to keep
+`[drivers]` is the former name of `[hardware]`. It is still read — `load()` falls back to
+it when there is no `[hardware]` table — so existing projects keep working.
+
+<Callout type="warning" title="`[sim-drivers]` no longer does anything">
+
+`[sim-drivers]` parses without complaint and is then never consulted by any code path. A
+project still relying on it has **silently lost its simulation override**: `horus run
+--sim` keys off the `sim` flag on the entry itself, so a driver whose simulated
+counterpart lives in `[sim-drivers]` now runs its real backend under `--sim`.
+
+Move each override onto the entry it belongs to. Keeping the real and simulated
+definition together is what makes `--sim` a flag rather than a second manifest to keep
 in step.
 
+</Callout>
+
 ```toml
-# Old
+# Old — the [sim-drivers] half is now dead
 [drivers]
 lidar = "rplidar"
 [sim-drivers]
@@ -650,7 +695,7 @@ lidar = "sim3d"
 
 # New
 [hardware.lidar]
-package = "rplidar"
+use = "rplidar"
 sim = true
 ```
 
@@ -745,12 +790,12 @@ enabled = true
 secret  = "shared-token"           # peer filtering only — NOT authentication
 import  = ["robot-b/odom"]         # topics to subscribe to from other machines
 deny_export = ["camera/raw"]       # topics that must never leave this machine
-optimize = ["lidar/points"]        # topics to prioritize for bandwidth
+optimize = ["delta", "spatial"]    # optimizers to enable (names, not topics)
 
 [network.safety]
 heartbeat_ms     = 100             # how often peers announce themselves
 missed_threshold = 3               # missed heartbeats before the link is considered lost
-on_link_lost     = "safe"          # what to do then: "safe", "warn", or "ignore"
+on_link_lost     = "safe_state"    # what to do then: "warn", "safe_state", or "stop"
 ```
 
 `secret` filters which peers will talk to each other — a host whose secret does not match
@@ -770,10 +815,37 @@ usually reaches for: `HORUS_NET_ENABLED`, `HORUS_NET_SECRET`, `HORUS_NET_IMPORT`
 robot and ruinous over a shared network is the common case, and the list is easier to
 write while you still remember which topics those are.
 
+`optimize` names **optimizers**, not topics. Exactly four are registered:
+
+| Optimizer | What it does |
+|-----------|--------------|
+| `fusion` | Coalesces multiple small updates into one datagram |
+| `delta` | Sends only what changed since the last message |
+| `spatial` | Drops updates below a spatial threshold (`spatial_radius`) |
+| `predict` | Suppresses updates a receiver can extrapolate (`predict_threshold`) |
+
+All are off by default. An unrecognised entry — a topic name, say — is not an error: it
+prints `[horus_net] Unknown optimizer: <name>` to stderr at startup and installs nothing,
+so `optimize = ["lidar/points"]` silently gives you no optimization at all.
+
 `[network.safety]` is what makes a dropped link a controlled event. With
-`on_link_lost = "safe"`, nodes that depend on a remote topic enter their safe state
+`on_link_lost = "safe_state"`, nodes that depend on a remote topic enter their safe state
 rather than continuing to act on the last value they received — which, for a robot
 holding a stale velocity command, is the difference between stopping and driving away.
+
+<Callout type="warning" title="Spell it `safe_state` exactly">
+
+The parser recognises three values — `warn` (the default), `safe_state` (`safestate` is
+also accepted) and `stop`. **Anything else silently becomes `warn`.** So
+`on_link_lost = "safe"` does not safe anything: it logs and keeps going, which is the
+precise failure this setting exists to prevent. There is no error and no warning about
+the unrecognised value, so check the spelling rather than assuming a link-loss drill
+passed because nothing complained.
+
+`stop` halts the whole scheduler — the blunt option, for when a missing peer means the
+system has no business continuing at all.
+
+</Callout>
 
 ### Authenticating the networked e-stop
 
@@ -794,7 +866,7 @@ be identical on every node; a mismatch is indistinguishable from a forgery and i
 refused the same way. HORUS logs the rejection once per process rather than on every
 packet, so check that line early rather than waiting for it during an incident.
 
-Local safety mechanisms — `SafetyMonitor`, watchdogs, `on_link_lost = "safe"` — are
+Local safety mechanisms — `SafetyMonitor`, watchdogs, `on_link_lost = "safe_state"` — are
 unaffected and keep working with no key configured. It is specifically the *remote*
 e-stop path that closes.
 
@@ -927,14 +999,34 @@ for the cases where the detected one is not the one you want.
 ```toml
 [cpp]
 compiler   = "clang++"
-toolchain  = "arm-linux-gnueabihf"           # cross-compilation target
+toolchain  = "armv7"                         # cross-compilation target
 cmake_args = ["-DCMAKE_BUILD_TYPE=Release", "-DUSE_SIMD=ON"]
 ```
 
 | Field | Type | Purpose |
 |-------|------|---------|
 | `compiler` | string | Compiler to use instead of the detected one |
-| `toolchain` | string | Cross-compilation toolchain prefix |
+| `toolchain` | string | Target architecture name, or a path to a custom `.cmake` toolchain file. Not a GNU triple — see below |
+
+`toolchain` takes one of HORUS's own target names, **not** a compiler prefix:
+
+| Value | Target |
+|-------|--------|
+| `aarch64`, `arm64`, `jetson`, `pi4`, `pi5` | 64-bit ARM |
+| `armv7`, `arm`, `pi3`, `pi2` | 32-bit ARM |
+| `x86_64`, `x64`, `amd64`, `intel` | 64-bit x86 |
+| `native`, `host`, `local` | Build for this machine |
+
+Anything else is treated as a path and must contain a `/` or end in `.cmake`. A GNU
+triple such as `arm-linux-gnueabihf` is neither, so it fails the build outright:
+
+```text
+Error: Failed to resolve toolchain 'arm-linux-gnueabihf': Unknown toolchain target:
+'arm-linux-gnueabihf'
+Supported targets: aarch64, arm64, jetson, pi4, pi5, armv7, arm, pi3, pi2, x86_64, native
+Or provide a path to a custom .cmake toolchain file
+```
+
 | `cmake_args` | array | Arguments appended to the CMake invocation |
 
 ## Best Practices

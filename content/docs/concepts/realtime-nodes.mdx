@@ -178,8 +178,12 @@ impl Node for SafetyCriticalNode {
 ```
 
 Pair `enter_safe_state()` with `.on_miss(Miss::SafeMode)` — that policy is what calls
-it on a deadline miss. It fires on every miss; the node is not isolated afterwards,
-and the scheduler does not poll `is_safe_state()` for automatic recovery.
+it on a deadline miss. It fires on the *transition* into safe mode, not on every miss,
+so a node under sustained overload is safed once rather than every cycle. The latch
+clears as soon as the node meets its deadline again, so a later degradation is caught
+too and a flapping node produces one entry per episode. The node is not isolated and
+keeps ticking, and the scheduler does not poll `is_safe_state()` for automatic
+recovery.
 
 ### Custom Deadline Policies
 
@@ -200,9 +204,32 @@ scheduler.add(estop_monitor).rate(100_u64.hz()).on_miss(Miss::Stop).build()?;
 
 ### Failure Handling and Degradation
 
-HORUS has no automatic fallback-node substitution. Degradation is expressed with
-two knobs: a failure policy for nodes that error out, and `Miss::SafeMode`
-for nodes that overrun their timing.
+HORUS has no automatic fallback-node substitution — nothing swaps in a backup
+implementation for you. What it does have is three mechanisms: a failure policy for
+nodes that error out, `Miss::SafeMode` for nodes that overrun their timing, and a
+graduated degradation ladder that runs whether or not you configure either.
+
+<Callout type="warning" title="A node that keeps missing its deadline is degraded automatically">
+
+The safety monitor is created unconditionally, and it tracks consecutive deadline misses
+for every node that has a `.rate()`. The ladder is not opt-in and `Miss::Warn` — the
+default — does not disable it:
+
+| Consecutive misses | Action |
+|--------------------|--------|
+| 3 | Warning logged |
+| 5 | Node's rate **halved** |
+| 10 | Node **isolated** — skipped in the tick loop |
+| 20 | Node **killed** — `shutdown()` called and it is removed from execution permanently |
+
+A node that recovers is restored to its original rate after 100 successful ticks at the
+reduced one. A node that reaches 20 does not come back for the life of the process.
+
+If a node of yours has "stopped running" after a period of overload, this ladder is the
+first thing to check — the misses have to be *consecutive*, so an intermittently slow
+node will sit at the warn stage rather than climbing.
+
+</Callout>
 
 ```rust
 use horus::prelude::*;

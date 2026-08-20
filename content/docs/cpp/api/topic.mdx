@@ -7,7 +7,7 @@ order: 53
 
 # Publisher and Subscriber API
 
-HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` writes messages, `Subscriber<T>` reads them -- both zero-copy. The loan pattern lets you write directly into shared memory without any intermediate buffers or serialization.
+HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` writes messages, `Subscriber<T>` reads them. The loan pattern is the API shape the zero-copy path will take; in the current binding it costs the same as `send()` — see [Loan vs send](#loan-vs-send).
 
 > **Rust**: See [`Topic<T>`](/rust/api/core#topic) for the Rust unified pub/sub API.
 > **Python**: See [`node.send()` / `node.recv()`](/python/api) for the Python wrapper.
@@ -24,7 +24,7 @@ HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` w
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `.loan()` | `LoanedSample<T>` | Get a writable buffer from SHM (zero-copy) |
+| `.loan()` | `LoanedSample<T>` | Get an empty sample to fill in |
 | `.publish(LoanedSample<T>&&)` | `void` | Make a loaned sample visible to subscribers |
 | `.send(const T&)` | `void` | Send a message by copy (simpler API) |
 | `.name()` | `const string&` | Get the topic name |
@@ -41,7 +41,7 @@ HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` w
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `operator->()` | `T*` / `const T*` | Direct SHM pointer access (zero-copy write) |
+| `operator->()` | `T*` / `const T*` | Pointer to the sample's data |
 | `operator*()` | `T&` / `const T&` | Dereference to the data |
 | `.get()` | `T*` / `const T*` | Raw pointer to the data |
 
@@ -92,17 +92,28 @@ auto node = horus::LambdaNode("controller")
 
 ---
 
-## Zero-Copy Loan Pattern
+## The Loan Pattern
 
-The loan pattern is the primary way to publish messages in HORUS. It eliminates all copies between producer and consumer.
-
-### How It Works
+The loan pattern is the primary way to publish messages in HORUS, and the shape the
+zero-copy path will take. What it does **today** is:
 
 ```
-1. pub.loan()                    --> SHM allocates a slot, returns LoanedSample<T>
-2. sample->field = value         --> writes directly into SHM (0 ns copy overhead)
-3. pub.publish(std::move(sample))--> flips visibility flag, subscribers can read
+1. pub.loan()                    --> returns an empty LoanedSample<T>
+                                     (a stack-local message, not an SHM slot)
+2. sample->field = value         --> fills it in place
+3. pub.publish(std::move(sample))--> forwards to send(), which copies into SHM
 ```
+
+<Callout type="info" title="Not yet a measured win">
+
+`LoanedSample<T>` holds the message by value (`T data_`), `loan()` default-constructs
+one, and `publish(sample)` is literally `send(*sample)`. So loan + publish performs the
+same single copy `send()` does — there is no SHM slot handed out and no visibility flag
+flipped. Write new code with `loan()` because it is the API that will become zero-copy
+once the binding writes through to the SHM buffer, but do not budget for a saving that
+is not there yet.
+
+</Callout>
 
 ### Full Example
 
@@ -160,12 +171,15 @@ auto pub = sched.advertise<horus::msg::CmdVel>("motor.cmd");
 pub.send(horus::msg::CmdVel{0, 0.5f, 0.1f});
 ```
 
-This is equivalent to `loan()` + write + `publish()` but performs one copy. For small messages like `CmdVel` (16 bytes), the overhead is negligible. For large messages like `LaserScan` (1480 bytes) or `Odometry`, prefer the loan pattern.
+### Loan vs send
 
-| Pattern | Copy Count | Best For |
-|---------|-----------|----------|
-| `loan()` + `publish()` | **0** | Large messages, high-frequency topics |
-| `send()` | **1** | Small messages, simple code |
+The two are equivalent, and currently cost the same: `publish()` forwards to `send()`, so
+both perform one copy into shared memory regardless of message size. (For `CmdVel` the
+hand-written specialization copies once more, field by field, into the C struct.)
+
+Pick on style rather than performance. `loan()` is worth preferring in new code because
+it is the form that will become zero-copy without a rewrite; `send()` is fine and simpler
+where a message is small or built in one expression.
 
 ---
 
