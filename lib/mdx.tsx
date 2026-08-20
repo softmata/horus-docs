@@ -38,6 +38,39 @@ import { defaultLocale, type Locale } from '@/lib/i18n';
 
 const contentDirectory = path.join(process.cwd(), 'content');
 
+/**
+ * Flatten a heading's React children to plain text.
+ *
+ * `children` is only a bare string when the heading is plain prose. Any inline
+ * code, link or emphasis makes it an array of elements, which is why the old
+ * `typeof children === 'string'` test produced `id=""` for 211 headings --
+ * every `## \`horus <cmd>\`` section in the CLI reference among them. Those
+ * headings could not be linked to, and a page with several of them emitted
+ * duplicate empty ids.
+ */
+function headingText(node: any): string {
+  if (node === null || node === undefined || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(headingText).join('');
+  if (typeof node === 'object' && 'props' in node) return headingText((node as any).props?.children);
+  return '';
+}
+
+/**
+ * Slug for a heading. Deliberately the same transform `TableOfContents` applies
+ * to `heading.textContent`, so the id rendered on the server is the one the ToC
+ * would have computed in the browser -- and cross-page `#fragment` links resolve
+ * without waiting for hydration.
+ */
+function headingId(children: any): string {
+  const id = headingText(children)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+  // Prefix ids that start with a number (invalid HTML ids)
+  return id && /^[0-9]/.test(id) ? 'section-' + id : id;
+}
+
 export interface DocFrontmatter {
   title: string;
   description?: string;
@@ -141,13 +174,7 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {
-          let id = typeof children === 'string'
-            ? children.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
-            : '';
-          // Prefix IDs that start with a number (invalid HTML IDs)
-          if (id && /^[0-9]/.test(id)) {
-            id = 'section-' + id;
-          }
+          const id = headingId(children);
           return (
             <h2 id={id} {...props}>
               {children}
@@ -155,13 +182,7 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
           );
         },
         h3: ({ children, ...props }: any) => {
-          let id = typeof children === 'string'
-            ? children.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
-            : '';
-          // Prefix IDs that start with a number (invalid HTML IDs)
-          if (id && /^[0-9]/.test(id)) {
-            id = 'section-' + id;
-          }
+          const id = headingId(children);
           return (
             <h3 id={id} {...props}>
               {children}
