@@ -585,6 +585,358 @@ packages = ["jupyter", "matplotlib"]  # matplotlib: visualization only
 
 The Python distribution is published on PyPI as `horus-robotics` and imported as `horus`. Spelling out `source = "pypi"` is the safe habit: HORUS recognizes well-known PyPI names (`numpy`, `opencv-python`, `pillow`, and several hundred more) and routes them to PyPI on its own, but anything it does not recognize stays on the HORUS registry and is left out of the generated `pyproject.toml`.
 
+## Hardware
+
+### `[hardware]` (Optional)
+
+Declares the hardware nodes your robot has. Each entry names a driver; `horus run`
+starts them alongside your own nodes, so a driver you list here does not need to be
+constructed in your code.
+
+```toml
+[hardware]
+camera = "opencv"        # backend name
+lidar  = true            # enable with the default backend
+imu    = false           # declared, but not started
+```
+
+The three forms above are the shorthand. For anything that needs parameters, use a
+sub-table:
+
+```toml
+[hardware.arm]
+package = "ur5e-driver"        # registry package providing the driver
+node    = "ArmDriver"          # node inside that package
+topic_command = "arm/cmd"      # topic the driver subscribes to
+topic_state   = "arm/state"    # topic the driver publishes on
+sim     = true                 # use the simulated backend under `horus run --sim`
+
+[hardware.arm.params]          # free-form; passed through to the driver
+port     = "/dev/ttyUSB0"
+baudrate = 115200
+```
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `package` | string | Registry package that provides the driver |
+| `node` | string | Node within that package |
+| `crate_name` | string | Rust crate name, when it differs from `package` |
+| `pip` | string | PyPI distribution, for Python drivers |
+| `source` | string | Where to resolve the package from |
+| `exec` | string | Run an external executable as the driver |
+| `args` | array | Arguments passed to `exec` |
+| `topic` | string | Single topic, for drivers that only publish or only subscribe |
+| `topic_state` | string | Topic the driver publishes state on |
+| `topic_command` | string | Topic the driver takes commands from |
+| `use_name` | string | Node name to register under, if not the table key |
+| `sim` | bool | Substitute the simulated backend under `--sim` |
+| `params` | table | Driver-specific parameters, passed through untouched |
+
+### `[drivers]` and `[sim-drivers]` (Deprecated)
+
+`[drivers]` is the former name of `[hardware]`, and `[sim-drivers]` the former way to
+override a driver for simulation. Both are still read, so existing projects keep
+working, but new projects should use `[hardware]` with `sim = true` on the entries that
+have a simulated backend. Keeping the real and simulated definition in one entry is
+what makes `horus run --sim` a flag rather than a second copy of the manifest to keep
+in step.
+
+```toml
+# Old
+[drivers]
+lidar = "rplidar"
+[sim-drivers]
+lidar = "sim3d"
+
+# New
+[hardware.lidar]
+package = "rplidar"
+sim = true
+```
+
+## Scripts
+
+### `[scripts]` (Optional)
+
+Project-local commands, in the spirit of npm scripts or a `justfile`. Each entry maps a
+name to a shell command, runnable as `horus <name>` or `horus scripts <name>`.
+
+```toml
+[scripts]
+calibrate = "python3 tools/calibrate.py"
+park      = "python3 tools/park_arm.py"
+flash     = "openocd -f board/stm32.cfg -c 'program firmware.elf verify reset exit'"
+```
+
+```bash
+horus scripts calibrate       # run it
+horus scripts                 # list what is available
+```
+
+Scripts are the unit that `[hooks]` schedules, so a command worth running by hand is
+usually worth naming here first.
+
+## Hooks
+
+### `[hooks]` (Optional)
+
+Commands HORUS runs around its own lifecycle. Every phase has a `pre_` and a `post_`
+hook:
+
+```toml
+[hooks]
+pre_build  = ["fmt"]
+post_build = ["sign-firmware"]
+
+pre_run    = ["check"]
+post_run   = ["park"]          # runs even if the run crashed
+
+pre_test   = ["fmt", "lint"]
+post_test  = ["coverage-report"]
+```
+
+Each entry is either a built-in — `fmt`, `lint`, or `check` — or the name of a
+`[scripts]` entry. A name that is neither is an error, not a silent skip.
+
+**`post_run` runs on both the success and the failure path.** That is deliberate: the
+moment you most need an arm parked, a bus released, or a motor controller de-energized
+is the moment the run died unexpectedly. A teardown that only ran after clean exits
+would be missing from exactly the case it exists for.
+
+If a `post_` hook fails after the command itself already failed, HORUS reports the
+original failure and mentions the hook separately. Your crash is what you need to see,
+not your cleanup script.
+
+Pass `--no-hooks` to skip both halves for one invocation:
+
+```bash
+horus run --no-hooks
+```
+
+## Capabilities
+
+### `enable` (Optional)
+
+Optional subsystems to compile in. This is a top-level key, not a table:
+
+```toml
+enable = ["net", "cuda"]
+```
+
+| Capability | Effect |
+|------------|--------|
+| `net` | Compiles in `horus_net`, enabling multi-machine transport. Equivalent to `horus run --net`. |
+| `cuda` | Enables CUDA-backed compute paths. |
+
+Capabilities cost build time, so they are opt-in. `net` in particular gates the whole
+networking stack: without it, a distributed setup builds and runs but never leaves the
+machine.
+
+## Networking
+
+### `[network]` (Optional)
+
+Configures the transport once `net` is enabled. Enabling the capability makes the code
+available; this table decides what it does.
+
+```toml
+[network]
+enabled = true
+secret  = "shared-token"           # peer filtering only — NOT authentication
+import  = ["robot-b/odom"]         # topics to subscribe to from other machines
+deny_export = ["camera/raw"]       # topics that must never leave this machine
+optimize = ["lidar/points"]        # topics to prioritize for bandwidth
+
+[network.safety]
+heartbeat_ms     = 100             # how often peers announce themselves
+missed_threshold = 3               # missed heartbeats before the link is considered lost
+on_link_lost     = "safe"          # what to do then: "safe", "warn", or "ignore"
+```
+
+`secret` filters which peers will talk to each other — a host whose secret does not match
+is ignored. It is **not** authentication and not encryption: the value is hashed to four
+bytes and used to reject strangers, so treat it as a way to keep two labs on one subnet
+from joining each other's topics, not as a security boundary. Set it here as a literal
+string, or leave it out of the manifest and export `HORUS_NET_SECRET` instead — there is
+no `env:` indirection, so writing `secret = "env:MY_VAR"` makes the literal text
+`env:MY_VAR` your secret.
+
+Every key above also has an environment override, which is what deployment tooling
+usually reaches for: `HORUS_NET_ENABLED`, `HORUS_NET_SECRET`, `HORUS_NET_IMPORT`,
+`HORUS_NET_DENY_EXPORT`, `HORUS_NET_PORT`, `HORUS_NET_MULTICAST`, `HORUS_NET_PEER`,
+`HORUS_NET_HEARTBEAT_MS`, `HORUS_NET_MISSED_THRESHOLD`, `HORUS_NET_ON_LINK_LOST`.
+
+`deny_export` is worth setting before you need it. A camera topic that is useful on the
+robot and ruinous over a shared network is the common case, and the list is easier to
+write while you still remember which topics those are.
+
+`[network.safety]` is what makes a dropped link a controlled event. With
+`on_link_lost = "safe"`, nodes that depend on a remote topic enter their safe state
+rather than continuing to act on the last value they received — which, for a robot
+holding a stale velocity command, is the difference between stopping and driving away.
+
+### Authenticating the networked e-stop
+
+`secret` does not protect the e-stop channel. Networked e-stop (`_horus.estop`) is
+authenticated separately, with an HMAC-SHA256 tag keyed by `HORUS_ESTOP_KEY` — a value
+provisioned off the wire and never transmitted:
+
+```bash
+# Same value on every node in the fleet
+export HORUS_ESTOP_KEY=$(openssl rand -hex 32)
+```
+
+<Callout type="warning" title="Remote e-stop fails closed without a key">
+
+If `HORUS_ESTOP_KEY` is unset, or the tag on an incoming e-stop is missing or does not
+verify, the e-stop is **rejected** — a remote halt will not stop the robot. The key must
+be identical on every node; a mismatch is indistinguishable from a forgery and is
+refused the same way. HORUS logs the rejection once per process rather than on every
+packet, so check that line early rather than waiting for it during an incident.
+
+Local safety mechanisms — `SafetyMonitor`, watchdogs, `on_link_lost = "safe"` — are
+unaffected and keep working with no key configured. It is specifically the *remote*
+e-stop path that closes.
+
+</Callout>
+
+64 hex characters are used as raw key material. Anything else is treated as a passphrase
+and stretched with PBKDF2-HMAC-SHA256, which is slower to start and only as strong as
+the passphrase — every packet on the wire is an offline verifier for a guess, so prefer
+the random hex form.
+
+### Which hosts the replicator will listen to
+
+The replicator binds `0.0.0.0`, so the second half of the network posture is a source-
+address filter. By default it accepts datagrams only from private space:
+
+| Range | What it covers |
+|-------|----------------|
+| `127.0.0.0/8` | loopback |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | RFC 1918 private networks |
+| `169.254.0.0/16` | RFC 3927 link-local |
+| `100.64.0.0/10` | RFC 6598 CGNAT — also where mesh VPNs such as Tailscale allocate |
+
+Zero-config replication between robots on a LAN therefore works untouched. **A peer
+whose address falls outside those ranges is dropped without reaching the import
+guard** — worth knowing before debugging a link that looks correctly configured but
+never delivers.
+
+Widen it with `HORUS_NET_ALLOW_PEERS`, a comma-separated list of addresses and CIDR
+blocks:
+
+```bash
+export HORUS_NET_ALLOW_PEERS="203.0.113.0/24,198.51.100.7"
+```
+
+An unparseable entry is reported and skipped rather than silently ignored, and if
+*every* entry fails to parse the default is kept — a typo cannot quietly widen the
+filter. Setting it to `any` (or `*` / `0.0.0.0/0`) accepts UDP from any routable host,
+including the public internet; HORUS warns when you do.
+
+Note the two similarly named variables do different jobs: `HORUS_NET_PEER` adds a peer
+to contact directly when multicast discovery cannot reach it, while
+`HORUS_NET_ALLOW_PEERS` decides whose inbound packets are accepted at all.
+
+This filter is a reduction in reach, not authentication — a hostile host on the same
+LAN still passes it. It and `HORUS_ESTOP_KEY` are complementary, and a fleet that can
+be reached from outside its own subnet wants both.
+
+## Robot Metadata
+
+### `[robot]` (Optional)
+
+Describes the physical robot, for tools that need to know about it — the 3-D simulator,
+the visualizer, and anything that loads a URDF.
+
+```toml
+[robot]
+name        = "husky-a200"
+description = "urdf/husky.urdf"      # path to the URDF
+simulator   = "sim3d"                # simulator `horus run --sim` launches
+```
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `name` | string | Robot name, shown in the simulator and visualizer |
+| `description` | string | Path to the URDF describing the robot |
+| `simulator` | string | Simulator to launch for `--sim`; defaults to `sim3d` |
+
+## Workspaces
+
+### `[workspace]` (Optional)
+
+Groups several HORUS projects that build and version together — the usual shape for a
+robot whose perception, planning, and control stacks live in one repository.
+
+```toml
+[workspace]
+members = ["perception", "planning", "control"]
+exclude = ["experiments/*"]
+
+[workspace.dependencies]
+horus-robotics = "0.2"
+nalgebra = "0.33"
+```
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `members` | array | Member project directories; globs are accepted |
+| `exclude` | array | Directories to leave out of an otherwise matching glob |
+| `dependencies` | table | Versions members can inherit, so they cannot drift apart |
+
+Declaring a dependency in `[workspace.dependencies]` and inheriting it from each member
+is what keeps two nodes in the same robot from linking two different versions of the
+same message crate.
+
+## Simulation and Development Dependencies
+
+### `[dev-dependencies]` (Optional)
+
+Dependencies needed to develop and test the project, but not to run it. They are
+excluded from `horus publish` and `horus deploy`, which is the point: test harnesses do
+not belong on the robot.
+
+```toml
+[dev-dependencies]
+criterion = "0.5"
+approx = "0.5"
+```
+
+### `[sim-dependencies]` (Optional)
+
+Simulation assets, fetched from the HORUS registry and cached under
+`.horus/packages/`. They are installed on demand by `horus sim3d`, so a fresh clone
+does not have to carry a warehouse of meshes.
+
+```toml
+[sim-dependencies]
+warehouse-world = "1.2"
+ur5e-robot = "0.4"
+```
+
+Package types are `robot`, `world`, `sensor-preset`, `actuator-preset`, and `task`.
+
+## C++ Build Configuration
+
+### `[cpp]` (Optional)
+
+Overrides for C++ projects. HORUS detects a working toolchain on its own; this table is
+for the cases where the detected one is not the one you want.
+
+```toml
+[cpp]
+compiler   = "clang++"
+toolchain  = "arm-linux-gnueabihf"           # cross-compilation target
+cmake_args = ["-DCMAKE_BUILD_TYPE=Release", "-DUSE_SIMD=ON"]
+```
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `compiler` | string | Compiler to use instead of the detected one |
+| `toolchain` | string | Cross-compilation toolchain prefix |
+| `cmake_args` | array | Arguments appended to the CMake invocation |
+
 ## Best Practices
 
 ### Version Your Configuration

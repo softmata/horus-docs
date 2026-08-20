@@ -53,7 +53,7 @@ match topic.send_blocking(CmdVel::new(1.0, 0.0), 10_u64.ms()) {
 
 | Method | Behavior |
 |--------|----------|
-| `send(msg)` | Always succeeds. Drops oldest message if full |
+| `send(msg)` | Never returns an error. On a broadcast ring the producer overwrites the oldest slot; on a point-to-point ring it retries briefly (64 spins + 4 yields) and then drops the **new** message, counting it in `dropped_count()` |
 | `try_send(msg)` | Returns `Err(msg)` if buffer is full |
 | `send_blocking(msg, timeout)` | Blocks until space is available or timeout elapses |
 
@@ -80,7 +80,25 @@ if let Some(latest) = topic.read_latest() {
 }
 ```
 
-Use `recv()` when you need every message in order. Use `read_latest()` for state-like data (sensor readings, poses) where only the newest value matters.
+Use `recv()` when order matters. Messages arrive in the order they were sent
+and are never delivered twice. Use `read_latest()` for state-like data (sensor
+readings, poses) where only the newest value matters.
+
+<Callout type="warning" title="recv() preserves order, not delivery">
+
+`recv()` does not guarantee you see *every* message. On a broadcast POD topic
+(`PodShm` — a fixed-size message with more than one subscriber, which is the
+usual shape for a camera or IMU feed), a producer that laps a slow consumer
+overwrites slots the consumer has not read yet. The consumer detects this and
+resumes about half a ring behind the head; everything it skipped is gone.
+
+The skip is silent. It raises no error and **increments no counter** —
+`dropped_count()` reports send-side failures only, so it stays at `0` while a
+slow subscriber is losing frames. If you must not miss a message, use
+`send_blocking()` on the publisher, or size the consumer's tick rate to keep up
+with the publisher's.
+
+</Callout>
 
 ## Zero-Copy for Large Data
 
@@ -125,7 +143,7 @@ message! {
     }
 }
 
-let feedback = Topic::<MotorFeedback>::new("motor.feedback")?;
+let feedback = MotorFeedback::topic("motor.feedback")?;
 feedback.send(MotorFeedback {
     motor_id: 1,
     velocity: 3.14,
@@ -135,6 +153,50 @@ feedback.send(MotorFeedback {
 ```
 
 The macro generates serialization traits automatically. The `#[fixed]` attribute — written before the doc comment, directly above the message name — emits the struct as `#[repr(C)]` and `Copy`, which is what puts it on the zero-copy fast path: the bytes are written straight into the ring slot with no serialization step. Leave `#[fixed]` off for messages whose fields are not all `Copy` (anything containing a `String` or `Vec`); those go through a bincode serialize/deserialize round trip on every send and receive. Which shared-memory backend carries a topic is then chosen automatically from its producer and consumer counts — see [Benchmarks](/performance/benchmarks) for measured per-route latencies.
+
+### Guard against a message that changed shape
+
+`Topic::new` checks the message type's name and, for fixed messages, its size.
+Neither says anything about field layout, so two builds of the same message that
+keep the name and the size while reordering fields will happily share a topic:
+
+```rust
+// Robot A, built from v1.0 of the message crate
+message! { #[fixed] Pose { x: f32, y: f32 } }
+
+// Robot B, built from v1.1 — someone reordered the fields
+message! { #[fixed] Pose { y: f32, x: f32 } }
+```
+
+Same name, same eight bytes. A sends `(x=1, y=2)` and B receives
+`Pose { y: 1.0, x: 2.0 }` — the coordinates arrive swapped, with no error
+anywhere. Halfway through a fleet rollout, that is a robot driving the wrong
+way.
+
+Every `message!` type carries a `LAYOUT_HASH` covering its name and each field's
+name and type, and a `Type::topic(name)` helper that supplies it:
+
+```rust
+let pose = Pose::topic("robot.pose")?;        // layout-checked
+let pose = Topic::<Pose>::new("robot.pose")?; // unchecked
+```
+
+With the checked form, B's open fails instead:
+
+```text
+Communication error: Failed to create topic 'robot.pose': message layout
+mismatch. This build's 'msgs::Pose' hashes to 0xf5f319cf, but the topic was
+opened with 0x1ab36d8b.
+The type name and size match, so only the field layout differs — two builds of
+the same message that reordered, renamed or retyped a field. Reading it would
+silently reinterpret the bytes rather than fail.
+Fix: rebuild both sides against the same message definition.
+```
+
+Prefer `Type::topic(...)`. It costs nothing at runtime — the hash is a compile-
+time constant and is compared once, when the topic is opened. A hash of zero
+means "not supplied", so a peer still using `Topic::new` is never rejected; it
+is simply not protected.
 
 ## Using Topics in Nodes
 
