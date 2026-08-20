@@ -6,19 +6,27 @@ import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
 import { useState, useEffect } from "react";
 import { localeFromPathname, localizedHref, stripLocale } from "@/lib/i18n";
 
-interface DocLink {
+export interface DocLink {
   title: string;
   href: string;
   order?: number;
   children?: DocLink[];
 }
 
-interface SidebarSection {
+export interface SidebarSection {
   title: string;
   links: DocLink[];
 }
 
-const sections: SidebarSection[] = [
+/// The one navigation order.
+///
+/// Exported because `PrevNextNav` used to hold a hand-copied flat version of
+/// this list, with a comment saying it "must match DocsSidebar.tsx". It did not
+/// — the two held the same set of pages but diverged in position by up to 61
+/// places, so Next/Prev walked the Rust section straight past the Rust Guide
+/// into Examples and only reached the guide after all of Python. A copy that
+/// must be kept in sync by hand is a copy that will not be.
+export const sections: SidebarSection[] = [
   {
     title: "Getting Started",
     links: [

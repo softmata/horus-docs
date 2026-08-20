@@ -25,7 +25,6 @@ const segmentLabels: Record<string, string> = {
   // Common file names
   "what-is-horus": "What is HORUS?",
   "goals": "Goals & Vision",
-  "complete-beginners-guide": "Complete Beginner's Guide",
   "installation": "Installation",
   "quick-start": "Quick Start",
   "second-application": "Second Application",

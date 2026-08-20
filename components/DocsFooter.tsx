@@ -24,12 +24,12 @@ export function DocsFooter() {
                 </Link>
               </li>
               <li>
-                <Link href="/complete-beginners-guide" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
-                  Beginner&apos;s Guide
+                <Link href="/concepts/what-is-horus" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                  What is HORUS?
                 </Link>
               </li>
               <li>
-                <Link href="/basic-examples" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                <Link href="/rust/examples/basic-examples" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
                   Examples
                 </Link>
               </li>
@@ -43,7 +43,7 @@ export function DocsFooter() {
             </h4>
             <ul className="space-y-3 text-sm">
               <li>
-                <Link href="/architecture" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                <Link href="/concepts/architecture" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
                   Architecture
                 </Link>
               </li>
@@ -58,7 +58,7 @@ export function DocsFooter() {
                 </Link>
               </li>
               <li>
-                <Link href="/api" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                <Link href="/rust/api" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
                   API Reference
                 </Link>
               </li>
@@ -88,7 +88,7 @@ export function DocsFooter() {
                 </a>
               </li>
               <li>
-                <Link href="/goals" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                <Link href="/concepts/goals" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
                   Goals & Vision
                 </Link>
               </li>
