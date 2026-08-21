@@ -1,0 +1,144 @@
+---
+title: Custom Messages
+description: Define a message once and use it from Rust, C++ and Python
+order: 8
+---
+
+# Custom Messages
+
+A message defined in `msgs/*.hmsg` becomes a Rust struct, a C++ struct and a
+Python `ctypes.Structure` — all with the same layout and the same layout hash.
+
+```bash
+mkdir msgs
+```
+
+`msgs/weather.hmsg`:
+
+```text
+/// A reading from the weather mast.
+#[topic = "weather.data"]
+WeatherData {
+    /// Nanoseconds since the epoch.
+    timestamp_ns: u64,
+    /// Degrees Celsius.
+    temperature: f32,
+    humidity: f32,
+    /// Last sixteen samples, oldest first.
+    history: [f32; 16],
+    heater_on: bool,
+}
+```
+
+```bash
+horus msg gen
+```
+
+```text
+* Generated 1 message(s) from 1 file(s)
+    WeatherData              0x8b734db7  88 bytes (7 padding)
+
+    .horus/generated/msgs/Cargo.toml
+    .horus/generated/msgs/src/lib.rs
+    .horus/generated/include/demo/msgs.hpp
+    .horus/generated/python/msgs.py
+```
+
+## Using it
+
+**Rust** — the generated crate is already a dependency of your project:
+
+```rust,ignore
+use demo_msgs::WeatherData;
+
+let topic: Topic<WeatherData> = Topic::new(WeatherData::TOPIC)?;
+topic.send(WeatherData { temperature: 21.5, ..Default::default() });
+```
+
+**C++** — the generated include path is already on your target's include path:
+
+```cpp
+#include <demo/msgs.hpp>
+
+demo::msg::WeatherData w{};
+w.temperature = 21.5f;
+w.set_heater_on(true);   // Rust's bool is one byte; the field is uint8_t
+```
+
+**Python**:
+
+```python
+import sys; sys.path.insert(0, ".horus/generated/python")
+from msgs import WeatherData
+
+w = WeatherData(temperature=21.5)
+```
+
+## The layout hash
+
+Every artifact carries the same number, and `horus msg hash` prints it:
+
+```bash
+$ horus msg hash WeatherData
+0x8b734db7
+```
+
+It is FNV-1a over a canonical rendering of the definition:
+
+```text
+WeatherData|timestamp_ns:u64|temperature:f32|humidity:f32|history:[f32; 16]|heater_on:bool
+```
+
+That string is embedded in the generated Rust as `LAYOUT_CANONICAL` rather than
+rebuilt with `stringify!`, which reproduces source spacing — `[u8;32]` and
+`[u8; 32]` would otherwise hash differently.
+
+The generated C++ header asserts its own layout against the Rust one, field by
+field:
+
+```cpp
+static_assert(sizeof(WeatherData) == 88, "WeatherData size differs from Rust");
+static_assert(offsetof(WeatherData, humidity) == 12, "...");
+```
+
+If the two ever disagree, the C++ build stops. This is not hypothetical: the
+hand-maintained Rust and C++ definitions of `JointCommand` once drifted to 928
+bytes against 88 — an 840-byte overrun on every receive, with no compiler
+anywhere in a position to notice.
+
+## What a message may contain
+
+Everything crossing the boundary is `#[repr(C)]` and is read and written with a
+raw pointer copy, so a message must be plain data:
+
+| Allowed | Not allowed |
+| --- | --- |
+| `u8`–`u64`, `i8`–`i64`, `f32`, `f64`, `bool` | `String`, `&str` |
+| `[T; N]` — a fixed-length array | `Vec<T>` |
+| another message declared in `msgs/` | `Option<T>`, `Box<T>`, `HashMap` |
+| | references, generics, enums |
+
+A rejected type is reported with the reason and what to write instead:
+
+```text
+msgs/weather.hmsg:4:11: `String` cannot be used in a message
+  help: a String owns a heap allocation, which cannot be shared between
+        processes. Use a fixed array like `[u8; 64]`.
+```
+
+### Built-in types
+
+`.hmsg` cannot yet reference built-in types such as `Vector3`. Write the fields
+out — `Vector3` is three `f64`s. The restriction is deliberate: sizing a
+built-in would mean this generator carrying a table of their layouts, and a
+table that is wrong produces a header whose `static_assert` passes against the
+wrong number. That is the failure the layout contract exists to catch.
+
+## In CI
+
+`--check` verifies the generated files match the definitions without rewriting
+them, so a commit that edits a `.hmsg` and forgets to regenerate fails:
+
+```bash
+horus msg gen --check
+```

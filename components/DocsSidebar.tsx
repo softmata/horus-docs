@@ -223,7 +223,8 @@ export const sections: SidebarSection[] = [
     title: "Development",
     links: [
       { title: "CLI Reference", href: "/development/cli-reference", order: 1 },
-      { title: "Environment Variables", href: "/development/environment-variables", order: 15 },
+      { title: "Custom Messages", href: "/development/custom-messages", order: 15 },
+      { title: "Environment Variables", href: "/development/environment-variables", order: 16 },
       { title: "Monitor", href: "/development/monitor", order: 2 },
       { title: "Testing", href: "/development/testing", order: 3 },
       { title: "Parameters", href: "/development/parameters", order: 4 },
