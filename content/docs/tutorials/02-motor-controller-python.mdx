@@ -1,0 +1,278 @@
+---
+title: "Tutorial 2: Motor Controller (Python)"
+description: "Build a closed-loop motor controller with PID and safety limits"
+order: 21
+---
+
+# Tutorial 2: Motor Controller (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/02-motor-controller-rust) and [C++](/tutorials/02-motor-controller-cpp).</Callout>
+
+In this tutorial you'll build a motor controller that:
+- Reads velocity commands from a topic
+- Applies PID control to track the commanded velocity
+- Clamps its output to the actuator limit and enforces safety constraints
+- Publishes motor state for monitoring
+- Enters safe state (stops motors) on safety events
+
+## What You'll Learn
+
+- Multi-topic node with subscribers AND publishers
+- PID control loop with anti-windup
+- Budget enforcement with `on_miss="safe_mode"`
+- `enter_safe_state()` for actuator safety
+
+## Prerequisites
+
+- Completed [Tutorial 1: IMU Sensor Node](/tutorials/01-sensor-node-python)
+- Understanding of PID control
+
+## Step 1: Create the Project
+
+```bash
+horus new motor_ctrl --python
+cd motor_ctrl
+```
+
+## Step 2: Write the Motor Controller
+
+Replace `main.py`:
+
+```python
+import horus
+from horus import CmdVel, Topic
+
+# Gains and limits. Tutorial 7 shows how to move these to runtime parameters.
+KP, KI, KD = 2.0, 0.5, 0.1
+DT = 0.01                    # 100 Hz
+INTEGRAL_MAX = 1.0
+MAX_PWM = 1.0
+ENCODER_TIMEOUT_TICKS = 50   # 500 ms at 100 Hz
+
+
+def clamp(value, limit):
+    return max(-limit, min(limit, value))
+
+
+# ── Motor Controller Node ───────────────────────────────────────────────
+class MotorController(horus.Node):
+    def __init__(self):
+        super().__init__(
+            name="motor_controller",
+            rate=100,
+            order=10,
+            budget=0.005,          # 5 ms
+            on_miss="safe_mode",   # stop motors if the tick overruns
+        )
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")           # from planner/teleop
+        self.encoder = Topic(CmdVel, endpoint="encoder.velocity")
+        self.motor = Topic(CmdVel, endpoint="motor.pwm")       # PWM duty cycle
+        self.state = Topic(CmdVel, endpoint="motor.state")     # for monitoring
+
+        self.target_linear = 0.0
+        self.target_angular = 0.0
+        self.lin_integral = 0.0
+        self.lin_prev_error = 0.0
+        self.ang_integral = 0.0
+        self.ang_prev_error = 0.0
+        self.ticks = 0
+        self.ticks_without_encoder = 0
+        self.encoder_timeout_logged = False
+
+    def init(self, info=None):
+        self.log_info("Motor controller initialized")
+        self.log_info("Waiting for encoder feedback")
+
+    def send_zero(self):
+        self.motor.send(CmdVel(linear=0.0, angular=0.0))
+
+    def drain(self, topic):
+        """Return the most recent message on a topic, or None."""
+        latest = None
+        while True:
+            msg = topic.recv()
+            if msg is None:
+                return latest
+            latest = msg
+
+    def tick(self, info=None):
+        # Drain to the most recent command rather than reading one per tick,
+        # so a burst from the planner does not queue up behind the controller.
+        cmd = self.drain(self.cmd)
+        if cmd is not None:
+            self.target_linear = cmd.linear
+            self.target_angular = cmd.angular
+
+        # Actual velocity from the encoder.
+        actual_linear = 0.0
+        actual_angular = 0.0
+        enc = self.drain(self.encoder)
+        if enc is not None:
+            actual_linear = enc.linear
+            actual_angular = enc.angular
+
+        # Safety: no encoder feedback for 500 ms means the cable is out, the
+        # driver process died, or the topic is gone. Stop rather than integrate
+        # against a velocity we are only assuming.
+        if enc is not None:
+            self.ticks_without_encoder = 0
+            self.encoder_timeout_logged = False
+        else:
+            self.ticks_without_encoder += 1
+            if self.ticks_without_encoder > ENCODER_TIMEOUT_TICKS:
+                if not self.encoder_timeout_logged:
+                    self.log_error("Encoder timeout - stopping motors")
+                    self.encoder_timeout_logged = True
+                self.send_zero()
+                return
+
+        # PID on linear velocity, with the integral clamped (anti-windup).
+        lin_error = self.target_linear - actual_linear
+        self.lin_integral = clamp(self.lin_integral + lin_error * DT, INTEGRAL_MAX)
+        lin_output = (
+            KP * lin_error
+            + KI * self.lin_integral
+            + KD * (lin_error - self.lin_prev_error) / DT
+        )
+        self.lin_prev_error = lin_error
+
+        # PID on angular velocity.
+        ang_error = self.target_angular - actual_angular
+        self.ang_integral = clamp(self.ang_integral + ang_error * DT, INTEGRAL_MAX)
+        ang_output = (
+            KP * ang_error
+            + KI * self.ang_integral
+            + KD * (ang_error - self.ang_prev_error) / DT
+        )
+        self.ang_prev_error = ang_error
+
+        # Clamp to the actuator limit and publish.
+        self.motor.send(
+            CmdVel(linear=clamp(lin_output, MAX_PWM), angular=clamp(ang_output, MAX_PWM))
+        )
+
+        # Publish state for monitoring every 10th tick → 10 Hz.
+        self.ticks += 1
+        if self.ticks % 10 == 0:
+            self.state.send(CmdVel(linear=actual_linear, angular=lin_error))
+
+    def enter_safe_state(self):
+        self.send_zero()
+        # Clear the integrators too: resuming with a wound-up integral would
+        # kick the motors the moment the node recovers.
+        self.lin_integral = 0.0
+        self.ang_integral = 0.0
+        self.log_error("Safe state - motors zeroed")
+
+
+# ── Simulated Encoder (for testing without hardware) ────────────────────
+class SimEncoder(horus.Node):
+    def __init__(self):
+        super().__init__(name="sim_encoder", rate=100, order=0)
+        self.pwm = Topic(CmdVel, endpoint="motor.pwm")
+        self.encoder = Topic(CmdVel, endpoint="encoder.velocity")
+        self.velocity = 0.0
+
+    def tick(self, info=None):
+        while True:
+            cmd = self.pwm.recv()
+            if cmd is None:
+                break
+            # Simulate motor dynamics: velocity tracks PWM with lag.
+            self.velocity = 0.9 * self.velocity + 0.1 * cmd.linear
+        self.encoder.send(CmdVel(linear=self.velocity, angular=0.0))
+
+
+# ── Simulated Command Source ────────────────────────────────────────────
+class Commander(horus.Node):
+    def __init__(self):
+        super().__init__(name="commander", rate=100, order=5)
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+        self.ticks = 0
+
+    def tick(self, info=None):
+        # Drive at 0.5 m/s for 3 s, then stop.
+        linear = 0.5 if self.ticks < 300 else 0.0
+        self.ticks += 1
+        self.cmd.send(CmdVel(linear=linear, angular=0.0))
+
+
+# ── Main ────────────────────────────────────────────────────────────────
+# deterministic=True keeps every node on the main tick loop, in order()
+# sequence — without it budget= moves the controller to an RT thread.
+sched = horus.Scheduler(tick_rate=100, name="motor_ctrl", deterministic=True)
+
+sched.add(SimEncoder())        # order 0 — runs first, provides feedback
+sched.add(Commander())         # order 5
+sched.add(MotorController())   # order 10 — reads command + encoder
+
+print("Motor controller running at 100 Hz (Ctrl+C to stop)")
+sched.run()
+```
+
+## Step 3: Run
+
+Python needs no build step:
+
+```bash
+horus run
+```
+
+## Step 4: Monitor
+
+In another terminal:
+
+```bash
+horus topic echo motor.state   # watch motor state
+horus topic echo motor.pwm     # watch PWM output
+horus node list                # see all 3 nodes running
+horus log                      # see init/error messages
+```
+
+## Key Concepts
+
+### Execution Order Matters
+
+```
+order 0:  SimEncoder      → reads PWM, publishes encoder velocity
+order 5:  Commander       → publishes velocity command
+order 10: MotorController → reads command + encoder, publishes PWM
+```
+
+The encoder runs BEFORE the controller so the controller always has fresh feedback. `deterministic=True` is what turns that into a guarantee: it keeps every node on the main tick loop and executes them sequentially in `order=` sequence. Without it, `budget=` promotes `MotorController` to an RT node that the scheduler hands to its own executor thread — `order=` then only sorts nodes *within* an executor, and the encoder/controller interleaving is no longer guaranteed.
+
+### Budget + safe_mode
+
+```python
+import horus
+
+motor = horus.Node(
+    name="motor",
+    rate=100,
+    order=10,
+    budget=0.005,
+    on_miss="safe_mode",
+)
+```
+
+If the motor controller takes longer than 5 ms, the scheduler calls `enter_safe_state()` — motors stop immediately. This prevents a slow computation from leaving motors running with stale commands.
+
+The hook fires on the **transition** into safe mode, not on every miss, so a node under sustained overload is safed once rather than re-safed every cycle. `scheduler.safety_stats()["degrade_activations"]` counts those transitions.
+
+<Callout type="note" title="Budget and deadline are in seconds">
+`budget=0.005` is 5 milliseconds. HORUS also exports unit constants, so `budget=5 * horus.ms` reads better and avoids the classic mistake of writing `budget=5` and getting a five-second budget.
+</Callout>
+
+### Encoder Timeout
+
+The controller tracks `ticks_without_encoder`. If no encoder data arrives for 50 ticks (500 ms at 100 Hz), it assumes the encoder is dead and stops motors. This catches:
+- Disconnected encoder cable
+- Crashed encoder driver process
+- SHM corruption
+
+Note that this is a *separate* safety net from the budget. The budget catches "this node is too slow"; the encoder timeout catches "this node is fine but its input is gone". Neither one detects the other's failure.
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-cpp) — combine sensor, controller, and actuator
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference
