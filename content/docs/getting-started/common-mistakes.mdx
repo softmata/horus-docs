@@ -8,6 +8,13 @@ order: 6
 
 New to HORUS? Here are the most common mistakes beginners make and how to fix them.
 
+Every entry below carries a **Could the API prevent this?** line. A page like
+this is a list of places the library asks the reader to remember something, so
+each entry is also a design bug report: either the API already makes the mistake
+impossible (and the entry survives only to correct an expectation), or it could
+and does not. Recording which is which is what keeps the list shrinking instead
+of growing.
+
 ---
 
 ## 1. Using Slashes in Topic Names
@@ -25,6 +32,12 @@ let topic: Topic<f32> = Topic::new("sensors/lidar")?;
 // CORRECT - Use dots instead
 let topic: Topic<f32> = Topic::new("sensors.lidar")?;
 ```
+
+**Could the API prevent this?** Yes, and it should. `/` is on `Topic::new`'s
+allowed-character list, so the constructor accepts it and the Linux backend
+nests a directory for it. Dropping `/` from that list — or normalising it to
+`.` — would turn this entry into an error message. Until then it is a
+convention that no code enforces.
 
 ---
 
@@ -63,6 +76,13 @@ fn tick(&mut self) {
 }
 ```
 
+**Could the API prevent this?** Not today. `Topic` exposes `recv()`,
+`has_message()`, `pending_count()` and `dropped_count()`, but no latching
+accessor: there is no `latest()` that returns the newest value without draining
+the ring, which is exactly what a node that only samples every tenth tick
+wants. Adding one would make the manual caching in "The Fix" unnecessary. Until
+then `dropped_count()` at least turns silent loss into a number you can watch.
+
 ---
 
 ## 3. Blocking in tick()
@@ -92,6 +112,13 @@ fn tick(&mut self) {
 }
 ```
 
+**Could the API prevent this?** No — no signature distinguishes a slow call
+from a fast one. But the scheduler can *report* it, and that is the practical
+fix: give the node `.budget(...)` and `.deadline(...)` (or a `.rate(...)`,
+which derives both) and an overrun is logged instead of quietly eating everyone
+else's tick. Work that is genuinely slow belongs in `.compute()` or
+`.async_io()`, which move it off the main tick thread entirely.
+
 ---
 
 ## 4. Wrong Priority Order
@@ -99,9 +126,9 @@ fn tick(&mut self) {
 **The Problem:**
 ```rust
 // WRONG - Logger runs before sensor!
-scheduler.add(logger).order(0).done();       // Order 0 (runs first)
-scheduler.add(sensor).order(10).done();      // Order 10
-scheduler.add(controller).order(5).done();   // Order 5
+scheduler.add(logger).order(0).build()?;       // Order 0 (runs first)
+scheduler.add(sensor).order(10).build()?;      // Order 10
+scheduler.add(controller).order(5).build()?;   // Order 5
 ```
 
 **Why:** Lower order number = runs first. Safety-critical code should be order 0.
@@ -109,11 +136,15 @@ scheduler.add(controller).order(5).done();   // Order 5
 **The Fix:**
 ```rust
 // CORRECT - Proper ordering
-scheduler.add(safety_monitor).order(0).done();   // Safety first!
-scheduler.add(sensor).order(5).done();           // Then sensors
-scheduler.add(controller).order(10).done();      // Then control
-scheduler.add(logger).order(100).done();         // Logging last
+scheduler.add(safety_monitor).order(0).build()?;   // Safety first!
+scheduler.add(sensor).order(5).build()?;           // Then sensors
+scheduler.add(controller).order(10).build()?;      // Then control
+scheduler.add(logger).order(100).build()?;         // Logging last
 ```
+
+**Could the API prevent this?** No, and probably never. Nothing in a type says
+a watchdog matters more than a logger — that is domain knowledge only the
+author has. This entry stays a documentation problem.
 
 ---
 
@@ -151,6 +182,13 @@ impl Node for MotorController {
     }
 }
 ```
+
+**Could the API prevent this?** Yes, one layer down. `Node::shutdown()` has an
+empty default body on purpose: most nodes have nothing to wind down, and making
+it required would put `Ok(())` in every file. The mistake disappears if the
+*actuator handle* stops itself in `Drop`, so dropping it is what stops the motor
+and forgetting `shutdown()` costs nothing. That is a driver contract, not a
+`Node` one.
 
 ---
 
@@ -192,6 +230,17 @@ let topic: Topic<CmdVel> = Topic::new("cmd_vel")?;
 let topic: Topic<Odometry> = Topic::new("odom")?;
 ```
 
+**Could the API prevent this?** Already does, twice over. The missing bound is
+a compile error, not a runtime surprise, so nothing ships broken. And `message!`
+emits `#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]` for you,
+so a type declared with it cannot be missing them:
+
+```rust
+message! {
+    MyMessage { x: f32, y: f32 }
+}
+```
+
 ---
 
 ## 7. Thinking send() Returns a Result
@@ -215,6 +264,11 @@ fn tick(&mut self) {
     self.pub_topic.send(data);
 }
 ```
+
+**Could the API prevent this?** Already does. `send()` returns `()`, so
+`if let Err(e) = ...send(...)` does not compile — rustc corrects the reader, not
+a misbehaving robot. This entry survives only to answer "where did my error
+go?", and the answer is `dropped_count()`, `try_send()` and `send_blocking()`.
 
 ---
 
@@ -250,6 +304,12 @@ fn tick(&mut self) {
 }
 ```
 
+**Could the API prevent this?** In principle. `Topic::new` opens shared memory
+on every call, so the cost scales with the call count; if it returned a cached
+handle per (name, type) the mistake would cost nothing. It does not do that
+today, and caching brings its own hazard (deciding who closes the last handle),
+so for now the constructor is a thing you call once.
+
 ---
 
 ## 9. Mismatched Topic Types
@@ -283,13 +343,25 @@ let sub_topic: Topic<SensorReading> = Topic::new("sensor")?;
 
 An alias is for readability only — `SensorReading` erases to `f32`, so the header still records `f32` and the runtime check above behaves exactly as it would without the alias. To make that check itself tell two `f32` payloads apart, give them genuinely distinct types (e.g. `struct SensorReading(f32);` with the derives from mistake 6), which stamps `SensorReading` into the header instead.
 
+**Could the API prevent this?** Half of it already is. The type name is stamped
+into the topic header and `Topic::new` refuses a mismatched open, so the failure
+is immediate and loud rather than silent corruption. Making it a *compile* error
+would need topic names bound to their types at declaration — a registry of
+`("data", f32)` pairs the compiler can see — which HORUS does not have. Two gaps
+stay open regardless: `GenericMessage` skips the check, and two distinct types
+can share a short name.
+
 ---
 
-## 10. Using Raw Node Trait When node! Macro Would Be Simpler
+## Not a mistake: writing `impl Node` by hand
 
-**The Problem:**
+Earlier versions of this page listed the hand-written trait form as mistake 10.
+It is not one. The trait form is the canonical HORUS style: it is what the
+[Quick Start](/getting-started/quick-start) teaches, what the README shows, and
+what `horus new` scaffolds by default. A reader who writes it has done the
+normal thing.
+
 ```rust
-// Manual implementation - lots of boilerplate
 struct MySensor {
     pub_topic: Topic<f32>,
 }
@@ -303,7 +375,7 @@ impl MySensor {
 }
 
 impl Node for MySensor {
-    fn name(&self) -> &'static str { "MySensor" }
+    fn name(&self) -> &str { "MySensor" }
 
     fn tick(&mut self) {
         let data = 42.0;  // Read sensor
@@ -312,9 +384,13 @@ impl Node for MySensor {
 }
 ```
 
-**The Fix:**
+`node!` is a shorter spelling of exactly that — it generates the `struct`, the
+constructor and the `impl Node` — and `horus new --macro` scaffolds a starter
+written that way. Note the constructor it generates is infallible
+(`MySensor::new()`, no `?`), which is the one place the two forms differ at the
+call site:
+
 ```rust
-// Use node! macro - 75% less code!
 node! {
     MySensor {
         pub { sensor_data: f32 -> "sensor.data" }
@@ -327,24 +403,24 @@ node! {
 }
 ```
 
-See [node! Macro](/concepts/node-macro) for more examples.
+Pick either. Mixing them in one codebase is fine too. See
+[node! Macro](/concepts/node-macro) for more examples.
 
 ---
 
 ## Quick Reference
 
-| Mistake | Fix |
-|---------|-----|
-| Slashes in topic names | Use dots: `sensors.lidar` |
-| Not checking recv() every tick | Always call recv(), cache last value |
-| Blocking in tick() | Keep tick() under 1ms, do I/O in init() |
-| Wrong priority order | Lower number = higher priority |
-| No shutdown() for motors | Always stop actuators in shutdown() |
-| Missing derives on messages | Add Clone, Serialize, Deserialize |
-| Treating send() as fallible | `send()` is infallible — just call it directly |
-| Creating Topic in tick() | Create Topic once in new() |
-| Mismatched topic types | Use same type for pub and sub |
-| Too much boilerplate | Use the `node!` macro |
+| # | Mistake | Fix | Could the API prevent it? |
+|---|---------|-----|---------------------------|
+| 1 | Slashes in topic names | Use dots: `sensors.lidar` | Yes — `Topic::new` could reject `/` |
+| 2 | Not checking recv() every tick | Always call recv(), cache last value | Not yet — needs a latching `latest()` |
+| 3 | Blocking in tick() | Keep tick() under 1ms, do I/O in init() | No — but `.budget()`/`.deadline()` report it |
+| 4 | Wrong priority order | Lower number = higher priority | No — only the author knows what is critical |
+| 5 | No shutdown() for motors | Always stop actuators in shutdown() | Yes, in the driver — stop the motor in `Drop` |
+| 6 | Missing derives on messages | Add Clone, Serialize, Deserialize | Already does — compile error, and `message!` derives them |
+| 7 | Treating send() as fallible | `send()` is infallible — just call it directly | Already does — it does not compile |
+| 8 | Creating Topic in tick() | Create Topic once in new() | In principle — `Topic::new` could cache per (name, type) |
+| 9 | Mismatched topic types | Use same type for pub and sub | Half — refused at runtime; a compile error needs a topic registry |
 
 ---
 
