@@ -1,0 +1,424 @@
+---
+title: "Tutorial 10: Write a Reusable Driver (Python)"
+description: "Package a hardware driver as a reusable Node with configuration, diagnostics, and safety"
+order: 101
+---
+
+# Tutorial 10: Write a Reusable Driver (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/10-write-a-driver-rust) and [C++](/tutorials/10-write-a-driver-cpp).</Callout>
+
+Turn a hardware interface into a reusable `horus.Node` that other projects can drop in. This tutorial builds a production-quality IMU driver.
+
+## What You'll Learn
+
+- Driver as a self-contained `horus.Node` subclass
+- Configuration via `horus.Params`
+- Health monitoring with `Heartbeat`
+- Diagnostic reporting with `DiagnosticStatus`
+- Safe shutdown on hardware failure
+
+## The Driver Pattern
+
+```
+┌─────────────────────────────────────┐
+│  ImuDriver(horus.Node)              │
+│                                     │
+│  init()  → open device, configure   │
+│  tick()  → read data, publish       │
+│  enter_safe_state() → close device  │
+│                                     │
+│  Publishes:                         │
+│    "imu.data"     (Imu)             │
+│    "imu.heartbeat"(Heartbeat)       │
+│    "imu.status"   (DiagnosticStatus)│
+│                                     │
+│  Params:                            │
+│    imu.port       = "/dev/ttyUSB0"  │
+│    imu.baudrate   = 115200          │
+│    imu.calibrate  = true            │
+└─────────────────────────────────────┘
+```
+
+## Complete Code
+
+```python
+import os
+
+import horus
+from horus import DiagnosticStatus, Heartbeat, Imu, Topic
+
+TICK_HZ = 100
+ERROR_LIMIT = 100      # 1 second at 100 Hz
+HEARTBEAT_EVERY = 100  # 1 Hz
+STATUS_EVERY = 500     # 0.2 Hz
+
+OK, ERROR = 0, 2       # DiagnosticStatus severity levels
+
+
+class ImuDriver(horus.Node):
+    def __init__(self, params):
+        super().__init__(
+            name="imu_driver",
+            rate=TICK_HZ,
+            order=0,
+            budget=2 * horus.ms,
+            on_miss="warn",
+            watchdog=5.0,
+        )
+        # horus.Params is a shared store, so the driver keeps the handle and
+        # reads through it whenever it likes.
+        self.params = params
+        self.imu = Topic(Imu, endpoint="imu.data")
+        self.heartbeat = Topic(Heartbeat, endpoint="imu.heartbeat")
+        self.status = Topic(DiagnosticStatus, endpoint="imu.status")
+
+        self.beat = Heartbeat(node_name="imu_driver", node_id=0)
+        self.fd = -1
+        self.connected = False
+        self.ticks = 0
+        self.consecutive_errors = 0
+        self.gyro_bias_z = 0.0
+
+    @classmethod
+    def from_config(cls, config):
+        """Build from a `[hardware.imu]` table in horus.toml.
+
+        The table's keys are mapped onto the same parameter names the driver
+        reads, so both construction routes configure exactly one thing.
+        """
+        params = horus.Params()
+        params["imu.port"] = config.get_or("port", "/dev/ttyUSB0")
+        params["imu.baudrate"] = config.get_or("baudrate", 115200)
+        params["imu.calibrate"] = config.get_or("calibrate", True)
+        return cls(params)
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
+    def init(self, info=None):
+        # super().init(info) is what hands the node its logging channel. An
+        # override that skips it leaves log_info/log_warning/log_error dropping
+        # every message for the rest of the node's life.
+        super().init(info)
+
+        port = self.params.get("imu.port", "/dev/ttyUSB0")
+        baudrate = self.params.get("imu.baudrate", 115200)
+
+        try:
+            # O_NONBLOCK is the flag that matters: tick() must never block the
+            # scheduler waiting on a device that has stopped talking.
+            self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as exc:
+            self.log_error(f"Could not open {port}: {exc}")
+            self.publish_status(ERROR, "Failed to open serial port")
+            # Returning normally keeps the node in the schedule: it reports
+            # "Disconnected" on imu.status rather than taking the whole process
+            # down because one cable is out.
+            return
+
+        self.connected = True
+        self.log_info(f"IMU connected on {port} at {baudrate} baud")
+        self.publish_status(OK, "Connected and calibrating")
+
+        if self.params.get("imu.calibrate", True):
+            self.calibrate()
+
+    def tick(self, info=None):
+        self.ticks += 1
+
+        if self.connected:
+            try:
+                frame = os.read(self.fd, 64)
+            except (BlockingIOError, OSError):
+                # An empty read and a hard I/O failure count towards the same
+                # limit — one second of silence from an IMU is a dead IMU
+                # either way.
+                frame = b""
+
+            if frame:
+                self.parse_and_publish(frame)
+                self.consecutive_errors = 0
+            else:
+                self.consecutive_errors += 1
+                if self.consecutive_errors > ERROR_LIMIT:
+                    self.log_error(f"IMU read timeout - {ERROR_LIMIT} consecutive misses")
+                    self.publish_status(ERROR, "Read timeout")
+                    self.close_port()
+
+        # Heartbeat at 1 Hz. update() bumps the sequence number and restamps.
+        if self.ticks % HEARTBEAT_EVERY == 0:
+            self.beat.update(self.ticks / TICK_HZ)
+            self.heartbeat.send(self.beat)
+
+        # Status at 0.2 Hz.
+        if self.ticks % STATUS_EVERY == 0:
+            if self.connected:
+                self.publish_status(OK, "OK")
+            else:
+                self.publish_status(ERROR, "Disconnected")
+
+    def enter_safe_state(self):
+        self.log_warning("Safe state - closing device")
+        self.close_port()
+
+    def shutdown(self, info=None):
+        super().shutdown(info)
+        self.close_port()
+        self.log_info("IMU driver stopped")
+
+    # ── Helpers ────────────────────────────────────────────────────────
+    def calibrate(self):
+        self.log_info("Calibrating (hold still)")
+        # A real driver averages ~100 gyro samples while the robot is still and
+        # keeps the mean as the bias.
+        self.gyro_bias_z = 0.0
+        self.log_info("Calibration complete")
+        self.publish_status(OK, "Ready")
+
+    def parse_and_publish(self, frame):
+        # Parse the device-specific protocol into the standard Imu message,
+        # applying the calibration offset measured at startup.
+        self.imu.send(
+            Imu(
+                accel_x=0.0,
+                accel_y=0.0,
+                accel_z=9.81,
+                gyro_x=0.0,
+                gyro_y=0.0,
+                gyro_z=0.01 - self.gyro_bias_z,
+            )
+        )
+
+    def publish_status(self, level, message):
+        self.status.send(
+            DiagnosticStatus(
+                level=level, code=0, message=message, component="imu_driver"
+            )
+        )
+
+    def close_port(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+        self.connected = False
+
+
+# Makes the driver loadable from a [hardware.imu] table in horus.toml.
+horus.drivers.register_driver("ImuDriver", ImuDriver.from_config)
+
+params = horus.Params()
+params["imu.port"] = "/dev/ttyUSB0"
+params["imu.baudrate"] = 115200
+params["imu.calibrate"] = True
+
+sched = horus.Scheduler(
+    tick_rate=TICK_HZ,
+    name="imu_node",
+    rt=True,
+    blackbox_mb=16,  # flight recorder for crash forensics
+)
+sched.add(ImuDriver(params))
+
+print("IMU driver running at 100 Hz (Ctrl+C to stop)")
+sched.run()
+```
+
+<Callout type="note" title="`horus.Params` is dict-like, and `super().init()` is not optional">
+
+`horus.Params` has no `set()` method — assign through the subscript
+(`params["imu.port"] = ...`) and read with `params.get(key, default)`. Nothing
+is written to disk until you call `params.save()`.
+
+The `super().init(info)` / `super().shutdown(info)` calls are load-bearing.
+`horus.Node` stores the scheduler's logging handle in those base methods, and
+`log_info()` and friends drop the message with a `RuntimeWarning` when it is
+missing. An override that forgets the `super()` call silences the node's
+logging for the whole run — including the `Could not open` line you most want
+to see.
+
+</Callout>
+
+<Callout type="note" title="The 2 ms budget is the C++ number, not a Python one">
+
+`budget=2 * horus.ms` mirrors the C++ tutorial so the three versions stay
+comparable, and a lone driver node meets it comfortably. A Python tick still
+carries interpreter overhead the C++ version does not, and the GIL means a
+second Python node in the same process can push this one over the line — which
+with a `budget` set is enough to trip the scheduler's critical-node check.
+Measure with `sched.safety_stats()` on your own machine and widen the
+number until you can actually meet it; a budget you cannot meet is the only
+thing that makes `on_miss` useful.
+
+</Callout>
+
+<Callout type="warning" title="`Heartbeat.alive` is read-only in Python">
+
+C++ and Rust set `hb.alive = connected` to say "this node is running but its
+device is gone". Python exposes `alive`, `sequence` and `node_name` as
+**read-only** properties — the writable surface is `update(uptime)`, which
+bumps the sequence and restamps the message, plus `timestamp_ns` — so the
+driver above cannot flip that flag.
+
+The disconnected state therefore rides entirely on `imu.status`, which carries
+`level = 2` and `"Disconnected"` and which all three language versions publish
+anyway. The heartbeat still does its own job: it proves the *node* is alive,
+which is a different failure from the device being gone.
+
+</Callout>
+
+<Callout type="warning" title="Python has no `blackbox.record()`">
+
+C++ offers `horus::blackbox::record(category, message)` for pushing a custom
+marker into the flight recorder. Python does not expose an equivalent: the
+recorder is fed by the scheduler, which records node errors, budget overruns,
+deadline misses, watchdog expiries and emergency stops on its own once
+`blackbox_mb=16` is set. The node-level equivalent of the C++ call is
+`self.log_error(...)` plus the `DiagnosticStatus` published on `imu.status`.
+
+</Callout>
+
+## What Makes a Good Driver
+
+| Aspect | Implementation |
+|--------|---------------|
+| **Self-contained** | All hardware access in one `horus.Node` subclass |
+| **Configurable** | Port, baudrate, calibration via `horus.Params` |
+| **Monitored** | `Heartbeat` + `DiagnosticStatus` published |
+| **Safe** | `enter_safe_state()` closes the device |
+| **Fault-tolerant** | Consecutive error counting, auto-disable |
+| **Logged** | `log_error()` for runtime, `blackbox_mb=16` for crash forensics |
+| **Non-blocking** | `os.O_NONBLOCK` on the file descriptor |
+| **Reusable** | `register_driver` makes it loadable from `horus.toml` |
+
+## Reusing the Driver
+
+Move the `ImuDriver` class into its own `imu_driver.py` — everything below the
+class definition in the listing above is the demo program, not the driver — and
+other projects import it and add it as a node:
+
+```python
+# In another project's main.py
+import horus
+
+from imu_driver import ImuDriver
+
+params = horus.Params()
+params["imu.port"] = "/dev/ttyUSB0"
+
+sched = horus.Scheduler(tick_rate=100, name="robot")
+sched.add(ImuDriver(params))
+```
+
+Or, because of the `register_driver` line, they never write construction code
+at all — they declare the device in `horus.toml`:
+
+```toml
+[hardware.imu]
+use       = "ImuDriver"   # the name passed to register_driver
+port      = "/dev/ttyUSB0"
+baudrate  = 115200
+calibrate = true
+```
+
+and load it:
+
+```python
+import horus
+
+from imu_driver import ImuDriver
+
+horus.drivers.register_driver("ImuDriver", ImuDriver.from_config)
+
+sched = horus.Scheduler(tick_rate=100, name="robot")
+
+# horus.drivers.load() reads the [hardware] tables out of horus.toml and
+# returns (name, node) pairs — one per declared device. Nothing in the CLI
+# does this for you; the program has to ask.
+for name, node in horus.drivers.load():
+    print(f"loading hardware node {name}")
+    sched.add(node)
+
+sched.run()
+```
+
+Every key in the table other than the reserved ones (`use`, `sim`, `args`)
+arrives on the `NodeParams` object handed to `from_config`. Note that
+`NodeParams.get(key)` raises `KeyError` when the key is absent — the
+default-taking form is `get_or(key, default)`, which is why `from_config` uses
+it while the rest of the driver uses `horus.Params.get(key, default)`. See
+[Configuration](/package-management/configuration) for the full set of reserved
+keys.
+
+### Consuming the driver's topics
+
+Any node — in this process or another one — opens the driver's topics by name.
+The heartbeat and status topics are what make the driver monitorable without
+the consumer knowing anything about IMUs:
+
+```python
+import horus
+from horus import DiagnosticStatus, Heartbeat, Topic
+
+
+class ImuHealth(horus.Node):
+    def __init__(self):
+        super().__init__(name="imu_health", rate=100, order=20)
+        self.heartbeat = Topic(Heartbeat, endpoint="imu.heartbeat")
+        self.status = Topic(DiagnosticStatus, endpoint="imu.status")
+        self.ticks_since_heartbeat = 0
+
+    def tick(self, info=None):
+        self.ticks_since_heartbeat += 1
+
+        while True:
+            beat = self.heartbeat.recv()
+            if beat is None:
+                break
+            self.ticks_since_heartbeat = 0
+
+        while True:
+            report = self.status.recv()
+            if report is None:
+                break
+            if report.level >= 2:
+                self.log_error(f"IMU status: {report.message}")
+
+        # Two missed beats at 1 Hz means the driver itself is gone — a
+        # different failure from the device dropping out, and one no `imu.data`
+        # timeout can tell apart from a merely idle sensor.
+        if self.ticks_since_heartbeat > 200:
+            self.log_error("No IMU heartbeat for 2 s")
+            self.ticks_since_heartbeat = 0
+```
+
+`Topic` is symmetric, so this is the same object type the driver publishes
+with, opened on the same endpoint. Nothing else has to be wired up.
+
+<Callout type="note" title="Python topics are shared-memory only">
+The driver and its consumers must run on the same machine. For cross-machine
+topics, use the Rust replicator — a Python driver's topics are visible to a
+Rust or C++ node in another process on the same host, but never over the wire.
+</Callout>
+
+## Key Takeaways
+
+- Drivers are `horus.Node` subclasses — portable, reusable, testable
+- Publish 3 topics: data, heartbeat, status — lets monitoring work automatically
+- Non-blocking I/O in `tick()` — never block the scheduler
+- Count consecutive errors — disable after a threshold (1 second is typical)
+- `enter_safe_state()` closes hardware safely; `shutdown()` handles the ordinary exit
+- `horus.Params` for configuration — no hardcoded values
+- `register_driver` plus a `[hardware]` table is what turns "a node" into "a driver another project can drop in"
+
+## Next Steps
+
+- [Tutorial 7: Parameters Deep Dive (Python)](/tutorials/07-params-deep-dive-python) — retune the driver while it runs
+- [Tutorial 3: Full Robot System (Python)](/tutorials/03-full-robot-python) — put the driver in a six-node robot
+- [Tutorial 5: Hardware & Real-Time](/tutorials/05-hardware-rt-cpp) — RT scheduling and hardware timing
+- [Configuration](/package-management/configuration) — the `[hardware]` table in full
+- [BlackBox Flight Recorder](/advanced/blackbox) — reading the recorder after a failure
+
+## See Also
+
+- [Message Types](/concepts/message-types) — `Heartbeat` and `DiagnosticStatus` on the wire
+- [Diagnostics Messages](/rust/api/diagnostics-messages) — the field-by-field reference (same wire format, Rust naming)
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

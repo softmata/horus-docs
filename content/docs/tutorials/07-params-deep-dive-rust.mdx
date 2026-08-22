@@ -1,0 +1,275 @@
+---
+title: "Tutorial 7: Parameters Deep Dive (Rust)"
+description: "Runtime configuration with typed parameters, startup loading from YAML, and organizing params by subsystem"
+order: 70
+---
+
+# Tutorial 7: Parameters Deep Dive (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/07-params-deep-dive-python) and [C++](/tutorials/07-params-deep-dive-cpp).</Callout>
+
+Parameters let you change robot behavior without recompiling. Tune PID gains, adjust speed limits, enable/disable features — from a YAML file read at startup, or from your own code while the robot is running.
+
+## What You'll Learn
+
+- `RuntimeParams` for typed key-value storage
+- `get_or()` with defaults for safe access
+- Loading startup values from `.horus/config/params.yaml` (written by `horus param set`)
+- Organizing parameters by subsystem
+
+## Basic Usage
+
+```rust
+use horus::prelude::*;
+
+struct TunableController {
+    cmd: Topic<CmdVel>,
+    out: Topic<CmdVel>,
+    params: RuntimeParams,
+}
+
+impl TunableController {
+    // `RuntimeParams` is Arc-backed, so this clone shares one store with
+    // `main()` — it is the Rust equivalent of C++'s `Params&`.
+    fn new(params: RuntimeParams) -> Result<Self> {
+        Ok(Self {
+            cmd: Topic::new("cmd_vel")?,
+            out: Topic::new("motor.cmd")?,
+            params,
+        })
+    }
+}
+
+impl Node for TunableController {
+    fn name(&self) -> &str {
+        "tunable_ctrl"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        // Read a startup value back — get_or() falls back to "unnamed".
+        let robot = self.params.get_or("robot_name", "unnamed".to_string());
+        hlog!(info, "robot: {}", robot);
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        // Read parameters every tick — picks up any set() done elsewhere
+        // in this process (there is no live channel from the CLI).
+        let max_speed = self.params.get_or("max_speed", 0.5_f64);
+        let gain = self.params.get_or("controller_gain", 0.8_f64);
+        let enabled = self.params.get_or("motor_enabled", true);
+
+        if !enabled {
+            self.out.send(CmdVel::new(0.0, 0.0));
+            return;
+        }
+
+        let cmd = match self.cmd.recv() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let scaled = (cmd.linear as f64 * gain).min(max_speed);
+        self.out.send(CmdVel::new(scaled as f32, 0.0));
+    }
+}
+
+fn main() -> Result<()> {
+    let params = RuntimeParams::new()?;
+
+    // Override whatever params.yaml supplied for these keys.
+    params.set("max_speed", 0.5_f64)?;
+    params.set("controller_gain", 0.8_f64)?;
+    params.set("motor_enabled", true)?;
+    params.set("robot_name", "atlas")?;
+
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .name("tunable")
+        .deterministic(true)
+        .with_params(params.clone());
+
+    sched
+        .add(TunableController::new(params.clone())?)
+        .order(10)
+        .build()?;
+
+    sched.run()
+}
+```
+
+`params.set()` takes `&self`, not `&mut self`, and `RuntimeParams` is `Clone` —
+cloning copies the `Arc`, not the map. Every clone reads and writes the same
+store, which is how `main()` and the node stay in sync without a lock in your
+code. Reads and writes are internally `RwLock`-guarded, so concurrent access
+from several nodes is safe.
+
+<Callout type="note" title="with_params() shares the store, it does not push updates">
+`.with_params(params.clone())` attaches the store to the scheduler, but the
+scheduler does **not** call a node's `on_parameter_change()` when a value
+changes — that bridge is unimplemented. Polling with `get_or()` inside `tick()`
+is how a node sees a new value today. If you need to react the moment a value
+changes, register a callback yourself with `RuntimeParams::on_change()`.
+</Callout>
+
+### Where startup values come from
+
+`RuntimeParams::new()` layers three sources, lowest precedence first:
+HORUS's built-in defaults, then `.horus/config/params.yaml` (the file
+`horus param set` writes), then any `HORUS_PARAM_*` environment variables. That
+happens **once, in `new()`** — there is no file watcher and no live channel from
+the `horus param` CLI, so a `horus param set` issued while the node is running
+changes nothing until you restart the process.
+
+Each layer overrides individual *keys* of the layer below it; it never replaces
+the whole map. Setting one key in `params.yaml` therefore leaves the built-in
+defaults for `max_speed`, `emergency_stop_distance`, `collision_threshold` and
+the rest intact.
+
+Note the ordering in `main()` above: the `params.set(...)` calls run *after* the
+file has been loaded, so they overwrite whatever `params.yaml` held for those
+keys. Drop them and rely on the fallbacks in `get_or("key", default)` if you want
+the YAML file to win.
+
+Going the other way, `params.save_to_disk()?` writes the store back to
+`.horus/config/params.yaml` — the whole store, built-in defaults included, not
+just the keys you touched. `params.load_from_disk(path)?` reads a file back, but
+note that it **replaces** the store rather than layering on top of it, so a
+two-key file leaves you with exactly two parameters and no
+`emergency_stop_distance` at all. Use it for a complete profile, not for a patch.
+
+<Callout type="warning" title="A malformed params.yaml refuses to start">
+Unlike a `get_or()` miss, a `params.yaml` that exists but cannot be read or
+parsed makes `RuntimeParams::new()` return `Err`, and `main()`'s `?` propagates
+it. That is deliberate: the built-in defaults are looser than whatever the
+operator wrote, so silently restoring `max_speed = 1.0` after a YAML typo would
+be worse than not starting. `RuntimeParams::default()` does fall back to the
+built-ins (with a loud stderr warning) because it has no way to report the
+error — prefer `new()`.
+</Callout>
+
+## Supported Types
+
+`set()` is generic over `Serialize` and `get()` over `Deserialize`, with the
+value stored as JSON in between — so a `Vec<f64>` waypoint list round-trips just
+as well as a scalar. The four scalar types you will use most:
+
+| Type | `set()` | `get_or()` | `get()` |
+|------|---------|------------|---------|
+| `f64` | `params.set("key", 1.5_f64)?` | `params.get_or("key", 0.0_f64)` | `params.get::<f64>("key")` → `Option<f64>` |
+| `i64` | `params.set("key", 42_i64)?` | `params.get_or("key", 0_i64)` | `params.get::<i64>("key")` → `Option<i64>` |
+| `bool` | `params.set("key", true)?` | `params.get_or("key", false)` | `params.get::<bool>("key")` → `Option<bool>` |
+| `String` | `params.set("key", "value")?` | `params.get_or("key", String::new())` | `params.get::<String>("key")` → `Option<String>` |
+
+Annotate the default (`0.5_f64`, not `0.5`) when the surrounding expression does
+not already pin the type — `get_or()` infers `T` from the default you pass.
+
+<Callout type="warning" title="A type mismatch reads as a missing key">
+JSON widens an integer to a float, so a key set to `42_i64` reads back fine as
+`f64`. The reverse does not: a key set to `1.5_f64` read as `i64` fails to
+deserialize, and both `get()` and `get_or()` swallow that — `get()` returns
+`None`, `get_or()` hands back your default, and nothing is logged. If the
+difference between "operator never set this" and "operator set this wrong"
+matters, use `get_typed::<T>("key")`, which returns `Result<T>` and distinguishes
+a missing key from a type mismatch.
+</Callout>
+
+## Organizing Parameters
+
+Group by subsystem:
+
+```rust
+use horus::prelude::*;
+
+fn configure(params: &RuntimeParams) -> Result<()> {
+    // Locomotion
+    params.set("loco.max_speed", 0.5_f64)?;
+    params.set("loco.max_angular", 1.0_f64)?;
+    params.set("loco.wheel_base", 0.3_f64)?;
+
+    // PID
+    params.set("pid.kp", 2.0_f64)?;
+    params.set("pid.ki", 0.1_f64)?;
+    params.set("pid.kd", 0.05_f64)?;
+
+    // Safety
+    params.set("safety.min_distance", 0.3_f64)?;
+    params.set("safety.estop_enabled", true)?;
+
+    Ok(())
+}
+```
+
+Keys are plain strings and the store is a `BTreeMap`, so the dot is a naming
+convention rather than a nested namespace — `params.list_keys()` returns
+`loco.max_speed` sorted next to `loco.wheel_base`, which is the whole point.
+
+One caveat on the third layer: `HORUS_PARAM_*` lowercases the name and does not
+translate underscores into dots, so `HORUS_PARAM_PID_KP=2.5` sets `pid_kp`, not
+`pid.kp`. Keys you expect a launch file to override are easier to reach with
+underscore names.
+
+## Pattern: Parameter Validation
+
+```rust
+use horus::prelude::*;
+
+struct Locomotion {
+    params: RuntimeParams,
+}
+
+impl Node for Locomotion {
+    fn name(&self) -> &str {
+        "locomotion"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        let kp = self.params.get_or("pid.kp", -1.0_f64);
+        if kp < 0.0 {
+            hlog!(error, "pid.kp must be >= 0");
+            return Ok(());
+        }
+
+        let max_speed = self.params.get_or("loco.max_speed", 0.5_f64);
+        if max_speed > 2.0 {
+            hlog!(warn, "max_speed > 2.0 m/s — are you sure?");
+        }
+
+        Ok(())
+    }
+
+    fn tick(&mut self) {}
+}
+```
+
+`hlog!` takes no node-name argument, unlike C++'s `horus::log::info(name(), ...)`.
+The scheduler installs the current node's context before it calls `init()` or
+`tick()`, and the macro reads it from there — so this message lands under
+`locomotion`, which is what `horus log locomotion` filters on, even though the
+key being checked lives under a different prefix.
+
+Returning `Ok(())` early, as above, keeps the node registered. Returning `Err`
+instead is the stronger option: the scheduler logs the failure, leaves the node
+uninitialized so it never ticks, and keeps the rest of the system running — it
+does not abort the process. If a bad value should stop the robot outright,
+validate in `main()` before `sched.run()`, where `?` on an `Err` exits.
+
+## Key Takeaways
+
+- Read params every tick — captures `set()` calls made elsewhere in the process
+- Startup values load once, in `RuntimeParams::new()` — restart to pick up a `horus param set`
+- Always provide defaults: `get_or("key", 0.0_f64)` never fails
+- Use `get_typed::<T>()` when a type mismatch should be an error rather than a silent default
+- Use dotted naming (`pid.kp`, `loco.max_speed`) to organize
+- Validate in `init()` — log warnings for dangerous values
+- `RuntimeParams` is `Clone` + `Arc`-backed and thread-safe for concurrent read/write
+
+## Next Steps
+
+- [Tutorial 2: Motor Controller (Rust)](/tutorials/02-motor-controller-rust) — the `KP`/`KI`/`KD` constants that belong in params
+- [Tutorial 3: Full Robot System (Rust)](/tutorials/03-full-robot-rust) — one store shared across six nodes
+- [Tutorial 8: Multi-Process Systems](/tutorials/08-multi-process-cpp) — splitting a system across processes
+
+## See Also
+
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference

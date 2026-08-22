@@ -1,0 +1,335 @@
+---
+title: "Tutorial 5: Hardware & Real-Time (Python)"
+description: "Connect real hardware with RT scheduling, CPU pinning, and watchdog protection"
+order: 51
+---
+
+# Tutorial 5: Hardware & Real-Time (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/05-hardware-rt-rust) and [C++](/tutorials/05-hardware-rt-cpp).</Callout>
+
+Connect real sensors and actuators to HORUS with proper real-time scheduling. This tutorial builds a motor controller that reads encoder feedback and drives a motor with SCHED_FIFO priority.
+
+## What You'll Learn
+
+- Opening serial ports from a Node
+- RT scheduling: `budget=`, `deadline=`, `core=`, `priority=`
+- Watchdog for detecting frozen hardware
+- `enter_safe_state()` for actuator safety
+- CPU governor and kernel requirements
+
+## Prerequisites
+
+- Completed [Tutorial 2: Motor Controller](/tutorials/02-motor-controller-python)
+- A Linux machine (RT features require Linux)
+- Optional: USB serial device for testing
+
+<Callout type="warning" title="What Python real-time actually buys you">
+The SCHED_FIFO priority, the core pinning and the budget below are applied to
+the executor thread that runs your `tick()`, so they are real and they do reduce
+jitter. What they cannot remove is CPython itself: the interpreter, the GIL and
+non-deterministic garbage collection put a floor under a Python tick that Rust
+and C++ do not have. Budgets in the low hundreds of microseconds are realistic;
+single-digit microseconds are not.
+
+Use this for hardware that talks at 100 Hz to 1 kHz over a serial or CAN link —
+which is most of it. For a hard-real-time inner loop, write that node in
+[Rust](/tutorials/05-hardware-rt-rust) or [C++](/tutorials/05-hardware-rt-cpp)
+and keep Python for supervision; they share topics through the same shared
+memory, so it is not an all-or-nothing choice.
+</Callout>
+
+## The Hardware Pattern
+
+Every hardware driver follows the same pattern:
+
+```
+init():              open device, configure, verify connection
+tick():              read sensor OR write actuator (never both blocking)
+enter_safe_state():  zero actuators, disable outputs
+shutdown():          close device, release resources
+```
+
+The C++ page calls the last one `on_shutdown()`. In Python the method is
+`shutdown(self, info=None)` — same slot in the lifecycle, different name.
+
+## Complete Code: RT Motor Driver
+
+Create the project with `horus new rt_motor --python`, then replace `main.py`:
+
+<Callout type="note" title="No serial library needed">
+Unlike Rust and C++, Python needs nothing extra here: `os.open`, `os.read`,
+`os.write` and the standard `termios` module do exactly what the C++ version's
+`open`/`tcsetattr`/`read`/`write` calls do, with the same constants under the
+same names. `pyserial` is a convenience, not a requirement.
+</Callout>
+
+```python
+import os
+import termios
+
+import horus
+from horus import CmdVel, Topic
+
+PORT = "/dev/ttyUSB0"
+BAUDRATE = termios.B115200
+
+# 100 ticks at 100 Hz = 1 s without encoder feedback.
+ENCODER_TIMEOUT_TICKS = 100
+
+
+class MotorDriver(horus.Node):
+    def __init__(self, port=PORT, baudrate=BAUDRATE):
+        super().__init__(
+            name="motor_driver",
+            rate=100,
+            order=0,                 # highest priority
+            budget=2 * horus.ms,     # must complete in 2 ms
+            deadline=5 * horus.ms,   # absolute deadline 5 ms
+            on_miss="safe_mode",     # stop motor if overrun
+            core=2,                  # pin to CPU core 2
+            priority=90,             # SCHED_FIFO priority 90
+            watchdog=1.0,            # scheduler-level watchdog, seconds
+        )
+        self.port = port
+        self.baudrate = baudrate
+        self.fd = -1
+        self.info = None
+        self.cmd = Topic(CmdVel, endpoint="motor.cmd")
+        self.state = Topic(CmdVel, endpoint="motor.state")
+        self.last_cmd = 0.0
+        self.watchdog_counter = 0
+        self.watchdog_fed = False
+        self.watchdog_alarmed = False
+
+    def init(self, info=None):
+        # Keep the tick context so log_* reaches `horus log` — see the callout
+        # below. enter_safe_state() has no `info` of its own and relies on it.
+        self.info = info
+        try:
+            self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as exc:
+            self.log_error(f"Failed to open serial port {self.port}: {exc}")
+            self.fd = -1
+            return
+
+        # Configure the line: 8N1, no parity, one stop bit, raw.
+        iflag, oflag, cflag, lflag, _ispeed, _ospeed, cc = termios.tcgetattr(self.fd)
+        cflag |= termios.CLOCAL | termios.CREAD
+        cflag &= ~termios.PARENB
+        cflag &= ~termios.CSTOPB
+        cflag &= ~termios.CSIZE
+        cflag |= termios.CS8
+        iflag, oflag, lflag = 0, 0, 0
+        termios.tcsetattr(
+            self.fd,
+            termios.TCSANOW,
+            [iflag, oflag, cflag, lflag, self.baudrate, self.baudrate, cc],
+        )
+        self.log_info("Serial port opened, motor ready")
+
+    def write_duty(self, duty):
+        # Protocol: "M<duty>" plus a newline, where duty is -100 to 100.
+        if self.fd >= 0:
+            os.write(self.fd, b"M%d\n" % round(duty))
+
+    def send_zero(self):
+        self.write_duty(0.0)
+        self.state.send(CmdVel(linear=0.0, angular=0.0))
+
+    def tick(self, info=None):
+        self.info = info
+        if self.fd < 0:
+            return
+
+        # Drain to the newest command so a burst never queues up behind us.
+        cmd = None
+        while True:
+            msg = self.cmd.recv()
+            if msg is None:
+                break
+            cmd = msg
+        if cmd is not None:
+            self.last_cmd = cmd.linear
+            self.write_duty(cmd.linear * 100.0)
+
+        # Encoder feedback. The fd is O_NONBLOCK, so an idle UART raises
+        # BlockingIOError immediately instead of parking the RT thread.
+        try:
+            data = os.read(self.fd, 64)
+        except BlockingIOError:
+            data = b""
+        except OSError as exc:
+            self.log_error(f"Serial read failed: {exc}")
+            data = b""
+
+        if data:
+            text = data.decode("ascii", "ignore").strip()
+            if text.startswith("E"):
+                try:
+                    rpm = float(text[1:])
+                except ValueError:
+                    rpm = None
+                if rpm is not None:
+                    self.state.send(CmdVel(linear=rpm, angular=self.last_cmd))
+                    self.watchdog_fed = True
+
+        # Watchdog: no encoder response for 100 ticks (1 s) means the cable is
+        # out, or the motor controller has stopped talking.
+        if self.watchdog_fed:
+            self.watchdog_counter = 0
+            self.watchdog_fed = False
+            # Clear the latch so a recovered encoder can alarm again later.
+            self.watchdog_alarmed = False
+        else:
+            self.watchdog_counter += 1
+            if self.watchdog_counter > ENCODER_TIMEOUT_TICKS and not self.watchdog_alarmed:
+                self.log_error("Encoder watchdog timeout (no feedback for 1 s)")
+                self.watchdog_alarmed = True
+                self.send_zero()
+
+    def enter_safe_state(self):
+        self.send_zero()
+        self.log_error("Safe state: motor zeroed")
+
+    def shutdown(self, info=None):
+        self.info = info
+        if self.fd >= 0:
+            self.send_zero()
+            os.close(self.fd)
+            self.fd = -1
+        self.log_info("Serial port closed")
+
+
+sched = horus.Scheduler(
+    tick_rate=100,
+    name="rt_motor",
+    rt=True,           # use SCHED_FIFO and mlockall if available
+    blackbox_mb=8,     # 8 MB flight recorder for post-mortem analysis
+    watchdog_ms=1000,
+)
+sched.add(MotorDriver())
+
+# rt=True succeeds even when nothing was granted, so ask afterwards.
+if not sched.has_full_rt():
+    for degradation in sched.degradations():
+        print(f"RT degraded: {degradation['feature']} — {degradation['severity']}")
+
+sched.run()
+```
+
+Python needs no build step:
+
+```bash
+horus run
+```
+
+<Callout type="warning" title="Logging from an overridden tick() or init()">
+Overriding `init()`, `tick()` or `shutdown()` replaces the base-class
+implementation that stores the scheduler's `NodeInfo` on `self`, so a bare
+`self.log_info(...)` warns `called outside scheduler — message dropped` and
+never reaches `horus log`. Two fixes work: call `info.log_info(...)` on the
+argument the scheduler hands you, or assign `self.info = info` at the top of the
+method as this page does.
+
+This page uses the assignment because `enter_safe_state()` takes **no** `info`
+argument at all — it is invoked by the executor on a deadline miss, not by the
+tick loop — and a stored `self.info` is what lets it log the one message you
+most want after a fault.
+</Callout>
+
+<Callout type="note" title="Where the blackbox entries go">
+C++ has a `horus::blackbox::record(category, message)` free function. It is a
+thin wrapper that publishes a warning-level log entry, so the Python equivalent
+is `self.log_error(...)` / `self.log_warning(...)` — same destination, readable
+with `horus log`. The *recorder itself* is a scheduler feature: `blackbox_mb=8`
+gives you an 8 MB ring buffer that captures deadline misses, budget violations
+and emergency stops on its own, with no per-call instrumentation.
+</Callout>
+
+## RT Configuration Explained
+
+```python
+import horus
+
+# Try SCHED_FIFO and mlockall; log a warning and keep going if the kernel or
+# your privileges do not allow them. Never raises.
+sched = horus.Scheduler(tick_rate=1000, name="rt_motor", rt=True)
+
+# Python has no require_rt() — enforce it yourself before adding nodes.
+if not sched.has_full_rt():
+    for degradation in sched.degradations():
+        print(f"{degradation['feature']}: {degradation['reason']}")
+    raise SystemExit("refusing to run actuators without real-time scheduling")
+```
+
+| Setting | Purpose | Typical Value |
+|---------|---------|---------------|
+| `budget=2 * horus.ms` | Max time per tick | 50-80% of period |
+| `deadline=5 * horus.ms` | Absolute tick deadline | 90-95% of period |
+| `core=2` | CPU affinity | Dedicated core, not core 0 |
+| `priority=90` | SCHED_FIFO level | 80-99 for critical, 50-79 for normal |
+| `watchdog=1.0` | Frozen node detection | 5-10x expected tick period |
+
+<Callout type="warning" title="Naming and units differ from C++">
+Three things move when you come from the C++ page:
+
+- CPU affinity is `core=2`, not `pin_core(2)`. Both take a zero-based core index.
+- `Scheduler(rt=True)` is C++'s `prefer_rt()`. There is no `require_rt()`
+  binding — check `has_full_rt()` and refuse to start yourself, as above.
+- Every duration is **seconds**, as a plain float. `budget=2 * horus.ms` is
+  2 milliseconds; `budget=2` is a two-second budget. `horus.ms` and `horus.us`
+  exist so you never have to count zeros. `watchdog=` is seconds too, but
+  `Scheduler(watchdog_ms=)` is milliseconds — the suffix is the tell.
+
+`priority=` runs 1-99 with **higher meaning more urgent**, so a safety-critical
+node wants 90-99, not 1.
+</Callout>
+
+## RT Kernel Setup
+
+For full RT guarantees:
+
+```bash
+# Check current kernel
+uname -r  # Look for "-rt" suffix
+
+# Let HORUS inspect and configure the machine for you. This grants your user
+# `rtprio 99` and `memlock unlimited` via /etc/security/limits.d — which is the
+# answer for Python, since there is no binary of your own to setcap.
+horus setup-rt --check
+horus setup-rt
+# then log out and back in for the new limits to apply
+
+# Or set the CPU governor to performance by hand
+sudo cpupower frequency-set -g performance
+
+# Last resort: run the process with elevated privileges
+sudo -E horus run
+```
+
+Do not `setcap cap_sys_nice+ep` the system `python3`: the capability applies to
+every script that interpreter ever runs, not just this robot. If you must use
+`setcap`, point it at a project-local virtualenv interpreter.
+
+Without an RT kernel, HORUS still works — `rt=True` logs warnings but continues
+with best-effort scheduling.
+
+## Key Takeaways
+
+- `init()` opens hardware, `tick()` reads/writes, `enter_safe_state()` zeros actuators
+- Never block in `tick()` — use non-blocking I/O (`os.O_NONBLOCK` plus a `BlockingIOError` handler)
+- Watchdog detects frozen hardware (encoder cable disconnected, motor driver crash)
+- `core=` prevents the OS from migrating the thread — critical for latency
+- `budget=` + `on_miss="safe_mode"` = automatic motor shutdown on timing overrun
+- Store `info` on `self` if you want `enter_safe_state()` to be able to log
+- Test without an RT kernel first, add RT for production deployment
+- Python trades peak determinism for iteration speed; move the inner loop to Rust or C++ when the numbers demand it
+
+## Next Steps
+
+- [Tutorial 10: Write a Reusable Driver](/tutorials/10-write-a-driver-python) — package this driver with configuration and diagnostics
+- [Real-Time Control](/tutorials/realtime-control-python) — a 1 kHz loop with jitter measurement and a failsafe
+- [RT Configuration](/advanced/rt-config) — every real-time knob the scheduler exposes
+- [Black Box](/advanced/blackbox) — reading the flight recorder after a fault
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

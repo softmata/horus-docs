@@ -1,0 +1,445 @@
+---
+title: "Tutorial 10: Write a Reusable Driver (Rust)"
+description: "Package a hardware driver as a reusable Node with configuration, diagnostics, and safety"
+order: 100
+---
+
+# Tutorial 10: Write a Reusable Driver (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/10-write-a-driver-python) and [C++](/tutorials/10-write-a-driver-cpp).</Callout>
+
+Turn a hardware interface into a reusable `Node` that other projects can drop in. This tutorial builds a production-quality IMU driver.
+
+## What You'll Learn
+
+- Driver as a self-contained `Node` implementation
+- Configuration via `RuntimeParams`
+- Health monitoring with `Heartbeat`
+- Diagnostic reporting with `DiagnosticStatus`
+- Safe shutdown on hardware failure
+
+## The Driver Pattern
+
+```
+┌─────────────────────────────────────┐
+│  ImuDriver: impl Node               │
+│                                     │
+│  init()  → open device, configure   │
+│  tick()  → read data, publish       │
+│  enter_safe_state() → close device  │
+│                                     │
+│  Publishes:                         │
+│    "imu.data"     (Imu)             │
+│    "imu.heartbeat"(Heartbeat)       │
+│    "imu.status"   (DiagnosticStatus)│
+│                                     │
+│  Params:                            │
+│    imu.port       = "/dev/ttyUSB0"  │
+│    imu.baudrate   = 115200          │
+│    imu.calibrate  = true            │
+└─────────────────────────────────────┘
+```
+
+## Complete Code
+
+```rust
+use horus::hardware::NodeParams;
+use horus::prelude::*;
+use horus::register_driver;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+
+const TICK_HZ: u64 = 100;
+const ERROR_LIMIT: u32 = 100; // 1 second at 100 Hz
+const HEARTBEAT_EVERY: u64 = 100; // 1 Hz
+const STATUS_EVERY: u64 = 500; // 0.2 Hz
+
+// O_NONBLOCK as open(2) defines it on Linux. A generated HORUS project depends
+// only on `horus`, so the flag is spelled out here rather than pulled in from
+// `libc`; a driver that already has a serial crate should use its constant.
+const O_NONBLOCK: i32 = 0o4000;
+
+// ── The driver ──────────────────────────────────────────────────────────
+struct ImuDriver {
+    params: RuntimeParams,
+    imu: Topic<Imu>,
+    heartbeat: Topic<Heartbeat>,
+    status: Topic<DiagnosticStatus>,
+
+    port: Option<File>,
+    connected: bool,
+    ticks: u64,
+    consecutive_errors: u32,
+    gyro_bias_z: f64,
+}
+
+impl ImuDriver {
+    // `RuntimeParams` is a shared handle (cloning it shares the same store), so
+    // the driver keeps its own clone and reads through it whenever it likes.
+    fn new(params: RuntimeParams) -> Result<Self> {
+        Ok(Self {
+            params,
+            imu: Topic::new("imu.data")?,
+            heartbeat: Topic::new("imu.heartbeat")?,
+            status: Topic::new("imu.status")?,
+            port: None,
+            connected: false,
+            ticks: 0,
+            consecutive_errors: 0,
+            gyro_bias_z: 0.0,
+        })
+    }
+
+    // The second constructor: build from a `[hardware.imu]` table in
+    // horus.toml. It maps the table's keys onto the same parameter names the
+    // driver reads, so both routes configure exactly one thing.
+    fn from_params(cfg: &NodeParams) -> Result<Self> {
+        let params = RuntimeParams::new()?;
+        params.set("imu.port", cfg.get_or("port", "/dev/ttyUSB0".to_string()))?;
+        params.set("imu.baudrate", cfg.get_or("baudrate", 115200_u64))?;
+        params.set("imu.calibrate", cfg.get_or("calibrate", true))?;
+        Self::new(params)
+    }
+
+    fn publish_status(&mut self, level: StatusLevel, message: &str) {
+        self.status
+            .send(DiagnosticStatus::new(level, 0, message).with_component("imu_driver"));
+    }
+
+    fn calibrate(&mut self) {
+        hlog!(info, "Calibrating (hold still)...");
+        // A real driver averages ~100 gyro samples while the robot is still and
+        // keeps the mean as the bias.
+        self.gyro_bias_z = 0.0;
+        hlog!(info, "Calibration complete");
+        self.publish_status(StatusLevel::Ok, "Ready");
+    }
+
+    fn parse_and_publish(&mut self, _frame: &[u8]) {
+        // Parse the device-specific protocol into the standard Imu message.
+        // Imu::new() starts from an identity quaternion and stamps the message,
+        // so only the live axes are assigned here.
+        let mut imu = Imu::new();
+        imu.angular_velocity = [0.0, 0.0, 0.01];
+        imu.linear_acceleration = [0.0, 0.0, 9.81];
+
+        // Apply the calibration offset measured at startup.
+        imu.angular_velocity[2] -= self.gyro_bias_z;
+
+        self.imu.send(imu);
+    }
+
+    fn close_port(&mut self) {
+        // Dropping the File closes the descriptor.
+        self.port = None;
+        self.connected = false;
+    }
+}
+
+impl Node for ImuDriver {
+    fn name(&self) -> &str {
+        "imu_driver"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        let port: String = self.params.get_or("imu.port", "/dev/ttyUSB0".to_string());
+        let baudrate: u64 = self.params.get_or("imu.baudrate", 115200_u64);
+
+        // O_NONBLOCK is the flag that matters: tick() must never block the
+        // scheduler waiting on a device that has stopped talking.
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&port)
+        {
+            Ok(file) => {
+                self.port = Some(file);
+                self.connected = true;
+                hlog!(info, "IMU connected on {} at {} baud", port, baudrate);
+                self.publish_status(StatusLevel::Ok, "Connected and calibrating");
+            }
+            Err(e) => {
+                hlog!(error, "Could not open {}: {}", port, e);
+                self.publish_status(StatusLevel::Error, "Failed to open serial port");
+                // Returning Ok keeps the node in the schedule: it reports
+                // "Disconnected" on imu.status rather than taking the whole
+                // process down because one cable is out.
+                return Ok(());
+            }
+        }
+
+        if self.params.get_or("imu.calibrate", true) {
+            self.calibrate();
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+
+        if self.connected {
+            let mut buf = [0u8; 64];
+            let read_result = match self.port.as_mut() {
+                Some(file) => file.read(&mut buf),
+                None => Ok(0),
+            };
+
+            match read_result {
+                Ok(n) if n > 0 => {
+                    self.parse_and_publish(&buf[..n]);
+                    self.consecutive_errors = 0;
+                }
+                _ => {
+                    // Both an empty read (WouldBlock, no frame yet) and a hard
+                    // I/O failure count towards the same limit — one second of
+                    // silence from an IMU is a dead IMU either way.
+                    self.consecutive_errors += 1;
+                    if self.consecutive_errors > ERROR_LIMIT {
+                        hlog!(error, "IMU read timeout — {} consecutive misses", ERROR_LIMIT);
+                        self.publish_status(StatusLevel::Error, "Read timeout");
+                        self.close_port();
+                    }
+                }
+            }
+        }
+
+        // Heartbeat at 1 Hz.
+        if self.ticks % HEARTBEAT_EVERY == 0 {
+            let mut hb = Heartbeat::new("imu_driver", 0);
+            hb.sequence = self.ticks / HEARTBEAT_EVERY;
+            hb.alive = self.connected as u8;
+            hb.uptime = self.ticks as f64 / TICK_HZ as f64;
+            self.heartbeat.send(hb);
+        }
+
+        // Status at 0.2 Hz.
+        if self.ticks % STATUS_EVERY == 0 {
+            if self.connected {
+                self.publish_status(StatusLevel::Ok, "OK");
+            } else {
+                self.publish_status(StatusLevel::Error, "Disconnected");
+            }
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        hlog!(warn, "Safe state — closing device");
+        self.close_port();
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.close_port();
+        hlog!(info, "IMU driver stopped");
+        Ok(())
+    }
+}
+
+// Makes the driver loadable from a [hardware.imu] table in horus.toml.
+register_driver!(ImuDriver, ImuDriver::from_params);
+
+fn main() -> Result<()> {
+    let params = RuntimeParams::new()?;
+    params.set("imu.port", "/dev/ttyUSB0")?;
+    params.set("imu.baudrate", 115200_u64)?;
+    params.set("imu.calibrate", true)?;
+
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .name("imu_node")
+        .prefer_rt()
+        .blackbox(16) // flight recorder for crash forensics
+        .with_params(params.clone());
+
+    sched
+        .add(ImuDriver::new(params)?)
+        .order(0)
+        .budget(2_u64.ms())
+        .on_miss(Miss::Warn)
+        .watchdog(5_u64.secs())
+        .build()?;
+
+    println!("IMU driver running at 100 Hz (Ctrl+C to stop)");
+    sched.run()
+}
+```
+
+<Callout type="note" title="Opening the port without a serial crate">
+
+`std` has no `O_NONBLOCK` constant and a project created by `horus new` depends
+only on `horus`, so the flag is written out and passed through
+`OpenOptionsExt::custom_flags` — the `std` equivalent of the extra argument the
+C++ version hands to `open(2)`. That is enough to read frames without blocking,
+but it does **not** configure the line: baud rate, parity and stop bits need
+`termios`, which means a real driver adds a crate (`horus add serialport`) and
+uses its constants instead. `baudrate` is read here so the parameter is wired
+end to end, and applied by whichever transport you swap in.
+
+Dropping the `File` closes the descriptor, so `close_port()` needs no `close()`
+call and cannot double-close.
+
+</Callout>
+
+<Callout type="warning" title="Rust has no `blackbox::record()`">
+
+C++ offers `horus::blackbox::record(category, message)` for pushing a custom
+marker into the flight recorder. Rust does not expose an equivalent: the
+recorder is fed by the scheduler, which records node errors, budget overruns,
+deadline misses, watchdog expiries and emergency stops on its own once
+`.blackbox(16)` is set. The node-level equivalent of the C++ call is
+`hlog!(error, ...)` — which is what the driver above does — plus the
+`DiagnosticStatus` it publishes on `imu.status`.
+
+</Callout>
+
+## What Makes a Good Driver
+
+| Aspect | Implementation |
+|--------|---------------|
+| **Self-contained** | All hardware access in one type implementing `Node` |
+| **Configurable** | Port, baudrate, calibration via `RuntimeParams` |
+| **Monitored** | `Heartbeat` + `DiagnosticStatus` published |
+| **Safe** | `enter_safe_state()` closes the device |
+| **Fault-tolerant** | Consecutive error counting, auto-disable |
+| **Logged** | `hlog!` for runtime, `.blackbox(16)` for crash forensics |
+| **Non-blocking** | `O_NONBLOCK` on the file descriptor |
+| **Reusable** | `register_driver!` makes it loadable from `horus.toml` |
+
+## Reusing the Driver
+
+Other projects add it as a node:
+
+```rust,ignore
+// In another project's main.rs
+sched
+    .add(ImuDriver::new(params.clone())?)
+    .order(0)
+    .budget(2_u64.ms())
+    .build()?;
+```
+
+Or, because of the `register_driver!` line, they never write construction code
+at all — they declare the device in `horus.toml`:
+
+```toml
+[hardware.imu]
+use       = "ImuDriver"   # the type name passed to register_driver!
+port      = "/dev/ttyUSB0"
+baudrate  = 115200
+calibrate = true
+```
+
+and load it:
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz()).name("robot");
+
+    // hardware::load() reads the [hardware] tables out of horus.toml and
+    // returns Vec<(String, Box<dyn Node>)> — one entry per declared device.
+    // Nothing in the CLI does this for you; the program has to ask.
+    for (name, node) in horus::hardware::load()? {
+        hlog!(info, "loading hardware node {}", name);
+        sched
+            .add(node)
+            .order(0)
+            .budget(2_u64.ms())
+            .on_miss(Miss::Warn)
+            .build()?;
+    }
+
+    sched.run()
+}
+```
+
+Every key in the table other than the reserved ones (`use`, `sim`, `args`)
+arrives as a `NodeParams` entry, which is what `ImuDriver::from_params` reads.
+See [Configuration](/package-management/configuration) for the full set of
+reserved keys.
+
+### Consuming the driver's topics
+
+Any node — in this process or another one — opens the driver's topics by name.
+The heartbeat and status topics are what make the driver monitorable without
+the consumer knowing anything about IMUs:
+
+```rust
+use horus::prelude::*;
+
+struct ImuHealth {
+    heartbeat: Topic<Heartbeat>,
+    status: Topic<DiagnosticStatus>,
+    ticks_since_heartbeat: u32,
+}
+
+impl ImuHealth {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            heartbeat: Topic::new("imu.heartbeat")?,
+            status: Topic::new("imu.status")?,
+            ticks_since_heartbeat: 0,
+        })
+    }
+}
+
+impl Node for ImuHealth {
+    fn name(&self) -> &str {
+        "imu_health"
+    }
+
+    fn tick(&mut self) {
+        self.ticks_since_heartbeat += 1;
+
+        while let Some(hb) = self.heartbeat.recv() {
+            self.ticks_since_heartbeat = 0;
+            // The driver is running but the device is gone.
+            if hb.alive == 0 {
+                hlog!(warn, "IMU reports itself not alive (seq {})", hb.sequence);
+            }
+        }
+
+        while let Some(st) = self.status.recv() {
+            if st.level >= StatusLevel::Error as u8 {
+                hlog!(error, "IMU status: {}", st.message_str());
+            }
+        }
+
+        // Two missed beats at 1 Hz means the driver itself is gone — a
+        // different failure from `alive == 0`, and one no `imu.data` timeout
+        // can tell apart from a merely idle sensor.
+        if self.ticks_since_heartbeat > 200 {
+            hlog!(error, "No IMU heartbeat for 2 s");
+            self.ticks_since_heartbeat = 0;
+        }
+    }
+}
+```
+
+`Topic<T>` is symmetric, so this is the same type the driver publishes with,
+opened on the same name. Nothing else has to be wired up.
+
+## Key Takeaways
+
+- Drivers are ordinary `Node` implementations — portable, reusable, testable
+- Publish 3 topics: data, heartbeat, status — lets monitoring work automatically
+- Non-blocking I/O in `tick()` — never block the scheduler
+- Count consecutive errors — disable after a threshold (1 second is typical)
+- `enter_safe_state()` closes hardware safely; `shutdown()` handles the ordinary exit
+- `RuntimeParams` for configuration — no hardcoded values
+- `register_driver!` plus a `[hardware]` table is what turns "a node" into "a driver another project can drop in"
+
+## Next Steps
+
+- [Tutorial 5: Hardware & Real-Time (Rust)](/tutorials/05-hardware-rt-rust) — RT scheduling and hardware timing
+- [Tutorial 7: Parameters Deep Dive (Rust)](/tutorials/07-params-deep-dive-rust) — retune the driver while it runs
+- [Tutorial 3: Full Robot System (Rust)](/tutorials/03-full-robot-rust) — put the driver in a six-node robot
+- [Configuration](/package-management/configuration) — the `[hardware]` table in full
+- [BlackBox Flight Recorder](/advanced/blackbox) — reading the recorder after a failure
+
+## See Also
+
+- [Diagnostics Messages](/rust/api/diagnostics-messages) — `Heartbeat`, `DiagnosticStatus`, `StatusLevel`
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference

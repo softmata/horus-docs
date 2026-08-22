@@ -1,0 +1,440 @@
+---
+title: "Tutorial 6: Services & Actions (Python)"
+description: "Request/response RPC and long-running tasks with progress feedback"
+order: 61
+---
+
+# Tutorial 6: Services & Actions (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/06-services-actions-rust) and [C++](/tutorials/06-services-actions-cpp).</Callout>
+
+Topics are fire-and-forget. Sometimes you need a **response** (services) or **progress updates** (actions). This tutorial covers both.
+
+<Callout type="warning" title="Python has no ServiceServer or ActionServer">
+The Python bindings expose nodes, topics, the scheduler, parameters, transforms
+and the message types — but not the service and action APIs that C++ and Rust
+get. There is no `horus.ServiceClient`, `horus.ServiceServer`, `horus.ActionClient`
+or `horus.ActionServer` to import.
+
+So this page builds the layer underneath them: request/response and
+goal/feedback/result over plain topics, correlated by an id. That is exactly
+how the C++ and Rust implementations work internally, and the sections below
+follow the same lifecycle. The consequence to plan around is reach: these
+patterns talk to *other Python nodes*. A Python client cannot call a C++ or
+Rust `ServiceServer`, because those expect a serialized request envelope on
+`{service}.request` that the Python bindings have no way to construct. When a
+service has to be callable from another language, write the server in
+[Rust](/tutorials/06-services-actions-rust) or [C++](/tutorials/06-services-actions-cpp).
+</Callout>
+
+## What You'll Learn
+
+- Dict topics as a type-erased payload — the Python counterpart of the C++ JSON wire format
+- A request/response service built from two topics and a request id
+- A goal/feedback/result action server that advances one step per tick
+- Cross-process calls between separate Python programs
+
+## Services: Request/Response
+
+A service is like a function call across processes. Client sends a request, server returns a response.
+
+### Example: Add Two Numbers
+
+Both halves are ordinary nodes on one scheduler. `Topic("some.name")` — a bare
+string instead of a message class — is a **generic** topic: it carries any
+JSON-shaped dict, MessagePack-encoded, which is what makes the payload
+type-erased the way the C++ handler's JSON is.
+
+```python
+import horus
+from horus import Topic
+
+REQUEST_TOPIC = "add_two_ints.request"
+RESPONSE_TOPIC = "add_two_ints.response"
+
+
+# ── Server: listens for requests, computes response ─────────────────────
+class AddServer(horus.Node):
+    def __init__(self):
+        super().__init__(name="add_server", rate=200, order=0)
+        self.requests = Topic(REQUEST_TOPIC)
+        self.responses = Topic(RESPONSE_TOPIC)
+
+    def tick(self, info=None):
+        # Drain: more than one request may have arrived since the last tick.
+        while True:
+            req = self.requests.recv()
+            if req is None:
+                return
+            self.responses.send({
+                "request_id": req["request_id"],   # echoed back for matching
+                "ok": True,
+                "sum": req["a"] + req["b"],
+            })
+
+
+# ── Client: sends request, polls for the matching response ──────────────
+class AddClient(horus.Node):
+    TIMEOUT_TICKS = 200          # 1 s at 200 Hz
+
+    def __init__(self):
+        super().__init__(name="add_client", rate=200, order=10)
+        self.requests = Topic(REQUEST_TOPIC)
+        self.responses = Topic(RESPONSE_TOPIC)
+        self.next_id = 0
+        self.pending = None
+        self.waited = 0
+
+    def tick(self, info=None):
+        # Nothing outstanding — send a new request and come back next tick.
+        if self.pending is None:
+            self.next_id += 1
+            self.pending = self.next_id
+            self.waited = 0
+            self.requests.send({"request_id": self.pending, "a": 3, "b": 4})
+            return
+
+        while True:
+            res = self.responses.recv()
+            if res is None:
+                break
+            if res["request_id"] != self.pending:
+                continue          # answer to somebody else's request
+            self.log_info(f"Response: sum = {res['sum']}")
+            # Output: Response: sum = 7
+            self.pending = None
+            return
+
+        # Bound the wait — this is the timeout argument of a C++ call().
+        self.waited += 1
+        if self.waited > self.TIMEOUT_TICKS:
+            self.log_error("Service call timed out")
+            self.pending = None
+
+
+sched = horus.Scheduler(tick_rate=200, name="add_service", deterministic=True)
+sched.add(AddServer())      # order 0 — answers before the client looks
+sched.add(AddClient())      # order 10
+sched.run(duration=2)
+```
+
+<Callout type="note" title="Never block a tick waiting for a response">
+The C++ client calls `call()` and blocks, which is why that example needs a
+worker thread and a `process()` pump on main. A Python node must not do the
+equivalent: sleeping inside `tick()` burns the node's budget and, under
+`deterministic=True`, stalls every other node on the tick loop with it. So the
+client above keeps its `pending` request id in `self` and checks for the answer
+on later ticks — the same shape as `AsyncServiceClient` in Rust.
+</Callout>
+
+### How Services Work
+
+```
+Client                          Server
+  │                               │
+  │─── Request dict ────────────→ │  tick() drains the request topic,
+  │    (via SHM topic)            │  computes the response
+  │  ←── Response dict ────────── │
+  │    (via SHM topic)            │
+```
+
+Two SHM topics, named by the same convention the C++ and Rust implementations
+use:
+- `{service_name}.request` — client publishes, server subscribes
+- `{service_name}.response` — server publishes, client subscribes
+
+The one thing you get for free in C++ and Rust and must do by hand here is
+correlation. Those implementations give each client its own response topic
+(`{service}.response.{client_id}`); this response topic is shared, so every
+client filters on the `request_id` it sent. Keep the check even with a single
+client — it is what stops a late answer to a timed-out request from being read
+as the answer to the next one.
+
+A round trip costs two ticks: the server answers on the tick after the request
+arrives. That is ~20 ms at 100 Hz — fine for a configuration query, far too
+slow to sit inside a control cycle.
+
+<Callout type="note" title="Dict payload limits">
+A generic topic carries dicts, lists, strings, numbers and booleans, up to
+**4096 bytes encoded** — about a thousand floats. Past that, `send()` raises
+`ValueError: Invalid input: 'data' out of range: expected [0..4096]`. It also
+rejects `bytes` outright (`TypeError: ... invalid type: byte array`); carry
+binary as a list of ints or a base64 string. Anything larger belongs on a typed
+topic — see [Custom Messages](/python/api/custom-messages).
+</Callout>
+
+## Actions: Long-Running Tasks with Progress
+
+Actions are for tasks that take time — navigating to a goal, calibrating a sensor, recording data.
+
+### Example: Navigate to Goal
+
+This is the **client half only**. Feedback and results reach a client solely
+because some action server is ticking — that is what publishes onto the
+feedback and result topics. Start the [Action Server](#action-server) shown
+below first, or the poll loop has nothing to receive.
+
+```python
+import horus
+from horus import Topic
+
+
+class NavigateClient(horus.Node):
+    TIMEOUT_TICKS = 100          # 5 s at 20 Hz
+
+    def __init__(self):
+        super().__init__(name="navigate_client", rate=20, order=0)
+        self.goals = Topic("navigate.goal")
+        self.cancels = Topic("navigate.cancel")
+        self.feedback = Topic("navigate.feedback")
+        self.results = Topic("navigate.result")
+        self.goal_id = 1
+        self.sent = False
+        self.waited = 0
+
+    def tick(self, info=None):
+        # Send the goal on the first tick. Doing it here rather than in init()
+        # keeps the send on the same clock as the polling below.
+        if not self.sent:
+            self.goals.send({"goal_id": self.goal_id, "target_x": 5.0, "target_y": 3.0})
+            self.log_info(f"Goal sent (id={self.goal_id})")
+            self.sent = True
+            return
+
+        if self.goal_id == 0:     # finished — nothing left to poll for
+            return
+
+        # Feedback: progress updates published while the goal runs.
+        while True:
+            fb = self.feedback.recv()
+            if fb is None:
+                break
+            if fb["goal_id"] == self.goal_id:
+                self.log_info(
+                    f"  feedback: {fb['progress'] * 100:.0f}% — "
+                    f"{fb['distance_remaining']:.2f} m remaining"
+                )
+
+        # Result: the terminal message for this goal.
+        while True:
+            res = self.results.recv()
+            if res is None:
+                break
+            if res["goal_id"] == self.goal_id:
+                self.log_info(
+                    f"Final status: {res['status']}, "
+                    f"at ({res['final_x']:.1f}, {res['final_y']:.1f})"
+                )
+                self.goal_id = 0
+                return
+
+        # Cancel at any time with:
+        #   self.cancels.send({"goal_id": self.goal_id})
+        #
+        # Always bound the wait: with no server running, no result is ever
+        # published and this node would poll forever.
+        self.waited += 1
+        if self.waited > self.TIMEOUT_TICKS:
+            self.log_error("No result — is the 'navigate' action server running?")
+            self.goal_id = 0
+
+
+sched = horus.Scheduler(tick_rate=20, name="navigate_client", deterministic=True)
+sched.add(NavigateClient())
+sched.run(duration=10)
+```
+
+### Action Lifecycle
+
+```
+Client                          Server
+  │                               │
+  │── Goal dict ────────────────→ │  accept or reject
+  │                               │
+  │  ←── Feedback dict ────────── │  (periodic progress updates)
+  │  ←── Feedback dict ────────── │
+  │  ←── Feedback dict ────────── │
+  │                               │
+  │  ←── Result dict ──────────── │  (final result)
+  │                               │
+  │── Cancel ───────────────────→ │  (optional, client-initiated)
+```
+
+Four topics, one per stage: `navigate.goal`, `navigate.cancel`,
+`navigate.feedback`, `navigate.result`.
+
+### Action Server
+
+The server owns the goal's progress state and advances it by one step per
+tick.
+
+```python
+import math
+import horus
+from horus import Topic
+
+STEPS = 10
+
+
+class NavigateServer(horus.Node):
+    def __init__(self):
+        super().__init__(name="navigate_server", rate=20, order=0)
+        self.goals = Topic("navigate.goal")
+        self.cancels = Topic("navigate.cancel")
+        self.feedback = Topic("navigate.feedback")
+        self.results = Topic("navigate.result")
+        self.active = None       # the goal in flight, or None
+
+    def finish(self, status, x, y):
+        """Publish the terminal result and free the server for the next goal."""
+        self.results.send({
+            "goal_id": self.active["goal_id"],
+            "status": status,     # succeeded | canceled | aborted
+            "final_x": x,
+            "final_y": y,
+        })
+        self.active = None
+
+    def tick(self, info=None):
+        # 1. New goal — accept it, or reject it if one is already running.
+        goal = self.goals.recv()
+        if goal is not None:
+            if self.active is not None:
+                self.results.send({
+                    "goal_id": goal["goal_id"],
+                    "status": "rejected",
+                    "final_x": 0.0,
+                    "final_y": 0.0,
+                })
+                self.log_warning(f"Goal {goal['goal_id']} rejected — already navigating")
+            else:
+                self.log_info(f"Goal {goal['goal_id']} accepted")
+                self.active = dict(goal, step=0, x=0.0, y=0.0)
+
+        # 2. Cancellation, checked before any further work is done.
+        cancel = self.cancels.recv()
+        if (
+            cancel is not None
+            and self.active is not None
+            and cancel["goal_id"] == self.active["goal_id"]
+        ):
+            self.log_info(f"Goal {cancel['goal_id']} canceled")
+            self.finish("canceled", self.active["x"], self.active["y"])
+            return
+
+        if self.active is None:
+            return
+
+        # 3. One step of work, then feedback.
+        g = self.active
+        g["step"] += 1
+        t = g["step"] / STEPS
+        g["x"] = g["target_x"] * t
+        g["y"] = g["target_y"] * t
+        self.feedback.send({
+            "goal_id": g["goal_id"],
+            "progress": t,
+            "distance_remaining": math.hypot(g["target_x"] - g["x"], g["target_y"] - g["y"]),
+        })
+
+        # 4. Done — publish the result.
+        if g["step"] >= STEPS:
+            self.finish("succeeded", g["x"], g["y"])
+
+
+sched = horus.Scheduler(tick_rate=20, name="navigate_server", deterministic=True)
+sched.add(NavigateServer())
+print("Action 'navigate' ready")
+sched.run(duration=30)
+```
+
+<Callout type="note" title="One step per tick, not one thread per goal">
+C++ and Rust run each accepted goal on its own thread, which is what keeps
+their servers responsive to cancellation while a goal executes. Python does not
+need the thread — and under the GIL would not gain much from it. A goal that
+lives in `self.active` and advances by one step per tick is already responsive:
+the cancel check happens at the top of the very next tick, with no shared state
+to synchronize. What you give up is a long blocking step. If a single step of
+your work takes longer than the node's budget, it must be broken into smaller
+steps, not run to completion inside one `tick()`.
+</Callout>
+
+A goal that finishes without publishing a result leaves the client polling
+until its own timeout. Make every exit path from the state machine call
+`finish()` — that is the discipline the C++ "returns without `succeed`/`abort`
+completes as Aborted" rule enforces for you.
+
+## Cross-Process Services
+
+Services work across processes — client and server can be separate programs.
+The action example above is already split that way, one scheduler each:
+
+```bash
+# Terminal 1: server
+python navigate_server.py
+
+# Terminal 2: client
+python navigate_client.py
+```
+
+The service pair splits identically — put `AddServer` in one file and
+`AddClient` in another, each with its own `horus.Scheduler`. Nothing in either
+node changes; they were only sharing a scheduler for convenience.
+
+Both connect through SHM. The topic names must match — they are the whole
+contract, along with the dict keys carried on them. Nothing is validated at
+connect time, so a typo in a name shows up as a client that never gets an
+answer.
+
+<Callout type="warning" title="Do not share a topic name with a typed service">
+A dict topic and a typed topic of the same name are two wire formats fighting
+over one shared-memory slot, and neither side reports the mismatch politely.
+Run the [Rust version](/tutorials/06-services-actions-rust) of this tutorial on
+the same machine and it leaves typed `navigate.*` topics behind: a Python node
+reading them then fails its tick with a MessagePack deserialization error, and
+— the other way round — a Rust action server opening topics Python created
+generically dies with a stack overflow before its first tick.
+Give the Python version its own names, or clear the leftovers with
+`horus clean --shm` before switching languages.
+</Callout>
+
+To watch the traffic:
+
+```bash
+horus topic list                     # see the four navigate.* topics
+horus topic echo navigate.feedback   # raw MessagePack bytes for dict topics
+```
+
+<Callout type="warning" title="The CLI cannot stand in for the client">
+`horus service list` will show `add_two_ints`, because the CLI infers service
+names from `.request` / `.response` topic pairs. But `horus service call` times
+out against it: the request goes to a gateway that only a real C++ or Rust
+`ServiceServer` polls. `horus topic pub` is worse than useless here — it writes
+a payload the dict decoder rejects, and the node draining that topic fails its
+tick with `RuntimeError: Failed to deserialize MessagePack`. Drive a Python
+service from a Python client; use the CLI to observe, not to inject.
+</Callout>
+
+## When To Use What
+
+| Pattern | Use Case | Latency |
+|---------|----------|---------|
+| **Topic** | Continuous data (sensor readings, commands) | one tick, in `order` sequence |
+| **Service** | One-shot query (get parameter, check status) | two ticks (~20 ms at 100 Hz) |
+| **Action** | Long task with progress (navigate, calibrate) | task duration + one tick |
+
+## Key Takeaways
+
+- Services = request/response, correlated by an id you carry in the payload
+- Actions = goal/feedback/result, with the goal's state living in the server node
+- Both are built from generic dict topics — the Python stand-in for type erasure
+- Both work same-process and cross-process via SHM, between Python programs
+- Poll across ticks with a bounded wait; never block inside `tick()`
+- Cancellation is just another topic: the server checks it at the top of the tick
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-python) — combine sensor, controller, and actuator
+- [Tutorial 6 (Rust)](/tutorials/06-services-actions-rust) — the typed service and action APIs, for servers other languages can call
+- [Custom Messages](/python/api/custom-messages) — dict topics and their typed alternative
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

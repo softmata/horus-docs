@@ -1,0 +1,352 @@
+---
+title: "Tutorial 5: Hardware & Real-Time (Rust)"
+description: "Connect real hardware with RT scheduling, CPU pinning, and watchdog protection"
+order: 50
+---
+
+# Tutorial 5: Hardware & Real-Time (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/05-hardware-rt-python) and [C++](/tutorials/05-hardware-rt-cpp).</Callout>
+
+Connect real sensors and actuators to HORUS with proper real-time scheduling. This tutorial builds a motor controller that reads encoder feedback and drives a motor with SCHED_FIFO priority.
+
+## What You'll Learn
+
+- Opening serial ports from a Node
+- RT scheduling: `budget()`, `deadline()`, `core()`, `priority()`
+- Watchdog for detecting frozen hardware
+- `enter_safe_state()` for actuator safety
+- CPU governor and kernel requirements
+
+## Prerequisites
+
+- Completed [Tutorial 2: Motor Controller](/tutorials/02-motor-controller-rust)
+- A Linux machine (RT features require Linux)
+- Optional: USB serial device for testing
+
+## The Hardware Pattern
+
+Every hardware driver follows the same pattern:
+
+```
+init():              open device, configure, verify connection
+tick():              read sensor OR write actuator (never both blocking)
+enter_safe_state():  zero actuators, disable outputs
+shutdown():          close device, release resources
+```
+
+The C++ page calls the last one `on_shutdown()`. In Rust the `Node` trait method is
+`shutdown(&mut self) -> Result<()>` — same slot in the lifecycle, different name.
+
+## Complete Code: RT Motor Driver
+
+Create the project with `horus new rt_motor`, then replace `src/main.rs`:
+
+<Callout type="note" title="No serial crate — on purpose">
+A project created by `horus new` depends only on the `horus` crate, and Rust's
+`std` has neither the `open(2)` flag constants nor a `termios` binding. So this
+driver opens the port with `std::fs::OpenOptions` — passing `O_NONBLOCK` through
+`OpenOptionsExt::custom_flags`, the `std` equivalent of the extra argument the
+C++ version hands to `open(2)` — and sets baud rate, parity and stop bits by
+shelling out to `stty` in `init()`, which is not RT-critical.
+
+That is real, working code with no extra dependency. A production driver runs
+`horus add serialport --source crates.io` and replaces `init()` with the crate's
+own configuration call; the node structure and every RT knob below stay exactly
+the same. Dropping the `File` closes the descriptor, so `shutdown()` needs no
+`close()` call and cannot double-close.
+</Callout>
+
+```rust
+use horus::prelude::*;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::process::Command;
+
+// Linux open(2) flags. std does not re-export libc's constants and a HORUS
+// project depends only on `horus`, so spell out the two we need.
+const O_NOCTTY: i32 = 0o400;
+const O_NONBLOCK: i32 = 0o4000;
+
+// 100 ticks at 100 Hz = 1 s without encoder feedback.
+const ENCODER_TIMEOUT_TICKS: u32 = 100;
+
+struct MotorDriver {
+    port: String,
+    baudrate: u32,
+    serial: Option<File>,
+    cmd: Topic<CmdVel>,
+    state: Topic<CmdVel>,
+    last_cmd: f32,
+    watchdog_counter: u32,
+    watchdog_fed: bool,
+    watchdog_alarmed: bool,
+}
+
+impl MotorDriver {
+    fn new(port: &str, baudrate: u32) -> Result<Self> {
+        Ok(Self {
+            port: port.to_string(),
+            baudrate,
+            serial: None,
+            cmd: Topic::new("motor.cmd")?,
+            state: Topic::new("motor.state")?,
+            last_cmd: 0.0,
+            watchdog_counter: 0,
+            watchdog_fed: false,
+            watchdog_alarmed: false,
+        })
+    }
+
+    /// Write one framed command to the motor controller.
+    /// Protocol: "M<duty>\n" where duty is -100 to 100.
+    fn write_duty(&mut self, duty: f32) {
+        // Format into a stack buffer: the hot path of an RT tick should not
+        // reach the heap.
+        let mut buf = [0u8; 32];
+        let used = {
+            let mut cursor = &mut buf[..];
+            let _ = write!(cursor, "M{:.0}\n", duty);
+            32 - cursor.len()
+        };
+        if let Some(serial) = self.serial.as_mut() {
+            let _ = serial.write_all(&buf[..used]);
+        }
+    }
+
+    fn send_zero(&mut self) {
+        self.write_duty(0.0);
+        self.state.send(CmdVel::new(0.0, 0.0));
+    }
+}
+
+impl Node for MotorDriver {
+    fn name(&self) -> &str {
+        "motor_driver"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        // Line discipline: 115200 8N1, raw, no modem control.
+        let stty = Command::new("stty")
+            .arg("-F")
+            .arg(&self.port)
+            .arg(self.baudrate.to_string())
+            .args(["raw", "-echo", "clocal", "cs8", "-parenb", "-cstopb"])
+            .status();
+        if let Err(e) = stty {
+            hlog!(warn, "stty failed on {}: {}", self.port, e);
+        }
+
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOCTTY | O_NONBLOCK)
+            .open(&self.port)
+        {
+            Ok(serial) => {
+                self.serial = Some(serial);
+                hlog!(info, "Serial port {} opened, motor ready", self.port);
+            }
+            Err(e) => {
+                // Log rather than fail: the scheduler keeps ticking and every
+                // tick short-circuits while `serial` is None.
+                hlog!(error, "Failed to open serial port {}: {}", self.port, e);
+            }
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        if self.serial.is_none() {
+            return;
+        }
+
+        // Drain to the newest command so a burst never queues up behind us.
+        let mut latest = None;
+        while let Some(cmd) = self.cmd.recv() {
+            latest = Some(cmd);
+        }
+        if let Some(cmd) = latest {
+            self.last_cmd = cmd.linear;
+            self.write_duty(cmd.linear * 100.0);
+        }
+
+        // Encoder feedback. The fd is O_NONBLOCK, so an idle UART returns
+        // WouldBlock immediately instead of parking the RT thread.
+        let mut rbuf = [0u8; 64];
+        let n = match self.serial.as_mut() {
+            Some(serial) => serial.read(&mut rbuf).unwrap_or(0),
+            None => 0,
+        };
+        if n > 0 {
+            if let Ok(text) = std::str::from_utf8(&rbuf[..n]) {
+                let rpm = text
+                    .trim()
+                    .strip_prefix('E')
+                    .and_then(|v| v.parse::<f32>().ok());
+                if let Some(rpm) = rpm {
+                    self.state.send(CmdVel::new(rpm, self.last_cmd));
+                    self.watchdog_fed = true;
+                }
+            }
+        }
+
+        // Watchdog: no encoder response for 100 ticks (1 s) means the cable is
+        // out, or the motor controller has stopped talking.
+        if self.watchdog_fed {
+            self.watchdog_counter = 0;
+            self.watchdog_fed = false;
+            // Clear the latch so a recovered encoder can alarm again later.
+            self.watchdog_alarmed = false;
+        } else {
+            self.watchdog_counter += 1;
+            if self.watchdog_counter > ENCODER_TIMEOUT_TICKS && !self.watchdog_alarmed {
+                hlog!(error, "Encoder watchdog timeout (no feedback for 1 s)");
+                self.watchdog_alarmed = true;
+                self.send_zero();
+            }
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.send_zero();
+        hlog!(error, "Safe state: motor zeroed");
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        if self.serial.is_some() {
+            self.send_zero();
+            self.serial = None; // dropping the File closes the fd
+        }
+        hlog!(info, "Serial port closed");
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .name("rt_motor")
+        .blackbox(8) // 8 MB flight recorder for post-mortem analysis
+        .prefer_rt(); // use SCHED_FIFO if available
+
+    sched
+        .add(MotorDriver::new("/dev/ttyUSB0", 115_200)?)
+        .order(0) // highest priority
+        .budget(2_u64.ms()) // must complete in 2 ms
+        .deadline(5_u64.ms()) // absolute deadline 5 ms
+        .on_miss(Miss::SafeMode) // stop motor if overrun
+        .core(2) // pin to CPU core 2
+        .priority(90) // SCHED_FIFO priority 90
+        .watchdog(1_u64.secs()) // scheduler-level watchdog
+        .build()?;
+
+    sched.run()
+}
+```
+
+Build and run it:
+
+```bash
+horus build && horus run
+```
+
+<Callout type="note" title="Where the blackbox entries go">
+C++ has a `horus::blackbox::record(category, message)` free function. It is a
+thin wrapper that publishes a warning-level log entry, so the Rust equivalent
+is simply `hlog!(warn, "...")` — same destination, readable with `horus log`.
+The *recorder itself* is a scheduler feature: `.blackbox(8)` gives you an 8 MB
+ring buffer that captures deadline misses, budget violations and emergency
+stops on its own, with no per-call instrumentation.
+</Callout>
+
+## RT Configuration Explained
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    // Try SCHED_FIFO and mlockall; log a warning and keep going if the kernel
+    // or your privileges do not allow them. Never panics.
+    let sched = Scheduler::new().tick_rate(1000_u64.hz()).prefer_rt();
+
+    // Production alternative — panics at construction instead of running
+    // without RT:
+    //     let sched = Scheduler::new().tick_rate(1000_u64.hz()).require_rt();
+
+    // prefer_rt() succeeds even when nothing was granted, so ask afterwards.
+    if !sched.has_full_rt() {
+        for degradation in sched.degradations() {
+            hlog!(warn, "RT degraded: {:?}", degradation);
+        }
+    }
+    Ok(())
+}
+```
+
+| Setting | Purpose | Typical Value |
+|---------|---------|---------------|
+| `.budget(2_u64.ms())` | Max time per tick | 50-80% of period |
+| `.deadline(5_u64.ms())` | Absolute tick deadline | 90-95% of period |
+| `.core(2)` | CPU affinity | Dedicated core, not core 0 |
+| `.priority(90)` | SCHED_FIFO level | 80-99 for critical, 50-79 for normal |
+| `.watchdog(1_u64.secs())` | Frozen node detection | 5-10x expected tick period |
+
+<Callout type="warning" title="It is `.core()`, not `pin_core()`">
+The C++ builder spells CPU affinity `pin_core(2)`; the Rust builder spells it
+`.core(2)`. Both take a zero-based core index.
+
+`.core()` and `.priority()` only mean anything on an **RT node**, and what makes
+a node RT is `.rate()`, `.budget()` or `.deadline()`. Set affinity or priority
+without one of those and the builder logs `has no effect` at `.build()` time
+rather than silently ignoring you — the driver above is RT because it sets
+`.budget()` and `.deadline()`.
+</Callout>
+
+## RT Kernel Setup
+
+For full RT guarantees:
+
+```bash
+# Check current kernel
+uname -r  # Look for "-rt" suffix
+
+# Let HORUS inspect and configure the machine for you
+horus setup-rt --check
+horus setup-rt
+
+# Or set the CPU governor to performance by hand
+sudo cpupower frequency-set -g performance
+
+# Grant RT privileges without root (release build, not the debug one)
+horus build --release
+sudo setcap cap_sys_nice+ep target/release/rt_motor
+
+# Or run with elevated privileges
+sudo nice -n -20 target/release/rt_motor
+```
+
+Without an RT kernel, HORUS still works — `prefer_rt()` logs warnings but
+continues with best-effort scheduling. Measure in release mode: a debug build is
+typically 10-50x slower, so deadline misses there tell you nothing about
+production timing.
+
+## Key Takeaways
+
+- `init()` opens hardware, `tick()` reads/writes, `enter_safe_state()` zeros actuators
+- Never block in `tick()` — use non-blocking I/O (`O_NONBLOCK` plus `unwrap_or(0)` on `WouldBlock`)
+- Format the wire command into a stack buffer — the hot path of `tick()` never touches the heap
+- Watchdog detects frozen hardware (encoder cable disconnected, motor driver crash)
+- `.core()` prevents the OS from migrating the thread — critical for latency
+- `.budget()` + `Miss::SafeMode` = automatic motor shutdown on timing overrun
+- `.core()` and `.priority()` are ignored on non-RT nodes; `.rate()`/`.budget()`/`.deadline()` is what makes a node RT
+- Test without an RT kernel first, add RT for production deployment
+
+## Next Steps
+
+- [Tutorial 10: Write a Reusable Driver](/tutorials/10-write-a-driver-rust) — package this driver with configuration and diagnostics
+- [Real-Time Control](/tutorials/realtime-control-rust) — a 1 kHz loop with jitter measurement and a failsafe
+- [RT Configuration](/advanced/rt-config) — every real-time knob the scheduler exposes
+- [Black Box](/advanced/blackbox) — reading the flight recorder after a fault
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference

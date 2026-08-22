@@ -1,0 +1,295 @@
+---
+title: "Tutorial 8: Multi-Process Systems (Python)"
+description: "Run multiple Python processes sharing topics over shared memory"
+order: 81
+---
+
+# Tutorial 8: Multi-Process Systems (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/08-multi-process-rust) and [C++](/tutorials/08-multi-process-cpp).</Callout>
+
+Real robots run multiple processes — a sensor driver, a controller, a safety monitor, each as a separate script. This tutorial shows how to build and run multi-process systems.
+
+Python has a second reason to care: CPython's GIL means one interpreter runs one node at a time. Splitting a Python robot across processes is not just an architectural preference, it is how you get the sensor loop and the control loop onto different cores at all.
+
+## What You'll Learn
+
+- Separate scripts sharing SHM topics
+- Process lifetime and SHM ownership across processes
+- Cross-process request/response (Python has no service API — see below)
+- Using `horus launch` for multi-process orchestration
+
+## Architecture
+
+```
+Process 1: lidar_driver      Process 2: controller        Process 3: safety
+┌────────────────────┐       ┌────────────────────┐       ┌────────────┐
+│ Publisher          │──SHM─→│ Subscriber         │       │ Subscriber │
+│ "lidar.scan"       │       │ "lidar.scan"       │       │ "cmd_vel"  │
+└────────────────────┘       │ Publisher          │──SHM─→│            │
+                             │ "cmd_vel"          │       └────────────┘
+                             └────────────────────┘
+```
+
+All three processes map their topics out of the **same directory**, `/dev/shm/horus_default/topics/`, and the two ends of a topic map the same file: process 1 and 2 share `lidar.scan`, process 2 and 3 share `cmd_vel`. No message broker, no serialization.
+
+<Callout type="note" title="endpoint= is the SHM key">
+`Topic(LaserScan, endpoint="lidar.scan")` names the topic *and* names the shared-memory file, so every process that wants the same ring buffer has to spell the same string. A bare `Topic(LaserScan)` does connect across processes too, but it derives one fixed name from the message type — `scan` for `LaserScan`, `cmd_vel` for `CmdVel` — so a second lidar, or any other `LaserScan` publisher anywhere in the system, lands in the same ring buffer. Pass `endpoint=` explicitly in multi-process code.
+</Callout>
+
+## Project Layout
+
+One process is one script, so this project is three files:
+
+```bash
+horus new robot_fleet --python
+cd robot_fleet
+mkdir nodes
+```
+
+```
+robot_fleet/
+├── horus.toml
+└── nodes/
+    ├── lidar.py
+    ├── controller.py
+    └── safety.py
+```
+
+There is no build step; `horus run` takes the list of files and spawns one interpreter per file.
+
+## Process 1: Sensor Driver
+
+```python
+# nodes/lidar.py
+import math
+
+import horus
+from horus import LaserScan, Topic
+
+
+class LidarSensor(horus.Node):
+    def __init__(self):
+        super().__init__(name="lidar", rate=10, order=0)
+        self.scan = Topic(LaserScan, endpoint="lidar.scan")
+
+    def tick(self, info=None):
+        self.scan.send(
+            LaserScan(
+                angle_min=-math.pi,
+                angle_max=math.pi,
+                angle_increment=math.pi / 180.0,
+                range_min=0.1,
+                range_max=30.0,
+                ranges=[2.0 + 0.5 * math.sin(i * 0.1) for i in range(360)],
+            )
+        )
+
+
+sched = horus.Scheduler(tick_rate=10, name="lidar_proc")
+sched.add(LidarSensor())
+sched.run()
+```
+
+<Callout type="warning" title="Build the ranges list, don't mutate it">
+`scan.ranges` hands back a *copy* of the underlying `[f32; 360]` array as a Python list. `scan.ranges[i] = 2.0` therefore mutates a throwaway list and is silently lost — no exception, no warning, just a scan full of zeros on the wire. Always assign a whole list: `scan.ranges = new_values`, or pass `ranges=[...]` to the constructor as above.
+</Callout>
+
+## Process 2: Controller
+
+```python
+# nodes/controller.py
+import horus
+from horus import CmdVel, LaserScan, Topic
+
+
+class Controller(horus.Node):
+    def __init__(self):
+        super().__init__(name="controller", rate=50, order=0)
+        self.scan = Topic(LaserScan, endpoint="lidar.scan")
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+
+    def tick(self, info=None):
+        scan = self.scan.recv()
+        if scan is None:
+            return
+        # min_range() skips readings outside [range_min, range_max] and returns
+        # None when nothing is valid, so a dropout encoded as 0.0 cannot
+        # masquerade as an obstacle at the axle.
+        min_range = scan.min_range()
+        if min_range is None:
+            return
+        self.cmd.send(CmdVel(linear=0.3 if min_range > 0.5 else 0.0, angular=0.0))
+
+    def enter_safe_state(self):
+        self.cmd.send(CmdVel(linear=0.0, angular=0.0))
+
+
+sched = horus.Scheduler(tick_rate=50, name="ctrl_proc")
+sched.add(Controller())
+sched.run()
+```
+
+## Process 3: Safety Monitor
+
+The third process watches `cmd_vel` without ever touching the lidar topic — it only needs the one SHM file the controller publishes into. It also answers `estop` requests, covered in the next section.
+
+```python
+# nodes/safety.py
+import horus
+from horus import CmdVel, EmergencyStop, Topic
+
+
+class SafetyMonitor(horus.Node):
+    def __init__(self):
+        super().__init__(name="safety", rate=100, order=0)
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+        self.requests = Topic(EmergencyStop, endpoint="estop.request")
+        self.acks = Topic(EmergencyStop, endpoint="estop.ack")
+        self.engaged = False
+
+    def tick(self, info=None):
+        # Answer any pending estop requests first, so a stop command cannot be
+        # overtaken by the cmd_vel check below in the same tick.
+        while True:
+            request = self.requests.recv()
+            if request is None:
+                break
+            self.engaged = bool(request.engaged)
+            self.log_error(f"estop engaged: {request.reason_str()}")
+            self.acks.send(
+                EmergencyStop.engage(request.reason_str()).with_source("safety")
+            )
+
+        cmd = self.cmd.recv()
+        if cmd is None:
+            return
+        if self.engaged or cmd.linear > 0.5:
+            self.log_warning("commanded motion blocked")
+
+
+sched = horus.Scheduler(tick_rate=100, name="safety_proc")
+sched.add(SafetyMonitor())
+sched.run()
+```
+
+## Cross-Process Request/Response
+
+Topics are one-way fan-out. When one process needs an *answer* from another — "are you armed?", "stop now" — the C++ and Rust tutorials reach for a service.
+
+<Callout type="warning" title="Python has no service API">
+`import horus` exposes `Node`, `Topic`, `Scheduler`, `Params`, `TransformFrame` and the message types — but no `ServiceServer`, no `ServiceClient`, and no `service!` equivalent. A Python process can neither host a HORUS service nor call one hosted by a Rust or C++ process.
+
+What follows is the portable substitute: a request topic and an ack topic, correlated by the caller waiting for a reply. Two things it does not buy you:
+
+- **`horus service call` cannot reach it.** The CLI delivers requests through a JSON file gateway that only the Rust `ServiceServer` polls, so a call to a Python "service" times out with *Is a server registered for 'estop'?*
+- **`horus service list` will list it anyway, and lie.** Service discovery works by scanning shared memory for a topic whose name ends in `.request`, so `estop.request` below shows up as a service named `estop` — with 0 servers and status `waiting`, forever.
+
+You also lose the request-ID matching `ServiceClient` does for you, so with more than one caller in flight you have to correlate replies yourself; `EmergencyStop.source` is the obvious field to key on. If you need real services, host them in a Rust node and drive the robot's Python nodes over topics.
+</Callout>
+
+The server side is the `estop.request` drain in `SafetyMonitor.tick()` above: read every pending request, act on it, and publish an ack. The client side is a plain script — no scheduler, no node, just two topics:
+
+```python
+# nodes/estop_client.py — a teleop script, a watchdog, anything
+import sys
+import time
+
+from horus import EmergencyStop, Topic
+
+requests = Topic(EmergencyStop, endpoint="estop.request")
+acks = Topic(EmergencyStop, endpoint="estop.ack")
+
+requests.send(EmergencyStop.engage("teleop button").with_source("estop_client"))
+
+deadline = time.monotonic() + 0.5
+while time.monotonic() < deadline:
+    reply = acks.recv()
+    if reply is not None:
+        print(f"stopped by {reply.reason_str()}")
+        sys.exit(0)
+    time.sleep(0.005)
+
+print("estop: no response within 500 ms", file=sys.stderr)
+sys.exit(1)
+```
+
+`recv()` returns `None` rather than blocking, so the timeout is the `while` loop — there is no exception to catch and nothing to cancel if the safety process is not running. The 5 ms sleep matters: without it this loop spins a core flat while it waits.
+
+`EmergencyStop.engage(reason)` and `.release()` are constructors that stamp `timestamp_ns` for you, and `.with_source(name)` returns a *new* message rather than mutating in place — chain them as above. On the receiving side, `reason` and `source` are fixed-size byte arrays, so read them back with `reason_str()` rather than treating them as Python strings.
+
+## Running Multi-Process
+
+```bash
+# Run (order does not matter — start them in any order)
+horus run nodes/controller.py &
+horus run nodes/lidar.py &
+horus run nodes/safety.py &
+
+# Or let horus spawn all three for you, one interpreter each
+horus run nodes/lidar.py nodes/controller.py nodes/safety.py
+
+# Monitor from any terminal
+horus topic list      # shows lidar.scan, cmd_vel, estop.request, estop.ack
+horus node list       # shows lidar, controller, safety (separate PIDs)
+horus service list    # shows estop with 0 servers — see the callout above
+```
+
+## Startup Order and SHM Lifetime
+
+Startup order does not affect correctness — a subscriber can join a topic that is already being published to and will start receiving on its next `recv()`. What does matter is process *lifetime*: the first process to open a topic owns its SHM file and unlinks it on exit, so if the publisher is the sole owner and exits, the ring buffer disappears with it.
+
+When a process genuinely does need another one up first (a driver that must claim a device, say), express it in `horus launch` with `depends_on` and `start_delay` rather than by hand-sequencing shell commands.
+
+## Orchestrating with `horus launch`
+
+Backgrounding three scripts by hand does not survive contact with a real robot. `horus launch` reads a YAML file and starts, orders, and supervises the whole set:
+
+```yaml
+# robot.launch.yaml
+session: robot
+
+nodes:
+  - name: lidar
+    command: horus run nodes/lidar.py
+
+  - name: safety
+    command: horus run nodes/safety.py
+
+  # Topics need no ordering, but we want the estop monitor answering
+  # before anything can command motion.
+  - name: controller
+    command: horus run nodes/controller.py
+    depends_on: [safety]
+    start_delay: 0.2
+    restart: on-failure
+```
+
+```bash
+horus launch --dry-run robot.launch.yaml   # print the startup order, launch nothing
+horus launch robot.launch.yaml             # start the session
+horus launch --status                      # list running sessions
+horus launch --stop robot                  # stop this session by name
+```
+
+`depends_on` topologically orders startup, `start_delay` waits that many seconds before starting a node, and `restart` (`never`, the default, `always`, or `on-failure`) decides whether a node that dies is respawned.
+
+`command` is split on whitespace and executed directly, so `python3 nodes/lidar.py` works too if you would rather not go through the `horus` wrapper — but then it is on you to have the `horus` module importable in that interpreter.
+
+## Key Takeaways
+
+- Each process has its own `Scheduler` — they don't share a scheduler
+- Topics are shared via SHM files (`/dev/shm/horus_default/topics/`); pass `endpoint=` so every process agrees on the name
+- Any process can start first; whichever opens a topic first creates (and on exit unlinks) its SHM ring buffer
+- `horus topic list` shows topics from ALL processes, including ones created by Rust and C++ nodes
+- No message broker — direct SHM ring buffer, ~170ns cross-process latency
+- Python has no service API; use a request topic plus an ack topic, or host the service in a Rust node. `horus service list` will still list a `.request` topic as a service, but `horus service call` has nothing to talk to
+- Python topics are shared-memory only — an `endpoint` containing `@host` has its host part stripped and still resolves to a local SHM topic, so multi-*machine* Python is not a thing yet
+- `horus launch` starts, orders (`depends_on`, `start_delay`) and restarts the whole set from one YAML file
+- Each process can have different tick rates (10 Hz sensor, 50 Hz controller, 100 Hz safety), and unlike threads in one interpreter they genuinely run in parallel
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-python) — the same pieces in a single process
+- [Cross-Language with Typed Topics](/python/api/python-bindings#cross-language-with-typed-topics) — mix C++, Rust and Python in one system
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

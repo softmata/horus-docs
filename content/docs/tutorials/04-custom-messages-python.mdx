@@ -1,0 +1,410 @@
+---
+title: "Tutorial 4: Custom Messages (Python)"
+description: "Define custom message types and use them with typed topics"
+order: 41
+---
+
+# Tutorial 4: Custom Messages (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/04-custom-messages-rust) and [C++](/tutorials/04-custom-messages-cpp).</Callout>
+
+HORUS provides 50+ built-in message types, but you'll often need your own. This
+tutorial shows the two ways to move a payload Python has no built-in type for,
+and what it actually costs to give Python a custom `#[repr(C)]` Pod message that
+C++ and Rust can read.
+
+## What You'll Learn
+
+- Sending a schema-free payload over a generic (dict) topic
+- Where the 4 KB ceiling and the value-type restrictions bite
+- Why a zero-copy Pod message is a `horus_py` change, not a Python one
+- Layout requirements for cross-language compatibility
+- When to use each
+
+## The Two Approaches
+
+### Approach 1: Dict Topics (Quick, Flexible)
+
+For prototyping or when the message schema changes frequently, use a **generic
+topic**: pass a bare string to `Topic()` where you would normally pass a message
+class. Whatever dict you send is MessagePack-encoded on the way through, with no
+schema, no code generation and no build step.
+
+<Callout type="warning" title="Python has no JsonWireMessage">
+The C++ page reaches its JSON wire type through `horus_publisher_json_wire_new` /
+`_send`. Those functions, and the `JsonWireMessage` type they carry, belong to
+`horus_cpp` — they are part of the C++ bridge and are not exposed to Python. A
+generic topic is the Python equivalent: same idea, MessagePack instead of JSON,
+and a 4096-byte ceiling instead of C++'s 3968.
+</Callout>
+
+```python
+import horus
+from horus import Topic
+
+
+# ── Publisher ───────────────────────────────────────────────────────────
+class WeatherStation(horus.Node):
+    def __init__(self):
+        super().__init__(name="weather_station", rate=10, order=0)
+        # A bare string instead of a message class opens a *generic* topic.
+        self.out = Topic("custom.data")
+
+    def read_temperature(self):
+        return 22.5
+
+    def read_humidity(self):
+        return 55.0
+
+    def read_pressure(self):
+        return 1013.25
+
+    def tick(self, info=None):
+        self.out.send({
+            "temperature": self.read_temperature(),   # Celsius
+            "humidity": self.read_humidity(),         # 0-100%
+            "pressure": self.read_pressure(),         # hPa
+            "wind_speed": 0.0,                        # m/s
+            "wind_direction": 0.0,                    # degrees (0=N, 90=E)
+            "timestamp_ns": horus.get_timestamp_ns(),
+        })
+
+
+# ── Subscriber ──────────────────────────────────────────────────────────
+class WeatherLogger(horus.Node):
+    def __init__(self):
+        super().__init__(name="weather_logger", rate=10, order=10)
+        self.input = Topic("custom.data")
+
+    def tick(self, info=None):
+        while True:
+            w = self.input.recv()
+            if w is None:
+                return
+            # recv() hands back a plain dict — index it, don't use attributes.
+            self.log_info(
+                "%.1f C, %.0f%% RH, %.1f hPa"
+                % (w["temperature"], w["humidity"], w["pressure"])
+            )
+
+
+sched = horus.Scheduler(tick_rate=10, name="weather", deterministic=True)
+sched.add(WeatherStation())
+sched.add(WeatherLogger())
+sched.run(duration=3)
+```
+
+Run it with `horus run` — Python needs no build step.
+
+**Pros:** No Rust changes, any JSON-shaped payload, works immediately, and it is
+the only approach available on a pip-installed HORUS.
+**Cons:** 4096-byte payload max, MessagePack encode/decode on every hop, no
+compile-time type checking, and `recv()` gives you a dict rather than an object.
+
+#### What a generic topic accepts
+
+Dicts, lists, strings, numbers and booleans, nested freely:
+
+```python
+from horus import Topic
+
+status = Topic("robot.status")
+status.send({
+    "battery": 85.0,
+    "ok": True,
+    "mode": "idle",
+    "pose": [1.0, 2.0, 0.0],
+    "limits": {"v_max": 1.5},
+})
+print(status.recv())   # -> dict, or None if nothing is queued
+```
+
+Two values it does *not* accept, and the exact errors they raise:
+
+```text
+TypeError: Failed to convert Python object: invalid type: byte array, expected any valid JSON value
+ValueError: Invalid input: 'data' out of range: expected [0..4096], got 18009
+```
+
+The first is `bytes` (and `complex`, which catches people sending `np.fft` output
+straight through). Carry raw bytes inside the dict as a list of ints or a base64
+string instead. The second is the size ceiling — roughly a thousand floats. That
+is ample for control values and poses, and far too small for an image or a point
+cloud; those belong on typed `horus.Image` / `horus.PointCloud` topics, which are
+pool-backed and never touch this encoder.
+
+### Approach 2: A Pod Struct (Production, Zero-Copy)
+
+<Callout type="warning" title="Python cannot define one — this section edits horus_py">
+`Topic()` selects the zero-copy Pod backend only for the built-in types listed in
+the `pod_topic_types!` macro in `horus_py/src/topic.rs`. Every other name — a
+plain Python class, a `dataclass`, or a class generated by `horus.msggen` — falls
+through to the generic MessagePack path. There is no Python-only spelling of
+this; the steps below are edits to a `horus_py` source checkout followed by a
+rebuild. On a pip-installed HORUS, Approach 1 is the whole story.
+</Callout>
+
+Defining the class in Python and handing it to `Topic()` looks like it works, and
+then fails on the first `send`:
+
+```python
+from horus import Topic
+
+
+class WeatherData:
+    __topic_name__ = "weather.custom"
+
+    def __init__(self):
+        self.temperature = 22.5
+
+
+topic = Topic(WeatherData)
+print(topic.is_generic())     # True — it did not get the Pod backend
+topic.send(WeatherData())     # TypeError below
+```
+
+```text
+TypeError: Failed to convert Python object: unsupported type WeatherData
+```
+
+`is_generic()` is the check worth remembering: `False` means the type reached the
+zero-copy Pod path, `True` means it is going through MessagePack.
+
+<Callout type="note" title="What horus.msggen does and doesn't do">
+`horus.msggen` generates a Rust `#[pyclass]` from a Python message definition and
+runs maturin over it. The resulting class is importable and constructible, but it
+is *not* registered in `pod_topic_types!` and derives no serde impls, so sending
+an instance raises the same `TypeError` as above. It is a code generator for
+Steps 1–2 below, not a shortcut past them. See
+[Custom Messages](/python/api/custom-messages) for its full API.
+</Callout>
+
+#### Step 1: Define it in Rust
+
+In the crate that holds your messages (or directly in `horus_py`):
+
+```rust
+message! {
+    #[fixed]
+    /// Custom sensor reading from a weather station
+    WeatherData {
+        temperature: f32,     // Celsius
+        humidity: f32,        // 0-100%
+        pressure: f32,        // hPa
+        wind_speed: f32,      // m/s
+        wind_direction: f32,  // degrees (0=N, 90=E)
+        timestamp_ns: u64,
+    }
+}
+```
+
+`#[fixed]` emits the struct as `#[repr(C)]` with `Copy` and `Default` — that is
+what makes it eligible for the zero-copy ring. See
+[Tutorial 4 (Rust)](/tutorials/04-custom-messages-rust) for the Rust side in full.
+
+#### Step 2: Add the PyO3 wrapper
+
+In `horus_py/src/messages.rs`, alongside `PyTemperature`, `PyImu` and the rest.
+The wrapper holds the Rust value in `inner` and exposes each field as a
+getter/setter pair:
+
+```rust,ignore
+/// Weather station reading
+#[pyclass(from_py_object, name = "WeatherData")]
+#[derive(Clone)]
+pub struct PyWeatherData {
+    pub(crate) inner: WeatherData,
+}
+
+#[pymethods]
+impl PyWeatherData {
+    #[new]
+    #[pyo3(signature = (temperature=0.0, humidity=0.0, timestamp_ns=0))]
+    fn new(temperature: f32, humidity: f32, timestamp_ns: u64) -> Self {
+        let mut w = WeatherData::default();
+        w.temperature = temperature;
+        w.humidity = humidity;
+        w.timestamp_ns = timestamp_ns;
+        Self { inner: w }
+    }
+
+    #[getter]
+    fn temperature(&self) -> f32 {
+        self.inner.temperature
+    }
+    #[setter]
+    fn set_temperature(&mut self, v: f32) {
+        self.inner.temperature = v;
+    }
+
+    #[classattr]
+    fn __topic_name__() -> &'static str {
+        "weather.data"
+    }
+}
+```
+
+`__topic_name__` is what `Topic(WeatherData)` uses when you don't pass
+`endpoint=`, exactly as for the built-in types.
+
+#### Step 3: Register the class
+
+Still in `horus_py/src/messages.rs`, add one line to `register_message_classes`:
+
+```rust,ignore
+m.add_class::<PyWeatherData>()?;
+```
+
+#### Step 4: Register the topic backend
+
+In `horus_py/src/topic.rs`, add the pair to the `pod_topic_types!` invocation.
+This is the step that moves the type off the MessagePack path — without it the
+class exists but `is_generic()` stays `True`:
+
+```rust,ignore
+pod_topic_types!(
+    (CmdVel, PyCmdVel),
+    (Pose2D, PyPose2D),
+    (WeatherData, PyWeatherData),
+);
+```
+
+The macro generates the `TopicType` variant, the dispatch arm and the
+send/recv paths from that one pair — it is the Python counterpart of the C++
+page's `HORUS_TOPIC_IMPL` line.
+
+#### Step 5: Export it from the Python package
+
+`horus/__init__.py` re-exports the Rust classes by hand. Three edits:
+
+```python
+from horus._horus import WeatherData as _RustWeatherData
+WeatherData = _RustWeatherData
+```
+
+then add `'weatherdata': WeatherData` to `_TYPE_NAME_MAP` (which maps the
+lowercase type name in the SHM header back to a Python class) and `"WeatherData"`
+to `__all__`.
+
+#### Step 6: Rebuild and use it
+
+```bash
+cd horus_py && maturin develop --release
+```
+
+From then on the custom type behaves exactly like a built-in one:
+
+```python
+import horus
+from horus import Topic, WeatherData
+
+
+class WeatherStation(horus.Node):
+    def __init__(self):
+        super().__init__(name="weather_station", rate=10, order=0)
+        self.out = Topic(WeatherData, endpoint="weather.data")
+
+    def tick(self, info=None):
+        self.out.send(WeatherData(
+            temperature=22.5,
+            humidity=55.0,
+            timestamp_ns=horus.get_timestamp_ns(),
+        ))
+
+
+class WeatherLogger(horus.Node):
+    def __init__(self):
+        super().__init__(name="weather_logger", rate=10, order=10)
+        self.input = Topic(WeatherData, endpoint="weather.data")
+
+    def tick(self, info=None):
+        w = self.input.recv()
+        if w is not None:
+            # A typed message — attributes, not dict keys.
+            self.log_info("%.1f C, %.0f%% RH" % (w.temperature, w.humidity))
+```
+
+## Talking to Rust and C++
+
+A generic topic is not a Python-only format. It is `GenericMessage` — the same
+ring, the same MessagePack encoding — so a Rust node reads the dicts from
+Approach 1 with no plumbing on either side:
+
+```rust
+use horus::prelude::*;
+use std::collections::HashMap;
+
+fn main() -> Result<()> {
+    let topic: Topic<GenericMessage> = Topic::new("custom.data")?;
+
+    // Read what the Python node published.
+    if let Some(msg) = topic.recv() {
+        let data: HashMap<String, f64> = msg.to_value()?;
+        hlog!(info, "{:.1} C, {:.0}% RH", data["temperature"], data["humidity"]);
+    }
+
+    // And publish back into the same dict topic.
+    let mut reading: HashMap<String, f64> = HashMap::new();
+    reading.insert("temperature".to_string(), 25.3);
+    topic.send(GenericMessage::from_value(&reading)?);
+    Ok(())
+}
+```
+
+A Pod message is the other way round: once Steps 1–6 are done, Python shares the
+struct byte-for-byte with Rust, and reaching C++ as well needs that language's
+own binding — the six-step FFI pipeline in
+[Tutorial 4 (C++)](/tutorials/04-custom-messages-cpp).
+
+## Layout Rules for Custom Types
+
+| Rule | Why |
+|------|-----|
+| `#[fixed]` on the Rust `message!` | Emits `#[repr(C)]` + `Copy`; Python never sees the struct, only the wrapper |
+| Only primitive types + fixed arrays | `Vec`, `String`, `Box` can't cross SHM in place |
+| Same field order in Rust and C++ | Memory layout must match exactly |
+| Use `f32`/`f64`/`u8`/`u16`/`u32`/`u64`/`i32`/`i64` | Cross-language compatible primitives |
+| Fixed-size arrays `[T; N]` only | Variable-length data needs a dict topic |
+| `timestamp_ns: u64` as last field | Convention for all HORUS messages |
+| Expose arrays as flat scalars or Python lists in the wrapper | Python has no fixed-size array type — this is why the built-ins look the way they do |
+
+### Field names differ from Rust and C++
+
+That last row is not hypothetical. The built-in wrappers already flatten the Rust
+layout: `Imu` exposes `accel_x`/`accel_y`/`accel_z` and `gyro_x`/`gyro_y`/`gyro_z`
+rather than the `linear_acceleration` and `angular_velocity` arrays, `Odometry` is
+flat (`odom.x`, `odom.y`, `odom.theta`, not `odom.pose.x`), and `LaserScan.ranges`
+is a Python list — mutating it in place does nothing, you assign a whole list back.
+The wire format is identical either way, so a hand-written wrapper for your own
+message should make the same call deliberately.
+
+## When To Use Each Approach
+
+| Scenario | Approach |
+|----------|----------|
+| Prototyping, schema changing | Dict topic |
+| Pip-installed HORUS (no source checkout) | Dict topic |
+| One-off configuration messages | Dict topic |
+| Production, performance-critical | Pod struct + `horus_py` binding |
+| Cross-language (Python + C++ + Rust) | Pod struct + one binding per language |
+| High-frequency sensor data (&gt;100 Hz) | Pod struct (zero-copy) |
+| Payload larger than 4096 bytes | Pod struct, or a pool-backed `Image` / `PointCloud` |
+
+## Key Takeaways
+
+- Dict topics are the fastest path to custom data from Python — no Rust changes, MessagePack payload, 4096-byte max
+- A zero-copy Pod message cannot be defined from Python: `Topic()` reaches that backend only for the types in `pod_topic_types!`, so it costs a `horus_py` edit and a rebuild (6 steps)
+- `topic.is_generic()` tells you which of the two you actually got
+- `horus.msggen` generates the Rust wrapper for Steps 1–2; it does not register the topic backend, so its classes still fail on `send`
+- Always put `timestamp_ns: u64` as the last field (convention)
+- Dict topics interoperate with Rust `Topic<GenericMessage>` in both directions with no build step on either side
+
+## Next Steps
+
+- [Tutorial 5: Hardware & Real-Time (Python)](/tutorials/05-hardware-rt-python) — drive real hardware with these messages
+- [Tutorial 4: Custom Messages (Rust)](/tutorials/04-custom-messages-rust) — the same message from the Rust side
+
+## See Also
+
+- [Custom Messages](/python/api/custom-messages) — full dict-topic and `horus.msggen` reference
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

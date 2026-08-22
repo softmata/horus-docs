@@ -1,0 +1,370 @@
+---
+title: "Tutorial 8: Multi-Process Systems (Rust)"
+description: "Run multiple Rust processes sharing topics over shared memory"
+order: 80
+---
+
+# Tutorial 8: Multi-Process Systems (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/08-multi-process-python) and [C++](/tutorials/08-multi-process-cpp).</Callout>
+
+Real robots run multiple processes — a sensor driver, a controller, a safety monitor, each as a separate binary. This tutorial shows how to build and run multi-process systems.
+
+## What You'll Learn
+
+- Separate binaries sharing SHM topics
+- Process lifetime and SHM ownership across processes
+- Cross-process service calls
+- Using `horus launch` for multi-process orchestration
+
+## Architecture
+
+```
+Process 1: lidar_driver      Process 2: controller        Process 3: safety
+┌────────────────────┐       ┌────────────────────┐       ┌────────────┐
+│ Publisher          │──SHM─→│ Subscriber         │       │ Subscriber │
+│ "lidar.scan"       │       │ "lidar.scan"       │       │ "cmd_vel"  │
+└────────────────────┘       │ Publisher          │──SHM─→│            │
+                             │ "cmd_vel"          │       └────────────┘
+                             └────────────────────┘
+```
+
+All three processes map their topics out of the **same directory**, `/dev/shm/horus_default/topics/`, and the two ends of a topic map the same file: process 1 and 2 share `lidar.scan`, process 2 and 3 share `cmd_vel`. No message broker, no serialization.
+
+## Project Layout
+
+One process is one `fn main()`, so this project is three source files rather than three crates:
+
+```bash
+horus new robot_fleet
+cd robot_fleet
+mkdir nodes
+```
+
+```
+robot_fleet/
+├── horus.toml
+└── nodes/
+    ├── lidar.rs
+    ├── controller.rs
+    └── safety.rs
+```
+
+When you hand `horus build` more than one file it emits one `[[bin]]` per file, named after the file stem, and builds them all in a single cargo invocation — so the three binaries land in `.horus/target/debug/` as `lidar`, `controller` and `safety`.
+
+## Process 1: Sensor Driver
+
+```rust
+// nodes/lidar.rs
+use horus::prelude::*;
+
+struct LidarSensor {
+    scan: Topic<LaserScan>,
+}
+
+impl LidarSensor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+        })
+    }
+}
+
+impl Node for LidarSensor {
+    fn name(&self) -> &str {
+        "lidar"
+    }
+
+    fn tick(&mut self) {
+        // LaserScan is a fixed 360-element POD struct — build it on the stack
+        // and hand the whole thing to send(). There is no loan/publish split:
+        // send() copies into the ring buffer slot.
+        let mut scan = LaserScan::new();
+        for i in 0..360 {
+            scan.ranges[i] = 2.0 + 0.5 * (i as f32 * 0.1).sin();
+        }
+        self.scan.send(scan);
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(10_u64.hz()).name("lidar_proc");
+    sched.add(LidarSensor::new()?).order(0).build()?;
+    sched.run()
+}
+```
+
+## Process 2: Controller
+
+```rust
+// nodes/controller.rs
+use horus::prelude::*;
+
+struct Controller {
+    scan: Topic<LaserScan>,
+    cmd: Topic<CmdVel>,
+}
+
+impl Controller {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+            cmd: Topic::new("cmd_vel")?,
+        })
+    }
+}
+
+impl Node for Controller {
+    fn name(&self) -> &str {
+        "controller"
+    }
+
+    fn tick(&mut self) {
+        let Some(scan) = self.scan.recv() else {
+            return;
+        };
+        // min_range() skips readings outside [range_min, range_max], so a
+        // dropout encoded as 0.0 cannot masquerade as an obstacle at the axle.
+        let min_range = scan.min_range().unwrap_or(f32::INFINITY);
+        let linear = if min_range > 0.5 { 0.3 } else { 0.0 };
+        self.cmd.send(CmdVel::new(linear, 0.0));
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.cmd.send(CmdVel::new(0.0, 0.0));
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(50_u64.hz()).name("ctrl_proc");
+    sched.add(Controller::new()?).order(0).build()?;
+    sched.run()
+}
+```
+
+## Process 3: Safety Monitor
+
+The third process watches `cmd_vel` without ever touching the lidar topic — it only needs the one SHM file the controller publishes into. It also hosts the `estop` service, covered in the next section.
+
+<Callout type="note" title="The service! macro expands to serde derives">
+Topics move raw POD structs and serialize nothing. Services do serialize their payloads: `service!` expands to `#[derive(serde::Serialize, serde::Deserialize)]` on the generated request and response types, so the name `serde` has to resolve inside your crate. `horus::prelude` does not re-export it.
+
+You do not have to add it. `horus build` writes
+
+```toml
+serde = { version = "1", features = ["derive"] }
+```
+
+into the generated `.horus/Cargo.toml` of every project, so the two `service!` blocks below compile in a fresh `horus new` project with nothing installed. Name `serde` in `horus.toml` only to pin a different version — an explicit entry replaces the implicit one instead of colliding with it.
+</Callout>
+
+```rust
+// nodes/safety.rs
+use horus::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+service! {
+    /// Engage the emergency stop. The macro lowercases and snake_cases the
+    /// type name, so this service is `estop` and its request topic is
+    /// `estop.request`.
+    Estop {
+        request { reason: String }
+        response { stopped: bool }
+    }
+}
+
+struct SafetyMonitor {
+    cmd: Topic<CmdVel>,
+    engaged: Arc<AtomicBool>,
+    server: Option<ServiceServer<Estop>>,
+}
+
+impl SafetyMonitor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd: Topic::new("cmd_vel")?,
+            engaged: Arc::new(AtomicBool::new(false)),
+            server: None,
+        })
+    }
+}
+
+impl Node for SafetyMonitor {
+    fn name(&self) -> &str {
+        "safety"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        // The handler is a closure, so it can capture — no file-scope statics
+        // and no out-parameter buffer, unlike the C++ function-pointer handler.
+        let engaged = self.engaged.clone();
+        self.server = Some(
+            ServiceServerBuilder::<Estop>::new()
+                .on_request(move |req: EstopRequest| {
+                    hlog!(error, "estop engaged: {}", req.reason);
+                    engaged.store(true, Ordering::Relaxed);
+                    Ok(EstopResponse { stopped: true })
+                })
+                .build()?,
+        );
+        hlog!(info, "estop service listening");
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let Some(cmd) = self.cmd.recv() else {
+            return;
+        };
+        if self.engaged.load(Ordering::Relaxed) || cmd.linear > 0.5 {
+            hlog!(warn, "commanded motion blocked");
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        // Dropping the handle stops the server thread and joins it.
+        self.server = None;
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz()).name("safety_proc");
+    sched.add(SafetyMonitor::new()?).order(0).build()?;
+    sched.run()
+}
+```
+
+## Cross-Process Service Calls
+
+Topics are one-way fan-out. When one process needs an *answer* from another — "are you armed?", "stop now" — use a service instead. `ServiceServerBuilder` and `ServiceClient` exchange serialized payloads over the same SHM machinery as topics, on `estop.request` and a per-client `estop.response.<id>` whose id embeds the caller's PID.
+
+The server side is the `init()` above. Two things differ from C++ and are worth naming:
+
+- **The handler runs on its own thread.** `build()` spawns a polling thread (5 ms interval by default, `poll_interval()` to change it) that owns the request topic. There is no `process()` to call from `tick()`, and the node's tick budget is not spent answering requests. The flip side is that the handler runs *concurrently* with `tick()`, which is why the engaged flag above is an `AtomicBool` rather than a plain `bool`.
+- **`ServiceServer` is a live handle.** Keep it alive for as long as the service should answer. Dropping it — including at the end of `init()`, if you forget to store it — sets the shutdown flag and joins the thread, and the service silently stops existing.
+
+The client side is a few lines from any other process:
+
+```rust
+// nodes/estop_client.rs — a teleop binary, a watchdog, anything
+use horus::prelude::*;
+
+service! {
+    Estop {
+        request { reason: String }
+        response { stopped: bool }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut client = ServiceClient::<Estop>::new()?;
+    let request = EstopRequest {
+        reason: "teleop button".to_string(),
+    };
+    match client.call_optional(request, 500_u64.ms()) {
+        Ok(Some(reply)) => println!("stopped = {}", reply.stopped),
+        Ok(None) => {
+            eprintln!("estop: no response within 500 ms");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("estop: {}", e);
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+```
+
+The service definition has to be repeated in the client because both sides need the same generated types, and with one `[[bin]]` per file there is no shared crate to hang it on. In a real project keep the `service!` block in one file — `nodes/shared/estop_service.rs` — and pull it into both binaries with `#[path = "shared/estop_service.rs"] mod estop_service;` rather than copying it. Put it in a subdirectory, not next to the binaries: every file you hand `horus build` becomes a `[[bin]]`, and a file with no `fn main()` is not one.
+
+`call()` returns `Err(ServiceError::Timeout)` when nobody answers in time; `call_optional()` folds exactly that case into `Ok(None)` and leaves the genuinely broken cases (`NoServer`, `ServiceFailed`, `Transport`) as errors, which is usually the shape you want at a call site.
+
+Unlike the C++ server, the Rust `ServiceServer` also polls the CLI's JSON gateway under `/dev/shm/horus_default/topics/.service_gateway/`, so both halves of the CLI work against it:
+
+```bash
+horus service list
+horus service call estop '{"reason": "cli"}'
+```
+
+`horus service call` resolves a `CamelCase` name to the snake_case one the macro generated, so `horus service call Estop` and `horus service call estop` reach the same server.
+
+## Running Multi-Process
+
+```bash
+# Build all three binaries in one cargo invocation
+horus build nodes/lidar.rs nodes/controller.rs nodes/safety.rs
+
+# Run (order does not matter — start them in any order)
+.horus/target/debug/controller &
+.horus/target/debug/lidar &
+.horus/target/debug/safety &
+
+# Or let horus build and spawn all three for you, one process each
+horus run nodes/lidar.rs nodes/controller.rs nodes/safety.rs
+
+# Monitor from any terminal
+horus topic list      # shows lidar.scan, cmd_vel, estop.request
+horus node list       # shows lidar, controller, safety (separate PIDs)
+horus service list    # shows estop
+```
+
+Rust binaries link HORUS statically, so there is no `LD_LIBRARY_PATH` to set — the executables in `.horus/target/debug/` run from anywhere.
+
+## Startup Order and SHM Lifetime
+
+Startup order does not affect correctness — a subscriber can join a topic that is already being published to and will start receiving on its next `recv()`. What does matter is process *lifetime*: the first process to open a topic owns its SHM file and unlinks it on exit, so if the publisher is the sole owner and exits, the ring buffer disappears with it.
+
+When a process genuinely does need another one up first (a driver that must claim a device, say), express it in `horus launch` with `depends_on` and `start_delay` rather than by hand-sequencing shell commands.
+
+## Orchestrating with `horus launch`
+
+Backgrounding three binaries by hand does not survive contact with a real robot. `horus launch` reads a YAML file and starts, orders, and supervises the whole set:
+
+```yaml
+# robot.launch.yaml
+session: robot
+
+nodes:
+  - name: lidar
+    command: .horus/target/debug/lidar
+
+  - name: safety
+    command: .horus/target/debug/safety
+
+  # Topics need no ordering, but we want the estop service answering
+  # before anything can command motion.
+  - name: controller
+    command: .horus/target/debug/controller
+    depends_on: [safety]
+    start_delay: 0.2
+    restart: on-failure
+```
+
+```bash
+horus launch --dry-run robot.launch.yaml   # print the startup order, launch nothing
+horus launch robot.launch.yaml             # start the session
+horus launch --status                      # list running sessions
+horus launch --stop robot                  # stop this session by name
+```
+
+`depends_on` topologically orders startup, `start_delay` waits that many seconds before starting a node, and `restart` (`never`, the default, `always`, or `on-failure`) decides whether a node that dies is respawned.
+
+## Key Takeaways
+
+- Each process has its own `Scheduler` — they don't share a scheduler
+- Topics are shared via SHM files (`/dev/shm/horus_default/topics/`)
+- Any process can start first; whichever opens a topic first creates (and on exit unlinks) its SHM ring buffer
+- `horus topic list` shows topics from ALL processes
+- No message broker — direct SHM ring buffer, ~170ns cross-process latency
+- `ServiceServerBuilder` / `ServiceClient` add request/response on top of the same SHM — the server polls on its own thread, so keep the `ServiceServer` handle alive instead of calling it from `tick()`
+- `service!` derives serde on its request/response types; `horus build` already puts `serde` in the generated manifest, so nothing needs installing
+- `horus launch` starts, orders (`depends_on`, `start_delay`) and restarts the whole set from one YAML file
+- Each process can have different tick rates (10 Hz sensor, 50 Hz controller, 100 Hz safety)
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-rust) — the same pieces in a single process
+- [Services](/concepts/services) — full `service!`, `ServiceServerBuilder` and `ServiceClient` reference
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference

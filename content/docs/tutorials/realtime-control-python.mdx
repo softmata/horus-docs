@@ -1,0 +1,352 @@
+---
+title: "Tutorial: Real-Time Control (Python)"
+description: "Build a 1kHz motor control loop with SCHED_FIFO, jitter measurement, and failsafe"
+order: 106
+---
+
+# Tutorial: Real-Time Control (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/realtime-control-rust) and [C++](/tutorials/realtime-control-cpp).</Callout>
+
+Build a 1 kHz motor control loop — the kind that runs real industrial servos. Measure jitter, enforce deadlines, and prove your system meets timing requirements.
+
+## What You'll Build
+
+A control loop that:
+- Runs at exactly 1000 Hz
+- Reads encoder + computes PID + writes motor in < 500us
+- Measures tick-to-tick jitter
+- Fails safe (stops motor) if any tick exceeds 900us
+
+<Callout type="warn" title="Read this before you wire it to a real servo">
+Every scheduling feature on this page — `budget`, `deadline`, `on_miss`, `core`,
+`priority`, `watchdog`, `rt=True` — is available from Python and does exactly
+what it does in Rust and C++. The scheduler is the same Rust kernel; only the
+node body is Python.
+
+What Python cannot give you is a **bounded** tick. Measured on an idle laptop
+with no RT capability, the tick body below ran at avg 87-133us with a p99 of
+143-200us — comfortably inside the 500us budget — and tick-to-tick spacing sat
+at avg 1000us, min 892us, for stretches of thousands of ticks. That is a usable
+1 kHz loop. What it is not is a bounded one: the same runs threw individual
+ticks of 2-6ms and inter-tick gaps past 5ms. CPython gives you no way to
+prevent that — a GC pause or a GIL handoff puts milliseconds into the
+distribution, and `on_miss="safe_mode"` will find them. The usual mitigations
+(`gc.freeze()` after setup, `gc.disable()` around the loop) shorten the tail;
+they do not bound it.
+
+So: use this page to learn how HORUS enforces timing, and to prototype and
+measure. For a servo loop that must never miss, put the inner loop in
+[Rust](/tutorials/realtime-control-rust) or
+[C++](/tutorials/realtime-control-cpp) and keep Python for the supervisory
+rates above it — they share topics through the same shared memory, so it is one
+system either way.
+</Callout>
+
+## Complete Code
+
+```python
+import time
+
+import horus
+from horus import CmdVel, Topic
+
+KP, KI, KD = 0.5, 0.01, 0.001
+DT = 0.001              # 1 ms
+INTEGRAL_MAX = 100.0
+MAX_PWM = 1.0
+
+
+def clamp(value, limit):
+    return max(-limit, min(limit, value))
+
+
+class RtMotorLoop(horus.Node):
+    def __init__(self):
+        super().__init__(
+            name="rt_motor_1khz",
+            rate=1000,
+            order=0,
+            budget=500 * horus.us,      # must finish in 500us (50% of 1ms period)
+            deadline=900 * horus.us,    # absolute deadline 900us
+            on_miss="safe_mode",
+            core=3,                     # dedicated CPU core
+            priority=95,                # near-max SCHED_FIFO priority
+            watchdog=100 * horus.ms,    # if stuck for 100ms, trigger safety
+        )
+        self.cmd = Topic(CmdVel, endpoint="motor.target")     # commanded RPM
+        self.encoder = Topic(CmdVel, endpoint="encoder.rpm")  # measured RPM
+        self.pwm = Topic(CmdVel, endpoint="motor.pwm")        # duty cycle out
+
+        self.target_rpm = 0.0
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.tick_count = 0
+        self.jitter_sum_us = 0.0
+        self.max_jitter_us = 0.0
+        self.min_jitter_us = float("inf")
+        self.last_tick = time.perf_counter()
+
+    def drain(self, topic):
+        """Return the most recent message on a topic, or None."""
+        latest = None
+        while True:
+            msg = topic.recv()
+            if msg is None:
+                return latest
+            latest = msg
+
+    def init(self, info=None):
+        self.info = info    # needed for log_*() — see below
+
+        # Touch every ring buffer once before the deadline clock starts. The
+        # first send/recv on a topic faults in its shared-memory pages, which
+        # costs milliseconds — inside tick() that is a budget overrun on tick 1.
+        self.pwm.send(CmdVel(linear=0.0, angular=0.0))
+        self.drain(self.cmd)
+        self.drain(self.encoder)
+
+        self.last_tick = time.perf_counter()
+        self.log_info("1kHz RT loop initialized")
+
+    def tick(self, info=None):
+        self.info = info
+
+        now = time.perf_counter()
+        dt_us = (now - self.last_tick) * 1e6
+        self.last_tick = now
+
+        # Track jitter statistics
+        if self.tick_count > 10:        # skip first 10 ticks (startup)
+            self.max_jitter_us = max(self.max_jitter_us, dt_us)
+            self.min_jitter_us = min(self.min_jitter_us, dt_us)
+            self.jitter_sum_us += dt_us
+        self.tick_count += 1
+
+        # Read target velocity — drain to the newest, never queue up.
+        cmd = self.drain(self.cmd)
+        if cmd is not None:
+            self.target_rpm = cmd.linear
+
+        # Read actual RPM
+        actual_rpm = 0.0
+        enc = self.drain(self.encoder)
+        if enc is not None:
+            actual_rpm = enc.linear
+
+        # PID (tuned for motor dynamics)
+        error = self.target_rpm - actual_rpm
+        self.integral = clamp(self.integral + error * DT, INTEGRAL_MAX)
+        derivative = (error - self.prev_error) / DT
+        self.prev_error = error
+
+        output = clamp(KP * error + KI * self.integral + KD * derivative, MAX_PWM)
+        self.pwm.send(CmdVel(linear=output, angular=0.0))
+
+        # Report jitter every 1000 ticks (1 Hz)
+        if self.tick_count % 1000 == 0:
+            avg = self.jitter_sum_us / (self.tick_count - 10)
+            self.log_info(
+                f"jitter: min={self.min_jitter_us:.0f}us avg={avg:.0f}us "
+                f"max={self.max_jitter_us:.0f}us (target=1000us)"
+            )
+
+    def enter_safe_state(self):
+        self.pwm.send(CmdVel(linear=0.0, angular=0.0))
+        self.integral = 0.0
+        self.log_error(f"SAFE STATE - max jitter was {self.max_jitter_us:.0f}us")
+
+
+sched = horus.Scheduler(
+    tick_rate=1000,
+    name="rt_control",
+    blackbox_mb=4,   # 4 MB flight recorder for post-mortem analysis
+    rt=True,         # the equivalent of C++ prefer_rt()
+)
+sched.add(RtMotorLoop())
+
+print("1kHz RT motor loop starting...")
+print("Monitor: horus log (see jitter stats)")
+sched.run()
+```
+
+Nothing in this program publishes `motor.target` or `encoder.rpm` — those come
+from your driver process, or from `horus topic pub` while you are testing. With
+no publisher, `recv()` returns `None`, the loop holds a target of zero, and the
+jitter numbers are still real: that is the measurement this tutorial is about.
+
+The node deliberately does **not** use `deterministic=True`. Tutorials 2 and 3
+use it to pin every node onto one ordered tick sequence; here the opposite is
+what you want. `budget=` promotes the node to an RT node with its own executor
+thread, and that thread is what `core=` and `priority=` configure.
+
+<Callout type="note" title="C++ builder methods become constructor keywords">
+| C++ | Python |
+| --- | --- |
+| `sched.tick_rate(1000_hz)` | `Scheduler(tick_rate=1000)` |
+| `sched.prefer_rt()` | `Scheduler(rt=True)` |
+| `sched.spin()` | `sched.run()` (or `sched.run(duration=3.0)`) |
+| `.budget(500_us)` | `budget=500 * horus.us` |
+| `.deadline(900_us)` | `deadline=900 * horus.us` |
+| `.on_miss(horus::Miss::SafeMode)` | `on_miss="safe_mode"` |
+| `.pin_core(3)` | `core=3` |
+| `.priority(95)` | `priority=95` |
+| `.watchdog(100_ms)` | `watchdog=100 * horus.ms` |
+
+`budget`, `deadline` and `watchdog` are **seconds**, which is why the unit
+constants matter: `budget=500` is an eight-minute budget, `budget=500 *
+horus.us` is what you meant. There is no Python equivalent of C++'s
+`require_rt()` — `rt=True` is always the graceful-degradation form, so check
+`sched.has_full_rt()` (and `sched.degradations()`, which names what was
+requested and not granted) yourself if a missing capability should be fatal.
+</Callout>
+
+<Callout type="warn" title="Assign `self.info` if you override `init()` or `tick()`">
+`log_info()`, `log_warning()`, `log_error()` and `log_debug()` write through
+`self.info`, the per-call context the scheduler hands to `init(info)` and
+`tick(info)`. The base class stores it for you — but only on the code path that
+runs when you pass `tick=` as a *callback*. Subclass `horus.Node` and override
+the methods, as this tutorial does, and nothing assigns it, so every log call
+raises a `RuntimeWarning` and drops the message:
+
+```
+RuntimeWarning: Node 'rt_motor_1khz': log_info() called outside scheduler —
+message dropped. Logging is only available during init/tick/shutdown.
+```
+
+One line at the top of each override (`self.info = info`) fixes it. The
+assignment persists, which is also what makes `log_error()` work inside
+`enter_safe_state()` — the scheduler calls that one with no arguments at all.
+Logs from `enter_safe_state()` are attributed to `unknown` rather than to the
+node, because that hook runs outside the scheduler's per-tick logging context.
+</Callout>
+
+<Callout type="warn" title="There is no `horus.blackbox.record()` in Python">
+The C++ helper is a log-buffer write under the hood: it publishes a
+Warning-level entry that shows up in `horus log` and is picked up by the flight
+recorder. `self.log_error(...)` writes to that same buffer, so the line above is
+the direct equivalent.
+
+You lose nothing important. `blackbox_mb=4` on the scheduler is what actually
+arms the recorder, and the scheduler writes the events that matter for a
+post-mortem by itself: budget violations, deadline misses, node errors and
+scheduler start/stop, each with the measured and configured microseconds. Read
+them back with `horus blackbox`.
+</Callout>
+
+## Understanding the Timing Budget
+
+```
+|←────────── 1000 us (1 kHz period) ──────────→|
+|── budget ──|── slack ──|── deadline ──|
+|   500 us   |           |   900 us    |
+                                        ^ on_miss="safe_mode" triggers here
+```
+
+- **budget (500us)**: expected max computation time
+- **deadline (900us)**: absolute latest the tick can finish
+- **slack**: 400us buffer for OS scheduling jitter
+- If tick exceeds 900us → `enter_safe_state()` called → motor stops
+
+Both are measured on the tick itself — the time from entering `tick()` to
+leaving it — not on how late the thread woke up. Wake-up lateness shows up in
+the jitter numbers the node computes for itself.
+
+<Callout type="warn" title="`watchdog=` makes this node *critical* — and that changes what a miss does">
+`on_miss="safe_mode"` on its own means "call `enter_safe_state()` once, then
+keep ticking"; the latch clears as soon as the node meets its deadline again.
+Passing a per-node `watchdog=` registers the node with the safety monitor as a
+**critical node**, and for a critical node the *first* budget overrun or
+deadline miss escalates to a scheduler-wide emergency stop:
+
+```
+ EMERGENCY STOP: Critical node rt_motor_1khz exceeded tick budget: 2.228613ms > 500µs
+[RT-thread] budget violation in 'rt_motor_1khz': 2.228613ms > 500µs
+[RT-thread] Deadline miss in 'rt_motor_1khz': 2.343529ms > 900µs
+ EMERGENCY STOP: Critical node rt_motor_1khz missed deadline
+[RT-thread] SafeMode: 'rt_motor_1khz' entering safe state after deadline miss
+ Emergency stop activated - shutting down scheduler
+```
+
+For a 1 kHz servo that is usually the behaviour you want — a drive that cannot
+hold its loop rate should stop the machine, not limp. It is also the reason
+this program will most likely exit within a second of starting: that transcript
+is the code above, run unmodified, and the overrun is the interpreter warming
+up on tick 1.
+
+To watch the loop actually run on a development machine, drop
+`watchdog=100 * horus.ms` from the constructor. `on_miss="safe_mode"` then
+behaves as documented — safe once per episode, recover, keep ticking:
+
+```
+[RT-thread] SafeMode: 'rt_motor_1khz' entering safe state after deadline miss
+[ERROR] [unknown] SAFE STATE - max jitter was 5026us
+[RT-thread] SafeMode: 'rt_motor_1khz' met its deadline again, leaving safe state
+```
+</Callout>
+
+<Callout type="note" title="Without CAP_SYS_NICE, `priority=95` is silently dropped">
+`rt=True` degrades rather than fails. On a stock machine you will see
+
+```
+[RT-thread] Could not set SCHED_FIFO: Permission denied ... (continuing with normal priority)
+[RT] Pinned thread to core 3
+```
+
+— `core=3` still takes effect, the priority request does not. Grant the
+capability to the interpreter as described in
+[RT Configuration](/advanced/rt-config), and expect the same for the CPU
+governor. `sched.degradations()` names exactly which requests were dropped.
+</Callout>
+
+## Jitter Measurement
+
+The code measures tick-to-tick timing with `time.perf_counter()` — monotonic,
+and the closest Python equivalent to C++'s `steady_clock`:
+
+- **Ideal**: every tick exactly 1000us apart
+- **Real (no RT kernel)**: 950-1200us typical, spikes to 5000us+
+- **Real (PREEMPT_RT)**: 995-1005us, max spike ~50us
+
+Measure with `perf_counter()`, not with `horus.dt()`. `horus.dt()` is documented
+as the *nominal* timestep — `1/rate` for a node with `rate=` set — and it is the
+same value in normal and deterministic mode. That is deliberate: a `dt()` that
+absorbed jitter would hide the very timing failures the scheduler reports as
+deadline misses. `horus.now()` reads the framework clock, which is a SimClock
+under `deterministic=True`. Neither one can tell you how late the OS woke your
+thread up; `perf_counter()` can.
+
+The scheduler prints its own per-node timing report at shutdown, which is the
+other half of the picture — your jitter numbers measure the *spacing* between
+ticks, the report measures the *duration* of each one:
+
+```
+Node                  Avg(us)  P99(us)  Max(us)   Stddev Budget(us) Overruns   Misses
+rt_motor_1khz             133      200     6198    117.8        500       16    5788!
+```
+
+Read `Avg`/`P99`/`Max` against `Budget`, and `Overruns` for how often you blew
+it. Do not read the `Misses` column — it currently prints the node's total tick
+count (5788 ticks here, not 5788 misses). For a real miss count use
+`sched.safety_stats()["deadline_misses"]`, or count the
+`[RT-thread] Deadline miss` lines in the log.
+
+## Key Takeaways
+
+- 1 kHz control is achievable on commodity Linux with HORUS — in Python, for as
+  long as the tail behaves; move the inner loop to Rust or C++ when it must not
+  miss
+- `core=` is critical — prevents OS migration mid-tick
+- `budget=` + `on_miss="safe_mode"` = automatic shutdown on timing failure
+- Measure jitter to prove your system meets requirements
+- `rt=True` is C++'s `prefer_rt()`; there is no `require_rt()`, so test
+  `sched.has_full_rt()` / `sched.degradations()` if degradation must be fatal
+- `blackbox_mb=` arms the flight recorder; the scheduler records every budget
+  violation and deadline miss with its measured microseconds for post-mortem
+  analysis
+
+## Next Steps
+
+- [Tutorial 2: Motor Controller](/tutorials/02-motor-controller-python) — the same PID loop at 100 Hz, with a simulated encoder to drive it
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-python) — six nodes, budgets and an emergency-stop path
+- [RT Configuration](/advanced/rt-config) — kernel, capabilities and core isolation

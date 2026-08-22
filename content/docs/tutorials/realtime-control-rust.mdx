@@ -1,0 +1,284 @@
+---
+title: "Tutorial: Real-Time Control (Rust)"
+description: "Build a 1kHz motor control loop with SCHED_FIFO, jitter measurement, and failsafe"
+order: 105
+---
+
+# Tutorial: Real-Time Control (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/realtime-control-python) and [C++](/tutorials/realtime-control-cpp).</Callout>
+
+Build a 1 kHz motor control loop — the kind that runs real industrial servos. Measure jitter, enforce deadlines, and prove your system meets timing requirements.
+
+## What You'll Build
+
+A control loop that:
+- Runs at exactly 1000 Hz
+- Reads encoder + computes PID + writes motor in < 500us
+- Measures tick-to-tick jitter
+- Fails safe (stops motor) if any tick exceeds 900us
+
+## Complete Code
+
+```rust
+use horus::prelude::*;
+use std::time::Instant;
+
+struct RtMotorLoop {
+    cmd: Topic<CmdVel>,     // motor.target — commanded RPM
+    encoder: Topic<CmdVel>, // encoder.rpm  — measured RPM
+    pwm: Topic<CmdVel>,     // motor.pwm    — duty cycle out
+
+    target_rpm: f64,
+    integral: f64,
+    prev_error: f64,
+    tick_count: u64,
+    jitter_sum_us: u64,
+    max_jitter_us: u64,
+    min_jitter_us: u64,
+    last_tick: Instant,
+}
+
+impl RtMotorLoop {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd: Topic::new("motor.target")?,
+            encoder: Topic::new("encoder.rpm")?,
+            pwm: Topic::new("motor.pwm")?,
+            target_rpm: 0.0,
+            integral: 0.0,
+            prev_error: 0.0,
+            tick_count: 0,
+            jitter_sum_us: 0,
+            max_jitter_us: 0,
+            min_jitter_us: u64::MAX,
+            last_tick: Instant::now(),
+        })
+    }
+}
+
+impl Node for RtMotorLoop {
+    fn name(&self) -> &str {
+        "rt_motor_1khz"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        // Touch every ring buffer once before the deadline clock starts. The
+        // first send/recv on a topic faults in its shared-memory pages, which
+        // costs milliseconds — inside tick() that is a budget overrun on tick 1.
+        self.pwm.send(CmdVel::new(0.0, 0.0));
+        let _ = self.cmd.recv();
+        let _ = self.encoder.recv();
+
+        self.last_tick = Instant::now();
+        hlog!(info, "1kHz RT loop initialized");
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let dt_us = now.duration_since(self.last_tick).as_micros() as u64;
+        self.last_tick = now;
+
+        // Track jitter statistics
+        if self.tick_count > 10 {
+            // skip first 10 ticks (startup)
+            self.max_jitter_us = self.max_jitter_us.max(dt_us);
+            self.min_jitter_us = self.min_jitter_us.min(dt_us);
+            self.jitter_sum_us += dt_us;
+        }
+        self.tick_count += 1;
+
+        // Read target velocity — drain to the newest, never queue up.
+        while let Some(cmd) = self.cmd.recv() {
+            self.target_rpm = cmd.linear as f64;
+        }
+
+        // Read actual RPM
+        let mut actual_rpm = 0.0;
+        while let Some(enc) = self.encoder.recv() {
+            actual_rpm = enc.linear as f64;
+        }
+
+        // PID (tuned for motor dynamics)
+        let error = self.target_rpm - actual_rpm;
+        self.integral = (self.integral + error * 0.001).clamp(-100.0, 100.0); // dt = 1ms
+        let derivative = (error - self.prev_error) * 1000.0;
+        self.prev_error = error;
+
+        let output =
+            (0.5 * error + 0.01 * self.integral + 0.001 * derivative).clamp(-1.0, 1.0);
+        self.pwm.send(CmdVel::new(output as f32, 0.0));
+
+        // Report jitter every 1000 ticks (1 Hz)
+        if self.tick_count % 1000 == 0 {
+            let avg = self.jitter_sum_us as f64 / (self.tick_count - 10) as f64;
+            hlog!(
+                info,
+                "jitter: min={}us avg={:.0}us max={}us (target=1000us)",
+                self.min_jitter_us,
+                avg,
+                self.max_jitter_us
+            );
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.pwm.send(CmdVel::new(0.0, 0.0));
+        self.integral = 0.0;
+
+        hlog!(
+            error,
+            "SAFE STATE — max jitter was {}us",
+            self.max_jitter_us
+        );
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new()
+        .tick_rate(1000_u64.hz())
+        .name("rt_control")
+        .blackbox(4) // 4 MB flight recorder for post-mortem analysis
+        .prefer_rt();
+
+    sched
+        .add(RtMotorLoop::new()?)
+        .order(0)
+        .rate(1000_u64.hz())
+        .budget(500_u64.us()) // must finish in 500us (50% of 1ms period)
+        .deadline(900_u64.us()) // absolute deadline 900us
+        .on_miss(Miss::SafeMode)
+        .core(3) // dedicated CPU core
+        .priority(95) // near-max SCHED_FIFO priority
+        .watchdog(100_u64.ms()) // if stuck for 100ms, trigger safety
+        .build()?;
+
+    println!("1kHz RT motor loop starting...");
+    println!("Monitor: horus log (see jitter stats)");
+    sched.run()
+}
+```
+
+Nothing in this program publishes `motor.target` or `encoder.rpm` — those come
+from your driver process, or from `horus topic pub` while you are testing. With
+no publisher, `recv()` returns `None`, the loop holds a target of zero, and the
+jitter numbers are still real: that is the measurement this tutorial is about.
+
+The node deliberately does **not** run under `deterministic(true)`. Tutorials 2
+and 3 use it to pin every node onto one ordered tick sequence; here the opposite
+is what you want. `.budget()` promotes the node to an RT node with its own
+executor thread, and that thread is what `.core()` and `.priority()` configure.
+
+<Callout type="note" title="`pin_core()` is spelled `.core()` in Rust">
+The C++ builder method is `pin_core(3)`; the Rust `NodeBuilder` calls the same
+thing `.core(3)`. `priority()`, `watchdog()`, `budget()`, `deadline()` and
+`on_miss()` keep their C++ names. On the scheduler, `spin()` is `run()` (or
+`run_for(3_u64.secs())` if you want it to stop by itself).
+</Callout>
+
+<Callout type="warn" title="There is no `horus::blackbox::record()` in Rust">
+The C++ helper is a log-buffer write under the hood: it publishes a
+Warning-level entry that shows up in `horus log` and is picked up by the flight
+recorder. `hlog!(error, ...)` writes to that same buffer, so the line above is
+the direct equivalent — it just carries the node name `unknown`, because
+`enter_safe_state()` runs outside the per-tick logging context.
+
+You lose nothing important. `.blackbox(4)` on the scheduler is what actually
+arms the recorder, and the scheduler writes the events that matter for a
+post-mortem by itself: `BudgetViolation`, `DeadlineMiss`, `NodeError` and
+scheduler start/stop, each with the measured and configured microseconds. Read
+them back with `horus blackbox`.
+</Callout>
+
+## Understanding the Timing Budget
+
+```
+|←────────── 1000 us (1 kHz period) ──────────→|
+|── budget ──|── slack ──|── deadline ──|
+|   500 us   |           |   900 us    |
+                                        ^ Miss::SafeMode triggers here
+```
+
+- **budget(500us)**: expected max computation time
+- **deadline(900us)**: absolute latest the tick can finish
+- **slack**: 400us buffer for OS scheduling jitter
+- If tick exceeds 900us → `enter_safe_state()` called → motor stops
+
+Both are measured on the tick itself — the time from entering `tick()` to
+leaving it — not on how late the thread woke up. Wake-up lateness shows up in
+the jitter numbers the node computes for itself.
+
+<Callout type="warn" title="`.watchdog()` makes this node *critical* — and that changes what a miss does">
+`Miss::SafeMode` on its own means "call `enter_safe_state()` once, then keep
+ticking"; the latch clears as soon as the node meets its deadline again. Adding
+a per-node `.watchdog()` registers the node with the safety monitor as a
+**critical node**, and for a critical node the *first* budget overrun or
+deadline miss escalates to a scheduler-wide emergency stop:
+
+```
+ EMERGENCY STOP: Critical node rt_motor_1khz exceeded tick budget: 2.028556ms > 500µs
+[RT-thread] budget violation in 'rt_motor_1khz': 2.028556ms > 500µs
+[RT-thread] Deadline miss in 'rt_motor_1khz': 2.152837ms > 900µs
+ EMERGENCY STOP: Critical node rt_motor_1khz missed deadline
+[RT-thread] SafeMode: 'rt_motor_1khz' entering safe state after deadline miss
+ Emergency stop activated - shutting down scheduler
+```
+
+For a 1 kHz servo that is usually the behaviour you want — a drive that cannot
+hold its loop rate should stop the machine, not limp. But if you are still
+tuning and want the "safe once, recover, keep running" behaviour that
+`Miss::SafeMode` describes, drop `.watchdog(100_u64.ms())` from the builder
+chain.
+</Callout>
+
+<Callout type="warn" title="A debug build will trip the budget immediately">
+Debug is 10–50x slower than release, and the scheduler says so at startup. The
+first tick of this program measured ~26 ms in a debug build without the
+shared-memory warm-up in `init()`, and ~2 ms with it — still four times the
+budget, and enough to e-stop a critical node on the way up. Steady state was
+fine (avg 18us, p99 23us against a 500us budget), so it is purely a startup
+transient. Build with `horus build --release` (or `cargo build --release`)
+before you read any of these numbers.
+
+`.prefer_rt()` also degrades rather than fails: without `CAP_SYS_NICE` you get
+`Could not set SCHED_FIFO ... continuing with normal priority`, and the
+`.priority(95)` request is dropped while `.core(3)` still takes effect. Grant it
+with `sudo setcap 'cap_sys_nice=ep' ./target/release/rt_control`, as described
+in [RT Configuration](/advanced/rt-config), or switch to `.require_rt()` in
+production so a machine without RT capability fails loudly instead.
+</Callout>
+
+## Jitter Measurement
+
+The code measures tick-to-tick timing with `std::time::Instant` — the Rust
+equivalent of C++'s `steady_clock`, and monotonic for the same reasons:
+
+- **Ideal**: every tick exactly 1000us apart
+- **Real (no RT kernel)**: 950-1200us typical, spikes to 5000us+
+- **Real (PREEMPT_RT)**: 995-1005us, max spike ~50us
+
+Measure with `Instant`, not with `horus::time::dt()`. `dt()` is documented as
+the *nominal* timestep — `1/rate` for a node with `.rate()` set — and it is the
+same value in normal and deterministic mode. That is deliberate: a `dt()` that
+absorbed jitter would hide the very timing failures the scheduler reports as
+deadline misses. `horus::time::now()` reads the framework clock, which is a
+`SimClock` under `deterministic(true)`. Neither one can tell you how late the OS
+woke your thread up; `Instant` can.
+
+## Key Takeaways
+
+- 1 kHz control is achievable on commodity Linux with HORUS
+- `.core()` is critical — prevents OS migration mid-tick
+- `.budget()` + `Miss::SafeMode` = automatic shutdown on timing failure
+- Measure jitter to prove your system meets requirements
+- `.prefer_rt()` for development, `.require_rt()` for production
+- `.blackbox(N)` arms the flight recorder; the scheduler records every budget
+  violation and deadline miss with its measured microseconds for post-mortem
+  analysis
+
+## Next Steps
+
+- [Tutorial 2: Motor Controller](/tutorials/02-motor-controller-rust) — the same PID loop at 100 Hz, with a simulated encoder to drive it
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-rust) — six nodes, budgets and an emergency-stop path
+- [RT Configuration](/advanced/rt-config) — kernel, capabilities and core isolation

@@ -1,0 +1,362 @@
+---
+title: "Tutorial 6: Services & Actions (Rust)"
+description: "Request/response RPC and long-running tasks with progress feedback"
+order: 60
+---
+
+# Tutorial 6: Services & Actions (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/06-services-actions-python) and [C++](/tutorials/06-services-actions-cpp).</Callout>
+
+Topics are fire-and-forget. Sometimes you need a **response** (services) or **progress updates** (actions). This tutorial covers both.
+
+## What You'll Learn
+
+- `ServiceServerBuilder` / `ServiceClient` for request/response
+- `ActionServerNode` / `ActionClient` for long-running tasks
+- The `service!` and `action!` macros — typed payloads instead of hand-parsed JSON
+- Cross-process service calls
+
+## Services: Request/Response
+
+A service is like a function call across processes. Client sends a request, server returns a response.
+
+### Example: Add Two Numbers
+
+```rust
+use horus::prelude::*;
+
+// Generates AddTwoIntsRequest, AddTwoIntsResponse and the AddTwoInts marker
+// type. The service name is the snake_case form of the type name, so these
+// two halves meet on "add_two_ints".
+service! {
+    /// Add two integers
+    AddTwoInts {
+        request {
+            a: i64,
+            b: i64,
+        }
+        response {
+            sum: i64,
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    // ── Server: listens for requests, computes response ─────────
+    // build() spawns the polling thread and returns a handle that owns it.
+    // Keep the handle alive: dropping it stops the server.
+    let _server = ServiceServerBuilder::<AddTwoInts>::new()
+        .on_request(|req| {
+            // Ok(response) answers the caller; Err(String) sends it a failure,
+            // which surfaces client-side as ServiceError::ServiceFailed.
+            Ok(AddTwoIntsResponse { sum: req.a + req.b })
+        })
+        .build()?;
+
+    // ── Client: sends request, waits for response ───────────────
+    // Nothing to pump here — the server answers from its own thread while
+    // call() blocks, and the timeout bounds the wait if it never does.
+    let mut client = ServiceClient::<AddTwoInts>::new()?;
+
+    match client.call(AddTwoIntsRequest { a: 3, b: 4 }, 1_u64.secs()) {
+        Ok(res) => println!("Response: sum = {}", res.sum),
+        // Output: Response: sum = 7
+        Err(e) => println!("Service call failed: {}", e),
+    }
+
+    Ok(())
+}
+```
+
+<Callout type="note" title="Typed payloads, no handler buffers">
+The C++ handler is handed raw bytes plus a `res_len` that is capacity on the
+way in and length written on the way out, so it has to parse and format the
+payload itself. The Rust handler takes an `AddTwoIntsRequest` and returns an
+`AddTwoIntsResponse` — the macro defines both structs and the transport
+serializes them. There is also no `process()` to pump: `build()` starts a
+polling thread, so the server answers requests no matter where your program
+is executing.
+</Callout>
+
+### How Services Work
+
+```
+Client                          Server
+  │                               │
+  │─── Request ─────────────────→ │  handler() runs on the server's
+  │    (via SHM topic)            │  polling thread, computes response
+  │  ←── Response ─────────────── │
+  │    (via SHM topic)            │
+```
+
+Under the hood, services use two SHM topics carrying bincode-serialized
+envelopes (`ServiceRequest` and `ServiceResponse`):
+- `{service_name}.request` — clients publish, server subscribes
+- `{service_name}.response.{client_id}` — server publishes, that one client subscribes
+
+Every client gets its own response topic, so concurrent callers never have to
+filter each other's replies off a shared one. Both names derive from
+`Service::name()`, which the macro sets to the snake_case form of the type name.
+
+Round-trip latency is dominated by the server's polling interval, not by
+serialization: with the 5 ms default a same-machine call measures roughly
+4–6 ms. Trade CPU for latency with `.poll_interval(200_u64.us())` on the
+builder.
+
+Three call flavors are available on `ServiceClient`:
+
+| Method | Behavior on failure |
+|--------|----------------------|
+| `call` | `Err(ServiceError::Timeout)` once the timeout elapses |
+| `call_optional` | `Ok(None)` on timeout, `Err` on a real failure |
+| `call_resilient` | retries transient errors (timeout, transport) with backoff |
+
+`AsyncServiceClient::call_async` returns a `PendingServiceCall` you poll with
+`check()` instead of blocking — useful when the call happens inside a node
+`tick()` that must not stall.
+
+## Actions: Long-Running Tasks with Progress
+
+Actions are for tasks that take time — navigating to a goal, calibrating a sensor, recording data.
+
+### Example: Navigate to Goal
+
+This is the **client half only**. Feedback and results reach a client solely
+because some action server is running its `tick()` — that is what publishes
+onto the feedback and result topics. Build the [Action Server](#action-server)
+shown below into its own binary and start it first, or the call has nothing to
+wait for.
+
+```rust
+use horus::prelude::*;
+
+// Both halves must agree on this definition — put it in a module both
+// binaries include, or in a small shared crate.
+action! {
+    /// Navigate to a target position
+    Navigate {
+        goal {
+            target_x: f64,
+            target_y: f64,
+        }
+        feedback {
+            distance_remaining: f64,
+            progress: f32,
+        }
+        result {
+            success: bool,
+            final_x: f64,
+            final_y: f64,
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    // Requires the "navigate" action server (shown below) running elsewhere.
+    let client = ActionClient::<Navigate>::new()?;
+
+    // send_goal_and_wait_with_feedback drains the client's topics itself, so
+    // no node has to tick for the callback to fire. Always bound the wait:
+    // with no server running, no result is ever published.
+    let outcome = client.send_goal_and_wait_with_feedback(
+        NavigateGoal { target_x: 5.0, target_y: 3.0 },
+        5_u64.secs(),
+        |fb| {
+            println!(
+                "  feedback: {:.0}% — {:.2} m remaining",
+                fb.progress * 100.0,
+                fb.distance_remaining
+            );
+        },
+    );
+
+    match outcome {
+        Ok(result) => println!(
+            "Arrived at ({:.1}, {:.1}) — success={}",
+            result.final_x, result.final_y, result.success
+        ),
+        // The sync client cancels the goal on its way out of a timeout, so a
+        // server that is merely slow does not keep driving after you gave up.
+        Err(ActionError::GoalTimeout) => {
+            println!("No result — is the 'navigate' action server running?")
+        }
+        Err(e) => println!("Goal failed: {}", e),
+    }
+
+    Ok(())
+}
+```
+
+`ActionClient` is an alias for `SyncActionClient`: it owns the goal for the
+duration of the blocking call. When you need the goal handle itself — to read
+`status()` or `last_feedback()` while other work continues, or to `cancel()` —
+use `ActionClientNode`, whose `send_goal()` returns a `ClientGoalHandle`. It is
+a `Node`, so its topics are created in `init()`: add it to a scheduler (or call
+`init()` on it yourself) before the first goal, or the send fails with
+`ActionError::ServerUnavailable`.
+
+### Action Lifecycle
+
+```
+Client                          Server
+  │                               │
+  │── Goal ─────────────────────→ │  on_goal() → Accept / Reject
+  │                               │
+  │  ←── Feedback ─────────────── │  (periodic progress updates)
+  │  ←── Feedback ─────────────── │
+  │  ←── Feedback ─────────────── │
+  │                               │
+  │  ←── Result ───────────────── │  (final result)
+  │                               │
+  │── Cancel ───────────────────→ │  (optional, client-initiated)
+```
+
+Each stage is its own SHM topic: `{action}.goal`, `{action}.cancel`,
+`{action}.feedback`, `{action}.result` and `{action}.status`.
+
+### Action Server
+
+Each accepted goal runs on its own thread, so the server stays responsive to
+cancellation while a goal executes. The server itself is a `Node` — add it to a
+scheduler and its `tick()` does the driving: intake of new goals, cancel and
+preemption handling, and dispatch of the feedback and results the goal threads
+produce.
+
+```rust
+use horus::prelude::*;
+
+action! {
+    Navigate {
+        goal { target_x: f64, target_y: f64 }
+        feedback { distance_remaining: f64, progress: f32 }
+        result { success: bool, final_x: f64, final_y: f64 }
+    }
+}
+
+fn main() -> Result<()> {
+    let server = ActionServerNode::<Navigate>::builder()
+        // Decide whether to accept the goal.
+        .on_goal(|goal| {
+            if goal.target_x.is_finite() && goal.target_y.is_finite() {
+                GoalResponse::Accept
+            } else {
+                GoalResponse::Reject("target is not a finite position".into())
+            }
+        })
+        .on_cancel(|_goal_id| CancelResponse::Accept)
+        // Runs on a dedicated thread per accepted goal. Poll for cancellation,
+        // publish feedback, and finish by returning a GoalOutcome.
+        .on_execute(|handle| {
+            // Read the goal out before finishing: succeed/canceled consume the
+            // handle, and `goal()` borrows from it.
+            let (tx, ty) = (handle.goal().target_x, handle.goal().target_y);
+            let (mut x, mut y) = (0.0_f64, 0.0_f64);
+
+            for step in 1..=10 {
+                if handle.is_cancel_requested() {
+                    return handle.canceled(NavigateResult {
+                        success: false,
+                        final_x: x,
+                        final_y: y,
+                    });
+                }
+
+                let t = step as f64 / 10.0;
+                x = tx * t;
+                y = ty * t;
+                let remaining = ((tx - x).powi(2) + (ty - y).powi(2)).sqrt();
+
+                handle.publish_feedback(NavigateFeedback {
+                    distance_remaining: remaining,
+                    progress: t as f32,
+                });
+                std::thread::sleep(200_u64.ms());
+            }
+
+            handle.succeed(NavigateResult { success: true, final_x: x, final_y: y })
+        })
+        .build();
+
+    // The scheduler tick is what drives the server: 50 Hz here bounds how fast
+    // a new goal is picked up and how promptly feedback reaches the client.
+    let mut sched = Scheduler::new().name("navigate_server").tick_rate(50_u64.hz());
+    sched.add(server).order(0).build()?;
+
+    println!("Action 'navigate' ready (Ctrl+C to stop)");
+    sched.run()
+}
+```
+
+Where C++ completes a goal as **Aborted** if the execute handler returns without
+calling `succeed`/`abort`/`canceled`, Rust makes that unrepresentable: the
+callback's return type is `GoalOutcome`, and the only way to build one is
+`handle.succeed(..)`, `.abort(..)`, `.canceled(..)` or `.preempted(..)`. The
+handle is moved in the process, so it cannot be stashed and used after the goal
+is finished either.
+
+The builder also carries the policy knobs: `.max_concurrent_goals(Some(1))`,
+`.preemption_policy(PreemptionPolicy::PreemptOld)` and `.goal_timeout(30_u64.secs())`.
+
+## Cross-Process Services
+
+Services work across processes — client and server can be separate binaries:
+
+```bash
+# One project, two binaries: src/bin/add_server.rs and src/bin/add_client.rs
+
+# Terminal 1: server
+cargo run --bin add_server
+
+# Terminal 2: client
+cargo run --bin add_client
+```
+
+Both connect through SHM. The `service!` block must be identical in both
+binaries: the topic names come from the type name, and bincode encodes fields
+by position rather than by name, so the two structs have to match field for
+field. Share one definition from a common module rather than copying it.
+
+Topic names are also not namespaced by payload type. If a Python program has
+already created `add_two_ints.request` as a generic dict topic — which is what
+[Tutorial 6 (Python)](/tutorials/06-services-actions-python) builds, having no
+typed service API to use — a typed server opening that name can crash on
+startup instead of reporting the mismatch. `horus clean --shm` clears the
+leftovers.
+
+The CLI is a third client. Any running server answers it, no rebuild needed:
+
+```bash
+horus service list
+horus service call add_two_ints '{"a": 3, "b": 4}'   # -> {"sum": 7}
+horus action list
+horus action send-goal navigate '{"target_x": 5.0, "target_y": 3.0}'
+```
+
+`send-goal` delivers the goal and prints its id; its `--wait` flag currently
+fails against a typed server, because the CLI opens `{action}.status` as
+untyped JSON while the server holds it as `GoalStatusUpdate`. Watch the goal
+from the client program instead.
+
+## When To Use What
+
+| Pattern | Use Case | Latency |
+|---------|----------|---------|
+| **Topic** | Continuous data (sensor readings, commands) | ~20 ns same-process / ~200 ns cross-process SHM |
+| **Service** | One-shot query (get parameter, check status) | one server poll interval (5 ms default) |
+| **Action** | Long task with progress (navigate, calibrate) | task duration + one server tick |
+
+## Key Takeaways
+
+- Services = synchronous request/response (like function calls)
+- Actions = asynchronous goal/feedback/result (like background tasks)
+- `service!` and `action!` generate the payload structs; the transport handles serialization
+- Both work same-process and cross-process via SHM
+- Client must specify a timeout for services and for waiting on a goal
+- Actions support cancellation: `handle.is_cancel_requested()` server-side, `ClientGoalHandle::cancel()` client-side
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-rust) — combine sensor, controller, and actuator
+- [Tutorial 7: Parameters Deep Dive](/tutorials/07-params-deep-dive-cpp) — runtime configuration
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference

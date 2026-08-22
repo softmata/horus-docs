@@ -1,0 +1,429 @@
+---
+title: "Tutorial 4: Custom Messages (Rust)"
+description: "Define custom message types and use them with typed topics"
+order: 40
+---
+
+# Tutorial 4: Custom Messages (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/04-custom-messages-python) and [C++](/tutorials/04-custom-messages-cpp).</Callout>
+
+HORUS provides 50+ built-in message types, but you'll often need your own. This tutorial shows how to define custom `#[repr(C)]` Pod messages usable across Rust, C++, and Python.
+
+## What You'll Learn
+
+- Defining messages with the `message!` macro
+- Using custom types with `Topic<T>`
+- Layout requirements for cross-language compatibility
+- When to use a fixed Pod message vs a flexible one
+
+## The Two Approaches
+
+### Approach 1: Let the Macro Serialize (Quick, Flexible)
+
+For prototyping or when the message schema changes frequently, define the message
+*without* `#[fixed]`. Every field type serde can handle is allowed — `String`,
+`Vec`, nested structs — and the topic serializes on the way through.
+
+<Callout type="warning" title="Rust has no JsonWireMessage">
+The C++ page reaches its JSON wire type through `horus_publisher_json_wire_new` /
+`_send`. Those functions, and the `JsonWireMessage` type they carry, live in
+`horus_cpp` — they belong to the C++ bridge, not to `horus`, and no Rust program
+can call them. Rust's equivalents are the two shown in this section: a `message!`
+without `#[fixed]` when you know the shape, and `GenericMessage` when you don't.
+</Callout>
+
+```rust
+use horus::prelude::*;
+
+message! {
+    /// Whatever the weather station happens to report today.
+    /// No `#[fixed]`, so fields may be String, Vec, nested structs.
+    WeatherReport {
+        location: String,
+        temperature: f64,
+        humidity: f64,
+        samples: Vec<f32>,
+        timestamp_ns: u64,
+    }
+}
+
+struct Sender {
+    out: Topic<WeatherReport>,
+}
+
+impl Sender {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            out: WeatherReport::topic("weather.report")?,
+        })
+    }
+}
+
+impl Node for Sender {
+    fn name(&self) -> &str {
+        "sender"
+    }
+
+    fn tick(&mut self) {
+        self.out.send(WeatherReport {
+            location: "lab".to_string(),
+            temperature: 25.3,
+            humidity: 60.0,
+            samples: vec![25.1, 25.2, 25.3],
+            timestamp_ns: horus::time::now().as_nanos(),
+        });
+    }
+}
+
+struct Receiver {
+    input: Topic<WeatherReport>,
+}
+
+impl Receiver {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            input: WeatherReport::topic("weather.report")?,
+        })
+    }
+}
+
+impl Node for Receiver {
+    fn name(&self) -> &str {
+        "receiver"
+    }
+
+    fn tick(&mut self) {
+        while let Some(r) = self.input.recv() {
+            hlog!(
+                info,
+                "{}: {:.1} C over {} samples",
+                r.location,
+                r.temperature,
+                r.samples.len()
+            );
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(2_u64.hz()).deterministic(true);
+    sched.add(Sender::new()?).order(0).build()?;
+    sched.add(Receiver::new()?).order(10).build()?;
+    sched.run_for(2_u64.secs())
+}
+```
+
+**Pros:** No FFI plumbing, any field types, no 4 KB payload ceiling — a `Vec` of
+100,000 floats crosses fine.
+**Cons:** A serialize/deserialize round trip on every send *and* every receive, so
+this is not the shape to put under a 1 kHz control loop.
+
+#### Schema-free: GenericMessage
+
+When the payload has no fixed shape at all — the closest analogue to the C++
+page's JSON wire message — send a `GenericMessage`. It carries a MessagePack blob
+and takes any `Serialize` value:
+
+```rust
+use horus::prelude::*;
+use std::collections::HashMap;
+
+fn main() -> Result<()> {
+    let topic: Topic<GenericMessage> = Topic::new("custom.data")?;
+
+    // Any Serialize value becomes a payload — here a plain map.
+    let mut reading: HashMap<String, f64> = HashMap::new();
+    reading.insert("temperature".to_string(), 25.3);
+    reading.insert("humidity".to_string(), 60.0);
+    topic.send(GenericMessage::from_value(&reading)?);
+
+    // The receiving side names the shape it expects.
+    if let Some(msg) = topic.recv() {
+        let data: HashMap<String, f64> = msg.to_value()?;
+        hlog!(info, "{:.1} C, {:.0}% RH", data["temperature"], data["humidity"]);
+    }
+    Ok(())
+}
+```
+
+`GenericMessage` has a hard 4096-byte payload ceiling (`MAX_GENERIC_PAYLOAD`);
+`from_value` returns an error rather than truncating. It is also the exact wire
+format behind Python's dict topics, which makes it the one custom-payload route
+that needs no build step on either side — see *Talking to C++ and Python* below.
+
+### Approach 2: Define a Fixed Pod Struct (Production, Zero-Copy)
+
+For production use, add `#[fixed]`. The macro emits the struct as `#[repr(C)]`
+with `Copy` and `Default`, and that is what selects the zero-copy SHM path: the
+bytes go straight into the ring slot with no serialization step.
+
+#### Step 1: Define it
+
+```rust
+message! {
+    #[fixed]
+    /// Custom sensor reading from a weather station
+    WeatherData {
+        temperature: f32,     // Celsius
+        humidity: f32,        // 0-100%
+        pressure: f32,        // hPa
+        wind_speed: f32,      // m/s
+        wind_direction: f32,  // degrees (0=N, 90=E)
+        timestamp_ns: u64,
+    }
+}
+```
+
+`#[fixed]` goes *before* the doc comment, directly above the message name. All
+fields must be `Copy`: a `String` or `Vec` here is a compile error, not a silent
+fallback.
+
+#### Step 2: Use it
+
+The macro gave you the type, its derives, and a layout-checked topic constructor.
+Nothing else is registered anywhere, so publisher and subscriber are ordinary
+nodes:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    #[fixed]
+    /// Custom sensor reading from a weather station
+    WeatherData {
+        temperature: f32,
+        humidity: f32,
+        pressure: f32,
+        wind_speed: f32,
+        wind_direction: f32,
+        timestamp_ns: u64,
+    }
+}
+
+// ── Publisher ───────────────────────────────────────────────────────────
+struct WeatherStation {
+    out: Topic<WeatherData>,
+}
+
+impl WeatherStation {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            out: WeatherData::topic("weather.data")?,
+        })
+    }
+
+    fn read_temperature(&self) -> f32 {
+        22.5
+    }
+    fn read_humidity(&self) -> f32 {
+        55.0
+    }
+    fn read_pressure(&self) -> f32 {
+        1013.25
+    }
+}
+
+impl Node for WeatherStation {
+    fn name(&self) -> &str {
+        "weather_station"
+    }
+
+    fn tick(&mut self) {
+        let data = WeatherData {
+            temperature: self.read_temperature(),
+            humidity: self.read_humidity(),
+            pressure: self.read_pressure(),
+            wind_speed: 0.0,
+            wind_direction: 0.0,
+            // Unlike horus_cpp, Rust ships a framework clock.
+            timestamp_ns: horus::time::now().as_nanos(),
+        };
+        self.out.send(data);
+    }
+}
+
+// ── Subscriber ──────────────────────────────────────────────────────────
+struct WeatherLogger {
+    input: Topic<WeatherData>,
+}
+
+impl WeatherLogger {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            input: WeatherData::topic("weather.data")?,
+        })
+    }
+}
+
+impl Node for WeatherLogger {
+    fn name(&self) -> &str {
+        "weather_logger"
+    }
+
+    fn tick(&mut self) {
+        // recv() returns None once the queue is drained.
+        while let Some(w) = self.input.recv() {
+            hlog!(
+                info,
+                "{:.1} C, {:.0}% RH, {:.1} hPa",
+                w.temperature,
+                w.humidity,
+                w.pressure
+            );
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new()
+        .tick_rate(10_u64.hz())
+        .name("weather")
+        .deterministic(true);
+
+    sched.add(WeatherStation::new()?).order(0).build()?;
+    sched.add(WeatherLogger::new()?).order(10).build()?;
+
+    sched.run_for(3_u64.secs())
+}
+```
+
+`WeatherData` is `Copy`, so `read_latest()` also works on it when you want the
+newest sample and don't care about the ones in between.
+
+<Callout type="note" title="There is no Step 3 through 6">
+The C++ tutorial needs six steps — an `impl_topic_ffi!` line, an
+`impl_pod_topic_c_api!` line, a mirrored C++ struct, seven hand-written C
+prototypes and a `HORUS_TOPIC_IMPL` specialization — because `horus_cpp` is a
+binding *over* exactly this Rust type. In Rust the macro is the whole pipeline.
+</Callout>
+
+#### Step 3: Guard against a message that changed shape
+
+`Topic::new` checks the message type's name and, for fixed messages, its size.
+Neither says anything about field layout, so two builds that keep the name and
+the size while reordering fields will happily share a topic:
+
+```rust,ignore
+// Robot A, built from v1.0 of the message crate
+message! { #[fixed] Pose { x: f32, y: f32 } }
+
+// Robot B, built from v1.1 — someone reordered the fields
+message! { #[fixed] Pose { y: f32, x: f32 } }
+```
+
+Same name, same eight bytes, coordinates silently swapped in flight. Every
+`message!` type therefore carries a `LAYOUT_HASH` over its name and each field's
+name and written type, and a `Type::topic(name)` constructor that supplies it:
+
+```rust
+use horus::prelude::*;
+
+message! {
+    #[fixed]
+    WeatherData {
+        temperature: f32,
+        humidity: f32,
+        pressure: f32,
+        wind_speed: f32,
+        wind_direction: f32,
+        timestamp_ns: u64,
+    }
+}
+
+fn main() -> Result<()> {
+    // Layout-checked: fails to open if the peer built a different WeatherData.
+    let checked = WeatherData::topic("weather.data")?;
+
+    // Unchecked: only the type name and size are compared.
+    let unchecked = Topic::<WeatherData>::new("weather.data")?;
+
+    hlog!(info, "layout hash {:#010x}", WeatherData::LAYOUT_HASH);
+    let _ = (checked, unchecked);
+    Ok(())
+}
+```
+
+With the checked form the mismatched peer fails to open the topic instead of
+misreading it:
+
+```text
+Communication error: Failed to create topic 'weather.data': message layout
+mismatch. This build's 'msgs::WeatherData' hashes to 0xf5f319cf, but the topic
+was opened with 0x1ab36d8b.
+The type name and size match, so only the field layout differs — two builds of
+the same message that reordered, renamed or retyped a field. Reading it would
+silently reinterpret the bytes rather than fail.
+Fix: rebuild both sides against the same message definition.
+```
+
+A hash of zero means "not supplied", so a peer still calling `Topic::new` is never
+rejected — it is simply not protected.
+
+## Talking to C++ and Python
+
+A `#[fixed]` message is zero-copy between Rust processes the moment it compiles.
+Reaching the other two languages is the plumbing their own tutorials describe:
+
+| Target | What it takes |
+|--------|---------------|
+| Another Rust process | Nothing — same definition, same layout hash |
+| C++ | The six-step FFI pipeline in [Tutorial 4 (C++)](/tutorials/04-custom-messages-cpp): `impl_topic_ffi!`, `impl_pod_topic_c_api!`, a mirrored C++ struct, a `HORUS_DECLARE_TOPIC` line and `HORUS_TOPIC_IMPL` |
+| Python | A `#[pyclass]` wrapper in `horus_py/src/messages.rs` plus a `pod_topic_types!` entry, then a rebuild — see [Tutorial 4 (Python)](/tutorials/04-custom-messages-python) |
+
+`GenericMessage` needs none of that. Python's dict topics are the same ring and
+the same MessagePack encoding, so the Rust snippet above pairs directly with:
+
+```python
+from horus import Topic
+
+# A bare string instead of a message class opens the same generic topic
+# the Rust `Topic<GenericMessage>` above opened.
+weather = Topic("custom.data")
+weather.send({"temperature": 25.3, "humidity": 60.0})
+
+reading = weather.recv()   # -> dict, or None
+if reading:
+    print(reading["temperature"])
+```
+
+## Layout Rules for Custom Types
+
+| Rule | Why |
+|------|-----|
+| `#[fixed]` on the message | Emits `#[repr(C)]` + `Copy`, which is what selects the zero-copy path |
+| Only primitive types + fixed arrays | `Vec`, `String`, `Box` are not `Copy` and can't cross SHM in place |
+| Same field order in C++ and Rust | Memory layout must match exactly |
+| Use `f32`/`f64`/`u8`/`u16`/`u32`/`u64`/`i32`/`i64` | Cross-language compatible primitives |
+| Fixed-size arrays `[T; N]` only | Variable-length data needs a flexible message or `GenericMessage` |
+| `timestamp_ns: u64` as last field | Convention for all HORUS messages |
+| Open with `Type::topic(name)` | Catches a peer built from a different field order |
+
+## When To Use Each Approach
+
+| Scenario | Approach |
+|----------|----------|
+| Prototyping, schema changing | `message!` without `#[fixed]` |
+| Payload shape not known at compile time | `GenericMessage` |
+| Production, performance-critical | `message!` with `#[fixed]` |
+| Cross-language (Rust + C++ + Python) | `#[fixed]` message + the per-language binding |
+| Talking to a Python dict topic, no build step | `GenericMessage` |
+| High-frequency sensor data (&gt;100 Hz) | `#[fixed]` message (zero-copy) |
+
+## Key Takeaways
+
+- A `message!` without `#[fixed]` is the fastest path to custom data — any field types, no plumbing, one serialize round trip per hop
+- `#[fixed]` buys zero-copy SHM in one macro; the C++ tutorial's six-step FFI pipeline exists because `horus_cpp` binds this Rust type, not the other way round
+- `GenericMessage` is the schema-free escape hatch — 4096 bytes max, and the same wire format as Python dict topics
+- Always put `timestamp_ns: u64` as the last field (convention)
+- Prefer `Type::topic(name)` over `Topic::<Type>::new(name)`: the layout hash is a compile-time constant compared once, and it turns a silently-misread message into an error
+
+## Next Steps
+
+- [Tutorial 5: Hardware & Real-Time (Rust)](/tutorials/05-hardware-rt-rust) — drive real hardware with these messages
+- [Tutorial 4: Custom Messages (Python)](/tutorials/04-custom-messages-python) — the same message from the Python side
+
+## See Also
+
+- [Topics & Communication](/rust-guide/topics#custom-message-types) — full `message!` and `Topic<T>` reference
+- [Standard Messages](/rust/api/messages) — the 50+ built-in types, before you write your own

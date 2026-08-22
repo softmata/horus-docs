@@ -1,0 +1,232 @@
+---
+title: "Tutorial 7: Parameters Deep Dive (Python)"
+description: "Runtime configuration with typed parameters, startup loading from YAML, and organizing params by subsystem"
+order: 71
+---
+
+# Tutorial 7: Parameters Deep Dive (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/07-params-deep-dive-rust) and [C++](/tutorials/07-params-deep-dive-cpp).</Callout>
+
+Parameters let you change robot behavior without recompiling. Tune PID gains, adjust speed limits, enable/disable features — from a YAML file read at startup, or from your own code while the robot is running.
+
+## What You'll Learn
+
+- `horus.Params` for key-value storage, with dict syntax
+- `get()` with defaults for safe access
+- Loading startup values from `.horus/config/params.yaml` (written by `horus param set`)
+- Organizing parameters by subsystem
+
+## Basic Usage
+
+```python
+import horus
+from horus import CmdVel, Topic
+
+
+class TunableController(horus.Node):
+    def __init__(self, params):
+        super().__init__(name="tunable_ctrl", rate=100, order=10)
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+        self.out = Topic(CmdVel, endpoint="motor.cmd")
+        # Params is a handle to a shared store, so holding a reference is the
+        # Python equivalent of C++'s `Params&` — no copy is made.
+        self.params = params
+
+    def init(self, info=None):
+        # Read a startup value back — get() falls back to "unnamed".
+        info.log_info(f"robot: {self.params.get('robot_name', 'unnamed')}")
+
+    def tick(self, info=None):
+        # Read parameters every tick — picks up any assignment done elsewhere
+        # in this process (there is no live channel from the CLI).
+        max_speed = self.params.get("max_speed", 0.5)
+        gain = self.params.get("controller_gain", 0.8)
+        enabled = self.params.get("motor_enabled", True)
+
+        if not enabled:
+            self.out.send(CmdVel(linear=0.0, angular=0.0))
+            return
+
+        cmd = self.cmd.recv()
+        if cmd is None:
+            return
+
+        scaled = min(cmd.linear * gain, max_speed)
+        self.out.send(CmdVel(linear=scaled, angular=0.0))
+
+
+params = horus.Params()
+
+# Override whatever params.yaml supplied for these keys.
+params["max_speed"] = 0.5
+params["controller_gain"] = 0.8
+params["motor_enabled"] = True
+params["robot_name"] = "atlas"
+
+sched = horus.Scheduler(tick_rate=100, name="tunable", deterministic=True)
+sched.add(TunableController(params))
+sched.run()
+```
+
+<Callout type="note" title="Params is a dict, not a setter API">
+There is no `params.set(key, value)` in Python — assignment is `params["key"] = value`,
+and the rest of the mapping protocol comes with it: `"key" in params`,
+`len(params)`, `for key in params`, plus `params.keys()`, `params.has(key)` and
+`params.remove(key)`. `params["missing"]` raises `KeyError`; `params.get("missing")`
+returns `None`, and `params.get("missing", default)` returns the default.
+</Callout>
+
+<Callout type="warning" title="Log through the info argument, not self">
+Overriding `tick()` or `init()` replaces the base-class implementation that
+stores the scheduler's `NodeInfo` on `self`, so `self.log_info(...)` warns
+`called outside scheduler — message dropped` and the message never reaches
+`horus log`. The `info` argument the scheduler passes in *is* that object — call
+`info.log_info()` / `info.log_warning()` / `info.log_error()` / `info.log_debug()`
+on it directly. (Assigning `self.info = info` at the top of the method also
+works, if you prefer `self.log_info(...)`.)
+</Callout>
+
+`horus.Scheduler` has no `params=` argument — Rust's `.with_params()` has no
+Python counterpart. Pass the store into each node's constructor instead, as
+above. Nothing is lost by that: the scheduler does not push parameter changes to
+nodes in any language, so polling with `get()` inside `tick()` is how a node sees
+a new value.
+
+### Where startup values come from
+
+Constructing `horus.Params()` layers three sources, lowest precedence first:
+HORUS's built-in defaults, then `.horus/config/params.yaml` (the file
+`horus param set` writes), then any `HORUS_PARAM_*` environment variables. That
+happens **once, in the constructor** — there is no file watcher and no live
+channel from the `horus param` CLI, so a `horus param set` issued while the node
+is running changes nothing until you restart the process.
+
+Each layer overrides individual *keys* of the layer below it; it never replaces
+the whole map. Setting one key in `params.yaml` therefore leaves the built-in
+defaults for `max_speed`, `emergency_stop_distance`, `collision_threshold` and
+the rest intact.
+
+Note the ordering in the script above: the `params[...] = ...` assignments run
+*after* the file has been loaded, so they overwrite whatever `params.yaml` held
+for those keys. Drop them and rely on the fallbacks in `params.get("key", default)`
+if you want the YAML file to win.
+
+Two extras that C++ does not expose. `params.save()` writes the store back to
+`.horus/config/params.yaml` — the whole store, built-in defaults included, not
+just the keys you touched. And `horus.Params("tuning.yaml")` loads that file
+after the three layers; note that it **replaces** the store rather than layering
+on top of it, so a two-key `tuning.yaml` leaves you with exactly two parameters
+and no `emergency_stop_distance` at all. Use it for a complete profile, not for
+a patch. (A path that does not exist is a no-op, and you keep the three layers.)
+
+## Supported Types
+
+Values round-trip through JSON, so anything JSON-shaped works — including lists
+and dicts, which C++'s four typed accessors cannot hold.
+
+| Type | Set | Get |
+|------|-----|-----|
+| `float` | `params["key"] = 1.5` | `params.get("key", 0.0)` |
+| `int` | `params["key"] = 42` | `params.get("key", 0)` |
+| `bool` | `params["key"] = True` | `params.get("key", False)` |
+| `str` | `params["key"] = "value"` | `params.get("key", "")` |
+| `list` / `dict` | `params["key"] = [1.0, 2.0, 3.0]` | `params.get("key", [])` |
+
+<Callout type="note" title="You get back the type that was stored">
+There is no `get<T>()` here — the default you pass is a fallback, not a type
+request. A key stored as an integer comes back as an `int`, so the built-in
+`params.get("camera_fps", 30.0)` is `30`, not `30.0`, and a value that arrived
+from `params.yaml` as `1` is an `int` even where you meant a float. Wrap the read
+in `float(...)` when the arithmetic downstream cares.
+</Callout>
+
+## Organizing Parameters
+
+Group by subsystem:
+
+```python
+import horus
+
+params = horus.Params()
+
+# Locomotion
+params["loco.max_speed"] = 0.5
+params["loco.max_angular"] = 1.0
+params["loco.wheel_base"] = 0.3
+
+# PID
+params["pid.kp"] = 2.0
+params["pid.ki"] = 0.1
+params["pid.kd"] = 0.05
+
+# Safety
+params["safety.min_distance"] = 0.3
+params["safety.estop_enabled"] = True
+```
+
+Keys are plain strings and the store is flat, so the dot is a naming convention
+rather than a nested namespace — `params["loco"]` is a `KeyError`, and
+`params.keys()` returns `loco.max_speed` sorted next to `loco.wheel_base`, which
+is the whole point.
+
+One caveat on the third layer: `HORUS_PARAM_*` lowercases the name and does not
+translate underscores into dots, so `HORUS_PARAM_PID_KP=2.5` sets `pid_kp`, not
+`pid.kp`. Keys you expect a launch file to override are easier to reach with
+underscore names.
+
+## Pattern: Parameter Validation
+
+```python
+import horus
+
+
+class Locomotion(horus.Node):
+    def __init__(self, params):
+        super().__init__(name="locomotion", rate=50, order=0)
+        self.params = params
+
+    def init(self, info=None):
+        kp = self.params.get("pid.kp", -1.0)
+        if kp < 0:
+            info.log_error("pid.kp must be >= 0")
+            return
+
+        max_speed = self.params.get("loco.max_speed", 0.5)
+        if max_speed > 2.0:
+            info.log_warning("max_speed > 2.0 m/s - are you sure?")
+
+    def tick(self, info=None):
+        pass
+```
+
+There is no node-name argument, unlike C++'s `horus::log::info(name(), ...)`. The
+`info` object the scheduler hands to `init()` already belongs to this node, so
+the message lands under `locomotion` — which is what `horus log locomotion`
+filters on — even though the key being checked lives under a different prefix.
+
+Returning early, as above, keeps the node registered. Raising instead is the
+stronger option: the scheduler logs the exception, leaves the node uninitialized
+so it never ticks, and keeps the rest of the system running — it does not stop
+the process. If a bad value should stop the robot outright, validate at module
+level before `sched.run()` and raise there.
+
+## Key Takeaways
+
+- Read params every tick — captures assignments made elsewhere in the process
+- Startup values load once, in the `Params()` constructor — restart to pick up a `horus param set`
+- Always provide defaults: `params.get("key", 0.0)` never raises; bare `params["key"]` does
+- Assignment replaces `set()`: `params["key"] = value`
+- Use dotted naming (`pid.kp`, `loco.max_speed`) to organize
+- Validate in `init()` — log warnings for dangerous values, through the `info` argument
+- `horus.Params` wraps the same thread-safe store the Rust and C++ APIs use
+
+## Next Steps
+
+- [Tutorial 2: Motor Controller (Python)](/tutorials/02-motor-controller-python) — the `KP`/`KI`/`KD` constants that belong in params
+- [Tutorial 3: Full Robot System (Python)](/tutorials/03-full-robot-python) — one store shared across six nodes
+- [Tutorial 8: Multi-Process Systems](/tutorials/08-multi-process-cpp) — splitting a system across processes
+
+## See Also
+
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

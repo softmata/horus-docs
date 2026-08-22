@@ -1,0 +1,265 @@
+---
+title: "Migrating from ROS2 (Python)"
+description: "Side-by-side comparison of ROS2 rclpy and HORUS Python — move faster with less code"
+order: 119
+---
+
+# Migrating from ROS2 (Python)
+
+<Callout type="info">Prefer another language? The same guide exists for [Rust](/tutorials/migrating-from-ros2-rust) and [C++](/tutorials/migrating-from-ros2-cpp).</Callout>
+
+This guide shows ROS2 rclpy patterns and their HORUS equivalents side by side.
+
+## Node Definition
+
+### ROS2 (27 lines)
+
+```python
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+
+
+class Controller(Node):
+    def __init__(self):
+        super().__init__("controller")
+        self.sub = self.create_subscription(
+            LaserScan, "scan", self.scan_cb, 10)
+        self.pub = self.create_publisher(Twist, "cmd_vel", 10)
+
+    def scan_cb(self, msg):
+        cmd = Twist()
+        cmd.linear.x = 0.3 if msg.ranges[0] > 0.5 else 0.0
+        self.pub.publish(cmd)
+
+
+def main():
+    rclpy.init()
+    rclpy.spin(Controller())
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### HORUS (19 lines)
+
+```python
+import horus
+from horus import CmdVel, LaserScan, Topic
+
+
+class Controller(horus.Node):
+    def __init__(self):
+        super().__init__(name="controller", rate=50)
+        self.scan = Topic(LaserScan, endpoint="scan")
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+
+    def tick(self, info=None):
+        scan = self.scan.recv()
+        if scan is None:
+            return
+        linear = 0.3 if scan.ranges[0] > 0.5 else 0.0
+        self.cmd.send(CmdVel(linear=linear, angular=0.0))
+
+
+horus.run(Controller())
+```
+
+`endpoint=` names the topic and is the shared-memory key, so it is what a Rust or C++ node on the other side of `"scan"` connects to. A bare `Topic(LaserScan)` derives the name from the message type instead (`"scan"`, as it happens — but say what you mean).
+
+## Pattern Comparison
+
+| Concept | ROS2 rclpy | HORUS Python |
+|---------|------------|--------------|
+| Node | `class C(rclpy.node.Node)` | `class C(horus.Node)` |
+| Node name | `super().__init__("controller")` | `super().__init__(name="controller", rate=50)` |
+| Publisher | `create_publisher(T, topic, qos)` | `Topic(T, endpoint=topic)` |
+| Subscriber | `create_subscription(T, topic, cb, qos)` | the same `Topic` |
+| Callback | bound method handed to `create_subscription` | `tick(self, info=None)` calling `recv()` |
+| Message | `geometry_msgs.msg.Twist` | `horus.CmdVel` |
+| Publish | `pub.publish(msg)` | `topic.send(msg)` |
+| Receive | callback-driven | poll: `topic.recv()` → message or `None` |
+| Init | `rclpy.init()` / `rclpy.shutdown()` | nothing needed |
+| Run | `rclpy.spin(node)` | `horus.run(node)` |
+| Rate | `create_timer(0.01, cb)` | `rate=100` on the node |
+| Ordering | executors and callback groups | `order=0` plus `deterministic=True` |
+| QoS | `QoSProfile(depth=10, reliability=...)` | `budget=5 * horus.ms, on_miss="skip"` |
+| Package | `package.xml` + `setup.py` + `setup.cfg` | `horus.toml` |
+| Transport | DDS over the network | shared memory, same machine |
+
+## Key Differences
+
+### Still a Subclass — but Not a Framework Object
+
+This is the one place where the C++ comparison does not carry over: HORUS Python *does* use inheritance. `class Controller(horus.Node)` looks almost exactly like `class Controller(rclpy.node.Node)`, and for most migrations the class statement is a rename.
+
+What changes is what the base class does for you. `rclpy.node.Node` is a live handle into the middleware — it owns publishers, subscriptions, timers, parameters and a callback group, and every one of those is created by calling a method on it. `horus.Node` is a description: a name, a rate, an `order`, a budget, and the methods you override. Topics are plain attributes you construct yourself, and the scheduler that runs the node is a separate object.
+
+### No Callbacks, No Executors
+
+rclpy delivers messages by invoking your callbacks from an executor. Which executor, how many threads it has, and which callback group each subscription belongs to together decide whether two callbacks can run at once — and getting it wrong produces the classic rclpy deadlock, where a service call made from inside a callback in the same mutually-exclusive group never returns.
+
+HORUS has no callbacks. The scheduler calls `tick()` on your node at its rate, and inside `tick()` you poll the topics you care about. There is one control flow per node, so there is no reentrancy to reason about:
+
+```python
+import horus
+from horus import CmdVel, Topic
+
+
+class Drain(horus.Node):
+    def __init__(self):
+        super().__init__(name="drain", rate=100)
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+
+    def tick(self, info=None):
+        # recv() returns one message or None. Loop to drain a burst rather
+        # than falling one tick behind per queued message.
+        latest = None
+        while True:
+            msg = self.cmd.recv()
+            if msg is None:
+                break
+            latest = msg
+        if latest is not None:
+            self.log_info(f"latest command: {latest.linear:.2f} m/s")
+```
+
+### No IDL / .msg Files
+
+ROS2 requires `.msg` files plus `rosidl` codegen, and a Python package that wants a custom message needs a second, CMake-based package to generate it. HORUS gives you three options, none of which involve a codegen step at build time:
+
+1. **Built-in types** — `CmdVel`, `Imu`, `LaserScan`, `Odometry`, `Image` and the rest import straight from `horus`. They are `#[repr(C)]` structs shared with Rust and C++, and they take the zero-copy path.
+2. **Dict topics** — a bare-string topic carries any JSON-shaped dict, serialized with MessagePack, with no schema and no build step:
+
+```python
+from horus import Topic
+
+status = Topic("robot.status")
+status.send({"battery_level": 85.0, "error_code": 0, "is_active": True})
+
+data = status.recv()          # -> dict, or None if nothing queued
+if data is not None:
+    print(data["battery_level"])
+```
+
+3. **Compiled messages** — `horus.msggen` adds a real Rust type with named fields, but it needs a `horus_py` source checkout and a `maturin` rebuild, and the result still travels the MessagePack path rather than the zero-copy one. See [Custom Messages](/python/api/custom-messages).
+
+Dict topics have a hard ceiling: the encoded payload must be at most 4096 bytes, roughly a thousand floats. That is ample for poses, control values and feature vectors, and far too small for an image — those belong on a typed topic carrying `horus.Image`, which is pool-backed and never passes through the encoder.
+
+### Zero-Copy IPC
+
+ROS2 copies data through the DDS middleware. A HORUS typed topic writes the message straight into a shared-memory ring — no serialization, no broker, no network stack — and pool-backed payloads (`Image`, `PointCloud`, `DepthImage`) keep the bytes in the pool and put only a descriptor through the ring, so `to_numpy()` on the receiving side hands you a view rather than a copy.
+
+<Callout type="warning" title="Python topics never leave the machine">
+Python topics are shared-memory only. A Python node reaches another machine only when a Rust process built with the `net` feature replicates the topic for it — `horus run --net` — and which topics cross is decided by the `[network]` section of `horus.toml`, not in Python. If your ROS2 system relies on DDS discovery across hosts, that part of the migration is a Rust-side replicator, not a Python change. See [Python Bindings](/python/api/python-bindings#multi-machine-systems).
+</Callout>
+
+### Deterministic Scheduling
+
+rclpy's ordering depends on the executor and on message arrival. HORUS provides explicit `order=` and an optional `deterministic=True` mode that keeps every node on the main tick loop and runs them sequentially in that order:
+
+```python
+import horus
+from horus import CmdVel, Topic
+
+
+class Estimator(horus.Node):
+    def __init__(self):
+        super().__init__(name="estimator", rate=100, order=0)
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+
+    def tick(self, info=None):
+        self.cmd.send(CmdVel(linear=0.2, angular=0.0))
+
+
+class Planner(horus.Node):
+    def __init__(self):
+        super().__init__(
+            name="planner",
+            rate=100,
+            order=1,
+            budget=5 * horus.ms,
+            on_miss="safe_mode",
+        )
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+
+    def tick(self, info=None):
+        self.cmd.recv()
+
+    def enter_safe_state(self):
+        self.log_error("planner safed")
+
+
+sched = horus.Scheduler(tick_rate=100, name="robot", deterministic=True)
+sched.add(Estimator())
+sched.add(Planner())
+print("nodes:", sched.get_node_names())
+sched.run(duration=3.0)
+```
+
+Without `deterministic=True`, `budget=` promotes a node to a real-time node that the scheduler hands to its own executor thread, and `order=` then only sorts nodes *within* an executor. Note that `budget=` and `deadline=` are in **seconds**: `budget=5 * horus.ms` is five milliseconds, while `budget=5` is five seconds.
+
+### Field Names Differ from Rust and C++
+
+The wire format is identical across languages — the same shared-memory struct — but the Python attribute names are not always the same as the Rust and C++ field names, so a straight transliteration of a Rust example will raise `AttributeError`:
+
+```python
+from horus import Imu, LaserScan, Odometry
+
+# Imu exposes scalar axes, where Rust and C++ use arrays:
+# accel_z here, linear_acceleration[2] there.
+imu = Imu(accel_x=0.0, accel_y=0.0, accel_z=9.81,
+          gyro_x=0.0, gyro_y=0.0, gyro_z=0.1)
+
+# Odometry is flattened too: odom.x, not odom.pose.x.
+odom = Odometry(x=1.0, y=2.0, theta=0.5)
+
+# LaserScan.ranges is a plain list, not a view into the message.
+scan = LaserScan(angle_min=-3.14, angle_max=3.14,
+                 range_min=0.1, range_max=30.0)
+ranges = scan.ranges
+ranges[0] = 1.2
+scan.ranges = ranges          # assign the whole list back
+```
+
+## Migration Checklist
+
+1. Replace `rclpy.node.Node` with `horus.Node`, and move the topic setup out of `create_*` calls into plain attributes
+2. Replace `create_publisher(T, topic, qos)` with `Topic(T, endpoint=topic)`
+3. Replace `create_subscription(T, topic, cb, qos)` with the same `Topic` — one object does both directions
+4. Move callback bodies into `tick(self, info=None)`, driven by `recv()`
+5. Replace `create_timer` with the node's `rate=`
+6. Replace executors and callback groups with `order=` and `deterministic=True`
+7. Replace `.msg` files with `horus` message types, a dict topic, or `horus.msggen`
+8. Replace `rclpy.init()` / `spin()` / `shutdown()` with `horus.run(node)`
+9. Replace `package.xml` + `setup.py` with `horus.toml`
+10. Replace `ros2 launch` with `horus launch`, and `ros2 topic echo` with `horus topic echo`
+
+## Performance
+
+The transport under a Python topic is the same shared-memory ring the Rust and C++ nodes use — around 40-85 ns depending on the backend, and 20 ns for a 16-byte `CmdVel`. Python does not get those numbers. Every `send()` and `recv()` crosses PyO3 and takes the GIL, and that crossing, not the transport, is what you are actually paying for: **budget microseconds, not nanoseconds**, for Python-to-Python traffic.
+
+Two consequences worth planning around:
+
+- **Typed topics beat dict topics by a wide margin.** A `CmdVel` is copied into the ring as a struct; a dict is MessagePack-encoded on send and decoded on receive. Prefer the built-in types on any hot path.
+- **Keep the innermost loop out of Python.** What sets a Python node's floor is the interpreter call and the GIL, not HORUS. Put a hard real-time loop in a Rust or C++ node and keep Python for perception, planning, orchestration and glue — they share the same topics, so the split costs nothing at the boundary.
+
+Measure it on your own machine rather than trusting a number from someone else's, and measure a release build — a debug build of the extension module runs several times slower:
+
+```bash
+cd horus_py
+maturin develop --release
+python3 benchmarks/bench_python.py
+```
+
+See [Performance Optimization](/performance/performance) for the framework-level measurement table, and [Python Bindings](/python/api/python-bindings#backend-selection) for the per-backend transport figures.
+
+## Next Steps
+
+- [Tutorial 1: IMU Sensor Node (Python)](/tutorials/01-sensor-node-python) — the publish/subscribe pattern from scratch
+- [Tutorial 2: Motor Controller (Python)](/tutorials/02-motor-controller-python) — budgets, `enter_safe_state()` and closed-loop control
+- [Tutorial 3: Full Robot System (Python)](/tutorials/03-full-robot-python) — six nodes, parameters and transforms in one scheduler
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference

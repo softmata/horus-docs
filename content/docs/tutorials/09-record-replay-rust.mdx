@@ -1,0 +1,331 @@
+---
+title: "Tutorial 9: Record & Replay (Rust)"
+description: "Record topic data for debugging and replay it offline"
+order: 90
+---
+
+# Tutorial 9: Record & Replay (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/09-record-replay-python) and [C++](/tutorials/09-record-replay-cpp).</Callout>
+
+Record your nodes' topic data while your robot runs, then replay it offline for debugging. This is the robotics equivalent of a flight recorder.
+
+## What You'll Learn
+
+- Using `horus run --record` to capture topic data, and `horus record list/info/clean` to manage the sessions
+- Using `horus record replay` to play back a recording, and `horus record inject` to run live nodes against it
+- Driving record and replay from Rust, without the CLI
+- Using BlackBox for crash analysis
+- Designing nodes that work with both live and recorded data
+
+## Recording Live Data
+
+Recording is enabled per run with the `--record` flag — pass a session name and
+every topic your nodes publish or subscribe to is snapshotted once per tick for
+the lifetime of the run:
+
+```bash
+# Record this run's topic data into a named session
+horus run --record session_001
+
+# Then manage captured sessions with the `horus record` subcommands:
+horus record list                 # list captured sessions
+horus record info session_001     # inspect one session
+horus record clean --older-than 7 # delete sessions older than 7 days
+```
+
+Each snapshot is stamped with a microsecond wall-clock timestamp and the tick number. Because it is a per-tick sample rather than a per-message log, a topic published twice inside one tick contributes only its latest value.
+
+Nothing in your node code changes: `--record` sets `HORUS_RECORD_SESSION`, and
+`Scheduler::new()` reads that variable and turns recording on for you. To record
+unconditionally — a soak test, a field robot that should always keep a flight
+recording — ask for it in code instead:
+
+```rust
+use horus::prelude::*;
+
+fn main() -> Result<()> {
+    // The same switch `horus run --record <session>` flips, but always on.
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .name("robot")
+        .with_recording();
+
+    println!("recording: {}", sched.is_recording());
+    sched.run()
+}
+```
+
+Sessions land in `~/.local/share/horus/recordings/<session>/` (on macOS,
+`~/Library/Application Support/horus/recordings/`), one `<node>@<id>.horus` file
+per node plus a `scheduler@<id>.horus` index.
+
+<Callout type="note" title="A topic is captured once a node has used it">
+`Topic::new()` alone does not put a topic in the recording. A `Topic<T>`
+registers itself against the owning node the first time you call `send()` or
+`recv()` on it from inside a callback the scheduler drives — `init()`, `tick()`
+or `shutdown()` — and the recorder only samples topics that are registered. A
+topic your node constructs but never uses from one of those, or one you drive
+from a thread of your own that the scheduler does not know about, simply will
+not be in the session.
+</Callout>
+
+## Replaying Recorded Data
+
+`horus record replay` re-runs the recording itself: it builds a fresh scheduler
+containing only replay nodes, which republish the recorded outputs onto the same
+SHM topics. None of your compiled node code is loaded — this is for inspecting
+what happened, at whatever speed you like:
+
+```bash
+# Replay a session at original speed (pass the session name)
+horus record replay session_001
+
+# Replay at 2x speed (for faster analysis)
+horus record replay session_001 --speed 2.0
+
+# Time-travel: replay a specific tick window
+horus record replay session_001 --start-tick 350 --stop-tick 500
+```
+
+To run your *own* recompiled nodes against the recorded sensor data, use
+`horus record inject` instead. It replays only the nodes you name and launches
+your source file alongside them with `horus run`, so live code and recorded data
+share the same topics:
+
+```bash
+# Replay the recorded lidar node; run controller.rs live against it
+horus record inject session_001 --nodes lidar_node --script controller.rs
+
+# Same, at half speed, over one tick window
+horus record inject session_001 --nodes lidar_node --script controller.rs \
+    --speed 0.5 --start-tick 350 --stop-tick 500
+```
+
+### Replaying from Rust
+
+Everything the CLI does is a `Scheduler` builder call, so you can assemble the
+same mix inside a test binary — recorded nodes beside live ones, with the tick
+window and speed set in code:
+
+```rust
+use horus::prelude::*;
+use std::path::PathBuf;
+
+fn main() -> Result<()> {
+    // One node's recording out of a session directory.
+    let recording = PathBuf::from(
+        "/home/me/.local/share/horus/recordings/session_001/lidar_node@abc123.horus",
+    );
+
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz()).deterministic(true);
+
+    // Republishes lidar_node's recorded outputs onto the same topics.
+    sched.add_replay(recording, 0)?;
+
+    // Your own nodes go in beside it, exactly as in a live run:
+    // sched.add(Controller::new()?).order(1).build()?;
+
+    // Window and speed come AFTER add_replay — see the note below.
+    let mut sched = sched
+        .start_at_tick(350)
+        .stop_at_tick(500)
+        .with_replay_speed(0.5);
+
+    println!("Replaying ticks 350-500 at 0.5x");
+    sched.run()
+}
+```
+
+<Callout type="warning" title="Order matters: replay settings after add_replay()">
+`stop_at_tick()` and `with_replay_speed()` write into the replay state that
+`add_replay()` (or `replay_from()`) creates. Called on a scheduler that has no
+recording loaded yet they are silently ignored — you get a full-speed replay of
+the whole recording and no error. `horus record inject` applies them in this
+same order internally.
+</Callout>
+
+`Scheduler::replay_from(scheduler_path)` is the whole-session version — it
+loads every node from a `scheduler@<id>.horus` file, which is what
+`horus record replay` does internally. `Scheduler::list_recordings()` and
+`Scheduler::delete_recording(name)` are the CLI's `list` and `delete` as plain
+functions, useful when a regression test wants to clean up after itself.
+
+## Designing for Replay
+
+The key pattern: separate your **processing nodes** from your **hardware drivers**. Processing nodes subscribe to topics — they don't care if data comes from live hardware or a recording.
+
+```rust
+use horus::prelude::*;
+
+// This controller works identically with live OR recorded data
+struct Controller {
+    scan: Topic<LaserScan>,
+    cmd: Topic<CmdVel>,
+}
+
+impl Controller {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+            cmd: Topic::new("cmd_vel")?,
+        })
+    }
+}
+
+impl Node for Controller {
+    fn name(&self) -> &str {
+        "controller"
+    }
+
+    fn tick(&mut self) {
+        // Drain to the freshest scan on the topic; do nothing if none arrived.
+        let mut latest = None;
+        while let Some(scan) = self.scan.recv() {
+            latest = Some(scan);
+        }
+        let Some(scan) = latest else { return };
+
+        // This code runs the same whether lidar.scan comes from
+        // a real LiDAR or from `horus record inject`
+        let mut min_range = 999.0_f32;
+        for r in scan.ranges.iter().copied() {
+            if r > 0.01 && r < min_range {
+                min_range = r;
+            }
+        }
+
+        let linear = if min_range > 0.5 { 0.3 } else { 0.0 };
+        self.cmd.send(CmdVel::new(linear, 0.0));
+    }
+}
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .name("replay_demo")
+        .deterministic(true);
+
+    sched.add(Controller::new()?).order(0).build()?;
+    sched.run()
+}
+```
+
+The node names matter here: `horus record inject --nodes lidar_node` matches on
+the string a node returns from `name()`, and that is also the filename the
+session is written under. Rename a node between the recording and the replay and
+the injector will not find it.
+
+## BlackBox for Crash Analysis
+
+Rust has no `horus::blackbox::record()` free function — but it does not need
+one. The C++ helper is a thin wrapper that publishes a Warning-level entry into
+the shared-memory log ring buffer, which is exactly what `hlog!(warn, ...)`
+already does from a node. That buffer lives outside your process, so the entries
+are still there after a crash:
+
+```rust
+use horus::prelude::*;
+
+struct SafetyMonitor {
+    scan: Topic<LaserScan>,
+    estop: Topic<EmergencyStop>,
+}
+
+impl SafetyMonitor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+            estop: Topic::new("safety.estop")?,
+        })
+    }
+}
+
+impl Node for SafetyMonitor {
+    fn name(&self) -> &str {
+        "safety"
+    }
+
+    fn tick(&mut self) {
+        // Record important events during operation. The node's name is the
+        // category the entry is filed under.
+        if let Some(scan) = self.scan.recv() {
+            let closest = scan
+                .ranges
+                .iter()
+                .copied()
+                .filter(|r| *r > 0.01)
+                .fold(f32::INFINITY, f32::min);
+            if closest < 0.35 {
+                hlog!(warn, "Obstacle detected at {:.2}m", closest);
+            }
+        }
+
+        if let Some(stop) = self.estop.recv() {
+            if stop.engaged == 1 {
+                hlog!(error, "E-stop triggered");
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    // .blackbox(mb) enables the scheduler's own flight recorder.
+    let mut sched = Scheduler::new().tick_rate(50_u64.hz()).blackbox(16);
+
+    sched.add(SafetyMonitor::new()?).order(0).build()?;
+    sched.run()
+}
+```
+
+After a crash, inspect the log ring buffer with the CLI:
+
+```bash
+horus log safety            # filter by node name — the category you logged under
+horus log --level warn -n 100
+horus log --since 5m
+```
+
+<Callout type="note" title="Category vs. node name">
+The C++ helper takes a free-form category string and files the entry under it,
+so `blackbox::record("motor", ...)` can appear under `motor` from any node.
+`hlog!` has no such argument: entries are attributed to whichever node the
+scheduler is currently ticking. In practice that is the same thing done more
+strictly — one category per node — but if you were relying on cross-node
+categories in C++, put the category in the message text and grep for it.
+</Callout>
+
+`horus blackbox --last 100` reads a separate store: it shows the events the
+scheduler itself writes to the flight recorder (deadline misses, budget
+violations, node errors, emergency stops), not the ones you log from Rust. That
+store is off by default and is switched on with `.blackbox(size_mb)`, as above;
+it persists to `.horus/blackbox/` in the working directory, so it also survives
+the crash.
+
+## Workflow
+
+```
+1. Run robot        → horus run --record test
+2. Bug happens      → stop the run (Ctrl+C)
+3. Fix controller   → edit code, recompile
+4. Test with data   → horus record inject test --nodes lidar_node --script controller.rs
+5. Verify fix       → no bug? ship it
+```
+
+No need to set up hardware again. No need to reproduce the exact scenario. The recording has everything.
+
+## Key Takeaways
+
+- `horus run --record <session>` captures topic data per tick; `horus record list/info/clean` manage the captured sessions
+- A topic is only captured once a node has actually `send()`/`recv()`'d on it from a scheduler-driven callback
+- `horus record replay` re-runs the recording itself; `horus record inject` feeds recorded data to your live nodes
+- The same thing from Rust: `.with_recording()`, `add_replay()`, `Scheduler::replay_from()`, `.start_at_tick()` / `.stop_at_tick()` / `.with_replay_speed()`
+- Design nodes as pure topic processors — they work with live AND recorded data
+- `hlog!(warn, ...)` is Rust's `blackbox::record()`: the entry lands in the shared-memory log ring buffer, which outlives the crashed process — read it back with `horus log`
+- Replay at different speeds for fast iteration
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-rust) — the six-node system worth recording
+- [Record & Replay](/advanced/record-replay) — the full record/replay reference
+- [BlackBox Flight Recorder](/advanced/blackbox) — buffer sizing and event types
