@@ -1,0 +1,507 @@
+---
+title: "Tutorial 3: Full Robot System (Rust)"
+description: "Combine sensors, control, safety and telemetry into one six-node robot"
+order: 30
+---
+
+# Tutorial 3: Full Robot System (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [C++](/tutorials/03-full-robot-cpp).</Callout>
+
+## What You'll Build
+
+```
+┌────────────┐   ┌────────────┐   ┌────────────┐
+│  LiDAR     │──→│ Controller │──→│  Motors    │
+│  (10 Hz)   │   │  (100 Hz)  │   │  (100 Hz)  │
+└────────────┘   └────────────┘   └────────────┘
+                      ↑  ↑
+┌────────────┐        │  │       ┌────────────┐
+│  IMU       │────────┘  └──────│  Safety    │
+│  (200 Hz)  │                   │  (50 Hz)   │
+└────────────┘                   └────────────┘
+                                 ┌────────────┐
+                                 │  Telemetry │
+                                 │  (1 Hz)    │
+                                 └────────────┘
+```
+
+## What You'll Learn
+
+- 6-node pipeline with different rates and execution orders
+- Coordinate transforms (lidar → base_link → world)
+- Runtime parameters for live tuning
+- Safety node with emergency stop
+- Telemetry logging at 1 Hz
+- Multi-rate execution in a single scheduler
+
+## Prerequisites
+
+- Completed [Tutorial 1](/tutorials/01-sensor-node-rust) and [Tutorial 2](/tutorials/02-motor-controller-rust)
+
+## Step 1: Create the Project
+
+```bash
+horus new full_robot
+cd full_robot
+```
+
+## Step 2: Write the System
+
+Replace `src/main.rs`:
+
+```rust
+use horus::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ── Shared safety flag ──────────────────────────────────────────────────
+static ESTOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// ── 1. LiDAR Driver (10 Hz) ─────────────────────────────────────────────
+struct LidarDriver {
+    scan: Topic<LaserScan>,
+    ticks: u64,
+}
+
+impl LidarDriver {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for LidarDriver {
+    fn name(&self) -> &str {
+        "lidar_driver"
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        if self.ticks % 20 != 0 {
+            return; // 10 Hz from a 200 Hz scheduler
+        }
+
+        let mut scan = LaserScan::new();
+        // Simulate a wall at 1.5 m with a doorway near 90°.
+        for i in 0..360 {
+            scan.ranges[i] = if (86..95).contains(&i) {
+                5.0 // gap (doorway)
+            } else {
+                1.5 + 0.2 * (i as f32 * 0.05).sin()
+            };
+        }
+        scan.angle_min = 0.0;
+        scan.angle_max = 6.283_185;
+        self.scan.send(scan);
+    }
+}
+
+// ── 2. IMU Driver (200 Hz — every tick) ─────────────────────────────────
+struct ImuDriver {
+    imu: Topic<Imu>,
+}
+
+impl ImuDriver {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            imu: Topic::new("imu.data")?,
+        })
+    }
+}
+
+impl Node for ImuDriver {
+    fn name(&self) -> &str {
+        "imu_driver"
+    }
+
+    fn tick(&mut self) {
+        let mut imu = Imu::new();
+        imu.linear_acceleration = [0.0, 0.0, 9.81]; // gravity
+        imu.angular_velocity = [0.0, 0.0, 0.01]; // slight yaw drift
+        self.imu.send(imu);
+    }
+}
+
+// ── 3. Controller (100 Hz) ──────────────────────────────────────────────
+struct Controller {
+    scan: Topic<LaserScan>,
+    imu: Topic<Imu>,
+    cmd: Topic<CmdVel>,
+    params: RuntimeParams,
+    ticks: u64,
+}
+
+impl Controller {
+    fn new(params: RuntimeParams) -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+            imu: Topic::new("imu.data")?,
+            cmd: Topic::new("cmd_vel")?,
+            params,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for Controller {
+    fn name(&self) -> &str {
+        "controller"
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        if self.ticks % 2 != 0 {
+            return; // 100 Hz from 200 Hz
+        }
+        if ESTOP_ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Read every tick: params can change while the robot is running.
+        let max_speed = self.params.get_or("max_speed", 0.3_f64);
+        let safe_dist = self.params.get_or("safe_distance", 0.5_f64);
+
+        // Nearest obstacle in the latest scan.
+        let mut min_range = f32::MAX;
+        let mut min_idx = 0usize;
+        while let Some(scan) = self.scan.recv() {
+            min_range = f32::MAX;
+            for i in 0..360 {
+                let r = scan.ranges[i];
+                if r > 0.01 && r < min_range {
+                    min_range = r;
+                    min_idx = i;
+                }
+            }
+        }
+
+        // Yaw drift from the IMU, to compensate.
+        let mut yaw_rate = 0.0_f64;
+        while let Some(imu) = self.imu.recv() {
+            yaw_rate = imu.angular_velocity[2];
+        }
+
+        // Simple obstacle avoidance: turn away from the nearest return.
+        let cmd = if min_range < safe_dist as f32 {
+            CmdVel::new(0.0, if min_idx < 180 { -0.5 } else { 0.5 })
+        } else {
+            CmdVel::new(max_speed as f32, (-yaw_rate * 0.5) as f32)
+        };
+        self.cmd.send(cmd);
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.cmd.send(CmdVel::new(0.0, 0.0));
+    }
+}
+
+// ── 4. Motor Driver (100 Hz) ────────────────────────────────────────────
+struct MotorDriver {
+    cmd: Topic<CmdVel>,
+    odom: Topic<Odometry>,
+    x: f64,
+    y: f64,
+    theta: f64,
+    ticks: u64,
+}
+
+impl MotorDriver {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd: Topic::new("cmd_vel")?,
+            odom: Topic::new("odom")?,
+            x: 0.0,
+            y: 0.0,
+            theta: 0.0,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for MotorDriver {
+    fn name(&self) -> &str {
+        "motor_driver"
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        if self.ticks % 2 != 0 {
+            return; // 100 Hz
+        }
+
+        let mut latest = None;
+        while let Some(cmd) = self.cmd.recv() {
+            latest = Some(cmd);
+        }
+        let Some(cmd) = latest else { return };
+
+        // Dead-reckon the pose forward one control period.
+        let dt = 0.01;
+        let v = cmd.linear as f64;
+        let w = cmd.angular as f64;
+        self.x += v * self.theta.cos() * dt;
+        self.y += v * self.theta.sin() * dt;
+        self.theta += w * dt;
+
+        let mut odom = Odometry::new();
+        odom.pose.x = self.x;
+        odom.pose.y = self.y;
+        odom.pose.theta = self.theta;
+        self.odom.send(odom);
+    }
+
+    fn enter_safe_state(&mut self) {
+        hlog!(warn, "Safe state — motors stopped");
+    }
+}
+
+// ── 5. Safety Monitor (50 Hz) ───────────────────────────────────────────
+struct SafetyMonitor {
+    scan: Topic<LaserScan>,
+    estop: Topic<EmergencyStop>,
+    ticks: u64,
+}
+
+impl SafetyMonitor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scan: Topic::new("lidar.scan")?,
+            estop: Topic::new("emergency.stop")?,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for SafetyMonitor {
+    fn name(&self) -> &str {
+        "safety_monitor"
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        if self.ticks % 4 != 0 {
+            return; // 50 Hz
+        }
+
+        let mut latest = None;
+        while let Some(scan) = self.scan.recv() {
+            latest = Some(scan);
+        }
+        let Some(scan) = latest else { return };
+
+        let danger = scan.ranges.iter().any(|&r| r > 0.01 && r < 0.2);
+
+        if danger && !ESTOP_ACTIVE.load(Ordering::Relaxed) {
+            ESTOP_ACTIVE.store(true, Ordering::Relaxed);
+            let mut msg = EmergencyStop::default();
+            msg.engaged = 1;
+            self.estop.send(msg);
+            hlog!(error, "EMERGENCY STOP — object < 20cm");
+        }
+
+        if !danger && ESTOP_ACTIVE.load(Ordering::Relaxed) {
+            ESTOP_ACTIVE.store(false, Ordering::Relaxed);
+            let clear = EmergencyStop::default();
+            self.estop.send(clear);
+            hlog!(info, "E-stop cleared");
+        }
+    }
+}
+
+// ── 6. Telemetry Logger (1 Hz) ──────────────────────────────────────────
+struct Telemetry {
+    odom: Topic<Odometry>,
+    cmd: Topic<CmdVel>,
+    ticks: u64,
+}
+
+impl Telemetry {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            odom: Topic::new("odom")?,
+            cmd: Topic::new("cmd_vel")?,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for Telemetry {
+    fn name(&self) -> &str {
+        "telemetry"
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        if self.ticks % 200 != 0 {
+            return; // 1 Hz
+        }
+
+        let mut pose = (0.0, 0.0, 0.0);
+        while let Some(odom) = self.odom.recv() {
+            pose = (odom.pose.x, odom.pose.y, odom.pose.theta);
+        }
+        let mut vel = (0.0_f32, 0.0_f32);
+        while let Some(cmd) = self.cmd.recv() {
+            vel = (cmd.linear, cmd.angular);
+        }
+
+        hlog!(
+            info,
+            "pos=({:.2}, {:.2}) heading={:.1}° cmd=({:.2}, {:.2})",
+            pose.0,
+            pose.1,
+            pose.2.to_degrees(),
+            vel.0,
+            vel.1
+        );
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
+fn main() -> Result<()> {
+    // Coordinate transforms: lidar sits 20 cm forward and 30 cm up on the base.
+    let tf = TransformFrame::new();
+    tf.register_frame("world", None)?;
+    tf.register_frame("base_link", Some("world"))?;
+    tf.register_frame("lidar", Some("base_link"))?;
+    let mut mount = Transform::default();
+    mount.translation = [0.2, 0.0, 0.3];
+    tf.update_transform("lidar", &mount, 0)?;
+
+    // Runtime parameters, tunable while the robot runs.
+    let params = RuntimeParams::new()?;
+    params.set("max_speed", 0.3_f64)?;
+    params.set("safe_distance", 0.5_f64)?;
+
+    let mut sched = Scheduler::new()
+        .tick_rate(200_u64.hz())
+        .name("full_robot")
+        .with_params(params.clone());
+
+    // Add nodes in execution order.
+    sched.add(ImuDriver::new()?).order(0).build()?; // 200 Hz
+    sched.add(LidarDriver::new()?).order(1).build()?; // 10 Hz
+
+    // Safety is critical: if it cannot run, the whole system stops.
+    sched
+        .add(SafetyMonitor::new()?)
+        .order(2)
+        .budget(2_u64.ms())
+        .on_miss(Miss::Stop)
+        .build()?;
+
+    sched
+        .add(Controller::new(params.clone())?)
+        .order(10)
+        .budget(5_u64.ms())
+        .on_miss(Miss::Skip)
+        .build()?;
+
+    // `on_miss` fires on a *deadline* miss, so the node needs a timing bound
+    // for it to mean anything — a budget auto-derives the deadline.
+    sched
+        .add(MotorDriver::new()?)
+        .order(20)
+        .budget(5_u64.ms())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+
+    sched.add(Telemetry::new()?).order(100).build()?; // 1 Hz
+
+    let nodes = sched.node_list();
+    println!("Robot ready: {} nodes", nodes.len());
+    for n in &nodes {
+        println!("  - {n}");
+    }
+
+    sched.run()
+}
+```
+
+## Step 3: Build and Run
+
+```bash
+horus build && horus run
+```
+
+## Step 4: Monitor Everything
+
+```bash
+horus topic list          # 6+ active topics
+horus node list           # 6 running nodes
+horus topic echo odom     # watch robot position
+horus topic echo cmd_vel  # watch velocity commands
+horus log                 # see telemetry + safety events
+```
+
+## Key Architecture Decisions
+
+| Node | Rate | Order | Miss Policy | Why |
+|------|------|-------|-------------|-----|
+| IMU | 200 Hz | 0 | default | Fastest sensor, runs every tick |
+| LiDAR | 10 Hz | 1 | default | Mechanical limit of sensor |
+| Safety | 50 Hz | 2 | **Stop** | If safety can't run, entire system must stop |
+| Controller | 100 Hz | 10 | Skip | Skipping one tick is better than lag |
+| Motors | 100 Hz | 20 | **SafeMode** | Overrun past the 5 ms budget → stop motors |
+| Telemetry | 1 Hz | 100 | default | Non-critical, best effort |
+
+`on_miss` is dispatched from the deadline check, so a node with no `.rate()`, `.budget()`
+or `.deadline()` never reaches it — the policy is silently inert. That is why Motors
+carries a budget here and Telemetry, which has no policy, does not need one.
+
+<Callout type="warning" title="Without RT privileges these budgets will trip">
+
+A node with a `.budget()` is handed to the RT executor, which tries to put its
+thread on `SCHED_FIFO`. That needs `CAP_SYS_NICE`. Without it HORUS prints
+
+```text
+[RT-thread] Could not set SCHED_FIFO: Permission denied ... (continuing with normal priority)
+```
+
+and carries on — at ordinary priority, where the kernel preempts the thread like
+any other. On a busy machine a 5 ms budget is then missed routinely:
+
+```text
+[RT-thread] budget violation in 'motor_driver': 9.986395ms > 5ms
+[RT-thread] SafeMode: 'motor_driver' entering safe state after deadline miss
+EMERGENCY STOP: RT node 'safety_monitor' deadline miss escalated to emergency stop
+```
+
+Nothing is wrong with the code — the same build with the budgets raised to 40 ms
+misses nothing. But `Miss::Stop` on the safety node means one missed deadline
+takes the whole system down, so the failure looks dramatic.
+
+Grant the capability as described in [RT Configuration](/advanced/rt-config):
+
+```bash
+sudo setcap 'cap_sys_nice=ep' ./target/release/full_robot
+```
+
+or, while you are just working through the tutorial, raise the budgets. Keep
+them tight once you are on the real machine — a budget you cannot meet is the
+only thing that makes `on_miss` useful.
+
+</Callout>
+
+### Rate division, not per-node rates
+
+Every node here runs on the 200 Hz scheduler tick and divides it down with a
+counter (`ticks % 20`). That keeps all six nodes on one deterministic tick
+sequence, so `.order()` fully describes the data flow. The alternative —
+`.rate()` per node — hands nodes to separate executors, where `.order()` only
+sorts within an executor.
+
+### Reading parameters every tick
+
+`Controller` calls `params.get_or(...)` inside `tick()` rather than caching the
+values in `new()`. `RuntimeParams` is shared, so a value changed while the robot
+is running is picked up on the next control cycle. Note that HORUS does not
+currently push change notifications to nodes — there is no `on_param_changed`
+callback firing — so polling like this is how a node sees an update.
+
+## Next Steps
+
+- [Cross-Language with Typed Topics](/python/api/python-bindings#cross-language-with-typed-topics) — mix C++, Rust and Python in one system
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference
