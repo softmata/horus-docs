@@ -1,0 +1,185 @@
+---
+title: "Tutorial 1: IMU Sensor Node (Rust)"
+description: "Build an IMU sensor node in Rust that publishes accelerometer and gyroscope readings, plus a display node that consumes them"
+order: 10
+---
+
+# Tutorial 1: IMU Sensor Node (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [C++](/tutorials/01-sensor-node-cpp) and [Python](/tutorials/01-sensor-node-python).</Callout>
+
+Inertial Measurement Units (IMUs) are one of the most common sensors in robotics. Drones rely on them for stabilization, self-driving cars fuse IMU data with GPS for localization, and warehouse AGVs use them to track heading. In this tutorial you'll build a HORUS node that simulates an IMU — publishing accelerometer and gyroscope readings at 100 Hz — and a second node that subscribes to that stream and displays it. This is the foundational publish/subscribe pattern you'll use for every sensor in HORUS.
+
+## Prerequisites
+
+- [Quick Start](/getting-started/quick-start) completed
+- A Rust toolchain and HORUS installed (`horus --help` working)
+
+## What You'll Build
+
+An IMU sensor node that:
+
+1. Generates accelerometer data (x, y, z in m/s²)
+2. Generates gyroscope data (roll, pitch, yaw rates in rad/s)
+3. Publishes the standard `Imu` message on a topic at 100 Hz
+4. A display node that prints the data once per second
+
+**Time estimate**: ~15 minutes
+
+## Step 1: Create the Project
+
+```bash
+horus new imu-demo
+cd imu-demo
+```
+
+Rust is the default language, so `horus new` needs no flag. You should see `horus.toml`, `src/main.rs`, and `.horus/` in the project directory.
+
+## Step 2: Write the Code
+
+HORUS ships a standard `Imu` message — a 9-axis reading with an orientation quaternion, angular velocity, and linear acceleration. It arrives through `horus::prelude`, so there is no `.msg` file and no codegen step. Replace `src/main.rs` with two nodes: a sensor that publishes it and a display that consumes it.
+
+```rust
+use horus::prelude::*;
+
+// ── Sensor Node: simulates an IMU at 100 Hz ──────────────────────────────
+struct ImuSensor {
+    imu: Topic<Imu>,
+    ticks: u64,
+}
+
+impl ImuSensor {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            // Publish IMU readings for any downstream consumer.
+            imu: Topic::new("imu.data")?,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for ImuSensor {
+    fn name(&self) -> &str {
+        "imu_sensor"
+    }
+
+    fn tick(&mut self) {
+        let t = self.ticks as f64 * 0.01; // 100 Hz → 0.01 s per tick
+
+        // Imu::new() starts from an identity quaternion and stamps the message
+        // with the current time, so only the live axes are assigned here.
+        let mut imu = Imu::new();
+        // Accelerometer (m/s²): a level robot feels ~1 g on the z axis.
+        imu.linear_acceleration = [0.0, 0.0, 9.81];
+        // Gyroscope (rad/s): a gentle yaw oscillation as the robot turns.
+        imu.angular_velocity = [0.0, 0.0, 0.1 * (t * 0.5).sin()];
+
+        self.imu.send(imu);
+        self.ticks += 1;
+    }
+}
+
+// ── Display Node: prints the IMU stream once per second ──────────────────
+struct ImuDisplay {
+    imu: Topic<Imu>,
+    samples: u64,
+}
+
+impl ImuDisplay {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            imu: Topic::new("imu.data")?,
+            samples: 0,
+        })
+    }
+}
+
+impl Node for ImuDisplay {
+    fn name(&self) -> &str {
+        "imu_display"
+    }
+
+    fn tick(&mut self) {
+        // Drain everything published since the last tick.
+        while let Some(imu) = self.imu.recv() {
+            self.samples += 1;
+            // Print every 100th sample → once per second at 100 Hz.
+            if self.samples % 100 == 0 {
+                let a = imu.linear_acceleration;
+                let g = imu.angular_velocity;
+                println!(
+                    "accel=({:.2}, {:.2}, {:.2})  gyro=({:.3}, {:.3}, {:.3})",
+                    a[0], a[1], a[2], g[0], g[1], g[2]
+                );
+            }
+        }
+    }
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz()).name("imu_demo");
+
+    // Sensor publishes (order 0) before the display subscribes (order 1).
+    sched.add(ImuSensor::new()?).order(0).build()?;
+    sched.add(ImuDisplay::new()?).order(1).build()?;
+
+    println!("IMU demo running at 100 Hz (Ctrl+C to stop)");
+    sched.run()
+}
+```
+
+A few things to notice:
+
+- **A node is a struct** that implements the `Node` trait. Topics are created once in the constructor — `Topic::new()` returns a `Result`, which is why `new()` does — and stored as fields.
+- **One type does both jobs.** Rust has no separate publisher and subscriber type: both nodes hold a `Topic<Imu>` opened on the same name, and HORUS connects them. Whether a topic sends or receives is decided by which methods you call on it.
+- **`send()` / `recv()`** move a message through a lock-free shared-memory ring buffer. `recv()` returns `None` when no new message is waiting, so the `while let` loop drains the ring and stops.
+- **Execution order** — `order(0)` runs before `order(1)` each tick, so the sensor publishes fresh data before the display reads it.
+
+## Step 3: Build and Run
+
+```bash
+horus build
+horus run
+```
+
+You should see one line per second:
+
+```
+IMU demo running at 100 Hz (Ctrl+C to stop)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.048)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.084)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.097)
+```
+
+Press **Ctrl+C** to stop.
+
+## Step 4: Introspect While Running
+
+With the demo still running, open a **second terminal** and inspect the live system:
+
+```bash
+horus topic list -v       # active topics, types, and rates
+horus topic hz imu.data   # confirm the 100 Hz publish rate
+horus topic echo imu.data # stream every message to your terminal
+horus node list           # see the running nodes
+```
+
+`horus topic echo` is a read-only observer — it never interferes with the running system, which makes it invaluable for debugging. If a subscriber isn't receiving data, use it to confirm the publisher is actually sending.
+
+## Key Takeaways
+
+1. **Nodes are structs** implementing the `Node` trait, creating their topics in a constructor that returns `Result<Self>`.
+2. **Standard messages** like `Imu` come from `horus::prelude` — no `.msg` files, no codegen step.
+3. **`Topic<T>` is symmetric**: the same type publishes and subscribes, connected by name.
+4. **`send()` / `recv()`** move data over a zero-copy shared-memory ring buffer; `recv()` returns `None` when there's nothing new.
+5. **Execution order** (`order(0)` before `order(1)`) guarantees the sensor publishes before the display reads.
+
+## Next Steps
+
+- [Tutorial 2: Motor Controller (Rust)](/tutorials/02-motor-controller-rust) — subscribe to velocity commands and publish state feedback
+
+## See Also
+
+- [Sensor Messages](/rust/api/sensor-messages) — the standard IMU message type
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference, including when `recv()` can skip messages

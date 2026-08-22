@@ -1,0 +1,163 @@
+---
+title: "Tutorial 1: IMU Sensor Node (Python)"
+description: "Build an IMU sensor node in Python that publishes accelerometer and gyroscope readings, plus a display node that consumes them"
+order: 11
+---
+
+# Tutorial 1: IMU Sensor Node (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/01-sensor-node-rust) and [C++](/tutorials/01-sensor-node-cpp).</Callout>
+
+Inertial Measurement Units (IMUs) are one of the most common sensors in robotics. Drones rely on them for stabilization, self-driving cars fuse IMU data with GPS for localization, and warehouse AGVs use them to track heading. In this tutorial you'll build a HORUS node that simulates an IMU — publishing accelerometer and gyroscope readings at 100 Hz — and a second node that subscribes to that stream and displays it. This is the foundational publish/subscribe pattern you'll use for every sensor in HORUS.
+
+## Prerequisites
+
+- [Quick Start](/getting-started/quick-start) completed
+- Python 3.8+ and HORUS installed (`horus --help` working, and `import horus` succeeding)
+
+## What You'll Build
+
+An IMU sensor node that:
+
+1. Generates accelerometer data (x, y, z in m/s²)
+2. Generates gyroscope data (roll, pitch, yaw rates in rad/s)
+3. Publishes the standard `Imu` message on a topic at 100 Hz
+4. A display node that prints the data once per second
+
+**Time estimate**: ~15 minutes
+
+## Step 1: Create the Project
+
+```bash
+horus new imu-demo --python
+cd imu-demo
+```
+
+You should see `horus.toml`, `main.py`, and `.horus/` in the project directory.
+
+## Step 2: Write the Code
+
+HORUS ships a standard `Imu` message, importable straight from the top-level `horus` package — there is no `.msg` file and no codegen step. Replace `main.py` with two nodes: a sensor that publishes it and a display that consumes it.
+
+```python
+import math
+
+import horus
+from horus import Imu, Topic
+
+
+# ── Sensor Node: simulates an IMU at 100 Hz ──────────────────────────────
+class ImuSensor(horus.Node):
+    def __init__(self):
+        super().__init__(name="imu_sensor", rate=100)
+        # Publish IMU readings for any downstream consumer.
+        self.imu = Topic(Imu, endpoint="imu.data")
+        self.ticks = 0
+
+    def tick(self, info=None):
+        t = self.ticks * 0.01  # 100 Hz → 0.01 s per tick
+
+        reading = Imu(
+            # Accelerometer (m/s²): a level robot feels ~1 g on the z axis.
+            accel_x=0.0,
+            accel_y=0.0,
+            accel_z=9.81,
+            # Gyroscope (rad/s): a gentle yaw oscillation as the robot turns.
+            gyro_x=0.0,
+            gyro_y=0.0,
+            gyro_z=0.1 * math.sin(t * 0.5),
+        )
+
+        self.imu.send(reading)
+        self.ticks += 1
+
+
+# ── Display Node: prints the IMU stream once per second ──────────────────
+class ImuDisplay(horus.Node):
+    def __init__(self):
+        super().__init__(name="imu_display", rate=100)
+        self.imu = Topic(Imu, endpoint="imu.data")
+        self.samples = 0
+
+    def tick(self, info=None):
+        # Drain everything published since the last tick. recv() returns None
+        # when the ring is empty, which is what ends the loop.
+        while True:
+            reading = self.imu.recv()
+            if reading is None:
+                break
+            self.samples += 1
+            # Print every 100th sample → once per second at 100 Hz.
+            if self.samples % 100 == 0:
+                print(
+                    f"accel=({reading.accel_x:.2f}, {reading.accel_y:.2f}, "
+                    f"{reading.accel_z:.2f})  "
+                    f"gyro=({reading.gyro_x:.3f}, {reading.gyro_y:.3f}, "
+                    f"{reading.gyro_z:.3f})"
+                )
+
+
+print("IMU demo running at 100 Hz (Ctrl+C to stop)")
+horus.run(ImuSensor(), ImuDisplay())
+```
+
+A few things to notice:
+
+- **A node is a class** deriving from `horus.Node`, passing its name and rate to `super().__init__()`. Topics are created once in `__init__` and stored as attributes.
+- **One type does both jobs.** Python has no separate publisher and subscriber type: both nodes hold a `Topic(Imu, ...)` opened on the same endpoint, and HORUS connects them. Whether a topic sends or receives is decided by which methods you call on it.
+- **`endpoint=` names the topic.** A bare `Topic(Imu)` derives the name from the message type; passing `endpoint="imu.data"` puts it on the same named topic the [Rust](/tutorials/01-sensor-node-rust) and [C++](/tutorials/01-sensor-node-cpp) versions of this tutorial use, so the nodes are interchangeable across all three languages.
+- **`send()` / `recv()`** move a message through a lock-free shared-memory ring buffer. `recv()` returns `None` when no new message is waiting, which is what ends the drain loop.
+- **`horus.run(...)`** takes any number of nodes and runs them together.
+
+<Callout type="note" title="Field names differ from Rust and C++">
+Python's `Imu` exposes flat scalar properties — `accel_x`, `accel_y`, `accel_z`, `gyro_x`, `gyro_y`, `gyro_z` — where Rust and C++ expose the arrays `linear_acceleration[3]` and `angular_velocity[3]`. The wire format is identical, so the nodes interoperate; only the attribute names change.
+</Callout>
+
+## Step 3: Run
+
+Python needs no build step:
+
+```bash
+horus run
+```
+
+You should see one line per second:
+
+```
+IMU demo running at 100 Hz (Ctrl+C to stop)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.048)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.084)
+accel=(0.00, 0.00, 9.81)  gyro=(0.000, 0.000, 0.097)
+```
+
+Press **Ctrl+C** to stop.
+
+## Step 4: Introspect While Running
+
+With the demo still running, open a **second terminal** and inspect the live system:
+
+```bash
+horus topic list -v       # active topics, types, and rates
+horus topic hz imu.data   # confirm the 100 Hz publish rate
+horus topic echo imu.data # stream every message to your terminal
+horus node list           # see the running nodes
+```
+
+`horus topic echo` is a read-only observer — it never interferes with the running system, which makes it invaluable for debugging. If a subscriber isn't receiving data, use it to confirm the publisher is actually sending.
+
+## Key Takeaways
+
+1. **Nodes are classes** deriving from `horus.Node`, creating their topics in `__init__`.
+2. **Standard messages** like `Imu` import straight from `horus` — no `.msg` files, no codegen step.
+3. **`Topic` is symmetric**: the same object publishes and subscribes, connected by name.
+4. **`send()` / `recv()`** move data over a shared-memory ring buffer; `recv()` returns `None` when there's nothing new.
+5. **Python topics are shared-memory only** — they never leave the machine. For cross-machine topics, use the Rust replicator.
+
+## Next Steps
+
+- [Tutorial 2: Motor Controller (Python)](/tutorials/02-motor-controller-python) — subscribe to velocity commands and publish state feedback
+
+## See Also
+
+- [Python Message Library](/python/library/python-message-library#imu) — the standard IMU message type and its fields
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference
