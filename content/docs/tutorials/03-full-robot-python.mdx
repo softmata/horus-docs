@@ -1,0 +1,388 @@
+---
+title: "Tutorial 3: Full Robot System (Python)"
+description: "Combine sensors, control, safety and telemetry into one six-node robot"
+order: 31
+---
+
+# Tutorial 3: Full Robot System (Python)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Rust](/tutorials/03-full-robot-rust) and [C++](/tutorials/03-full-robot-cpp).</Callout>
+
+## What You'll Build
+
+```
+┌────────────┐   ┌────────────┐   ┌────────────┐
+│  LiDAR     │──→│ Controller │──→│  Motors    │
+│  (10 Hz)   │   │  (100 Hz)  │   │  (100 Hz)  │
+└────────────┘   └────────────┘   └────────────┘
+                      ↑  ↑
+┌────────────┐        │  │       ┌────────────┐
+│  IMU       │────────┘  └──────│  Safety    │
+│  (200 Hz)  │                   │  (50 Hz)   │
+└────────────┘                   └────────────┘
+                                 ┌────────────┐
+                                 │  Telemetry │
+                                 │  (1 Hz)    │
+                                 └────────────┘
+```
+
+## What You'll Learn
+
+- 6-node pipeline with different rates and execution orders
+- Coordinate transforms (lidar → base_link → world)
+- Runtime parameters for live tuning
+- Safety node with emergency stop
+- Telemetry logging at 1 Hz
+- Multi-rate execution in a single scheduler
+
+## Prerequisites
+
+- Completed [Tutorial 1](/tutorials/01-sensor-node-python) and [Tutorial 2](/tutorials/02-motor-controller-python)
+
+## Step 1: Create the Project
+
+```bash
+horus new full_robot --python
+cd full_robot
+```
+
+## Step 2: Write the System
+
+Replace `main.py`:
+
+```python
+import math
+
+import horus
+from horus import CmdVel, EmergencyStop, Imu, LaserScan, Odometry, Topic
+
+# ── Shared safety flag ──────────────────────────────────────────────────
+ESTOP_ACTIVE = False
+
+
+# ── 1. LiDAR Driver (10 Hz) ─────────────────────────────────────────────
+class LidarDriver(horus.Node):
+    def __init__(self):
+        super().__init__(name="lidar_driver", rate=200, order=1)
+        self.scan = Topic(LaserScan, endpoint="lidar.scan")
+        self.ticks = 0
+
+    def tick(self, info=None):
+        self.ticks += 1
+        if self.ticks % 20 != 0:
+            return  # 10 Hz from a 200 Hz scheduler
+
+        scan = LaserScan()
+        ranges = list(scan.ranges)
+        # Simulate a wall at 1.5 m with a doorway near 90°.
+        for i in range(360):
+            if 86 <= i < 95:
+                ranges[i] = 5.0                       # gap (doorway)
+            else:
+                ranges[i] = 1.5 + 0.2 * math.sin(i * 0.05)
+        scan.ranges = ranges
+        scan.angle_min = 0.0
+        scan.angle_max = 6.283185
+        self.scan.send(scan)
+
+
+# ── 2. IMU Driver (200 Hz — every tick) ─────────────────────────────────
+class ImuDriver(horus.Node):
+    def __init__(self):
+        super().__init__(name="imu_driver", rate=200, order=0)
+        self.imu = Topic(Imu, endpoint="imu.data")
+
+    def tick(self, info=None):
+        self.imu.send(
+            Imu(
+                accel_x=0.0, accel_y=0.0, accel_z=9.81,   # gravity
+                gyro_x=0.0, gyro_y=0.0, gyro_z=0.01,      # slight yaw drift
+            )
+        )
+
+
+# ── 3. Controller (100 Hz) ──────────────────────────────────────────────
+class Controller(horus.Node):
+    def __init__(self, params):
+        super().__init__(
+            name="controller", rate=200, order=10,
+            budget=0.005, on_miss="skip",
+        )
+        self.scan = Topic(LaserScan, endpoint="lidar.scan")
+        self.imu = Topic(Imu, endpoint="imu.data")
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+        self.params = params
+        self.ticks = 0
+
+    def drain(self, topic):
+        latest = None
+        while True:
+            msg = topic.recv()
+            if msg is None:
+                return latest
+            latest = msg
+
+    def tick(self, info=None):
+        self.ticks += 1
+        if self.ticks % 2 != 0:
+            return  # 100 Hz from 200 Hz
+        if ESTOP_ACTIVE:
+            return
+
+        # Read every tick: params can change while the robot is running.
+        max_speed = self.params.get("max_speed", 0.3)
+        safe_dist = self.params.get("safe_distance", 0.5)
+
+        # Nearest obstacle in the latest scan.
+        min_range = float("inf")
+        min_idx = 0
+        scan = self.drain(self.scan)
+        if scan is not None:
+            for i, r in enumerate(scan.ranges):
+                if r > 0.01 and r < min_range:
+                    min_range = r
+                    min_idx = i
+
+        # Yaw drift from the IMU, to compensate.
+        yaw_rate = 0.0
+        imu = self.drain(self.imu)
+        if imu is not None:
+            yaw_rate = imu.gyro_z
+
+        # Simple obstacle avoidance: turn away from the nearest return.
+        if min_range < safe_dist:
+            cmd = CmdVel(linear=0.0, angular=-0.5 if min_idx < 180 else 0.5)
+        else:
+            cmd = CmdVel(linear=max_speed, angular=-yaw_rate * 0.5)
+        self.cmd.send(cmd)
+
+    def enter_safe_state(self):
+        self.cmd.send(CmdVel(linear=0.0, angular=0.0))
+
+
+# ── 4. Motor Driver (100 Hz) ────────────────────────────────────────────
+class MotorDriver(horus.Node):
+    def __init__(self):
+        # on_miss fires on a *deadline* miss, so the node needs a timing bound
+        # for it to mean anything — a budget auto-derives the deadline.
+        super().__init__(
+            name="motor_driver", rate=200, order=20,
+            budget=0.005, on_miss="safe_mode",
+        )
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+        self.odom = Topic(Odometry, endpoint="odom")
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.ticks = 0
+
+    def tick(self, info=None):
+        self.ticks += 1
+        if self.ticks % 2 != 0:
+            return  # 100 Hz
+
+        latest = None
+        while True:
+            msg = self.cmd.recv()
+            if msg is None:
+                break
+            latest = msg
+        if latest is None:
+            return
+
+        # Dead-reckon the pose forward one control period.
+        dt = 0.01
+        self.x += latest.linear * math.cos(self.theta) * dt
+        self.y += latest.linear * math.sin(self.theta) * dt
+        self.theta += latest.angular * dt
+
+        odom = Odometry()
+        odom.x = self.x
+        odom.y = self.y
+        odom.theta = self.theta
+        self.odom.send(odom)
+
+    def enter_safe_state(self):
+        self.log_warning("Safe state - motors stopped")
+
+
+# ── 5. Safety Monitor (50 Hz) ───────────────────────────────────────────
+class SafetyMonitor(horus.Node):
+    def __init__(self):
+        super().__init__(
+            name="safety_monitor", rate=200, order=2,
+            budget=0.002, on_miss="stop",
+        )
+        self.scan = Topic(LaserScan, endpoint="lidar.scan")
+        self.estop = Topic(EmergencyStop, endpoint="emergency.stop")
+        self.ticks = 0
+
+    def tick(self, info=None):
+        global ESTOP_ACTIVE
+        self.ticks += 1
+        if self.ticks % 4 != 0:
+            return  # 50 Hz
+
+        latest = None
+        while True:
+            msg = self.scan.recv()
+            if msg is None:
+                break
+            latest = msg
+        if latest is None:
+            return
+
+        danger = any(0.01 < r < 0.2 for r in latest.ranges)
+
+        if danger and not ESTOP_ACTIVE:
+            ESTOP_ACTIVE = True
+            msg = EmergencyStop()
+            msg.engaged = 1
+            self.estop.send(msg)
+            self.log_error("EMERGENCY STOP - object < 20cm")
+
+        if not danger and ESTOP_ACTIVE:
+            ESTOP_ACTIVE = False
+            self.estop.send(EmergencyStop())
+            self.log_info("E-stop cleared")
+
+
+# ── 6. Telemetry Logger (1 Hz) ──────────────────────────────────────────
+class Telemetry(horus.Node):
+    def __init__(self):
+        super().__init__(name="telemetry", rate=200, order=100)
+        self.odom = Topic(Odometry, endpoint="odom")
+        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
+        self.ticks = 0
+
+    def tick(self, info=None):
+        self.ticks += 1
+        if self.ticks % 200 != 0:
+            return  # 1 Hz
+
+        pose = (0.0, 0.0, 0.0)
+        while True:
+            odom = self.odom.recv()
+            if odom is None:
+                break
+            pose = (odom.x, odom.y, odom.theta)
+
+        vel = (0.0, 0.0)
+        while True:
+            cmd = self.cmd.recv()
+            if cmd is None:
+                break
+            vel = (cmd.linear, cmd.angular)
+
+        self.log_info(
+            f"pos=({pose[0]:.2f}, {pose[1]:.2f}) "
+            f"heading={math.degrees(pose[2]):.1f} deg "
+            f"cmd=({vel[0]:.2f}, {vel[1]:.2f})"
+        )
+
+
+# ── Main ────────────────────────────────────────────────────────────────
+# Coordinate transforms: lidar sits 20 cm forward and 30 cm up on the base.
+tf = horus.TransformFrame()
+tf.register_frame("world")
+tf.register_frame("base_link", parent="world")
+tf.register_frame("lidar", parent="base_link")
+tf.update_transform("lidar", horus.Transform(translation=[0.2, 0.0, 0.3]))
+
+# Runtime parameters, tunable while the robot runs.
+params = horus.Params()
+params["max_speed"] = 0.3
+params["safe_distance"] = 0.5
+
+sched = horus.Scheduler(tick_rate=200, name="full_robot")
+
+# Add nodes in execution order.
+sched.add(ImuDriver())              # 200 Hz, order 0
+sched.add(LidarDriver())            # 10 Hz,  order 1
+sched.add(SafetyMonitor())          # 50 Hz,  order 2  — critical
+sched.add(Controller(params))       # 100 Hz, order 10
+sched.add(MotorDriver())            # 100 Hz, order 20
+sched.add(Telemetry())              # 1 Hz,   order 100
+
+print(f"Robot ready: {sched.get_node_count()} nodes")
+for n in sched.get_node_names():
+    print(f"  - {n}")
+
+sched.run()
+```
+
+## Step 3: Run
+
+Python needs no build step:
+
+```bash
+horus run
+```
+
+## Step 4: Monitor Everything
+
+```bash
+horus topic list          # 6+ active topics
+horus node list           # 6 running nodes
+horus topic echo odom     # watch robot position
+horus topic echo cmd_vel  # watch velocity commands
+horus log                 # see telemetry + safety events
+```
+
+## Key Architecture Decisions
+
+| Node | Rate | Order | Miss Policy | Why |
+|------|------|-------|-------------|-----|
+| IMU | 200 Hz | 0 | default | Fastest sensor, runs every tick |
+| LiDAR | 10 Hz | 1 | default | Mechanical limit of sensor |
+| Safety | 50 Hz | 2 | **stop** | If safety can't run, entire system must stop |
+| Controller | 100 Hz | 10 | skip | Skipping one tick is better than lag |
+| Motors | 100 Hz | 20 | **safe_mode** | Overrun past the 5 ms budget → stop motors |
+| Telemetry | 1 Hz | 100 | default | Non-critical, best effort |
+
+`on_miss` is dispatched from the deadline check, so a node with no `rate=`, `budget=`
+or `deadline=` never reaches it — the policy is silently inert. That is why Motors
+carries a budget here and Telemetry, which has no policy, does not need one.
+
+<Callout type="warning" title="Without RT privileges these budgets will trip">
+
+A node with a `budget=` is handed to the RT executor, which tries to put its
+thread on `SCHED_FIFO`. That needs `CAP_SYS_NICE`. Without it HORUS prints
+
+```text
+[RT-thread] Could not set SCHED_FIFO: Permission denied ... (continuing with normal priority)
+```
+
+and carries on — at ordinary priority, where the kernel preempts the thread like
+any other. On a busy machine a 5 ms budget is then missed routinely, and
+`on_miss="stop"` on the safety node means one missed deadline takes the whole
+system down.
+
+Nothing is wrong with the code. Grant the capability as described in
+[RT Configuration](/advanced/rt-config), or raise the budgets while you are
+working through the tutorial — but keep them tight once you are on the real
+machine, since a budget you cannot meet is the only thing that makes `on_miss`
+useful.
+
+Python has a second reason to keep an eye on this: the GIL means one slow node
+can delay another in a way the Rust and C++ versions do not experience.
+
+</Callout>
+
+### Rate division, not per-node rates
+
+Every node here is constructed with `rate=200` and divides that down with a
+counter (`ticks % 20`). That keeps all six nodes on one tick sequence, so
+`order=` fully describes the data flow.
+
+### Field names differ from Rust and C++
+
+Python flattens `Odometry`: `odom.x`, `odom.y`, `odom.theta`, where Rust and C++
+nest it as `odom.pose.x`. `Imu` likewise exposes `accel_z`/`gyro_z` rather than
+`linear_acceleration[2]`/`angular_velocity[2]`. The wire format is identical, so
+these nodes interoperate with the Rust and C++ versions of this tutorial.
+
+## Next Steps
+
+- [Cross-Language with Typed Topics](/python/api/python-bindings#cross-language-with-typed-topics) — mix C++, Rust and Python in one system
+- [Python Bindings](/python/api/python-bindings) — full `Node`, `Topic` and `Scheduler` reference
