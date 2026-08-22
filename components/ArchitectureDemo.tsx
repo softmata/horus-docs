@@ -67,23 +67,32 @@ export function ArchitectureDemo() {
     return () => clearInterval(interval);
   }, []);
 
-  // Extended log entries for continuous scrolling (updated with wait-free IPC times)
+  // Illustrative log lines for the scrolling panel. Invented traffic, but the
+  // latencies have to sit inside the band /performance/benchmarks measures,
+  // because a reader takes an animated terminal for a recording of a real run.
+  //
+  // They did not. Every PUB line was around 87 ns — the figure that travelled
+  // with the retracted "575x faster than ROS2" claim and appears in no
+  // benchmark, no report and no source — and every SUB line was around 300 ns,
+  // which is nothing at all. Measured on the reference i7-10750H:
+  // same-process median 63 ns / p99 93 ns, cross-process median 151 ns / p99
+  // 181 ns. PUB lines below stay in the first band, SUB lines in the second.
   const allLogEntries = [
-    { time: '12:39:28.039', ipc: '87ns', tick: '218μs', node: 'SensorNode', type: 'PUB', topic: 'sensors.imu' },
-    { time: '12:39:28.039', ipc: '312ns', tick: '10μs', node: 'ControlNode', type: 'SUB', topic: 'sensors.imu' },
-    { time: '12:39:28.156', ipc: '91ns', tick: '31μs', node: 'SensorNode', type: 'PUB', topic: 'cmd_vel' },
-    { time: '12:39:28.207', ipc: '298ns', tick: '41μs', node: 'ActuatorNode', type: 'SUB', topic: 'cmd_vel' },
-    { time: '12:39:28.208', ipc: '84ns', tick: '241μs', node: 'ControlNode', type: 'PUB', topic: 'odom' },
-    { time: '12:39:28.219', ipc: '321ns', tick: '25μs', node: 'ControlNode', type: 'SUB', topic: 'odom' },
-    { time: '12:39:28.358', ipc: '89ns', tick: '29μs', node: 'SensorNode', type: 'PUB', topic: 'laser_scan' },
-    { time: '12:39:28.408', ipc: '287ns', tick: '30μs', node: 'ActuatorNode', type: 'SUB', topic: 'laser_scan' },
-    { time: '12:39:28.558', ipc: '82ns', tick: '25μs', node: 'SensorNode', type: 'PUB', topic: 'sensors.imu' },
-    { time: '12:39:28.608', ipc: '305ns', tick: '28μs', node: 'ControlNode', type: 'SUB', topic: 'sensors.imu' },
-    { time: '12:39:28.708', ipc: '93ns', tick: '35μs', node: 'ActuatorNode', type: 'PUB', topic: 'cmd_vel' },
-    { time: '12:39:28.808', ipc: '276ns', tick: '42μs', node: 'SensorNode', type: 'SUB', topic: 'laser_scan' },
-    { time: '12:39:28.908', ipc: '86ns', tick: '19μs', node: 'ControlNode', type: 'PUB', topic: 'sensors.imu' },
-    { time: '12:39:29.008', ipc: '318ns', tick: '51μs', node: 'ActuatorNode', type: 'SUB', topic: 'odom' },
-    { time: '12:39:29.108', ipc: '88ns', tick: '27μs', node: 'SensorNode', type: 'PUB', topic: 'cmd_vel' }
+    { time: '12:39:28.039', ipc: '63ns', tick: '218μs', node: 'SensorNode', type: 'PUB', topic: 'sensors.imu' },
+    { time: '12:39:28.039', ipc: '158ns', tick: '10μs', node: 'ControlNode', type: 'SUB', topic: 'sensors.imu' },
+    { time: '12:39:28.156', ipc: '71ns', tick: '31μs', node: 'SensorNode', type: 'PUB', topic: 'cmd_vel' },
+    { time: '12:39:28.207', ipc: '149ns', tick: '41μs', node: 'ActuatorNode', type: 'SUB', topic: 'cmd_vel' },
+    { time: '12:39:28.208', ipc: '66ns', tick: '241μs', node: 'ControlNode', type: 'PUB', topic: 'odom' },
+    { time: '12:39:28.219', ipc: '173ns', tick: '25μs', node: 'ControlNode', type: 'SUB', topic: 'odom' },
+    { time: '12:39:28.358', ipc: '78ns', tick: '29μs', node: 'SensorNode', type: 'PUB', topic: 'laser_scan' },
+    { time: '12:39:28.408', ipc: '164ns', tick: '30μs', node: 'ActuatorNode', type: 'SUB', topic: 'laser_scan' },
+    { time: '12:39:28.558', ipc: '61ns', tick: '25μs', node: 'SensorNode', type: 'PUB', topic: 'sensors.imu' },
+    { time: '12:39:28.608', ipc: '152ns', tick: '28μs', node: 'ControlNode', type: 'SUB', topic: 'sensors.imu' },
+    { time: '12:39:28.708', ipc: '84ns', tick: '35μs', node: 'ActuatorNode', type: 'PUB', topic: 'cmd_vel' },
+    { time: '12:39:28.808', ipc: '147ns', tick: '42μs', node: 'SensorNode', type: 'SUB', topic: 'laser_scan' },
+    { time: '12:39:28.908', ipc: '69ns', tick: '19μs', node: 'ControlNode', type: 'PUB', topic: 'sensors.imu' },
+    { time: '12:39:29.008', ipc: '169ns', tick: '51μs', node: 'ActuatorNode', type: 'SUB', topic: 'odom' },
+    { time: '12:39:29.108', ipc: '74ns', tick: '27μs', node: 'SensorNode', type: 'PUB', topic: 'cmd_vel' }
   ];
 
   return (
@@ -106,7 +115,7 @@ export function ArchitectureDemo() {
           HORUS IPC Architecture
         </text>
         <text x="900" y="50" fill="var(--text-tertiary)" fontSize="13" textAnchor="middle">
-          87ns latency (wait-free) • Zero-copy shared memory communication
+          63ns median latency (wait-free) • Zero-copy shared memory communication
         </text>
 
         {/* Shared Memory Region (Center-Right) */}

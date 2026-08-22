@@ -20,6 +20,14 @@ npm run build
 
 # Start production server
 npm start
+
+# Contract checks — both gate CI, both run in about a second
+npm run check           # links + performance claims
+npm run check:links     # every internal link and #anchor resolves
+npm run check:claims    # no retracted performance claim anywhere
+
+# Include the framework README's links in the check
+node scripts/check-links.mjs ../horus/README.md
 ```
 
 Visit `http://localhost:3009` to view the documentation.
@@ -28,56 +36,36 @@ Visit `http://localhost:3009` to view the documentation.
 
 ```
 content/
-── docs/                              # Core documentation (30+ pages)
-   ── getting-started.mdx
-   ── installation.mdx
-   ── quick-start.mdx
-   ── node-macro.mdx
-   ── monitor.mdx
-   ── parameters.mdx
-   ── cli-reference.mdx
-   ── package-management.mdx        # Package install/publish
-   ── environment-management.mdx    # Freeze/restore environments
-   ── registry.mdx                   # Registry
-   ── authentication.mdx             # GitHub OAuth, API keys
-   ── remote-deployment.mdx          # Deploy to robots
-   ── library-reference.mdx          # Standard library components
-   ── core-concepts-nodes.mdx
-   ── core-concepts-topic.mdx
-   ── core-concepts-scheduler.mdx
-   ── core-concepts-shared-memory.mdx
-   ── api-node.mdx                   # Node API reference
-   ── api-topic.mdx                  # Topic API reference
-   ── api-scheduler.mdx              # Scheduler API reference
-   ── message-types.mdx
-   ── examples.mdx
-   ── performance.mdx
-   ── multi-language.mdx             # Python bindings
-   ── architecture.mdx
-── assets/         # Images and media
+  docs/                       # 151 pages, one directory per section
+    getting-started/          # installation, quick-start, choosing-language,
+                              # second-application, common-mistakes
+    concepts/                 # language-neutral explanations (nodes, topics,
+                              # scheduler, execution classes, transforms)
+    rust/  python/  cpp/      # per-language API references, guides, examples
+    tutorials/                # the ten-part series, in all three languages
+    recipes/                  # task-shaped answers
+    examples/                 # the ten projects shipped in horus/examples
+    learn/                    # orientation pages (coming-from-ros2)
+    development/              # CLI reference, monitor, testing, env vars
+    package-management/       # horus.toml, environments, prebuilt nodes
+    advanced/                 # deployment, RT, safety, blackbox, scheduler
+    performance/              # benchmarks and the optimization guide
+    plugins/
+  locales/<lang>/docs/        # translations; English is the fallback
 ```
 
-### Documentation Categories
+Routes come from the file tree: `content/docs/a/b.mdx` is served at `/a/b`, and
+`content/docs/a/index.mdx` at `/a`. `app/[...slug]/page.tsx` sets
+`dynamicParams = false`, so a link to a slug with no file behind it is a hard 404 —
+`npm run check:links` is the guard for that.
 
-**Getting Started**
-- Installation, Quick Start, node! Macro
-
-**Core Concepts**
-- Nodes, Topic (Pub/Sub), PodTopic (Ultra-Fast), Scheduler, Shared Memory
-
-**Guides**
-- Monitor, Parameters, CLI Reference
-- Package Management, Environment Management
-- Registry, Authentication
-- Remote Deployment, Library Reference
-- Message Types, Examples, Performance, Multi-Language
-
-**API Reference**
-- Node, Topic, PodTopic, Scheduler APIs
+Adding a page means adding it to `sections` in `components/DocsSidebar.tsx` as well:
+`PrevNextNav` derives its order from that list, and a contract test in the framework
+repo fails on any page nothing links to.
 
 ## Tech Stack
 
-- **Next.js 14** - React framework with App Router
+- **Next.js 15** - React framework with App Router
 - **MDX** - Markdown with React components
 - **Tailwind CSS** - Utility-first styling
 - **Shiki** - Syntax highlighting
@@ -115,16 +103,24 @@ General guidelines:
 - Include code examples
 - Test all code snippets
 - Follow existing formatting
-- Update navigation if adding new pages
+- Update navigation if adding new pages — `sections` in `components/DocsSidebar.tsx`
 - Run `npm run build` before committing to catch MDX errors
+- Run `npm run check` before committing to catch dead links and unsupported claims
 
 ## Performance Focus
 
-The documentation emphasizes HORUS's production-grade performance:
+Every performance figure on this site has to be traceable to a benchmark in the HORUS
+repository. The measured one-way medians, from `all_paths_latency` on the reference
+i7-10750H, are:
 
-- **~50ns-167ns** latency for real robotics messages (PodTopic ~50ns / Topic SPSC ~85ns / Topic MPMC ~167ns)
-- Production benchmarks with serde serialization
-- Real-world message types (CmdVel, LaserScan, IMU, etc.)
+- **20 ns** same-thread and **63 ns** cross-thread, 1:1 uncontended
+- **151 ns** cross-process 1:1 — against a **79 ns** raw-shared-memory hardware floor
+- **~190-280 ns** for contended multi-producer paths
+
+Competitor numbers (iceoryx, CycloneDDS, FastDDS, ROS 2) are **published reference
+values**, not measurements taken here, and the pages quoting them say so.
+`npm run check:claims` fails on the ratios that were previously asserted without either.
+See [Benchmarks](content/docs/performance/benchmarks.mdx) for the method.
 
 ## Links
 

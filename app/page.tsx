@@ -4,15 +4,28 @@ import { TableOfContents } from '@/components/TableOfContents';
 import { PrevNextNav } from '@/components/PrevNextNav';
 import type { Metadata } from 'next';
 
+// Numbers in this metadata have to be numbers the benchmarks page can produce.
+//
+// The site's <title>, description and OG card all led with "575x faster than
+// ROS2" and "87ns latency". Neither figure exists anywhere in the HORUS
+// repository: the only ROS 2 reference it holds is REP 2014's ~5,000 ns, and
+// the measured same-process median is 63 ns, not 87. The README dropped the
+// 575x claim; the SEO metadata kept stamping it onto every page, which is the
+// surface a skeptical evaluator meets first.
+//
+// What is measured, and is on /performance/benchmarks: 63 ns same-process and
+// 151 ns cross-process one-way medians, and ~33x against the ROS 2 reference
+// cross-process. Those are the numbers here.
 export const metadata: Metadata = {
-  title: 'HORUS Documentation | Real-Time Robotics Framework - 575x Faster Than ROS2',
-  description: 'Official documentation for HORUS, the world\'s fastest robotics framework. Sub-microsecond IPC latency (87ns), zero-copy messaging, Rust & Python support. Build production robots in minutes. FREE & open source.',
+  title: 'HORUS Documentation | Real-Time Robotics Framework, Sub-200ns IPC',
+  description: 'Official documentation for HORUS, a real-time robotics middleware for Rust, Python and C++. Measured 63 ns same-process and 151 ns cross-process IPC, zero-copy shared memory messaging. FREE & open source.',
   keywords: [
     'HORUS', 'HORUS robotics', 'HORUS framework',
-    'robotics framework', 'fastest robotics framework',
+    'robotics framework', 'real-time middleware',
     'ROS2 alternative', 'ROS alternative',
-    'Rust robotics', 'Python robotics',
+    'Rust robotics', 'Python robotics', 'C++ robotics',
     'real-time robotics', 'low latency robotics',
+    'zero-copy IPC', 'shared memory robotics',
     'robot programming', 'robotics documentation',
   ],
   alternates: {
@@ -20,7 +33,7 @@ export const metadata: Metadata = {
   },
   openGraph: {
     title: 'HORUS Documentation | Real-Time Robotics Framework',
-    description: 'Build production robots 575x faster than ROS2. Sub-microsecond latency, zero-copy messaging, Rust & Python.',
+    description: 'Real-time robotics middleware for Rust, Python and C++. Zero-copy shared memory IPC with a measured 63 ns same-process median — see /performance/benchmarks for the method.',
     url: 'https://docs.horus-registry.dev',
     siteName: 'HORUS Documentation',
     type: 'website',

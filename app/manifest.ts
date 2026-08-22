@@ -1,10 +1,17 @@
 import { MetadataRoute } from 'next';
 
+// The installed-app name and description, so the same rule applies here as to
+// the page metadata: only claims /performance/benchmarks can produce.
+//
+// This said "575x Faster Than ROS2" and "breakthrough 87ns latency" — neither
+// number exists in the HORUS repository — alongside "Trusted by elite AI
+// startups", which names no one and cites nothing. The measured medians are
+// 63 ns same-process and 151 ns cross-process.
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: 'HORUS - World\'s Fastest Robotics Framework | 575x Faster Than ROS2',
+    name: 'HORUS - Real-Time Robotics Framework for Rust, Python and C++',
     short_name: 'HORUS Robotics',
-    description: 'Revolutionary real-time robotics framework with breakthrough 87ns latency. Build autonomous robots, humanoids, and drones 575x faster than ROS2. Trusted by elite AI startups. Multi-language (Rust/Python). FREE & open source.',
+    description: 'Real-time robotics middleware with zero-copy shared memory IPC — a measured 63 ns same-process and 151 ns cross-process median. Build autonomous robots, humanoids and drones in Rust, Python or C++. FREE & open source.',
     start_url: '/',
     display: 'standalone',
     background_color: '#0a0e14',
@@ -74,13 +81,13 @@ export default function manifest(): MetadataRoute.Manifest {
         name: 'Examples',
         short_name: 'Examples',
         description: 'Production-ready code samples',
-        url: '/basic-examples',
+        url: '/examples',
         icons: [{ src: '/icons/code.png', sizes: '96x96' }],
       },
       {
         name: 'Benchmarks',
         short_name: 'Performance',
-        description: 'See why HORUS is 575x faster',
+        description: 'Latency, throughput and method',
         url: '/performance/benchmarks',
         icons: [{ src: '/icons/speed.png', sizes: '96x96' }],
       },

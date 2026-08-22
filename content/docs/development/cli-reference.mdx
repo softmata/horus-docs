@@ -219,9 +219,9 @@ Options:
                            Example: --enable cuda,editor,python
   -p, --package <NAME>     Run a specific workspace member by name
       --sim [<DRIVERS>...] Run in simulation mode using horus-sim3d.
-                           With no arguments, simulates every driver that has a
-                           [sim-drivers] override; with arguments, simulates
-                           only the named drivers.
+                           With no arguments, simulates every [hardware] entry
+                           marked `sim = true`; with arguments, simulates only
+                           the named ones.
       --net                Enable LAN network replication (transparent
                            cross-machine topics over UDP multicast)
       --record <NAME>      Enable recording for this session
@@ -232,6 +232,39 @@ Options:
   -V, --version            Print version
   -- <ARGS>                Arguments for your program
 ```
+
+### Simulating hardware with --sim
+
+`--sim` swaps a driver for a stub. Which drivers it swaps is decided by the `sim = true`
+flag on the `[hardware]` entry itself — nothing else:
+
+```toml
+[hardware.lidar]
+use = "rplidar"
+sim = true          # horus run --sim replaces this one with a stub
+
+[hardware.motors]
+use = "roboclaw"    # no sim flag — stays on the real backend under --sim
+```
+
+```bash
+horus run --sim              # every entry with sim = true
+horus run --sim lidar        # only lidar, even if others are marked
+```
+
+Naming a driver that is not marked `sim = true` does nothing: the argument list *narrows*
+the simulated set, it does not create it. So `horus run --sim motors` above still drives
+real motors.
+
+<Callout type="warning" title="`[sim-drivers]` is not consulted">
+
+An older form put the simulated backend in a separate `[sim-drivers]` table. That table
+still parses, and is then read by nothing — a project relying on it has **silently lost its
+simulation override** and runs its real hardware under `--sim`. `horus check` reports it as
+a warning naming the replacement. See
+[`[drivers]` and `[sim-drivers]`](/package-management/configuration#drivers-and-sim-drivers-deprecated).
+
+</Callout>
 
 ### Using --enable for Capabilities
 
@@ -1621,6 +1654,43 @@ Options:
   -h, --help           Print help
 ```
 
+### Logs are machine-wide, not project-scoped
+
+<Callout type="warning" title="`horus log` shows every HORUS process on this machine">
+
+There is no project scoping. Logs go into one shared-memory ring per **namespace**, at
+`/dev/shm/horus_<namespace>/logs`, and the default namespace is `default` for every
+process on the box — the same design as ROS 2's `domain_id=0`. So `horus log` in an empty
+directory with no project in it still prints whatever ran last:
+
+```bash
+$ cd /tmp/empty && ls -a
+.  ..
+$ horus log -n 1
+13:01:22.299 PUB   [pyattr_controller] uniq_livea_topic {"angular":0.0,"linear":1.0}
+```
+
+The banner it prints, `(showing local + remote logs)`, means *this machine* plus peers
+reached over `horus_net` — not *this project*.
+
+</Callout>
+
+To scope logs to one project, give it a namespace. `HORUS_NAMESPACE` isolates the
+shared-memory tree — topics and the log ring live under `/dev/shm/horus_<namespace>/` —
+so it has to be set for both the run and the viewer. Parameters are not in that tree:
+they are read from `.horus/config/params.yaml` relative to the working directory, and a
+namespace does not scope them.
+
+```bash
+HORUS_NAMESPACE=my_robot horus run       # in the project
+HORUS_NAMESPACE=my_robot horus log       # only that project's logs
+```
+
+Without it, treat the node name in each line as the only indication of which project the
+entry came from — and check it before concluding anything from a log during incident
+analysis. See [`HORUS_NAMESPACE`](/development/environment-variables) for the full effect
+of the setting.
+
 ### Examples
 
 **Follow logs from a specific node**:
@@ -2291,9 +2361,44 @@ Options:
   -e, --event <TYPE>       Filter by event type (e.g. "DeadlineMiss", "NodeError")
       --json               Output as machine-readable JSON
   -l, --last <N>           Show only the last N events
-  -p, --path <DIR>         Custom blackbox directory (default: .horus/blackbox/)
+  -p, --path <DIR>         Custom blackbox directory (default: the nearest
+                           .horus/blackbox/ holding records, else the
+                           machine-global store)
       --clear              Clear all blackbox data (with confirmation)
 ```
+
+### Which directory it reads
+
+With no `--path`, `blackbox` resolves the directory in three steps:
+
+1. Walk up from the current directory — at most ten levels — for a `.horus/blackbox/`
+   that actually holds a `blackbox.wal` or a `blackbox.json`. This is why it works from
+   `src/` and not only from the project root.
+2. Failing that, a `.horus/blackbox/` directory in the current directory, even an empty
+   one.
+3. Failing that, the **machine-global** store — shared by every project on the box:
+
+| Platform | Fallback directory |
+|----------|--------------------|
+| Linux | `$XDG_DATA_HOME/horus/blackbox`, else `~/.local/share/horus/blackbox` |
+| macOS | `~/Library/Application Support/horus/blackbox` |
+| Windows | `%LOCALAPPDATA%\horus\data\blackbox` |
+
+The first line of output names the directory it read — whether it found events or not —
+so check it before drawing conclusions:
+
+```
+BLACKBOX 42 events from /home/you/robot/.horus/blackbox
+INFO No blackbox events found in /home/you/.local/share/horus/blackbox
+```
+
+<Callout type="warning" title="Outside a project you are reading the global store">
+
+Run `horus blackbox` in a directory with no `.horus/blackbox/` above it and the events you
+see may come from a different project's run. During incident analysis that is worse than
+seeing nothing. Pass `--path .horus/blackbox` to pin it, or `cd` into the project first.
+
+</Callout>
 
 ### Examples
 

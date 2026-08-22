@@ -16,6 +16,17 @@ interface PageProps {
   }>;
 }
 
+// This function stamps a suffix onto the <title> of every page on the site, so
+// whatever claim it carries is the site's loudest one.
+//
+// It carried "575x Faster Than ROS2" — a ratio that appears in no benchmark, no
+// report and no source in the HORUS repository. The README was corrected and
+// this was not, so the retracted claim went on being served on 152 pages, in
+// the OG card, in the Twitter card and in the keywords array. The replacement
+// is the figure /performance/benchmarks actually measures: a 151 ns
+// cross-process one-way median, which is ~33x the ROS 2 REP 2014 reference —
+// stated as a reference comparison, not as a ROS 2 measurement, because nothing
+// here measures ROS 2 without `-F dds` and a DDS implementation installed.
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const { slug } = await params;
   const docPath = ['docs', ...slug];
@@ -23,14 +34,14 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 
   if (!doc) {
     return {
-      title: 'Page Not Found | HORUS - World\'s Fastest Robotics Framework',
-      description: 'The requested page could not be found. Explore HORUS documentation to build revolutionary robots 575x faster than ROS2.',
+      title: 'Page Not Found | HORUS Robotics Documentation',
+      description: 'The requested page could not be found. Browse the HORUS documentation for the Rust, Python and C++ guides, the CLI reference and the benchmarks.',
     };
   }
 
   const baseTitle = doc.frontmatter.title || 'HORUS Documentation';
-  const title = `${baseTitle} | HORUS - 575x Faster Than ROS2`;
-  const description = doc.frontmatter.description || 'Learn to build production robots with HORUS - the world\'s fastest robotics framework. 87ns latency, 575x faster than ROS2. Rust & Python. FREE & open source.';
+  const title = `${baseTitle} | HORUS Robotics`;
+  const description = doc.frontmatter.description || 'Build real-time robots with HORUS — zero-copy shared memory IPC for Rust, Python and C++, with a measured 151 ns cross-process median. FREE & open source.';
   const url = `https://docs.horus-registry.dev/${slug.join('/')}`;
   const pathName = `/${slug.join('/')}`;
 
@@ -40,10 +51,9 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     keywords: [
       // Primary keywords
       'HORUS',
-      'fastest robotics framework',
-      '575x faster than ROS2',
-      '87ns latency',
-      'revolutionary robotics',
+      'real-time robotics middleware',
+      'sub-microsecond IPC',
+      'zero-copy robotics framework',
 
       // Technical keywords
       'real-time robotics',
@@ -51,6 +61,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       'shared memory robotics',
       'Rust robotics framework',
       'Python robotics',
+      'C++ robotics',
 
       // Use case keywords
       'autonomous robot',
@@ -61,7 +72,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       // Comparison keywords
       'ROS alternative',
       'ROS2 alternative',
-      'best robotics framework',
+      'DDS alternative',
       'modern robotics',
 
       // Intent keywords
@@ -73,10 +84,10 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     creator: 'HORUS Robotics',
     publisher: 'HORUS Robotics',
     openGraph: {
-      title: `${baseTitle} | HORUS - Revolutionary Robotics Framework`,
+      title: `${baseTitle} | HORUS Robotics Framework`,
       description: `${description} Build your first robot in 5 minutes.`,
       url,
-      siteName: 'HORUS - World\'s Fastest Robotics Framework',
+      siteName: 'HORUS - Real-Time Robotics Framework',
       type: 'article',
       locale: 'en_US',
       images: [
@@ -84,13 +95,13 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
           url: 'https://docs.horus-registry.dev/og-image.png',
           width: 1200,
           height: 630,
-          alt: `${baseTitle} - HORUS Documentation | 575x Faster Than ROS2`,
+          alt: `${baseTitle} - HORUS Documentation`,
         },
       ],
     },
     twitter: {
       card: 'summary_large_image',
-      title: `${baseTitle} | HORUS - 575x Faster`,
+      title: `${baseTitle} | HORUS Robotics`,
       description: `${description.substring(0, 200)}...`,
       images: ['https://docs.horus-registry.dev/og-image.png'],
       creator: '@horus_robotics',

@@ -137,7 +137,7 @@ export function TableOfContents() {
             </li>
             <li>
               <Link
-                href="/api-node"
+                href="/rust/api"
                 className="text-xs text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors block touch-manipulation py-1"
               >
                 API Reference
@@ -145,7 +145,7 @@ export function TableOfContents() {
             </li>
             <li>
               <Link
-                href="/benchmarks"
+                href="/performance/benchmarks"
                 className="text-xs text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors block touch-manipulation py-1"
               >
                 Benchmarks

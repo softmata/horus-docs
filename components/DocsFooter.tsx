@@ -29,7 +29,7 @@ export function DocsFooter() {
                 </Link>
               </li>
               <li>
-                <Link href="/rust/examples/basic-examples" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
+                <Link href="/examples" className="text-[var(--text-secondary)] hover:text-[var(--text)] transition-colors">
                   Examples
                 </Link>
               </li>
