@@ -1,0 +1,329 @@
+---
+title: "Tutorial 2: Motor Controller (Rust)"
+description: "Build a closed-loop motor controller with PID and safety limits"
+order: 20
+---
+
+# Tutorial 2: Motor Controller (Rust)
+
+<Callout type="info">Prefer another language? The same tutorial exists for [Python](/tutorials/02-motor-controller-python) and [C++](/tutorials/02-motor-controller-cpp).</Callout>
+
+In this tutorial you'll build a motor controller that:
+- Reads velocity commands from a topic
+- Applies PID control to track the commanded velocity
+- Clamps its output to the actuator limit and enforces safety constraints
+- Publishes motor state for monitoring
+- Enters safe state (stops motors) on safety events
+
+## What You'll Learn
+
+- Multi-topic node with subscribers AND publishers
+- PID control loop with anti-windup
+- Budget enforcement with `Miss::SafeMode`
+- `enter_safe_state()` for actuator safety
+
+## Prerequisites
+
+- Completed [Tutorial 1: IMU Sensor Node](/tutorials/01-sensor-node-rust)
+- Understanding of PID control
+
+## Step 1: Create the Project
+
+```bash
+horus new motor_ctrl
+cd motor_ctrl
+```
+
+## Step 2: Write the Motor Controller
+
+Replace `src/main.rs`:
+
+```rust
+use horus::prelude::*;
+
+// Gains and limits. Tutorial 7 shows how to move these to runtime parameters.
+const KP: f64 = 2.0;
+const KI: f64 = 0.5;
+const KD: f64 = 0.1;
+const DT: f64 = 0.01; // 100 Hz
+const INTEGRAL_MAX: f64 = 1.0;
+const MAX_PWM: f64 = 1.0;
+const ENCODER_TIMEOUT_TICKS: u32 = 50; // 500 ms at 100 Hz
+
+// ── Motor Controller Node ───────────────────────────────────────────────
+struct MotorController {
+    cmd: Topic<CmdVel>,     // velocity commands from planner/teleop
+    encoder: Topic<CmdVel>, // encoder feedback
+    motor: Topic<CmdVel>,   // motor commands (PWM duty cycle)
+    state: Topic<CmdVel>,   // motor state for monitoring
+
+    target_linear: f64,
+    target_angular: f64,
+    lin_integral: f64,
+    lin_prev_error: f64,
+    ang_integral: f64,
+    ang_prev_error: f64,
+    tick_count: u64,
+    ticks_without_encoder: u32,
+    encoder_timeout_logged: bool,
+}
+
+impl MotorController {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd: Topic::new("cmd_vel")?,
+            encoder: Topic::new("encoder.velocity")?,
+            motor: Topic::new("motor.pwm")?,
+            state: Topic::new("motor.state")?,
+            target_linear: 0.0,
+            target_angular: 0.0,
+            lin_integral: 0.0,
+            lin_prev_error: 0.0,
+            ang_integral: 0.0,
+            ang_prev_error: 0.0,
+            tick_count: 0,
+            ticks_without_encoder: 0,
+            encoder_timeout_logged: false,
+        })
+    }
+
+    fn send_zero(&mut self) {
+        self.motor.send(CmdVel::new(0.0, 0.0));
+    }
+}
+
+impl Node for MotorController {
+    fn name(&self) -> &str {
+        "motor_controller"
+    }
+
+    fn init(&mut self) -> Result<()> {
+        hlog!(info, "Motor controller initialized");
+        hlog!(info, "Waiting for encoder feedback...");
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        // Drain to the most recent command rather than reading one per tick,
+        // so a burst from the planner does not queue up behind the controller.
+        while let Some(cmd) = self.cmd.recv() {
+            self.target_linear = cmd.linear as f64;
+            self.target_angular = cmd.angular as f64;
+        }
+
+        // Actual velocity from the encoder.
+        let mut actual_linear = 0.0;
+        let mut actual_angular = 0.0;
+        let mut encoder_alive = false;
+        while let Some(enc) = self.encoder.recv() {
+            actual_linear = enc.linear as f64;
+            actual_angular = enc.angular as f64;
+            encoder_alive = true;
+        }
+
+        // Safety: no encoder feedback for 500 ms means the cable is out, the
+        // driver process died, or the topic is gone. Stop rather than integrate
+        // against a velocity we are only assuming.
+        if encoder_alive {
+            self.ticks_without_encoder = 0;
+            self.encoder_timeout_logged = false;
+        } else {
+            self.ticks_without_encoder += 1;
+            if self.ticks_without_encoder > ENCODER_TIMEOUT_TICKS {
+                if !self.encoder_timeout_logged {
+                    hlog!(error, "Encoder timeout — stopping motors");
+                    self.encoder_timeout_logged = true;
+                }
+                self.send_zero();
+                return;
+            }
+        }
+
+        // PID on linear velocity, with the integral clamped (anti-windup).
+        let lin_error = self.target_linear - actual_linear;
+        self.lin_integral =
+            (self.lin_integral + lin_error * DT).clamp(-INTEGRAL_MAX, INTEGRAL_MAX);
+        let lin_output = KP * lin_error
+            + KI * self.lin_integral
+            + KD * (lin_error - self.lin_prev_error) / DT;
+        self.lin_prev_error = lin_error;
+
+        // PID on angular velocity.
+        let ang_error = self.target_angular - actual_angular;
+        self.ang_integral =
+            (self.ang_integral + ang_error * DT).clamp(-INTEGRAL_MAX, INTEGRAL_MAX);
+        let ang_output = KP * ang_error
+            + KI * self.ang_integral
+            + KD * (ang_error - self.ang_prev_error) / DT;
+        self.ang_prev_error = ang_error;
+
+        // Clamp to the actuator limit and publish.
+        self.motor.send(CmdVel::new(
+            lin_output.clamp(-MAX_PWM, MAX_PWM) as f32,
+            ang_output.clamp(-MAX_PWM, MAX_PWM) as f32,
+        ));
+
+        // Publish state for monitoring every 10th tick → 10 Hz.
+        self.tick_count += 1;
+        if self.tick_count % 10 == 0 {
+            self.state
+                .send(CmdVel::new(actual_linear as f32, lin_error as f32));
+        }
+    }
+
+    fn enter_safe_state(&mut self) {
+        self.send_zero();
+        // Clear the integrators too: resuming with a wound-up integral would
+        // kick the motors the moment the node recovers.
+        self.lin_integral = 0.0;
+        self.ang_integral = 0.0;
+        hlog!(error, "Safe state — motors zeroed");
+    }
+}
+
+// ── Simulated Encoder (for testing without hardware) ────────────────────
+struct SimEncoder {
+    pwm: Topic<CmdVel>,
+    encoder: Topic<CmdVel>,
+    velocity: f64,
+}
+
+impl SimEncoder {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            pwm: Topic::new("motor.pwm")?,
+            encoder: Topic::new("encoder.velocity")?,
+            velocity: 0.0,
+        })
+    }
+}
+
+impl Node for SimEncoder {
+    fn name(&self) -> &str {
+        "sim_encoder"
+    }
+
+    fn tick(&mut self) {
+        while let Some(cmd) = self.pwm.recv() {
+            // Simulate motor dynamics: velocity tracks PWM with lag.
+            self.velocity = 0.9 * self.velocity + 0.1 * cmd.linear as f64;
+        }
+        self.encoder.send(CmdVel::new(self.velocity as f32, 0.0));
+    }
+}
+
+// ── Simulated Command Source ────────────────────────────────────────────
+struct Commander {
+    cmd: Topic<CmdVel>,
+    ticks: u64,
+}
+
+impl Commander {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            cmd: Topic::new("cmd_vel")?,
+            ticks: 0,
+        })
+    }
+}
+
+impl Node for Commander {
+    fn name(&self) -> &str {
+        "commander"
+    }
+
+    fn tick(&mut self) {
+        // Drive at 0.5 m/s for 3 s, then stop.
+        let linear = if self.ticks < 300 { 0.5 } else { 0.0 };
+        self.ticks += 1;
+        self.cmd.send(CmdVel::new(linear, 0.0));
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
+fn main() -> Result<()> {
+    // deterministic(true) keeps every node on the main tick loop, in .order()
+    // sequence — without it .budget() moves the controller to an RT thread.
+    let mut sched = Scheduler::new()
+        .tick_rate(100_u64.hz())
+        .name("motor_ctrl")
+        .deterministic(true);
+
+    // Encoder first (order 0) so the controller always has fresh feedback.
+    sched.add(SimEncoder::new()?).order(0).build()?;
+    sched.add(Commander::new()?).order(5).build()?;
+    sched
+        .add(MotorController::new()?)
+        .order(10)
+        .budget(5_u64.ms())
+        .on_miss(Miss::SafeMode) // stop motors if the tick overruns
+        .build()?;
+
+    println!("Motor controller running at 100 Hz (Ctrl+C to stop)");
+    sched.run()
+}
+```
+
+## Step 3: Build and Run
+
+```bash
+horus build && horus run
+```
+
+## Step 4: Monitor
+
+In another terminal:
+
+```bash
+horus topic echo motor.state   # watch motor state
+horus topic echo motor.pwm     # watch PWM output
+horus node list                # see all 3 nodes running
+horus log                      # see init/error messages
+```
+
+## Key Concepts
+
+### Execution Order Matters
+
+```
+order 0:  SimEncoder      → reads PWM, publishes encoder velocity
+order 5:  Commander       → publishes velocity command
+order 10: MotorController → reads command + encoder, publishes PWM
+```
+
+The encoder runs BEFORE the controller so the controller always has fresh feedback. `deterministic(true)` is what turns that into a guarantee: it keeps every node on the main tick loop and executes them sequentially in `.order()` sequence. Without it, `.budget(5_u64.ms())` promotes `MotorController` to an RT node that the scheduler hands to its own executor thread — `.order()` then only sorts nodes *within* an executor, and the encoder/controller interleaving is no longer guaranteed.
+
+### Budget + SafeMode
+
+```rust
+use horus::prelude::*;
+
+fn configure(sched: &mut Scheduler, motor: impl Node + 'static) -> Result<()> {
+    sched
+        .add(motor)
+        .order(10)
+        .budget(5_u64.ms())
+        .on_miss(Miss::SafeMode)
+        .build()?;
+    Ok(())
+}
+```
+
+If the motor controller takes longer than 5 ms, the scheduler calls `enter_safe_state()` — motors stop immediately. This prevents a slow computation from leaving motors running with stale commands.
+
+The hook fires on the **transition** into safe mode, not on every miss, so a node under sustained overload is safed once rather than re-safed every cycle. The latch clears once the node meets its deadline again.
+
+### Encoder Timeout
+
+The controller tracks `ticks_without_encoder`. If no encoder data arrives for 50 ticks (500 ms at 100 Hz), it assumes the encoder is dead and stops motors. This catches:
+- Disconnected encoder cable
+- Crashed encoder driver process
+- SHM corruption
+
+Note that this is a *separate* safety net from the budget. The budget catches "this node is too slow"; the encoder timeout catches "this node is fine but its input is gone". Neither one detects the other's failure.
+
+## Next Steps
+
+- [Tutorial 3: Full Robot System](/tutorials/03-full-robot-cpp) — combine sensor, controller, and actuator
+- [Tutorial 7: Parameters Deep Dive](/tutorials/07-params-deep-dive-cpp) — tune the PID gains at runtime
+- [Topics & Communication](/rust-guide/topics) — full `Topic<T>` reference
