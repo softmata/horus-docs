@@ -66,29 +66,49 @@ It is not what auto-detection would pick for that topology: a real 1-publisher /
 many-subscriber POD topic gets `PodShm`, because `SpmcShm`'s consumers compete for
 messages rather than each receiving the stream.
 
-**Real message types**:
+**Real message types** (measured with `robotics_messages_benchmark`, 50K iterations after 5K warmup):
 
 | Message | Size | Median | p99 |
 |---------|------|--------|-----|
-| CmdVel | 16B | 20ns | 29ns |
+| CmdVel | 16B | 75ns | 135ns |
 
 **Key insight**: cross-process shared memory adds only ~31ns of framework overhead over the raw shared-memory hardware floor.
 
-Reproduce these numbers yourself with `cargo run --release -p horus_benchmarks --bin all_paths_latency`; the full result set and methodology live in `benchmarks/README.md` in the HORUS repository.
+Reproduce these numbers yourself with `cargo run --release -p horus_benchmarks --bin all_paths_latency` (backend scenarios) and `--bin robotics_messages_benchmark` (real message types); the full result set and methodology live in `benchmarks/README.md` in the HORUS repository.
 
 ### Throughput
 
-HORUS can handle:
-- **12M+ messages/second** for small messages (16B), 1 publisher : 1 subscriber
-- **3M+ messages/second** for small messages (16B), many publishers : many subscribers
-- **1M+ messages/second** for medium messages (1KB)
-- **100K+ messages/second** for large messages (100KB)
+> **No published throughput table.** `benchmarks/README.md` publishes latency percentiles only. The HORUS repository has no throughput result for a 1 KB or 100 KB payload and none for a many-publisher / many-subscriber topology — no benchmark in it even sends a 100 KB message. The largest payloads anywhere in `benchmarks/` are 4 KB (`research_latency`), 1 KB (`ThroughputPayload1K` in `benches/topic_throughput.rs`) and the 1,480-byte `LaserScan` in `robotics_messages_benchmark`.
+
+The only per-message throughput figures HORUS publishes come from the same `robotics_messages_benchmark` run as the latency row above. They are **send-only** — producer-side `send()`, one publisher, derived from the median send time — not a sustained pub/sub rate:
+
+| Message | Size | Send-only throughput |
+|---------|------|----------------------|
+| CmdVel | 16 B | 12.14 M msg/s |
+| Imu | 304 B | 7.46 M msg/s |
+| JointCommand | 928 B | 6.89 M msg/s |
+| LaserScan | 1,480 B | 4.42 M msg/s |
+
+Full result set on the [Benchmarks](/performance/benchmarks) page.
+
+For anything larger, or for a topology with more than one publisher, measure it yourself rather than extrapolating:
+
+```bash
+# 16 B / 256 B / 1 KB sustained send, Criterion
+cargo bench -p horus_benchmarks --bench topic_throughput
+
+# 1:1 through 8:8 producers:consumers, with scaling efficiency
+cargo run --release -p horus_benchmarks --bin scalability_benchmark
+
+# sustained msg/s over 60s+, per-second granularity
+cargo run --release -p horus_benchmarks --bin research_throughput
+```
 
 ## Build Optimization
 
 ### Always Use Release Mode
 
-Debug builds are **10-100x slower**:
+Debug builds are **10–50x slower**:
 
 ```bash
 # SLOW: Debug build
@@ -98,10 +118,15 @@ horus run
 horus run --release
 ```
 
-**Why it matters**:
-- Debug: 50µs per tick
-- Release: 500ns per tick
-- **100x difference** for the same code
+**Why it matters**: at a 1 kHz control loop a debug build typically misses its deadlines outright, and its timing tells you nothing about release performance. The scheduler says so itself at startup when it sees RT nodes in a debug build:
+
+```text
+Note: 1 real-time node in a debug build. Debug is typically 10-50x slower,
+so deadline misses here are expected and timing is not representative.
+Use `horus run --release` to measure.
+```
+
+> **Measurement Note**: 10–50x is the figure HORUS reports at runtime (`horus_core/src/scheduling/scheduler/mod.rs`), not a benchmarked ratio. The repository publishes no debug-vs-release per-tick measurement — the numbers in `benchmarks/README.md` are all release builds. Measure your own workload with `horus run --release` before and after rather than assuming a multiplier.
 
 ### Link-Time Optimization (LTO)
 
@@ -491,10 +516,10 @@ perf report
 ### Pitfall: Using Debug Builds
 
 ```bash
-# SLOW: 50µs/tick
+# SLOW: debug build, 10–50x slower, timing not representative
 horus run
 
-# FAST: 500ns/tick
+# FAST: release build, the configuration all published numbers use
 horus run --release
 ```
 

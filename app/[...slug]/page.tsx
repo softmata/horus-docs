@@ -42,7 +42,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const baseTitle = doc.frontmatter.title || 'HORUS Documentation';
   const title = `${baseTitle} | HORUS Robotics`;
   const description = doc.frontmatter.description || 'Build real-time robots with HORUS — zero-copy shared memory IPC for Rust, Python and C++, with a measured 151 ns cross-process median. FREE & open source.';
-  const url = `https://docs.horus-registry.dev/${slug.join('/')}`;
+  const url = `https://docs.horusrobotics.dev/${slug.join('/')}`;
   const pathName = `/${slug.join('/')}`;
 
   return {
@@ -92,7 +92,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       locale: 'en_US',
       images: [
         {
-          url: 'https://docs.horus-registry.dev/og-image.png',
+          url: 'https://docs.horusrobotics.dev/og-image.png',
           width: 1200,
           height: 630,
           alt: `${baseTitle} - HORUS Documentation`,
@@ -103,7 +103,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       card: 'summary_large_image',
       title: `${baseTitle} | HORUS Robotics`,
       description: `${description.substring(0, 200)}...`,
-      images: ['https://docs.horus-registry.dev/og-image.png'],
+      images: ['https://docs.horusrobotics.dev/og-image.png'],
       creator: '@horus_robotics',
       site: '@horus_robotics',
     },

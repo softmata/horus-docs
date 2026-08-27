@@ -51,7 +51,7 @@ export default function robots(): MetadataRoute.Robots {
         allow: '/',
       },
     ],
-    sitemap: 'https://docs.horus-registry.dev/sitemap.xml',
-    host: 'https://docs.horus-registry.dev',
+    sitemap: 'https://docs.horusrobotics.dev/sitemap.xml',
+    host: 'https://docs.horusrobotics.dev',
   };
 }

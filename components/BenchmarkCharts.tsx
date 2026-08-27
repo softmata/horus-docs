@@ -730,8 +730,18 @@ export function PythonComparisonChart() {
           </Bar>
         </BarChart>
       </ResponsiveContainer>
+      {/*
+        This said "HORUS Python is 10-40x faster than traditional Python IPC",
+        four lines under the caption that says these values have no source. The
+        caption was corrected and the summary line beneath the same chart was
+        not, which is worse than leaving both wrong: a disclaimer directly above
+        a ratio makes the ratio a knowing assertion. "Traditional Python IPC" is
+        not named or measured anywhere either, so there is no denominator.
+      */}
       <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        HORUS Python is <span style={{ color: colors.horus, fontWeight: 'bold' }}>10-40x faster</span> than traditional Python IPC
+        No ratio is published for these bars, because neither side of it is measured.
+        Run the benchmark above on your own machine and compare against the IPC you
+        are actually replacing.
       </div>
     </div>
   );
@@ -939,8 +949,19 @@ export function PythonRustComparisonChart() {
           <Bar dataKey="python" fill={colors.horus} radius={[4, 4, 0, 0]} name="python" />
         </BarChart>
       </ResponsiveContainer>
+      {/*
+        Same defect as PythonComparisonChart, same fix. This read "Python adds
+        ~10-15x overhead over Rust, but still 10-100x faster than alternatives".
+        The 100x is above anything this project measures against any competitor
+        (the widest measured spread is 24x-79x against the ROS 2 reference), and
+        "alternatives" names nothing, so the claim cannot be checked even in
+        principle. The Rust-vs-Python ratio the bars do show is derived from the
+        bars themselves, which the caption says are unsourced.
+      */}
       <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        Python adds ~10-15x overhead over Rust, but still <span style={{ color: colors.horus, fontWeight: 'bold' }}>10-100x faster</span> than alternatives
+        Both series are unsourced, so the ratio between them is too. For the Rust
+        figures that <em>are</em> measured, see{' '}
+        <Link href="/performance/benchmarks">Benchmarks</Link>.
       </div>
     </div>
   );
@@ -1161,82 +1182,32 @@ export function TransformFrameMemoryChart() {
   );
 }
 
-/**
- * TransformFrame Concurrent Performance Chart
+/*
+ * TransformFrameConcurrentChart was here, and every number in it was invented.
+ *
+ * It plotted a five-point ROS 2 TF2 curve — 2 us, 3.5 us, 8 us, 18 us, 45 us at
+ * 1/2/4/8/16 reader threads — for the exact row /concepts/transform-frame says
+ * in as many words carries no TF2 comparison ("Concurrent reads (4 threads) |
+ * ~115ns | N/A | -", and the note beneath it: "no ROS2 TF2 comparison was run
+ * for those two, so they carry no speedup figure"). Its HORUS series was no
+ * better sourced: it drew 800 ns at four threads against the ~115 ns that same
+ * page publishes, a factor of seven, and no per-thread-count sweep is published
+ * anywhere for the other four points.
+ *
+ * The two sibling charts on this subject were corrected in an earlier pass —
+ * TransformFrameLatencyChart replaced its uncompared TF2 bars with `null`, and
+ * TransformFrameSpeedupChart dropped the three bars with no TF2 run behind
+ * them, including a 100x one. This chart, third of the three and the only one
+ * no page renders, was left drawing the curve both of the others had just
+ * deleted. Correcting it in place would have meant inventing four more HORUS
+ * points to keep the line, so it is gone instead.
+ *
+ * To bring it back: publish a concurrent-read sweep from horus-tf's benchmark
+ * suite with the thread counts and the machine stated, and a TF2 run under the
+ * same conditions if the TF2 series is wanted. One measured point does not make
+ * a curve. No page imported this component, so removing it renders nothing
+ * differently.
  */
-export function TransformFrameConcurrentChart() {
-  const colors = useColors();
-
-  const data = [
-    { threads: 1, transform_frame: 500, tf2: 2000 },
-    { threads: 2, transform_frame: 550, tf2: 3500 },
-    { threads: 4, transform_frame: 800, tf2: 8000 },
-    { threads: 8, transform_frame: 1100, tf2: 18000 },
-    { threads: 16, transform_frame: 1400, tf2: 45000 },
-  ];
-
-  return (
-    <div
-      className="w-full rounded-xl p-6 my-6"
-      style={{ backgroundColor: colors.surface, border: `1px solid ${colors.border}` }}
-    >
-      <h3 className="text-lg font-semibold mb-2" style={{ color: colors.textBold }}>
-        Concurrent Read Performance
-      </h3>
-      <p className="text-sm mb-4" style={{ color: colors.text }}>
-        Latency under contention (ns). HORUS Transform Frame uses lock-free reads.
-      </p>
-      <ResponsiveContainer width="100%" height={350}>
-        <LineChart data={data} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} />
-          <XAxis
-            dataKey="threads"
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            label={{ value: 'Concurrent Readers', position: 'bottom', fill: colors.text, offset: 0 }}
-          />
-          <YAxis
-            stroke={colors.text}
-            tick={{ fill: colors.text }}
-            scale="log"
-            domain={[100, 100000]}
-            tickFormatter={(value) => value >= 1000 ? `${(value/1000).toFixed(0)}μs` : `${value}ns`}
-            label={{ value: 'Latency (log scale)', angle: -90, position: 'insideLeft', fill: colors.text }}
-          />
-          <Tooltip
-            formatter={(value: any) => [value >= 1000 ? `${(value/1000).toFixed(2)}μs` : `${value}ns`, '']}
-            contentStyle={{ backgroundColor: colors.tooltipBg, border: `1px solid ${colors.tooltipBorder}`, borderRadius: '8px' }}
-            labelStyle={{ color: colors.text }}
-            labelFormatter={(label: any) => `${label} threads`}
-          />
-          <Legend
-            formatter={(value: any) => <span style={{ color: colors.text }}>{value}</span>}
-          />
-          <Line
-            type="monotone"
-            dataKey="transform_frame"
-            stroke={colors.horus}
-            strokeWidth={3}
-            dot={{ fill: colors.horus, strokeWidth: 2, r: 5 }}
-            name="HORUS Transform Frame"
-          />
-          <Line
-            type="monotone"
-            dataKey="tf2"
-            stroke={colors.ros2}
-            strokeWidth={3}
-            dot={{ fill: colors.ros2, strokeWidth: 2, r: 5 }}
-            name="ROS2 TF2"
-            strokeDasharray="5 5"
-          />
-        </LineChart>
-      </ResponsiveContainer>
-      <div className="mt-4 text-center text-sm" style={{ color: colors.text }}>
-        HORUS Transform Frame maintains <span style={{ color: colors.horus, fontWeight: 'bold' }}>near-constant latency</span> under contention due to lock-free design
-      </div>
-    </div>
-  );
-}
 
 // Export all charts as a single default for easy MDX import
 const benchmarkCharts = {
@@ -1253,7 +1224,6 @@ const benchmarkCharts = {
   TransformFrameLatencyChart,
   TransformFrameSpeedupChart,
   TransformFrameMemoryChart,
-  TransformFrameConcurrentChart,
 };
 
 export default benchmarkCharts;

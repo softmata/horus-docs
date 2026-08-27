@@ -110,12 +110,22 @@ General guidelines:
 ## Performance Focus
 
 Every performance figure on this site has to be traceable to a benchmark in the HORUS
-repository. The measured one-way medians, from `all_paths_latency` on the reference
-i7-10750H, are:
+repository. Quote the record that matches the claim, and name the machine it was taken
+on — the repository holds figures from more than one.
 
-- **20 ns** same-thread and **63 ns** cross-thread, 1:1 uncontended
-- **151 ns** cross-process 1:1 — against a **79 ns** raw-shared-memory hardware floor
-- **~190-280 ns** for contended multi-producer paths
+The headline medians are the ones in `horus/README.md` (Intel i9-14900K, RDTSC cycle
+counting with calibrated overhead subtraction, Tukey IQR fences, bootstrap 95% CIs):
+
+- **91 ns** same-process pub/sub, producer-side `send()`
+- **171 ns** cross-process, end-to-end one-way
+- **80 ns** for 1 publisher → 3 subscribers, producer-side `send()`
+
+The per-backend percentile tables in `horus/benchmarks/README.md` are being regenerated
+and currently carry no numbers, so there is nothing there to quote yet. Until they are
+refilled, do not put a per-backend p50/p99, a raw-shared-memory hardware floor, or a
+contended multi-producer figure on a page — regenerate them first with
+`cargo run --release -p horus_benchmarks --bin all_paths_latency`, and attribute whatever
+you publish to the machine that produced it.
 
 Competitor numbers (iceoryx, CycloneDDS, FastDDS, ROS 2) are **published reference
 values**, not measurements taken here, and the pages quoting them say so.

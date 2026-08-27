@@ -3,7 +3,7 @@ import "./globals.css";
 import { Analytics } from "@vercel/analytics/react";
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://docs.horus-registry.dev'),
+  metadataBase: new URL('https://docs.horusrobotics.dev'),
   title: "HORUS Documentation | Real-Time Robotics Framework",
   description: "Documentation for HORUS, a high-performance robotics framework. Sub-microsecond IPC latency, zero-copy messaging, multi-language support (Rust/Python). Open source under Apache 2.0.",
   keywords: [
@@ -33,11 +33,11 @@ export const metadata: Metadata = {
   openGraph: {
     title: "HORUS Documentation | Real-Time Robotics Framework",
     description: "Documentation for HORUS, a high-performance robotics framework with sub-microsecond IPC latency, zero-copy messaging, and multi-language support.",
-    url: "https://docs.horus-registry.dev",
+    url: "https://docs.horusrobotics.dev",
     siteName: "HORUS Documentation",
     images: [
       {
-        url: 'https://docs.horus-registry.dev/og-image.png',
+        url: 'https://docs.horusrobotics.dev/og-image.png',
         width: 1200,
         height: 630,
         alt: 'HORUS - Real-Time Robotics Framework Documentation',
@@ -50,7 +50,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: "HORUS Documentation | Real-Time Robotics Framework",
     description: "Documentation for HORUS, a high-performance robotics framework with sub-microsecond IPC latency and zero-copy messaging.",
-    images: ['https://docs.horus-registry.dev/og-image.png'],
+    images: ['https://docs.horusrobotics.dev/og-image.png'],
   },
   robots: {
     index: true,
@@ -64,7 +64,7 @@ export const metadata: Metadata = {
     },
   },
   alternates: {
-    canonical: 'https://docs.horus-registry.dev',
+    canonical: 'https://docs.horusrobotics.dev',
   },
 };
 
@@ -91,10 +91,10 @@ export default function RootLayout({
     operatingSystem: ['Linux', 'macOS', 'Windows'],
     description: 'HORUS is an open-source robotics framework with sub-microsecond IPC latency, zero-copy shared memory messaging, and multi-language support (Rust, Python).',
     softwareVersion: '0.1.7',
-    url: 'https://docs.horus-registry.dev',
+    url: 'https://docs.horusrobotics.dev',
     downloadUrl: 'https://github.com/softmata/horus',
-    installUrl: 'https://docs.horus-registry.dev/getting-started/installation',
-    softwareHelp: 'https://docs.horus-registry.dev',
+    installUrl: 'https://docs.horusrobotics.dev/getting-started/installation',
+    softwareHelp: 'https://docs.horusrobotics.dev',
     releaseNotes: 'https://github.com/softmata/horus/releases',
     keywords: 'robotics framework, real-time, rust, python, IPC, shared memory',
     programmingLanguage: ['Rust', 'Python'],

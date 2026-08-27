@@ -3,7 +3,7 @@ import path from 'path';
 import type { MetadataRoute } from 'next';
 import { locales, localizedHref } from '@/lib/i18n';
 
-const baseUrl = 'https://docs.horus-registry.dev';
+const baseUrl = 'https://docs.horusrobotics.dev';
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const contentDir = path.join(process.cwd(), 'content/docs');
