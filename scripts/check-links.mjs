@@ -115,11 +115,14 @@ for (const file of walk(contentDir)) {
 
 // The hosts this site is served from. A link written the long way is still a
 // link to a route here, and is the form the project README uses.
+//
+// docs.horus-registry.dev used to be listed here as a second self-host, which is why this
+// checker stayed green while every canonical tag on the site pointed at it — a hostname that
+// serves nothing. Keep this list to hosts that actually serve the docs, so the same class of
+// regression fails the check instead of passing it.
 const OWN_HOSTS = [
   'https://docs.horusrobotics.dev',
-  'https://docs.horus-registry.dev',
   'http://docs.horusrobotics.dev',
-  'http://docs.horus-registry.dev',
 ];
 
 const extra = process.argv.slice(2).map((p) => path.resolve(root, p));
