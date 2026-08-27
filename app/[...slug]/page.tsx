@@ -7,7 +7,7 @@ import type { Metadata } from 'next';
 import { locales, localizedHref } from '@/lib/i18n';
 
 // Only serve pre-rendered pages - return 404 for unknown paths
-// This ensures Vercel properly serves all static pages
+// Unknown paths must 404 rather than render an empty shell.
 export const dynamicParams = false;
 
 interface PageProps {
