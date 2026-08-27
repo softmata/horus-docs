@@ -31,7 +31,6 @@ import {
   TransformFrameLatencyChart,
   TransformFrameSpeedupChart,
   TransformFrameMemoryChart,
-  TransformFrameConcurrentChart,
 } from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
 import { defaultLocale, type Locale } from '@/lib/i18n';
@@ -170,7 +169,12 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
         TransformFrameLatencyChart,
         TransformFrameSpeedupChart,
         TransformFrameMemoryChart,
-        TransformFrameConcurrentChart,
+        // TransformFrameConcurrentChart was removed: every point in it was
+        // invented, including a TF2 curve for the one row
+        // /concepts/transform-frame says has no TF2 comparison. A component in
+        // this map is a component any page can drop in, so an unrendered chart
+        // is still a live surface — see the note where it used to be in
+        // components/BenchmarkCharts.tsx.
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {

@@ -20,17 +20,25 @@
  * live on every page.
  *
  * This is the docs-side half of that contract, over the files the Rust test
- * cannot see: `app/`, `components/`, `lib/`, and the Markdown alongside them.
+ * cannot see: `app/`, `components/`, `lib/`, `scripts/`, `public/`, and the
+ * Markdown alongside them.
  *
  * What it checks
  * --------------
- *   1. The retracted ratios (575x, 550x, 585x, 875x) appear nowhere.
+ *   1. The retracted ratios appear nowhere. The list is every bar the
+ *      `SpeedupChart` used to draw (575x, 940x, 750x, 167x) plus the three the
+ *      blog's retracted post printed (550x, 585x, 875x).
  *   2. "87ns" / "87 ns" appears nowhere: it is the phantom latency figure that
  *      travelled with the 575x claim. The measured medians are 63 ns
  *      same-process and 151 ns cross-process.
- *   3. A line that names ROS 2 *and* says "measured"/"benchmark" *and* carries a
- *      three-digit-or-larger ratio is flagged — the shape of the original
- *      defect, which was asserting a measurement that had not been taken.
+ *   3. A line naming a competitor and carrying a ratio at or above the ceiling
+ *      is flagged. The measured spread against the ROS 2 reference is 24x-79x,
+ *      so a three-digit competitor ratio is fabricated by construction.
+ *   4. Chart data: a `speedup:` datum at or above the ceiling, and a competitor
+ *      series (`tf2:`, `ros2:`, `dds:`, `reference:`) drawn in a component that
+ *      states no provenance for it.
+ *   5. A component that admits "Not measured" and asserts an "Nx faster" ratio
+ *      in the same breath.
  *
  * It does not check whether any surviving number is correct. It checks that the
  * numbers we know to be unsupported do not come back.
@@ -47,21 +55,70 @@ const root = process.cwd();
 // Directories whose contents are ours to keep honest. `content/docs` is left to
 // perf_claims_contract.rs, which already walks it from the Rust side; scanning
 // it here too is harmless and catches the case where that job is not run.
-const SCAN_DIRS = ['app', 'components', 'lib', 'content'];
-const SCAN_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js', '.mdx', '.md'];
+//
+// `scripts/` and `public/` were outside the walk, and both serve claims:
+// `build-search-index.js` writes the blob the site search reads, and
+// `public/og-image.svg` IS the share card. `''` is the repository root, whose
+// `README.md` is the first thing a visitor to the GitHub mirror reads. The
+// original defect was a claim retracted in one directory and live in the one
+// next to it, so a scan that stops at a directory boundary reproduces it.
+const SCAN_DIRS = ['app', 'components', 'lib', 'content', 'scripts', 'public', ''];
+const SCAN_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.mdx', '.md', '.svg', '.json'];
 const SKIP_DIRS = new Set(['node_modules', '.next', '.git', 'out', 'dist']);
 
-/** Ratios the repository cannot support. From perf_claims_contract.rs. */
-const RETRACTED_RATIOS = ['575x', '550x', '585x', '875x', '575 x'];
+// Generated artefacts. `search-index.json` and `extracted-code-blocks.json` are
+// built from `content/`, which is scanned directly — flagging the derived copy
+// would report the same claim twice and point at a file nobody edits.
+const SKIP_FILES = new Set([
+  'scripts/check-claims.mjs',
+  'public/search-index.json',
+  'extracted-code-blocks.json',
+  'package-lock.json',
+]);
+
+/**
+ * Ratios the repository cannot support.
+ *
+ * 575/940/750/167 are the four bars `SpeedupChart` drew under the heading
+ * "HORUS Speedup vs ROS2"; 550/585/875 are the three the blog's retracted
+ * benchmarking post tabulated. Only 575 was ever on a ban list, which is the
+ * shape of the whole defect: the number that got famous was guarded and the
+ * four sitting beside it in the same array were not.
+ */
+const RETRACTED_RATIOS = ['575x', '575 x', '940x', '750x', '167x', '550x', '585x', '875x'];
 
 /**
  * Highest per-message speedup any benchmark in the HORUS repository produces
- * (CmdVel 16B, 67x). Chart data above this is not a measurement.
+ * (CmdVel 16B, 67x). A competitor ratio above this is not a measurement.
  */
 const SPEEDUP_CEILING = 100;
 
 /** The latency figure that travelled with them and exists in no benchmark. */
 const PHANTOM_LATENCY = [/\b87\s?ns\b/i, /\b87\s?nanoseconds\b/i];
+
+/**
+ * Names that make a number a competitor comparison rather than a HORUS figure.
+ *
+ * Word-bounded on purpose: a bare `includes('dds')` also fires on "adds" and
+ * "odds", and a rule that cries wolf on an English word is a rule someone
+ * deletes.
+ */
+const COMPETITORS = /\b(?:ros ?2|tf2|cyclonedds|fastdds|iceoryx2?|dds)\b/i;
+
+/** Chart series keys that hold a competitor's numbers rather than HORUS's. */
+const COMPETITOR_SERIES = /^\s*(?:const\s+)?.*\b(tf2|ros2|dds|reference)\s*:\s*(\d[\d_.]*)/;
+
+/**
+ * Wording that tells the reader where a number came from.
+ *
+ * A chart may draw a competitor series it did not measure — that is what a
+ * published reference figure is for — but it may not draw one silently. This
+ * is the marker set the corrected charts already use.
+ */
+const PROVENANCE = /not measured|no source|published reference|literature|measured on|REP\s?2014|no TF2 comparison/i;
+
+/** An assertion of the form "Nx faster" or "N-Mx faster". */
+const FASTER_RATIO = /(\d[\d,]*(?:\.\d+)?)\s*(?:-|–|to)?\s*(\d[\d,]*(?:\.\d+)?)?\s*x\s*(?:faster|speedup)/gi;
 
 function walk(dir, out = []) {
   if (!fs.existsSync(dir)) return out;
@@ -76,9 +133,85 @@ function walk(dir, out = []) {
   return out;
 }
 
-const files = SCAN_DIRS.flatMap((d) => walk(path.join(root, d))).filter((f) =>
+/**
+ * The root entry of SCAN_DIRS means "root-level files only" — walking it would
+ * re-walk every directory above and double-report.
+ */
+function filesIn(dir) {
+  if (dir === '') {
+    return fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isFile())
+      .map((e) => path.join(root, e.name));
+  }
+  return walk(path.join(root, dir));
+}
+
+const files = SCAN_DIRS.flatMap(filesIn).filter((f) =>
   SCAN_EXTENSIONS.includes(path.extname(f))
 );
+
+const CODE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs'];
+
+/**
+ * Blank out block comments, keeping every newline so line numbers still line up.
+ *
+ * This used to be a per-line test, and it had the defect in both directions.
+ *
+ * Too eager: `*` counted as a comment marker everywhere, and in Markdown `*` is
+ * a bullet — so `* HORUS is 575x faster than ROS2.`, a claim in a list on a
+ * page, was read as a JSDoc continuation and skipped, while the same sentence
+ * with a `-` bullet was caught.
+ *
+ * Not eager enough: only the FIRST line of a JSX comment starts with `{/*`. The
+ * body of a `{/* ... *\/}` block — which is how this codebase records what a
+ * retracted claim used to say, right where it used to say it — reads as served
+ * prose, so writing down the defect reintroduced it as far as this check was
+ * concerned.
+ *
+ * A block-level strip gets both right. End-of-line `//` is deliberately left
+ * alone: a `//` inside a URL in a string literal would swallow the rest of the
+ * line, and hiding a claim is the failure that matters here.
+ */
+function stripBlockComments(text, ext) {
+  const blank = (m) => m.replace(/[^\n]/g, ' ');
+  if (CODE_EXTENSIONS.includes(ext)) {
+    return text.replace(/\{?\/\*[\s\S]*?\*\/\}?/g, blank);
+  }
+  if (ext === '.mdx' || ext === '.md') {
+    // JSX comments (MDX) and HTML comments. A bare `/* */` in Markdown is
+    // ordinary text or a C code sample, so it is not stripped here.
+    return text
+      .replace(/\{\/\*[\s\S]*?\*\/\}/g, blank)
+      .replace(/<!--[\s\S]*?-->/g, blank);
+  }
+  return text;
+}
+
+/**
+ * Is this line a whole-line comment rather than something a reader is served?
+ *
+ * Block comments are already gone by the time this runs; what is left is the
+ * `//` and `<!--` forms that start a line.
+ */
+function isCommentLine(trimmed, ext) {
+  if (trimmed.startsWith('//')) return true;
+  if (trimmed.startsWith('<!--')) return true;
+  return false;
+}
+
+/** Largest ratio asserted on a line, or 0. Handles "10-100x faster". */
+function largestFasterRatio(line) {
+  let max = 0;
+  for (const m of line.matchAll(FASTER_RATIO)) {
+    for (const g of [m[1], m[2]]) {
+      if (g === undefined) continue;
+      const n = Number(g.replace(/,/g, ''));
+      if (Number.isFinite(n) && n > max) max = n;
+    }
+  }
+  return max;
+}
 
 const violations = [];
 let scanned = 0;
@@ -86,10 +219,11 @@ let scanned = 0;
 for (const file of files) {
   const rel = path.relative(root, file).replace(/\\/g, '/');
   // This file names the retracted claims in order to ban them.
-  if (rel === 'scripts/check-claims.mjs') continue;
+  if (SKIP_FILES.has(rel)) continue;
+  const ext = path.extname(file);
   scanned += 1;
 
-  const lines = fs.readFileSync(file, 'utf8').split('\n');
+  const lines = stripBlockComments(fs.readFileSync(file, 'utf8'), ext).split('\n');
   lines.forEach((line, i) => {
     const at = `${rel}:${i + 1}`;
     const trimmed = line.trim();
@@ -98,14 +232,7 @@ for (const file of files) {
     // explains why it was retracted — the codebase writes those. Comments are
     // not served to anyone, so what matters is the string literals and the
     // prose around them.
-    if (
-      trimmed.startsWith('//') ||
-      trimmed.startsWith('*') ||
-      trimmed.startsWith('/*') ||
-      trimmed.startsWith('<!--')
-    ) {
-      return;
-    }
+    if (isCommentLine(trimmed, ext)) return;
 
     const lower = line.toLowerCase();
 
@@ -143,23 +270,120 @@ for (const file of files) {
       );
     }
 
-    // The sharpest form: asserting that a comparison was measured when nothing
-    // in the repository measures ROS 2 without `-F dds` and a DDS install.
-    const namesRos2 = lower.includes('ros2') || lower.includes('ros 2');
-    const claimsMeasured = lower.includes('measured') || lower.includes('benchmark');
-    const bigRatio = /\b[1-9]\d{2,}\s?x\b/.test(line);
-    if (namesRos2 && claimsMeasured && bigRatio) {
+    // The sharpest form, generalised.
+    //
+    // This rule used to require the line to say "measured" or "benchmark" as
+    // well, on the theory that the defect was asserting a measurement. It was
+    // not — the defect was publishing a ratio nothing produces, and the word
+    // "measured" is the part an editor drops first. `HORUS moves CmdVel 940x
+    // faster than ROS2.` passed every rule in this file. Against the ~5 us ROS 2
+    // reference the measured spread is 24x-79x, so any competitor ratio at or
+    // above SPEEDUP_CEILING is fabricated whatever the sentence around it says.
+    const namesCompetitor = COMPETITORS.test(line);
+    const ratio = largestFasterRatio(line);
+    if (namesCompetitor && ratio >= SPEEDUP_CEILING) {
       violations.push(
-        `${at}: presents a large ROS 2 ratio as measured. ROS 2 is not measured ` +
-          `in this project; its figures are published references.\n      ${line.trim()}`
+        `${at}: claims ${ratio}x against a competitor. Nothing in this project ` +
+          `measures one above 79x; ROS 2 and DDS figures here are published ` +
+          `references, not measurements.\n      ${line.trim()}`
       );
     }
   });
 }
 
+/**
+ * Per-component rules.
+ *
+ * The two defects below cannot be seen one line at a time, because both are a
+ * disagreement between two lines of the same component.
+ */
+const componentFiles = files.filter(
+  (f) => ['.tsx', '.jsx'].includes(path.extname(f)) && !SKIP_FILES.has(path.relative(root, f))
+);
+
+for (const file of componentFiles) {
+  const rel = path.relative(root, file).replace(/\\/g, '/');
+  const text = stripBlockComments(fs.readFileSync(file, 'utf8'), path.extname(file));
+  // Split on exported component boundaries. Crude, and right for this file
+  // shape: one exported chart per block, data array and caption inside it.
+  const blocks = text.split(/^export function /m);
+  let lineBase = 1;
+  for (const [index, block] of blocks.entries()) {
+    const name = index === 0 ? '(module scope)' : block.slice(0, block.indexOf('(')).trim();
+    const blockLines = block.split('\n');
+    const startLine = lineBase;
+    lineBase += blockLines.length - 1;
+
+    const body = blockLines
+      .filter((l) => !isCommentLine(l.trim(), path.extname(file)))
+      .join('\n');
+    const hasProvenance = PROVENANCE.test(body);
+
+    // A component that says "Not measured. These values have no source." and
+    // then prints "HORUS Python is 10-40x faster than traditional Python IPC"
+    // four lines below it is worse than either half alone: the disclaimer is
+    // what makes the ratio a knowing assertion. Both live instances of this
+    // were produced by correcting a chart's caption and leaving the summary
+    // line under the same chart untouched — the sibling path, inside one
+    // function.
+    const admitsUnmeasured = /not measured|no source/i.test(body);
+    if (admitsUnmeasured) {
+      for (const [offset, l] of blockLines.entries()) {
+        if (isCommentLine(l.trim(), path.extname(file))) continue;
+        const r = largestFasterRatio(l);
+        if (r > 0) {
+          violations.push(
+            `${rel}:${startLine + offset}: ${name} states "not measured" and asserts ` +
+              `a ${r}x speedup in the same component. A disclaimer above the chart ` +
+              `does not cover a ratio printed below it.\n      ${l.trim()}`
+          );
+        }
+      }
+    }
+
+    // A competitor series drawn with no word about where it came from. The
+    // TF2 curve in TransformFrameConcurrentChart was five invented numbers for
+    // the exact row /concepts/transform-frame says carries no TF2 comparison,
+    // in the one chart of three on that subject that nobody had corrected.
+    if (!hasProvenance) {
+      for (const [offset, l] of blockLines.entries()) {
+        if (isCommentLine(l.trim(), path.extname(file))) continue;
+        const m = l.match(COMPETITOR_SERIES);
+        if (m) {
+          violations.push(
+            `${rel}:${startLine + offset}: ${name} plots a "${m[1]}" series with no ` +
+              `provenance note. Competitor figures in this project are published ` +
+              `references, and a chart that does not say so reads as a measurement.` +
+              `\n      ${l.trim()}`
+          );
+        }
+      }
+    }
+  }
+}
+
 // A scan that read nothing passes trivially. It must not be able to.
 if (scanned < 50) {
   console.error(`only ${scanned} files scanned — the walk is broken and this check is vacuous`);
+  process.exit(2);
+}
+
+// A count is a weak guard: a walk that lost `components/` still reads 180 files
+// from `content/` and passes. Name the files that carried the original defect,
+// so a rename or a re-rooted walk fails loudly instead of going quiet.
+const MUST_SCAN = [
+  'components/BenchmarkCharts.tsx',
+  'app/[...slug]/page.tsx',
+  'content/docs/performance/benchmarks.mdx',
+  'scripts/build-search-index.js',
+];
+const relFiles = new Set(files.map((f) => path.relative(root, f).replace(/\\/g, '/')));
+const missed = MUST_SCAN.filter((f) => !relFiles.has(f));
+if (missed.length) {
+  console.error(
+    `the walk did not reach ${missed.join(', ')} — every claim these files ` +
+      `carried would pass unseen. Fix the walk, or update MUST_SCAN if the file moved.`
+  );
   process.exit(2);
 }
 
