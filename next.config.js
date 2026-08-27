@@ -5,7 +5,7 @@ const nextConfig = {
   // application root.
   outputFileTracingRoot: __dirname,
   pageExtensions: ['ts', 'tsx', 'js', 'jsx', 'md', 'mdx'],
-  // Ensure consistent URL handling on Vercel
+  // Keep URLs canonical: no trailing slash, one form per page.
   trailingSlash: false,
   // Optimize for static generation
   experimental: {
@@ -42,7 +42,7 @@ const nextConfig = {
           },
           {
             key: 'Content-Security-Policy',
-            value: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://va.vercel-scripts.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://va.vercel-scripts.com; frame-ancestors 'none';",
+            value: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none';",
           },
         ],
       },
