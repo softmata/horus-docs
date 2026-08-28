@@ -1,0 +1,325 @@
+---
+title: "API Papercuts"
+description: "The Common Mistakes page read as a design backlog: which entries name an API change, what the change is, and what it costs"
+order: 30
+---
+
+# API Papercuts
+
+Every entry on [Common Mistakes](/getting-started/common-mistakes) marks a place
+where the library let a reader do the wrong thing and a page had to catch it.
+That makes the page two documents at once: a guide for someone learning HORUS,
+and a bug report against the API for whoever maintains it. This is the second
+one, extracted, so the list has somewhere to shrink to.
+
+The reader-facing page carries a one-line **Could the API prevent this?** verdict
+per entry. This page is where a *yes* becomes something a maintainer can pick up:
+what the code does today and where, the change that would retire the entry, what
+that change breaks, and the test that would show it worked.
+
+<Callout type="info" title="Scope">
+
+Nothing here is a bug. Every behaviour below is working as written and shipped in
+0.4.0. The claim is only that the reader should not have to be told about it.
+
+Line numbers are against HORUS 0.4.0 and are a starting point, not a citation —
+follow the symbol name.
+
+</Callout>
+
+## The nine entries, triaged
+
+| # | Common Mistakes entry | Verdict | Backlog item |
+|---|-----------------------|---------|--------------|
+| 1 | Slashes in topic names | **API change available** | [P1](#p1-topic-new-accepts-a-separator-nothing-else-accepts) |
+| 2 | Not calling `recv()` every tick | **Partly solved; bound is the gap** | [P2](#p2-the-latching-read-is-copy-only) |
+| 3 | Blocking in `tick()` | Documentation, permanently | [Why not](#entries-that-are-not-api-problems) |
+| 4 | Wrong priority order | Documentation, permanently | [Why not](#entries-that-are-not-api-problems) |
+| 5 | No `shutdown()` for motors | **API change available, one layer down** | [P3](#p3-an-actuator-handle-that-does-not-stop-itself) |
+| 6 | Missing derives on messages | Already prevented | [Why not](#entries-that-are-not-api-problems) |
+| 7 | Treating `send()` as fallible | Already prevented | [Why not](#entries-that-are-not-api-problems) |
+| 8 | Creating a `Topic` inside `tick()` | **Reportable now, preventable later** | [P4](#p4-topic-new-cost-is-invisible) |
+| 9 | Mismatched topic types | **The check exists and the default spelling opts out** | [P5](#p5-the-layout-check-is-opt-in) |
+
+Four of the nine are already impossible, permanently domain knowledge, or both.
+Five name a change. P5 is the cheapest and the most valuable: the mechanism is
+already written and shipped, and only the constructor everyone reaches for
+declines to use it.
+
+---
+
+## P1 — `Topic::new` accepts a separator nothing else accepts
+
+**Retires:** Common Mistakes 1.
+
+**Today.** `RingTopic::with_capacity_and_kind` validates the topic name against
+`is_ascii_alphanumeric() || matches!(b, b'_' | b'/' | b'-' | b'.')`
+(`horus_core/src/communication/topic/mod.rs:903-905`). `/` is on that list, so
+`Topic::<f32>::new("sensors/lidar")` succeeds, and `horus_sys::shm` creates the
+intermediate directory for it — `validate_region_name`
+(`horus_sys/src/shm/mod.rs:452-456`) says so in as many words: *"A single
+embedded `/` remains legal: legacy hierarchical topic names rely on it."*
+
+So `/` is not merely discouraged. It is supported by one layer and unsupported by
+the next. `ShmFanoutRing::endpoint_lock_path`
+(`horus_core/src/communication/topic/shm_fanout.rs:896-903`) builds the fan-out
+lock filename by flattening every character outside `[A-Za-z0-9_.-]` to `_`, so
+`sensors/lidar` and `sensors_lidar` are two distinct topics that name one lock
+file. Reading the code, that is a collision in the lock namespace rather than in
+the data ring — we have not exercised it, and the point is that nobody should
+have to work out whether it matters.
+
+**The change.** Drop `b'/'` from the allowed set, or normalise it to `.` in the
+same place. Either turns the entry into an error message the first time someone
+writes it, with the convention stated in the error rather than on a page they may
+not have read.
+
+**What it costs.** A breaking change for the hierarchical names
+`validate_region_name` is protecting, which is why this is a proposal and not a
+patch. Normalising `/` to `.` is the compatible half: an existing
+`sensors/lidar` keeps working and lands in the same place a `sensors.lidar`
+publisher expects, at the cost of two spellings resolving to one topic. Rejecting
+outright wants a deprecation cycle — accept and warn in one minor version, reject
+in the next.
+
+**How you would know it worked.** `Topic::<f32>::new("sensors/lidar")` returns
+`Err`, its message names the dot convention, and the fan-out lock path for every
+accepted name is injective. That last one is the assertion worth writing
+regardless of which direction this goes, because it holds today only by accident.
+
+---
+
+## P2 — the latching read is `Copy`-only
+
+**Retires:** the hand-rolled cache in Common Mistakes 2.
+
+**Today.** This entry used to say HORUS has no latching accessor. It has one:
+`Topic::read_latest()` (`horus_core/src/communication/topic/mod.rs:2536`,
+documented at [read_latest()](/concepts/core-concepts-topic#read-latest))
+returns the newest published value without advancing the consumer position, which
+is exactly what the entry's "Fix" builds by hand out of `recv()` and a
+`last_data` field.
+
+The gap is its bound. `read_latest` requires `T: Copy`, and the doc comment gives
+the reason: on the multi-consumer backends a consumer can claim the slot by CAS
+between the `head` load and the read, so a type holding a heap pointer would be
+read after free. `T: Copy` rules that out by construction.
+
+It is a blanket bound for a race that only exists on some backends. The cost lands
+on exactly the message shapes the next entry on the same page recommends —
+Common Mistakes 6 ends with *"Strings work fine! Vecs work too!"* — so a reader
+who follows entry 6 loses the fix for entry 2 and is back to hand-caching, with
+nothing telling them why.
+
+**The change.** Either of:
+
+- `read_latest_cloned(&self) -> Option<T> where T: Clone`, which serves the
+  request on the single-consumer backends and returns `None` on `SpmcShm` /
+  `MpscShm` / `PodShm` where the TOCTOU window is real. Backend selection is a
+  runtime decision (`Topic` picks from the publisher and subscriber counts), so
+  this cannot be a compile-time distinction — which is the argument for the
+  second option.
+- A producer-side latch: one seqlock-versioned slot holding the newest value,
+  written on `send` and read independently of the ring. The protocol is already
+  written and already model-checked —
+  `horus_core/src/communication/topic/seqlock.rs`, covered by
+  `tests/loom_fanout.rs` — so this is an application of existing machinery rather
+  than new lock-free code. It costs one slot per topic and one extra write per
+  `send`.
+
+**What it costs.** The first is additive and cheap, and buys a method whose
+availability depends on a topology the caller did not choose. The second is a
+wire-format change: the latch slot has to live in the shared-memory layout, which
+is a cross-language contract (`horus_py` computes slot geometry the same way) and
+cannot be changed on one side alone.
+
+**How you would know it worked.** A node with a `Vec`-carrying message samples
+every tenth tick, holds no cached copy, and still sees the newest value — with
+one publisher and with three.
+
+**Meanwhile, in the docs.** `recv()`'s reference entry does not mention
+`read_latest()`, which is how a whole page came to be written as if it did not
+exist. A cross-reference is free and is the actual reason this entry survived
+two rewrites.
+
+---
+
+## P3 — an actuator handle that does not stop itself
+
+**Retires:** Common Mistakes 5.
+
+**Today.** `Node::shutdown()` has an empty default body
+(`horus_core/src/core/node.rs:640-642`), and that default is correct: most nodes
+have nothing to wind down, and making the method required would put `Ok(())` in
+every file for the sake of the few that do not. Forgetting it is free for every
+node except the ones driving something physical, where it means the motor holds
+its last commanded velocity through Ctrl+C.
+
+**The change.** Not on `Node`. Move it to the handle: a motor handle that
+commands zero in its `Drop` impl makes dropping it the thing that stops the
+motor, and `shutdown()` becomes an optimisation rather than a safety requirement.
+The scheduler drops nodes on the way out, so the existing shutdown path already
+runs it.
+
+**What it costs.** It is a contract for driver authors, not a change the
+framework can make for them — HORUS cannot know which handle is an actuator. What
+the framework *can* do is provide the shape: an `Actuator` trait whose blanket
+`Drop` calls a required `fn safe_state(&mut self)`, so implementing the trait is
+what makes the guarantee, and a driver that skips it is visibly not an actuator.
+`Drop` cannot report a failure, so a handle whose safe state can itself fail
+still needs an explicit call — that is the boundary of what this buys.
+
+**How you would know it worked.** A driver test that drops the handle mid-motion
+and asserts the commanded velocity is zero afterwards, with no `shutdown()`
+implemented anywhere in the node.
+
+---
+
+## P4 — `Topic::new` cost is invisible
+
+**Retires:** Common Mistakes 8.
+
+**Today.** `Topic::new` → `with_capacity_and_kind` opens or creates the
+shared-memory region on every call
+(`horus_core/src/communication/topic/mod.rs:819, 883`). There is no per-process
+handle cache; `topic/registry.rs` is a metadata registry that records which node
+publishes what, not a pool of handles. Calling it inside `tick()` therefore pays
+the open on every tick, and nothing says so at runtime — the program works, just
+slowly, which is the worst way for a cost to present itself.
+
+**The change.** Two, in increasing order of design work:
+
+1. **Report it.** Count `Topic::new` calls per (name, type) per process and warn
+   past a threshold — "opened 'data' 4,812 times; construct it once and store the
+   handle". This needs no new semantics and closes the loop for the reader who is
+   about to hit the entry.
+2. **Prevent it.** Return a cached handle per (name, `TypeId`), so the mistake
+   costs a hash lookup instead of an `mmap`.
+
+**What it costs.** (1) is a counter and a log line. (2) is the one with the
+hazard: with handles shared, the last drop is what tears down the local state, and
+`Topic` is `!Sync` by design — each handle carries its own thread-local ring
+position — so a cache would have to hand out per-thread clones rather than share
+one handle. That is the whole design problem, and it is why this entry says
+*in principle*.
+
+**How you would know it worked.** For (1): a test that opens the same topic in a
+loop and asserts the warning fires once, not 4,812 times. For (2): a benchmark
+where `Topic::new` in a hot loop and `Topic::new` hoisted out of it are within
+noise of each other.
+
+---
+
+## P5 — the layout check is opt-in
+
+**Retires:** the half of Common Mistakes 9 that is still open. The mechanism
+already ships and the default spelling declines it, which makes this the
+cheapest item on the page.
+
+**Today.** `Topic::new` stamps the message type's short name into the topic header
+and compares it on every open
+(`horus_core/src/communication/topic/mod.rs:1103-1121`), which is why a mismatch
+fails loudly instead of corrupting data. That check has two documented holes: it
+is skipped entirely when either side is `GenericMessage` — which is what
+`horus_py` uses for untyped topics — and the name is stored in a fixed 32-byte
+field and compared case-insensitively, so two distinct types sharing a short name
+compare equal.
+
+A stronger check already exists and already ships. `TopicHeader` carries a
+`layout_hash` (`horus_core/src/communication/topic/header.rs:278-301`), installed
+first-writer-wins and compared on open. `message!` emits `LAYOUT_HASH` for every
+type it declares — a hash over the type name and every field's name and written
+type, so reordering, renaming or retyping a field changes it — plus a
+`Type::topic(name)` constructor that supplies it
+(`horus_core/src/communication/macros.rs:354-399`). The macro's own doc comment
+gives the case the short-name check cannot see: *"two builds of `Pose { x, y }`
+and `Pose { y, x }` share a name and 8 bytes, open the same topic without
+complaint, and swap the coordinates on the way through."*
+
+The check binds only when both sides supply a hash, and `Topic::new` supplies
+nothing. So the safety mechanism is present, tested, documented in
+[Topics & Communication](/rust-guide/topics) and
+[tutorial 4](/tutorials/04-custom-messages-rust) — and the spelling every reader
+learns first, `Topic::<T>::new(name)`, silently declines it.
+
+**The change.** Make `Topic::new` bind the layout hash for any `T` that has one.
+The `message!`-generated `LAYOUT_HASH` is an associated const, so this wants a
+trait — `trait LayoutHashed { const LAYOUT_HASH: u32; }` implemented by the macro
+— and `Topic::new` routing through `new_checked` when `T: LayoutHashed`. Every
+`message!` type then gets the check without its author knowing the feature exists,
+which is the point.
+
+**What it costs.** Specialising on a trait bound is not available on stable Rust,
+so `Topic::new` cannot branch on `T: LayoutHashed` as written. The practical
+routes are to make `LayoutHashed` a supertrait of the bound `Topic<T>` already
+requires (breaking for hand-written message types that derive `Serialize` and
+nothing else), or to have `message!` emit its types with a hash-carrying wrapper.
+Both are real work. The cheap part that needs none of it: `message!` types already
+have `Type::topic(name)`, and it is what the samples should show.
+
+**How you would know it worked.** Two crates declare `Pose { x: f32, y: f32 }`
+and `Pose { y: f32, x: f32 }`, both open `"robot.pose"` with `Topic::new`, and
+the second gets an error naming the two hashes — today it gets the coordinates
+swapped.
+
+**Meanwhile, in the docs.** Common Mistakes 9 is the page about mismatched topic
+types and never mentioned `Type::topic()`; its "Fix" used `Topic::new`. That is
+fixed. The same sweep is worth running over every Rust sample that opens a topic
+for a `message!` type.
+
+---
+
+## Entries that are not API problems
+
+Recorded here so nobody re-opens them.
+
+**3 — Blocking in `tick()`.** No signature distinguishes a slow call from a fast
+one, and no reasonable one could. The scheduler can *report* it, and does:
+`.budget(...)` and `.deadline(...)` log an overrun instead of letting it eat
+everyone else's tick, and `.compute()` / `.async_io()` move genuinely slow work
+off the tick thread. Documentation, permanently.
+
+**4 — Wrong priority order.** Nothing in a type says a watchdog matters more than
+a logger. That is domain knowledge only the author has. Documentation,
+permanently.
+
+**6 — Missing derives on messages.** Already prevented twice: the missing bound is
+a compile error, so nothing ships broken, and `message!` emits the derives so a
+type declared with it cannot be missing them. The entry survives to correct an
+expectation, not to describe a hazard.
+
+**7 — Treating `send()` as fallible.** Already prevented. `send()` returns `()`,
+so `if let Err(e) = ...send(...)` does not compile — rustc corrects the reader
+rather than a misbehaving robot. The entry survives to answer "where did my error
+go?": `dropped_count()`, `try_send()`, `send_blocking()`.
+
+---
+
+## Keeping the list shrinking
+
+The rule that produced this page, worth keeping: **a new entry on Common Mistakes
+must arrive with a verdict.** Either the API already makes the mistake impossible
+— in which case say so, and the entry is there to correct an expectation — or it
+could and does not, in which case the entry names the change and lands here.
+
+An entry with no verdict is a papercut that has been accepted rather than
+triaged, and the page grows. That is how it reached 431 lines.
+
+Two working notes from writing this one:
+
+- **Check the verdict against the code, every time.** Entry 2 asserted for two
+  revisions that HORUS had no latching accessor. It has had `read_latest()` the
+  whole time, documented on four other pages of this site. A verdict written from
+  the prose rather than the source is worse than no verdict: it puts a
+  "needs building" item on the backlog for something already built.
+- **Look for the mechanism before proposing one.** P5 and the second half of P2
+  both turned out to be *existing* machinery that the default path does not
+  reach. That is a much cheaper class of fix than the one the entry's wording
+  implies, and it is invisible unless you go looking.
+
+## See also
+
+- [Common Mistakes](/getting-started/common-mistakes) — the reader-facing page this is derived from
+- [Topics & Communication](/rust-guide/topics) — `Type::topic()` and layout hashes
+- [Topic (Pub/Sub)](/concepts/core-concepts-topic) — `read_latest()`, `try_send()`, `send_blocking()`
+- [Troubleshooting](/troubleshooting) — the runtime-symptom counterpart
