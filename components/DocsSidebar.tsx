@@ -275,6 +275,11 @@ export const sections: SidebarSection[] = [
       { title: "Static Analysis", href: "/development/static-analysis", order: 5 },
       { title: "Error Handling", href: "/development/error-handling", order: 6 },
       { title: "AI Integration", href: "/development/ai-integration", order: 7 },
+      // Last in the section on purpose: this one is for whoever maintains HORUS,
+      // not whoever is using it. It is the Common Mistakes page read backwards —
+      // each entry as a bug report against the API that made the mistake
+      // possible — and it is only useful once the rest of the section is known.
+      { title: "API Papercuts", href: "/development/api-papercuts", order: 8 },
     ],
   },
   {

@@ -15,6 +15,11 @@ impossible (and the entry survives only to correct an expectation), or it could
 and does not. Recording which is which is what keeps the list shrinking instead
 of growing.
 
+The five entries whose answer is *it could* are written up as
+[API Papercuts](/development/api-papercuts) — what the code does today, the
+change that would retire the entry, and what that change breaks. If you maintain
+HORUS rather than use it, start there.
+
 ---
 
 ## 1. Using Slashes in Topic Names
@@ -76,12 +81,34 @@ fn tick(&mut self) {
 }
 ```
 
-**Could the API prevent this?** Not today. `Topic` exposes `recv()`,
-`has_message()`, `pending_count()` and `dropped_count()`, but no latching
-accessor: there is no `latest()` that returns the newest value without draining
-the ring, which is exactly what a node that only samples every tenth tick
-wants. Adding one would make the manual caching in "The Fix" unnecessary. Until
-then `dropped_count()` at least turns silent loss into a number you can watch.
+**Could the API prevent this?** Partly, and it already does — this line said
+otherwise for two revisions. `Topic` has a latching accessor:
+[`read_latest()`](/concepts/core-concepts-topic#read-latest) returns the newest
+published value **without** advancing the consumer position, which is exactly
+what "The Fix" above builds by hand out of `recv()` and a `last_data` field. For
+a `Copy` message, the manual cache is unnecessary:
+
+```rust
+fn tick(&mut self) {
+    // No caching needed — read_latest() does not drain the ring, so it can be
+    // called on the ticks you care about and skipped on the ones you do not.
+    if self.counter % 10 == 0 {
+        if let Some(data) = self.sensor_sub.read_latest() {
+            self.process(data);
+        }
+    }
+    self.counter += 1;
+}
+```
+
+The gap is its bound. `read_latest()` requires `T: Copy` — a blanket guard
+against a use-after-free that is only reachable on the multi-consumer backends —
+so a message carrying a `String` or a `Vec`, which
+[mistake 6](#section-6-not-deriving-required-traits-for-custom-messages) below
+explicitly encourages, cannot use it and is back to the hand-written cache.
+Widening that bound is
+[papercut P2](/development/api-papercuts#p2-the-latching-read-is-copy-only).
+Either way, `dropped_count()` turns silent loss into a number you can watch.
 
 ---
 
@@ -255,7 +282,7 @@ fn tick(&mut self) {
 }
 ```
 
-**Why:** `send()` returns `()` — there is no error to check. It is fire-and-forget: if the ring is full it retries briefly (64 spins + 4 yields) and then **drops the new message**, incrementing a counter you can read with `topic.dropped_count()`. Point-to-point topics are drop-newest, not drop-oldest. When loss is unacceptable use `try_send(msg) -> Result<(), T>`, which hands the message back, or `send_blocking(msg, timeout) -> Result<(), SendBlockingError>` — both only meaningful on a point-to-point topic, since a broadcast ring never reports itself full.
+**Why:** `send()` returns `()` — there is no error to check. It is fire-and-forget: if the ring is full it retries briefly (64 spins + 4 yields) and then **drops the new message**, incrementing a counter you can read with `topic.dropped_count()`. A point-to-point topic is drop-newest only while a subscriber is actually draining it. When nothing is — no subscriber, a subscriber whose process is gone, or a `tail` that has not moved for a full lease timeout (5 s by default) — `send()` retires the oldest slot and takes it instead, so an unread ring holds the most recent `capacity` messages rather than freezing on the first ones it was given. `try_send()` and `send_blocking()` never reclaim like this: their contract is to report a full ring, not to drop from it. When loss is unacceptable use `try_send(msg) -> Result<(), T>`, which hands the message back, or `send_blocking(msg, timeout) -> Result<(), SendBlockingError>` — both only meaningful on a point-to-point topic, since a broadcast ring never reports itself full.
 
 **The Fix:**
 ```rust
@@ -343,13 +370,36 @@ let sub_topic: Topic<SensorReading> = Topic::new("sensor")?;
 
 An alias is for readability only — `SensorReading` erases to `f32`, so the header still records `f32` and the runtime check above behaves exactly as it would without the alias. To make that check itself tell two `f32` payloads apart, give them genuinely distinct types (e.g. `struct SensorReading(f32);` with the derives from mistake 6), which stamps `SensorReading` into the header instead.
 
-**Could the API prevent this?** Half of it already is. The type name is stamped
-into the topic header and `Topic::new` refuses a mismatched open, so the failure
-is immediate and loud rather than silent corruption. Making it a *compile* error
-would need topic names bound to their types at declaration — a registry of
-`("data", f32)` pairs the compiler can see — which HORUS does not have. Two gaps
-stay open regardless: `GenericMessage` skips the check, and two distinct types
-can share a short name.
+**Better tip:** for a `message!` type, open the topic with the generated
+`Type::topic(name)` constructor rather than `Topic::new`:
+```rust
+message! {
+    Pose { x: f32, y: f32 }
+}
+
+// Layout-checked: refuses a peer whose Pose has different fields, in a
+// different order, or of different types.
+let pose = Pose::topic("robot.pose")?;
+```
+
+The name check below compares only the type's **short name**, so a peer built
+from `Pose { y, x }` — same name, same 8 bytes, coordinates swapped — opens the
+topic without complaint. `Type::topic()` supplies a `LAYOUT_HASH` over the name
+and every field's name and type, which catches exactly that. It costs nothing at
+runtime. See [Topics & Communication](/rust-guide/topics).
+
+**Could the API prevent this?** Half already is, and a better half exists that
+the default spelling declines. The type name is stamped into the topic header and
+`Topic::new` refuses a mismatched open, so the failure is immediate and loud
+rather than silent corruption — but that check compares a short name in a
+32-byte field, case-insensitively, and skips entirely when either side is
+`GenericMessage` (which is what the Python bindings use). The stronger layout
+check ships today and binds only when both sides supply a hash, and `Topic::new`
+supplies none; `Type::topic()` does. Routing `Topic::new` through it is
+[papercut P5](/development/api-papercuts#p5-the-layout-check-is-opt-in). Making
+it a *compile* error would additionally need topic names bound to their types at
+declaration — a registry of `("data", f32)` pairs the compiler can see — which
+HORUS does not have.
 
 ---
 
@@ -413,14 +463,18 @@ Pick either. Mixing them in one codebase is fine too. See
 | # | Mistake | Fix | Could the API prevent it? |
 |---|---------|-----|---------------------------|
 | 1 | Slashes in topic names | Use dots: `sensors.lidar` | Yes — `Topic::new` could reject `/` |
-| 2 | Not checking recv() every tick | Always call recv(), cache last value | Not yet — needs a latching `latest()` |
+| 2 | Not checking recv() every tick | `read_latest()`, or call recv() every tick and cache | Mostly — `read_latest()` exists; its `T: Copy` bound is the gap |
 | 3 | Blocking in tick() | Keep tick() under 1ms, do I/O in init() | No — but `.budget()`/`.deadline()` report it |
 | 4 | Wrong priority order | Lower number = higher priority | No — only the author knows what is critical |
 | 5 | No shutdown() for motors | Always stop actuators in shutdown() | Yes, in the driver — stop the motor in `Drop` |
 | 6 | Missing derives on messages | Add Clone, Serialize, Deserialize | Already does — compile error, and `message!` derives them |
 | 7 | Treating send() as fallible | `send()` is infallible — just call it directly | Already does — it does not compile |
 | 8 | Creating Topic in tick() | Create Topic once in new() | In principle — `Topic::new` could cache per (name, type) |
-| 9 | Mismatched topic types | Use same type for pub and sub | Half — refused at runtime; a compile error needs a topic registry |
+| 9 | Mismatched topic types | Same type both ends; open with `Type::topic()` | Half — the name check runs by default, the layout check is opt-in |
+
+The five entries in the last column that say the API *could* are written up with
+the code, the proposed change and its cost in
+[API Papercuts](/development/api-papercuts).
 
 ---
 
