@@ -45,6 +45,10 @@ export const sections: SidebarSection[] = [
     ],
   },
   {
+    title: "Learn",
+    links: [{ title: "Overview", href: "/learn", order: 0 }],
+  },
+  {
     title: "Core Concepts",
     links: [
       { title: "Overview", href: "/concepts", order: 0 },
@@ -163,6 +167,7 @@ export const sections: SidebarSection[] = [
   {
     title: "C++",
     links: [
+      { title: "Overview", href: "/cpp", order: -1 },
       { title: "API Reference", href: "/cpp/api", order: 0,
         children: [
           { title: "Overview", href: "/cpp/api", order: 0 },
@@ -260,6 +265,7 @@ export const sections: SidebarSection[] = [
   {
     title: "Development",
     links: [
+      { title: "Overview", href: "/development", order: 0 },
       { title: "CLI Reference", href: "/development/cli-reference", order: 1 },
       { title: "Custom Messages", href: "/development/custom-messages", order: 15 },
       { title: "Environment Variables", href: "/development/environment-variables", order: 16 },
@@ -274,6 +280,7 @@ export const sections: SidebarSection[] = [
   {
     title: "Advanced Topics",
     links: [
+      { title: "Overview", href: "/advanced", order: 0 },
       { title: "Scheduler Configuration", href: "/advanced/scheduler-configuration", order: 1 },
       { title: "Execution Modes", href: "/advanced/execution-modes", order: 2 },
       { title: "Deterministic Execution", href: "/advanced/deterministic-execution", order: 3 },
@@ -309,9 +316,22 @@ export const sections: SidebarSection[] = [
   {
     title: "Performance",
     links: [
+      { title: "Overview", href: "/performance", order: 0 },
       { title: "Optimization Guide", href: "/performance/performance", order: 1 },
       { title: "Benchmarks", href: "/performance/benchmarks", order: 2 },
     ],
+  },
+  {
+    title: "Standard Library",
+    links: [{ title: "Overview", href: "/stdlib", order: 0 }],
+  },
+  {
+    title: "Operations",
+    links: [{ title: "Overview", href: "/operations", order: 0 }],
+  },
+  {
+    title: "API Reference",
+    links: [{ title: "Overview", href: "/reference", order: 0 }],
   },
 ];
 
