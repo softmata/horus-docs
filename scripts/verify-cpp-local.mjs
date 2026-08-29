@@ -65,14 +65,45 @@ if (!fs.existsSync(extractedPath)) {
 }
 const extracted = JSON.parse(fs.readFileSync(extractedPath, 'utf8'));
 
-/** A fence that is only declarations — an API reference listing a signature. */
+/**
+ * A fence that is only declarations — an API reference listing a signature.
+ *
+ * Judged on the joined text, not line by line, because a signature is routinely
+ * spread over several lines and only the last of them ends in `;`:
+ *
+ *     template<typename T>
+ *     T get(const char* key, T default_val) const;
+ *
+ *     TensorHandle alloc(
+ *         const TensorPool& pool,   // pool to allocate from
+ *         Dtype dtype
+ *     );
+ *
+ * A declaration has no body and no initialiser, so "no `{`, no `=`, ends in `;`"
+ * separates it from real code — `auto pool = horus::TensorPool(...);` has the
+ * `=` and is checked normally.
+ */
 function isSignatureListing(code) {
-  const lines = code
+  const joined = code
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
     .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('//'));
-  if (!lines.length) return false;
-  return lines.every((l) => l.endsWith(';')) && !code.includes('{');
+    .map((l) => l.replace(/\/\/.*$/, '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  if (!joined) return false;
+  if (!joined.endsWith(';') || joined.includes('{')) return false;
+  if (/[^=!<>]=[^=]/.test(joined)) return false;
+  // `operator""_hz` is a declaration whose name contains an empty string
+  // literal; drop it before looking for literals.
+  const bare = joined.replace(/operator""/g, 'operator_');
+  // A declaration names parameter types. A statement passes values and chains
+  // calls, so a string literal, a numeric argument or a `.`/`->` call means
+  // this is code being executed, not an API listing.
+  if (/"/.test(bare)) return false;
+  if (/[.]\s*[A-Za-z_]\w*\s*\(|->\s*[A-Za-z_]\w*\s*\(/.test(bare)) return false;
+  if (/\(\s*[-\d]|,\s*[-\d]/.test(bare)) return false;
+  return true;
 }
 
 /**
@@ -222,7 +253,7 @@ try {
 
     checked += 1;
     let passed = false;
-    let lastOutput = '';
+    const outputs = [];
     for (let s = 0; s < shapes.length; s += 1) {
       const file = path.join(work, `block_${i}_${s}.cpp`);
       fs.writeFileSync(file, shapes[s]);
@@ -231,15 +262,24 @@ try {
         passed = true;
         break;
       }
-      lastOutput = `${result.stdout}${result.stderr}`.trim();
+      outputs.push(`${result.stdout}${result.stderr}`.trim());
     }
     if (!passed) {
-      const missing = contextOnly(lastOutput, code);
+      // Ask every shape, not just the last one. A member-function body fails the
+      // statement wrapper with "a function-definition is not allowed here" — a
+      // fact about the wrapper — while the file-scope shape fails with the
+      // undeclared members that actually explain it. Judging on the last output
+      // alone reported that block as a defect.
+      const missing = outputs.map((o) => contextOnly(o, code)).find(Boolean);
       if (missing) {
         skipped.push(`${block.id} — continues an earlier block (uses ${missing})`);
         checked -= 1;
         continue;
       }
+      // Report the attempt that got furthest: fewest errors.
+      const lastOutput = outputs
+        .slice()
+        .sort((a, b) => (a.match(/error:/g) || []).length - (b.match(/error:/g) || []).length)[0] || '';
       failures.push({ block, output: lastOutput });
       console.error(`FAIL ${block.id}`);
       if (options.verbose) console.error(lastOutput.split('\n').slice(0, 6).join('\n'));

@@ -255,7 +255,46 @@ if (orphans.length || phantoms.length) {
   process.exit(1);
 }
 
+// ─── The committed search index has to cover the pages that exist ──────────
+//
+// `public/search-index.json` is a build artifact that is *committed*, so it goes
+// stale in the repo whenever content changes and nobody runs `npm run
+// build:search`. It had: built 2026-08-28 against 151 pages while 160 existed,
+// so nine pages were unsearchable, and the text it served still carried wording
+// the docs had already corrected. `npm run build` regenerates it, so a deploy
+// was fine — but the file in git, which is what a reader of the repo and any
+// tooling reading it sees, was not.
+//
+// check:claims already scans public/ for retracted wording, which catches the
+// stale-text half. This is the structural half.
+const indexPath = path.join(root, 'public', 'search-index.json');
+if (fs.existsSync(indexPath)) {
+  let index;
+  try {
+    index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  } catch (e) {
+    console.error(`public/search-index.json is not valid JSON: ${e.message}`);
+    process.exit(1);
+  }
+  const indexed = new Set((index.docs || []).map((d) => d.slug));
+  const unsearchable = [...routes.keys()].filter((r) => !indexed.has(r));
+  const phantomDocs = [...indexed].filter((slug) => !routes.has(slug));
+  if (unsearchable.length || phantomDocs.length) {
+    if (unsearchable.length) {
+      console.error(`${unsearchable.length} page(s) are missing from the search index:\n`);
+      for (const u of unsearchable.slice(0, 20)) console.error(`  ${u}`);
+      if (unsearchable.length > 20) console.error(`  ... and ${unsearchable.length - 20} more`);
+    }
+    if (phantomDocs.length) {
+      console.error(`\n${phantomDocs.length} indexed slug(s) no longer have a page:\n`);
+      for (const p of phantomDocs.slice(0, 20)) console.error(`  ${p}`);
+    }
+    console.error('\nRun `npm run build:search` and commit the result.');
+    process.exit(1);
+  }
+}
+
 console.log(
   `OK — ${checked} internal links across ${routes.size} routes all resolve, ` +
-    `and every page is reachable from the sidebar.`
+    `every page is reachable from the sidebar, and the search index covers them all.`
 );
