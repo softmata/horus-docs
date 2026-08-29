@@ -93,6 +93,43 @@ function unresolvableInclude(code) {
   return null;
 }
 
+/**
+ * True when a block failed only because it continues an earlier one.
+ *
+ * An API page shows `sched.advertise<...>("odom")` under a heading, having built
+ * `sched` three fences up. Compiled alone that is "'sched' was not declared in
+ * this scope" — which says nothing about whether the documented call is right.
+ * The distinction that matters: an undeclared *local* is missing context, while
+ * an unknown member, a wrong type or a bad namespace is a defect in the sample.
+ *
+ * So: if every root error is an undeclared identifier that the block never
+ * declares and that is not a `horus` name, this is a continuation. Anything else
+ * — including an undeclared identifier under `horus::` — is a real failure.
+ * Returns the identifiers, or null.
+ */
+function contextOnly(output, code) {
+  const roots = output
+    .split('\n')
+    .filter((l) => l.includes('error:'))
+    .map((l) => l.slice(l.indexOf('error:') + 6).trim());
+  if (!roots.length) return null;
+
+  const names = new Set();
+  for (const e of roots) {
+    // Cascades from an undeclared name on the same line carry no information.
+    if (/^expected primary-expression before/.test(e)) continue;
+    if (/^expected [';,)]/.test(e)) continue;
+    const m = /^[‘'"]([A-Za-z_][A-Za-z0-9_]*)[’'"] (?:was not declared in this scope|does not name a type)/.exec(e);
+    if (!m) return null;
+    const name = m[1];
+    // A horus name that does not resolve is exactly what this check is for.
+    if (new RegExp(`horus::(?:\\w+::)*${name}\\b`).test(code)) return null;
+    if (new RegExp(`\\b(?:class|struct|enum)\\s+${name}\\b`).test(code)) return null;
+    names.add(name);
+  }
+  return names.size ? [...names].join(', ') : null;
+}
+
 /** Types produced by `horus msg` codegen — absent until the reader runs it. */
 const GENERATED_TYPES = /\bhorus::msg::(WeatherData|SensorPacket)\b/;
 
@@ -109,12 +146,40 @@ const failures = [];
 let checked = 0;
 const skipped = [];
 
-function compile(file) {
-  return spawnSync(
-    process.env.CXX || 'g++',
-    ['-std=c++17', '-fsyntax-only', '-w', '-I', includeDir, file],
-    { encoding: 'utf8' }
+// Precompile the HORUS headers once.
+//
+// Every block otherwise re-parses ~5,000 lines of horus_cpp/include, which is
+// 1.3s of the ~1.5s each compile takes. With the header precompiled it is 0.3s,
+// and the job goes from about ten minutes to about two -- the difference between
+// a check CI keeps and one someone turns off. Forced in with `-include`, so it
+// also covers blocks that write their own #include lines: the include guards
+// make those a no-op.
+const preludeHeader = path.join(work, 'horus_docs_prelude.hpp');
+fs.writeFileSync(preludeHeader, '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n');
+const pch = spawnSync(
+  process.env.CXX || 'g++',
+  ['-std=c++17', '-w', '-I', includeDir, '-x', 'c++-header', preludeHeader, '-o', preludeHeader + '.gch'],
+  { encoding: 'utf8' }
+);
+// A failed precompile is not fatal -- it only costs speed -- but it usually
+// means the headers themselves stopped compiling, which is worth saying.
+const usePch = pch.status === 0;
+if (!usePch) {
+  // Say why. A silent fallback turns a broken header into "the job got slower",
+  // and the reason is usually worth reading: no disk for the ~90 MB .gch, or the
+  // headers themselves no longer compiling.
+  const why = `${pch.stdout || ''}${pch.stderr || ''}`.trim().split('\n').slice(0, 4).join('\n');
+  console.error(
+    'note: could not precompile the HORUS headers; falling back to per-block ' +
+      `parsing, which is roughly 4x slower${why ? `:\n${why}` : ` (g++ exited ${pch.status})`}`
   );
+}
+
+function compile(file) {
+  const flags = ['-std=c++17', '-fsyntax-only', '-w'];
+  if (usePch) flags.push('-include', preludeHeader, '-I', work);
+  flags.push('-I', includeDir, file);
+  return spawnSync(process.env.CXX || 'g++', flags, { encoding: 'utf8' });
 }
 
 try {
@@ -136,9 +201,17 @@ try {
       continue;
     }
 
-    const prelude = code.includes('#include')
-      ? ''
-      : '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n';
+    // `using namespace horus::literals;` is the prerequisite the duration page
+    // states once, at the top of its Literals section, and the samples below it
+    // rely on. Supplying it here matches what a reader following the page has in
+    // scope; without it every `50_hz` is an "unable to find numeric literal
+    // operator" that says nothing about the doc.
+    const needsLiterals = /\b\d+_(?:hz|s|ms|us|ns)\b/.test(code) && !/using namespace horus::literals/.test(code);
+    const prelude =
+      (usePch || code.includes('#include')
+        ? ''
+        : '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n') +
+      (needsLiterals ? 'using namespace horus::literals;\n' : '');
     const hasMain = /\bint\s+main\s*\(/.test(code);
     const shapes = hasMain
       ? [prelude + code]
@@ -161,6 +234,12 @@ try {
       lastOutput = `${result.stdout}${result.stderr}`.trim();
     }
     if (!passed) {
+      const missing = contextOnly(lastOutput, code);
+      if (missing) {
+        skipped.push(`${block.id} — continues an earlier block (uses ${missing})`);
+        checked -= 1;
+        continue;
+      }
       failures.push({ block, output: lastOutput });
       console.error(`FAIL ${block.id}`);
       if (options.verbose) console.error(lastOutput.split('\n').slice(0, 6).join('\n'));
