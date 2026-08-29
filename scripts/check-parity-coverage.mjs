@@ -170,10 +170,48 @@ const CLASSES = [
   // ── structure: the page renders ─────────────────────────────────────────
   {
     class: 'structure/mdx',
-    what: 'every page compiles and renders — fences, tables and JSX',
+    what: 'every page compiles — fences, tables and JSX',
     enforced: { where: '.github/workflows/verify-docs.yml', needle: 'npm run extract:code' },
     direction: 'n/a',
-    // `next build` is the real oracle here and runs in the deploy pipeline.
+    // This says compiles, not renders. It used to claim both, with a note that
+    // `next build` was "the real oracle". A green build proves the MDX parsed;
+    // it proves nothing about what reaches the screen, which is why all 17
+    // diagrams on the site could render nothing while this class read enforced.
+    // structure/rendered-output is the class that actually covers that.
+  },
+  {
+    class: 'structure/mdx-expression',
+    what: 'a `{...}` an author wrote is still in the compiled output',
+    enforced: { where: 'scripts/check-mdx-props.mjs', needle: 'did not survive compilation' },
+    direction: 'docs->code',
+    // next-mdx-remote 6's `blockJS` default deletes every expression node. It
+    // took `chart={`...`}` off all 17 <MermaidDiagram> tags and no check moved.
+  },
+  {
+    class: 'structure/rendered-output',
+    what: 'a page in a browser shows what its source says it shows',
+    enforced: { where: 'scripts/check-rendered.mjs', needle: 'did not render as written' },
+    direction: 'docs->code',
+    // The class nothing covered. Every other check reads source or served HTML;
+    // this one opens the page. It found the blank diagrams, three hydration
+    // mismatches and six code blocks with no Copy button on its first run.
+  },
+  {
+    class: 'structure/route-uniqueness',
+    what: 'no two app routes can match the same URL',
+    enforced: { where: 'scripts/check-routes.mjs', needle: 'can match the same URL' },
+    direction: 'n/a',
+    // Four page routes overlapped, so `next dev` 404'd every English page after
+    // its first request while the prerendered production build looked fine.
+  },
+  {
+    class: 'existence/anchor',
+    what: 'a `#fragment` link points at a heading that exists',
+    enforced: { where: 'scripts/check-links.mjs', needle: 'page exists, #' },
+    direction: 'docs->docs',
+    // Bare `#anchor` links matched none of the extractor's patterns, so four
+    // dead ones sat on /development/cli-reference and /development/static-analysis
+    // while the checker reported every link resolving.
   },
 
   // ── value: a documented value matches the source ────────────────────────

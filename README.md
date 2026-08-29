@@ -21,14 +21,27 @@ npm run build
 # Start production server
 npm start
 
-# Contract checks — both gate CI, both run in about a second
-npm run check           # links + performance claims
+# Contract checks — all gate CI, all run in about a second
+npm run check           # everything below except check:rendered
 npm run check:links     # every internal link and #anchor resolves, and every
                         #   page is reachable from the sidebar
 npm run check:claims    # no retracted performance claim anywhere, and the
                         #   headline latency figures agree with benchmarks.mdx
 npm run check:parity    # every class of claim is either enforced by a named
                         #   check or explained as needing a reader
+npm run check:mdx       # every `{...}` an author wrote survives compilation
+npm run check:routes    # no two app routes can match the same URL
+
+# The one check that opens a page. Needs a build and a browser, so it is its own
+# CI job rather than part of `npm run check`:
+#
+#   npm run build && npx playwright install chromium
+#   npm run check:rendered
+#
+# Everything else here reads source or served HTML. That gap is why all 17
+# diagrams on the site rendered nothing while every check stayed green — the
+# pages returned 200 and the HTML still carried the <figure> and its caption.
+npm run check:rendered  # every page shows what its source says it shows
 
 # Include the framework README's links in the check
 node scripts/check-links.mjs ../horus/README.md

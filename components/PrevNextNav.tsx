@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { FiArrowLeft, FiArrowRight } from "react-icons/fi";
 import { localeFromPathname, localizedHref, stripLocale } from "@/lib/i18n";
 
-import { sections, type DocLink } from "./DocsSidebar";
+import { ordered, sections, type DocLink } from "./DocsSidebar";
 
 // Derived from the sidebar rather than copied from it.
 //
@@ -18,8 +18,12 @@ import { sections, type DocLink } from "./DocsSidebar";
 // Children are included in depth-first order, which is the order they are read
 // in, and de-duplicated: a page reachable from two sections should appear once
 // in a linear walk.
+// `ordered` is the sidebar's own sort. Walking the raw array instead put the
+// reader somewhere the sidebar never suggested: on /advanced/circuit-breaker,
+// Previous pointed at "Recipe: ROS 2 Bridge" while the sidebar showed
+// "Production Deployment" directly above it.
 function flatten(links: DocLink[], out: DocLink[], seen: Set<string>) {
-  for (const link of links) {
+  for (const link of ordered(links)) {
     if (!seen.has(link.href)) {
       seen.add(link.href);
       out.push(link);

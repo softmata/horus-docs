@@ -18,6 +18,25 @@ export interface SidebarSection {
   links: DocLink[];
 }
 
+/// The order the sidebar shows a list of links in.
+///
+/// Both call sites used to write `section.links.sort(...)` inline. `sort`
+/// mutates, so rendering the sidebar permanently reordered the exported
+/// `sections` array, and `PrevNextNav` — which walks the same array — got the
+/// literal order or the sorted one depending on whether its module happened to
+/// be evaluated before or after the first sidebar render. It resolved one way
+/// on the server and the other in the browser, so React threw a hydration
+/// mismatch on every page whose neighbours differ between the two orders
+/// (/advanced/circuit-breaker, /development/environment-variables and
+/// /recipes/ros2-bridge), and the Previous link a reader saw after hydration
+/// was not the one the sidebar put above the page.
+///
+/// Returning a sorted copy fixes both: nothing is mutated, and the sidebar and
+/// Prev/Next read the same order however the modules load.
+export function ordered(links: DocLink[]): DocLink[] {
+  return [...links].sort((a, b) => (a.order ?? 999) - (b.order ?? 999));
+}
+
 /// The one navigation order.
 ///
 /// Exported because `PrevNextNav` used to hold a hand-copied flat version of
@@ -426,9 +445,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
 
         {hasChildren && isExpanded && (
           <ul className="space-y-1 ml-6 mt-1">
-            {link.children!
-              .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-              .map((child) => renderLink(child, depth + 1))}
+            {ordered(link.children!).map((child) => renderLink(child, depth + 1))}
           </ul>
         )}
       </li>
@@ -456,9 +473,7 @@ export function DocsSidebar({ isOpen = true, onClose }: DocsSidebarProps) {
 
             {isExpanded && (
               <ul className="space-y-1 ml-6">
-                {section.links
-                  .sort((a, b) => (a.order ?? 999) - (b.order ?? 999))
-                  .map((link) => renderLink(link, 0))}
+                {ordered(section.links).map((link) => renderLink(link, 0))}
               </ul>
             )}
           </div>

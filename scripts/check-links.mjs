@@ -30,8 +30,8 @@
  *   - the `#fragment`, against the heading ids the site actually renders
  *   - both route spellings lib/mdx.tsx accepts: `x.mdx` and `x/index.mdx`
  *
- * Other external URLs, mailto:, and bare anchors on the same page are checked
- * for the fragment only where the page is known.
+ * Other external URLs and mailto: are left alone. A bare `#anchor` is resolved
+ * against the page it is written on.
  *
  * Run: node scripts/check-links.mjs
  *      node scripts/check-links.mjs ../horus/README.md   # extra files to check
@@ -155,6 +155,17 @@ for (const file of sources) {
     const patterns = [
       /\]\((\/[^)\s]*)\)/g,
       /href=["'](\/[^"']*)["']/g,
+      // Bare `#fragment` links, which resolve against the page they sit on.
+      //
+      // Every pattern here used to require a leading `/`, so `](#anchor)` matched
+      // nothing at all and the `slug === ''` branch below was unreachable — this
+      // checker reported "all links resolve" while four hand-written anchors on
+      // /development/cli-reference and /development/static-analysis pointed at
+      // ids that were never rendered. They were GitHub's slug spelling, which
+      // keeps a run of separators as a run of dashes ("a - b" -> "a---b"); the
+      // site collapses the run to one dash, so every one of them was dead.
+      /\]\((#[^)\s]*)\)/g,
+      /href=["'](#[^"']*)["']/g,
       // `url: '/x'` — how the web-app manifest names its shortcut targets.
       /\burl:\s*["'](\/[^"']*)["']/g,
       // Absolute links to this site, in markdown or in an href.
