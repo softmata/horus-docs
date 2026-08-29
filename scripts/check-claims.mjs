@@ -397,4 +397,94 @@ if (violations.length) {
   process.exit(1);
 }
 
-console.log(`OK — ${scanned} files carry no retracted performance claim.`);
+// ─── The surviving numbers have to agree with each other ────────────────────
+//
+// Everything above answers "is this claim retracted?". Nothing answered "do the
+// pages that quote a real figure quote the same one?", and they had drifted:
+// what-is-horus said 125 ns cross-process and "~40ns to ~85ns" backend paths,
+// goals said 30x, and two comparison tables put the 75 ns *send-only* CmdVel
+// median against ROS 2's end-to-end 5 µs — the exact like-for-like error the
+// benchmarks page warns about two sections earlier. None of it tripped a check,
+// because every one of those numbers is individually plausible.
+//
+// benchmarks.mdx is the source. CANONICAL restates the figures other pages are
+// allowed to quote, and the check runs both ways: each figure must still be on
+// the benchmarks page (so a re-measurement cannot silently orphan the quotes),
+// and the superseded spellings must not come back anywhere.
+const benchmarksPage = path.join(root, 'content/docs/performance/benchmarks.mdx');
+const benchmarksText = fs.readFileSync(benchmarksPage, 'utf8');
+
+const CANONICAL = [
+  { figure: '63 ns', what: 'same-process (CrossThread-1P1C) median' },
+  { figure: '151 ns', what: 'cross-process 1:1 one-way median' },
+  { figure: '191 ns', what: 'cross-process 1-to-many (PodShm) median' },
+  { figure: '20 ns', what: 'same-thread median' },
+  { figure: '75 ns', what: 'CmdVel 16 B send-only median' },
+];
+
+const orphaned = CANONICAL.filter((c) => !benchmarksText.includes(c.figure));
+if (orphaned.length) {
+  console.error(
+    'these figures are quoted elsewhere in the docs but no longer appear on ' +
+      'content/docs/performance/benchmarks.mdx:\n'
+  );
+  for (const o of orphaned) console.error(`  ${o.figure} — ${o.what}`);
+  console.error(
+    '\nIf the benchmarks were re-run, update the pages that quote them and this ' +
+      'list together. A figure with no source page is how the last set drifted.'
+  );
+  process.exit(1);
+}
+
+// Spellings that were wrong and are easy to reintroduce, because each reads
+// like a rounding of a real number rather than a different measurement.
+const SUPERSEDED = [
+  { re: /\b125\s?ns\b/, why: 'cross-process one-way is 151 ns, not 125 ns' },
+  {
+    re: /~40ns to ~85ns|~40 ns to ~85 ns/,
+    why: 'the backend fast paths are 20/63/74 ns, not a 40-85 ns range',
+  },
+  {
+    re: /0\.075\s?µs[^|\n]*\|[^|\n]*(?:ROS|DDS|REP 2014)/,
+    why: '0.075 µs is the send-only CmdVel median; comparing it to ROS 2\'s ' +
+      'end-to-end 5 µs is the like-for-like error benchmarks.mdx warns about — ' +
+      'use the 151 ns cross-process row',
+  },
+  {
+    re: /(?:roughly|about|~)\s*30x lower/,
+    why: 'the ratio against the REP 2014 reference is ~33x, not ~30x',
+  },
+  {
+    re: /sub-200ns end-to-end/,
+    why: 'the 151 ns figure is one-way, not end-to-end',
+  },
+];
+
+const drift = [];
+for (const file of files) {
+  const rel = path.relative(root, file).replace(/\\/g, '/');
+  // This file states the superseded spellings in order to search for them.
+  if (rel === 'scripts/check-claims.mjs') continue;
+  const text = fs.readFileSync(file, 'utf8');
+  // Skip source comments, where these spellings appear as prose about the bug.
+  // Only in code: a Markdown line very often starts with `**`, and treating
+  // that as a comment blinded this check to every bolded claim in the docs.
+  const isMarkdown = /\.mdx?$/.test(rel);
+  text.split('\n').forEach((line, i) => {
+    const t = line.trimStart();
+    if (!isMarkdown && (t.startsWith('//') || t.startsWith('*'))) return;
+    for (const s of SUPERSEDED) {
+      if (s.re.test(line)) drift.push(`${rel}:${i + 1} — ${s.why}\n      ${line.trim().slice(0, 140)}`);
+    }
+  });
+}
+if (drift.length) {
+  console.error(`${drift.length} superseded performance figure(s):\n`);
+  for (const d of drift) console.error(`  ${d}\n`);
+  process.exit(1);
+}
+
+console.log(
+  `OK — ${scanned} files carry no retracted performance claim, and the ` +
+    `${CANONICAL.length} headline figures agree with benchmarks.mdx.`
+);
