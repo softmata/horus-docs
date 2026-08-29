@@ -156,6 +156,23 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
       source: mdxContent,
       options: {
         parseFrontmatter: true,
+        // next-mdx-remote 6 added `blockJS`, defaulting to true, which runs a
+        // remark plugin that deletes every `{...}` from the tree -- including
+        // JSX attribute expressions. It is aimed at sites whose MDX comes from
+        // an untrusted CMS. Ours is first-party and lives in this repository,
+        // compiled at build time from files that go through review.
+        //
+        // Left on, it silently dropped `chart={`...`}` from all 17
+        // <MermaidDiagram> tags on 11 pages. The prop arrived as `undefined`,
+        // the component's `if (!chart) return` fired before it ever imported
+        // mermaid, and every diagram on the site sat on "Loading diagram..."
+        // forever -- no console error, no failed request, nothing for a test
+        // that only checks status codes or HTML to catch.
+        // `scripts/check-mdx-props.mjs` fails the build if this regresses.
+        //
+        // `blockDangerousJS` still defaults to true, so eval/Function/process
+        // and friends remain blocked inside those expressions.
+        blockJS: false,
         mdxOptions: {
           remarkPlugins: [remarkGfm],
           rehypePlugins: [],
