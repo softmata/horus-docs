@@ -23,11 +23,19 @@ npm start
 
 # Contract checks — both gate CI, both run in about a second
 npm run check           # links + performance claims
-npm run check:links     # every internal link and #anchor resolves
-npm run check:claims    # no retracted performance claim anywhere
+npm run check:links     # every internal link and #anchor resolves, and every
+                        #   page is reachable from the sidebar
+npm run check:claims    # no retracted performance claim anywhere, and the
+                        #   headline latency figures agree with benchmarks.mdx
 
 # Include the framework README's links in the check
 node scripts/check-links.mjs ../horus/README.md
+
+# Compile the code samples against a HORUS checkout at ../horus
+npm run verify:code     # extract, then Rust + Python + C++
+npm run verify:rust     # compiles the self-contained Rust blocks
+npm run verify:python   # syntax-checks the Python blocks (py_compile only)
+npm run verify:cpp      # -fsyntax-only against horus_cpp/include
 ```
 
 Visit `http://localhost:3009` to view the documentation.
@@ -60,8 +68,10 @@ Routes come from the file tree: `content/docs/a/b.mdx` is served at `/a/b`, and
 `npm run check:links` is the guard for that.
 
 Adding a page means adding it to `sections` in `components/DocsSidebar.tsx` as well:
-`PrevNextNav` derives its order from that list, and a contract test in the framework
-repo fails on any page nothing links to.
+`PrevNextNav` derives its order from that list, and `npm run check:links` fails on a
+page that is not listed there (and on a sidebar entry with no page behind it). That
+list is the only navigation order — the `order:` frontmatter key is inert, because
+`getDocsList` in `lib/mdx.tsx` is its only reader and nothing calls it.
 
 ## Tech Stack
 
@@ -131,6 +141,12 @@ Competitor numbers (iceoryx, CycloneDDS, FastDDS, ROS 2) are **published referen
 values**, not measurements taken here, and the pages quoting them say so.
 `npm run check:claims` fails on the ratios that were previously asserted without either.
 See [Benchmarks](content/docs/performance/benchmarks.mdx) for the method.
+
+It also holds the pages that *quote* a figure to the page that *measures* it. The
+headline latencies live on `performance/benchmarks.mdx`; anywhere else they appear,
+they have to be the same number. Quote the 151 ns cross-process row when comparing
+against ROS 2's end-to-end reference — the 75 ns CmdVel median is send-only, and
+putting it beside a round-trip figure is the mistake that check catches.
 
 ## Links
 
