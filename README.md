@@ -27,6 +27,8 @@ npm run check:links     # every internal link and #anchor resolves, and every
                         #   page is reachable from the sidebar
 npm run check:claims    # no retracted performance claim anywhere, and the
                         #   headline latency figures agree with benchmarks.mdx
+npm run check:parity    # every class of claim is either enforced by a named
+                        #   check or explained as needing a reader
 
 # Include the framework README's links in the check
 node scripts/check-links.mjs ../horus/README.md

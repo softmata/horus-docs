@@ -1,0 +1,297 @@
+#!/usr/bin/env node
+/**
+ * Which kinds of claim in these docs are machine-checked, and which are not.
+ *
+ * Why this exists
+ * ---------------
+ * On 2026-08-29 an audit of all 166 pages raised 155 findings. At that moment
+ * the repositories already held roughly 190 automated checks between them —
+ * `check-links`, `check-claims`, the three `verify:*` compilers, and eleven
+ * `docs_*` contract suites on the Rust side. Every one of them was green.
+ *
+ * They were green because each asserts something specific and true. What none
+ * of them could say is what was *not* being asserted. A reader of the test
+ * suite could not have answered "is anything checking that a documented default
+ * matches the constant?" without reading all 190 and noticing an absence, which
+ * is not a thing people notice. So the gap stayed invisible until someone read
+ * every page by hand.
+ *
+ * This file exists to make the gap visible instead. It does not check the
+ * documentation. It checks that every class of claim the documentation makes
+ * has been *classified* — either a named check enforces it, or someone wrote
+ * down why a machine cannot.
+ *
+ * How the classes were chosen
+ * ---------------------------
+ * Not by imagination. Each of the 155 findings was labelled with the oracle
+ * that could have caught it, and the classes below are the six that fell out:
+ *
+ *     39  existence    set membership against an inventory
+ *     30  consistency  the same fact stated twice, once wrongly
+ *     17  value        a documented value against the constant
+ *     14  structure    a parser
+ *     11  compiles     a compiler
+ *     44  behaviour    a reader, and nothing else
+ *
+ * 71% of what went wrong is reachable by a machine. The remaining 28% is not,
+ * and saying so plainly is the point: a suite that quietly implies full cover
+ * is worse than one that names what it cannot reach.
+ *
+ * The strictness
+ * --------------
+ * An `enforced` entry is not taken at its word. The named file must exist and
+ * must contain the named check, so a renamed or deleted test turns into a
+ * failure here rather than a line of documentation that stopped being true. A
+ * `manual` entry must carry a reason. A class with neither fails.
+ *
+ * Run: node scripts/check-parity-coverage.mjs [--verbose]
+ */
+
+import fs from 'fs';
+import path from 'path';
+
+const root = process.cwd();
+const horus = process.env.HORUS_DIR || path.resolve(root, '../horus');
+const verbose = process.argv.includes('--verbose');
+
+/**
+ * Every class of factual claim these docs make.
+ *
+ * `where` names where the check lives: a path under this repo, or under the
+ * HORUS repo for the Rust-side contract suites. `needle` is a string that must
+ * appear in it — the function name, so a rename is caught.
+ */
+const CLASSES = [
+  // ── existence: a named thing is claimed to exist ────────────────────────
+  {
+    class: 'existence/route',
+    what: 'every internal link and #anchor resolves to a page and heading',
+    enforced: { where: 'scripts/check-links.mjs', needle: 'internal link(s) resolve to nothing' },
+    direction: 'both',
+  },
+  {
+    class: 'existence/navigation',
+    what: 'every page is reachable from the sidebar, and every sidebar entry has a page',
+    enforced: { where: 'scripts/check-links.mjs', needle: 'are not in the sidebar' },
+    direction: 'both',
+  },
+  {
+    class: 'existence/search',
+    what: 'the committed search index covers exactly the pages that exist',
+    enforced: { where: 'scripts/check-links.mjs', needle: 'missing from the search index' },
+    direction: 'both',
+  },
+  {
+    class: 'existence/cli-command',
+    what: 'every documented command resolves, and every visible command is documented',
+    enforced: {
+      where: 'horus:horus_manager/tests/docs_cli_contract.rs',
+      needle: 'every_visible_command_has_a_section_in_the_cli_reference',
+    },
+    direction: 'both',
+  },
+  {
+    class: 'existence/cli-flag',
+    what: 'every documented flag is accepted by the command it is documented under',
+    enforced: {
+      where: 'horus:horus_manager/tests/docs_cli_contract.rs',
+      needle: 'every_documented_flag_is_accepted',
+    },
+    // Honest about the half that is missing: a flag added to HORUS and never
+    // written up is not caught by anything. See the note at the bottom.
+    direction: 'docs->code',
+  },
+  {
+    class: 'existence/env-var',
+    what: 'documented variables are read, and variables the code reads are documented',
+    enforced: {
+      where: 'horus:horus_manager/tests/docs_parity.rs',
+      needle: 'every_env_var_the_code_reads_is_documented',
+    },
+    direction: 'both',
+  },
+  {
+    class: 'existence/manifest-key',
+    what: 'every horus.toml key documented exists, and every schema key is documented',
+    enforced: { where: 'horus:horus_manager/tests/docs_contract.rs', needle: 'undocumented' },
+    direction: 'both',
+  },
+  {
+    class: 'existence/python-symbol',
+    what: 'every `from horus import X` and `horus.X` names something horus_py exports',
+    enforced: { where: 'scripts/verify_python_api.py', needle: 'horus exports no' },
+    direction: 'docs->code',
+  },
+  {
+    class: 'existence/benchmark-binary',
+    what: 'every benchmark the docs tell a reader to run exists',
+    enforced: {
+      where: 'horus:horus_manager/tests/docs_parity.rs',
+      needle: 'documented_benchmark_binaries_exist',
+    },
+    direction: 'docs->code',
+  },
+  {
+    class: 'existence/version-pin',
+    what: 'a documented `horus = "x.y"` can resolve to the crate this repo ships',
+    enforced: {
+      where: 'horus:horus_manager/tests/docs_parity.rs',
+      needle: 'documented_horus_version_pins_resolve_to_this_crate',
+    },
+    direction: 'both',
+  },
+
+  // ── compiles: a sample is claimed to work ───────────────────────────────
+  {
+    class: 'compiles/rust',
+    what: 'self-contained Rust samples compile against the real crate',
+    enforced: { where: 'scripts/verify-rust-local.mjs', needle: 'Rust documentation verification' },
+    direction: 'docs->code',
+  },
+  {
+    class: 'compiles/cpp',
+    what: 'C++ samples type-check against horus_cpp/include',
+    enforced: { where: 'scripts/verify-cpp-local.mjs', needle: 'C++ documentation verification' },
+    direction: 'docs->code',
+  },
+  {
+    class: 'compiles/python-syntax',
+    what: 'Python samples are valid Python',
+    enforced: { where: 'scripts/verify-python-local.mjs', needle: 'Python documentation verification' },
+    direction: 'docs->code',
+  },
+  {
+    class: 'compiles/python-api',
+    what: 'Python keyword arguments name real parameters',
+    enforced: { where: 'scripts/verify_python_api.py', needle: 'not a parameter of' },
+    direction: 'docs->code',
+  },
+
+  // ── structure: the page renders ─────────────────────────────────────────
+  {
+    class: 'structure/mdx',
+    what: 'every page compiles and renders — fences, tables and JSX',
+    enforced: { where: '.github/workflows/verify-docs.yml', needle: 'npm run extract:code' },
+    direction: 'n/a',
+    // `next build` is the real oracle here and runs in the deploy pipeline.
+  },
+
+  // ── value: a documented value matches the source ────────────────────────
+  {
+    class: 'value/performance-figure',
+    what: 'headline latencies agree with the page that measures them, and retracted ones stay gone',
+    enforced: { where: 'scripts/check-claims.mjs', needle: 'agree with benchmarks.mdx' },
+    direction: 'both',
+  },
+  {
+    class: 'value/default',
+    what: 'a documented default equals the constant it describes',
+    manual:
+      'No inventory of defaults exists to diff against. Nine findings were of this ' +
+      'shape — BudgetPolicy::Enforce trips at 2x not 1x, lethal_cost is 254 not 253, ' +
+      'HORUS_NODE_NAME falls back to "Scheduler" not the binary name. Each default ' +
+      'lives in a different form (a const, a serde attribute, an unwrap_or, a clap ' +
+      'default_value), so catching these needs `horus inventory --json` to emit them ' +
+      'first. That is the highest-value thing not yet built.',
+  },
+
+  // ── consistency: the same fact, stated twice ────────────────────────────
+  {
+    class: 'consistency/cross-page',
+    what: 'a fact stated on more than one page is stated the same way',
+    manual:
+      'The largest single category — 30 findings — and only partly reachable. ' +
+      'check-claims pins the five headline latency figures to benchmarks.mdx, which ' +
+      'is single-sourcing done by hand for one fact family. The general form needs ' +
+      'facts to be transcluded from one place rather than retyped, which is a ' +
+      'content-model change, not a test. Until then a reader is the only oracle for ' +
+      'the rest: two pages disagreeing about what .watchdog() does are each ' +
+      'individually plausible.',
+  },
+
+  // ── behaviour: what the system does ─────────────────────────────────────
+  {
+    class: 'behaviour/runtime-semantics',
+    what: 'what the docs say happens is what happens',
+    enforced: { where: 'horus:horus_manager/tests/docs_behavior.rs', needle: 'Behavioural contracts' },
+    direction: 'docs->code',
+    partial:
+      'Covers the promises someone thought to write a test for. It cannot cover the ' +
+      'ones nobody thought of, which is where 44 of the 155 findings were: four pages ' +
+      'still described a critical-node escalation that safety_monitor.rs had ' +
+      'deliberately removed, and every sentence was self-consistent and wrong.',
+  },
+];
+
+// ─── Enforce the manifest ───────────────────────────────────────────────────
+
+function resolve(where) {
+  return where.startsWith('horus:') ? path.join(horus, where.slice('horus:'.length)) : path.join(root, where);
+}
+
+const problems = [];
+const missingCheck = [];
+let enforced = 0;
+let manual = 0;
+
+for (const entry of CLASSES) {
+  if (!entry.class || !entry.what) {
+    problems.push(`an entry is missing class or what: ${JSON.stringify(entry).slice(0, 80)}`);
+    continue;
+  }
+  if (entry.enforced) {
+    const file = resolve(entry.enforced.where);
+    if (!fs.existsSync(file)) {
+      missingCheck.push(`${entry.class} — ${entry.enforced.where} does not exist`);
+      continue;
+    }
+    const text = fs.readFileSync(file, 'utf8');
+    if (!text.includes(entry.enforced.needle)) {
+      missingCheck.push(
+        `${entry.class} — ${entry.enforced.where} no longer contains "${entry.enforced.needle}"`
+      );
+      continue;
+    }
+    enforced += 1;
+  } else if (entry.manual) {
+    manual += 1;
+  } else {
+    problems.push(`${entry.class} is neither enforced nor explained`);
+  }
+}
+
+if (problems.length) {
+  console.error(`${problems.length} class(es) are unclassified:\n`);
+  for (const p of problems) console.error(`  ${p}`);
+  console.error(
+    '\nEvery class of claim needs either an `enforced` check or a `manual` reason. ' +
+      'An unclassified class is exactly the blind spot this file exists to prevent.'
+  );
+  process.exit(1);
+}
+
+if (missingCheck.length) {
+  console.error(`${missingCheck.length} claimed check(s) are gone or renamed:\n`);
+  for (const m of missingCheck) console.error(`  ${m}`);
+  console.error(
+    '\nThis manifest says these classes are enforced. They are not. Restore the ' +
+      'check, or move the class to `manual` and say why.'
+  );
+  process.exit(1);
+}
+
+if (verbose) {
+  console.log('enforced:');
+  for (const e of CLASSES.filter((c) => c.enforced)) {
+    const arrow = { both: '<->', 'docs->code': '-->', 'code->docs': '<--', 'n/a': '   ' }[e.direction] || '   ';
+    console.log(`  ${arrow} ${e.class.padEnd(32)} ${e.enforced.where}`);
+  }
+  console.log('\nleft to a reader:');
+  for (const e of CLASSES.filter((c) => c.manual)) console.log(`  --- ${e.class}`);
+}
+
+const oneWay = CLASSES.filter((c) => c.enforced && c.direction === 'docs->code').length;
+console.log(
+  `OK — ${CLASSES.length} claim classes classified: ${enforced} enforced ` +
+    `(${oneWay} in one direction only), ${manual} left to a reader.`
+);
