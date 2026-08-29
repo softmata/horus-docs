@@ -162,6 +162,9 @@ function contextOnly(output, code) {
     // A statement placed at file scope produces this, and so does the closing
     // line of a call whose receiver was undeclared. Both are shape noise.
     if (/^expected unqualified-id before/.test(e)) continue;
+    // Also a file-scope artifact: a lambda with a capture-default is fine in a
+    // function body and illegal at namespace scope.
+    if (/^non-local lambda expression cannot have a capture-default/.test(e)) continue;
     const m = /^[‘'"]([A-Za-z_][A-Za-z0-9_]*)[’'"] (?:was not declared in this scope|does not name a type)/.exec(e);
     if (!m) return null;
     const name = m[1];
@@ -198,7 +201,31 @@ const skipped = [];
 // also covers blocks that write their own #include lines: the include guards
 // make those a no-op.
 const preludeHeader = path.join(work, 'horus_docs_prelude.hpp');
-fs.writeFileSync(preludeHeader, '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n');
+// The HORUS headers, plus the standard ones a page has usually included in an
+// earlier fence before the one being checked -- `<thread>` for a sleep,
+// `<cstdio>` for a printf, `<cassert>` for an assert. Supplying them is the
+// same call as supplying `using namespace horus::literals`: it reproduces what
+// a reader working through the page has in scope, so a continuation fence is
+// judged on the HORUS API it uses rather than on a missing `<thread>`.
+fs.writeFileSync(
+  preludeHeader,
+  [
+    '#include <horus/horus.hpp>',
+    '#include <horus/messages.hpp>',
+    '#include <thread>',
+    '#include <chrono>',
+    '#include <cstdio>',
+    '#include <cstring>',
+    '#include <cmath>',
+    '#include <cassert>',
+    '#include <atomic>',
+    '#include <string>',
+    '#include <vector>',
+    '#include <optional>',
+    '#include <algorithm>',
+    '',
+  ].join('\n')
+);
 const pch = spawnSync(
   process.env.CXX || 'g++',
   ['-std=c++17', '-w', '-I', includeDir, '-x', 'c++-header', preludeHeader, '-o', preludeHeader + '.gch'],
@@ -251,11 +278,25 @@ try {
     // operator" that says nothing about the doc.
     const needsLiterals = /\b\d+_(?:hz|s|ms|us|ns)\b/.test(code) && !/using namespace horus::literals/.test(code);
     const prelude =
-      (usePch || code.includes('#include')
+      (usePch
         ? ''
-        : '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n') +
+        : '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n#include <thread>\n' +
+          '#include <chrono>\n#include <cstdio>\n#include <cassert>\n#include <string>\n') +
       (needsLiterals ? 'using namespace horus::literals;\n' : '');
     const hasMain = /\bint\s+main\s*\(/.test(code);
+    // Anything that has to stay at file scope is hoisted out of the wrappers.
+    // A block that writes its own `#include <horus/action.hpp>` and then a
+    // statement would otherwise get the include expanded *inside* a function
+    // body, which puts every class it declares there too.
+    const lines = code.split('\n');
+    const topIdx = [];
+    for (let n = 0; n < lines.length; n += 1) {
+      if (/^\s*(#\s*(include|pragma|define)\b|using\s+namespace\b)/.test(lines[n])) topIdx.push(n);
+    }
+    const hoisted = topIdx.map((n) => lines[n]).join('\n');
+    const rest = lines.filter((_, n) => !topIdx.includes(n)).join('\n');
+    const head = prelude + (hoisted ? hoisted + '\n' : '');
+
     // Both a void and an int body, because fragments are written as if inside
     // whichever the surrounding function was: `if (!client) return;` needs void,
     // and a snippet ending `return 0;` needs int.
@@ -263,11 +304,11 @@ try {
       ? [prelude + code]
       : [
           prelude + code + '\n',
-          `${prelude}void __horus_docs_body() {\n${code}\n}\n`,
-          `${prelude}int __horus_docs_body_i() {\n${code}\nreturn 0;\n}\n`,
+          `${head}void __horus_docs_body() {\n${rest}\n}\n`,
+          `${head}int __horus_docs_body_i() {\n${rest}\nreturn 0;\n}\n`,
           // A member shown on its own — `void tick() override { ... }` is not
           // legal at file scope or inside a function, only inside a class.
-          `${prelude}struct __HorusDocsNode : horus::Node {\n${code}\n};\n`,
+          `${head}struct __HorusDocsNode : horus::Node {\n${rest}\n};\n`,
         ];
 
     checked += 1;
@@ -315,8 +356,9 @@ if (options.verbose && skipped.length) {
   for (const s of skipped) console.log(`  ${s}`);
 }
 
-// A pass that examined nothing is not a pass.
-if (checked < 100) {
+// A pass that examined nothing is not a pass. Skipped on a filtered run, where
+// examining a handful of blocks is the point.
+if (!options.filter && checked < 100) {
   console.error(`only ${checked} C++ blocks examined — the selection is broken`);
   process.exit(2);
 }
