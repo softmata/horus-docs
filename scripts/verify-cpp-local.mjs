@@ -200,43 +200,61 @@ const skipped = [];
 // a check CI keeps and one someone turns off. Forced in with `-include`, so it
 // also covers blocks that write their own #include lines: the include guards
 // make those a no-op.
+const STD_HEADERS = [
+  '#include <thread>',
+  '#include <chrono>',
+  '#include <cstdio>',
+  '#include <cstring>',
+  '#include <cmath>',
+  '#include <cassert>',
+  '#include <atomic>',
+  '#include <string>',
+  '#include <vector>',
+  '#include <optional>',
+  '#include <algorithm>',
+];
+const HORUS_HEADERS = ['#include <horus/horus.hpp>', '#include <horus/messages.hpp>'];
+
 const preludeHeader = path.join(work, 'horus_docs_prelude.hpp');
-// The HORUS headers, plus the standard ones a page has usually included in an
-// earlier fence before the one being checked -- `<thread>` for a sleep,
-// `<cstdio>` for a printf, `<cassert>` for an assert. Supplying them is the
-// same call as supplying `using namespace horus::literals`: it reproduces what
-// a reader working through the page has in scope, so a continuation fence is
-// judged on the HORUS API it uses rather than on a missing `<thread>`.
-fs.writeFileSync(
-  preludeHeader,
-  [
-    '#include <horus/horus.hpp>',
-    '#include <horus/messages.hpp>',
-    '#include <thread>',
-    '#include <chrono>',
-    '#include <cstdio>',
-    '#include <cstring>',
-    '#include <cmath>',
-    '#include <cassert>',
-    '#include <atomic>',
-    '#include <string>',
-    '#include <vector>',
-    '#include <optional>',
-    '#include <algorithm>',
-    '',
-  ].join('\n')
-);
-const pch = spawnSync(
-  process.env.CXX || 'g++',
-  ['-std=c++17', '-w', '-I', includeDir, '-x', 'c++-header', preludeHeader, '-o', preludeHeader + '.gch'],
-  { encoding: 'utf8' }
-);
-// A failed precompile is not fatal -- it only costs speed -- but it usually
-// means the headers themselves stopped compiling, which is worth saying.
+
+/**
+ * Write the prelude and try to precompile it. Returns the compiler result.
+ *
+ * Two tiers, because the full header set precompiles to roughly 200 MB and the
+ * first thing that goes wrong on a constrained tmpfs is "cannot write PCH file:
+ * Disk quota exceeded". The HORUS-only header is a fraction of that and still
+ * removes most of the per-block cost, since horus_cpp/include is what every
+ * block re-parses. Falling straight from 200 MB to nothing gives up a 4x
+ * speed-up over a few dozen megabytes of disk.
+ */
+function buildPrelude(lines) {
+  fs.writeFileSync(preludeHeader, lines.join('\n') + '\n');
+  return spawnSync(
+    process.env.CXX || 'g++',
+    ['-std=c++17', '-w', '-I', includeDir, '-x', 'c++-header', preludeHeader, '-o', preludeHeader + '.gch'],
+    { encoding: 'utf8' }
+  );
+}
+
+let preludeLines = [...HORUS_HEADERS, ...STD_HEADERS];
+let pch = buildPrelude(preludeLines);
+if (pch.status !== 0) {
+  fs.rmSync(preludeHeader + '.gch', { force: true });
+  preludeLines = [...HORUS_HEADERS];
+  const retry = buildPrelude(preludeLines);
+  if (retry.status === 0) {
+    console.error(
+      'note: precompiling the full prelude failed; using a HORUS-only one. The ' +
+        'standard headers are supplied as text, so results are unchanged.'
+    );
+    pch = retry;
+  }
+}
 const usePch = pch.status === 0;
 if (!usePch) {
+  fs.rmSync(preludeHeader + '.gch', { force: true });
   // Say why. A silent fallback turns a broken header into "the job got slower",
-  // and the reason is usually worth reading: no disk for the ~90 MB .gch, or the
+  // and the reason is usually worth reading: no disk for the .gch, or the
   // headers themselves no longer compiling.
   const why = `${pch.stdout || ''}${pch.stderr || ''}`.trim().split('\n').slice(0, 4).join('\n');
   console.error(
@@ -244,6 +262,11 @@ if (!usePch) {
       `parsing, which is roughly 4x slower${why ? `:\n${why}` : ` (g++ exited ${pch.status})`}`
   );
 }
+// Whatever the precompiled prelude does not carry is supplied as text instead,
+// so a block sees the same set of headers whichever tier we ended up on.
+const carried = usePch ? new Set(preludeLines) : new Set();
+const asText = [...HORUS_HEADERS, ...STD_HEADERS].filter((h) => !carried.has(h));
+const textPrelude = asText.length ? asText.join('\n') + '\n' : '';
 
 function compile(file) {
   const flags = ['-std=c++17', '-fsyntax-only', '-w'];
@@ -277,12 +300,7 @@ try {
     // scope; without it every `50_hz` is an "unable to find numeric literal
     // operator" that says nothing about the doc.
     const needsLiterals = /\b\d+_(?:hz|s|ms|us|ns)\b/.test(code) && !/using namespace horus::literals/.test(code);
-    const prelude =
-      (usePch
-        ? ''
-        : '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n#include <thread>\n' +
-          '#include <chrono>\n#include <cstdio>\n#include <cassert>\n#include <string>\n') +
-      (needsLiterals ? 'using namespace horus::literals;\n' : '');
+    const prelude = textPrelude + (needsLiterals ? 'using namespace horus::literals;\n' : '');
     const hasMain = /\bint\s+main\s*\(/.test(code);
     // Anything that has to stay at file scope is hoisted out of the wrappers.
     // A block that writes its own `#include <horus/action.hpp>` and then a
