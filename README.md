@@ -34,7 +34,8 @@ node scripts/check-links.mjs ../horus/README.md
 # Compile the code samples against a HORUS checkout at ../horus
 npm run verify:code     # extract, then Rust + Python + C++
 npm run verify:rust     # compiles the self-contained Rust blocks
-npm run verify:python   # syntax-checks the Python blocks (py_compile only)
+npm run verify:python   # py_compile, then the API check below
+npm run verify:python:api # every horus name and keyword argument is real
 npm run verify:cpp      # -fsyntax-only against horus_cpp/include
 ```
 
