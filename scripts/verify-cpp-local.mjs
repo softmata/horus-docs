@@ -93,7 +93,16 @@ function isSignatureListing(code) {
     .trim();
   if (!joined) return false;
   if (!joined.endsWith(';') || joined.includes('{')) return false;
-  if (/[^=!<>]=[^=]/.test(joined)) return false;
+  // An `=` inside the parameter list is a default argument, which declarations
+  // routinely have (`Encoding enc = Encoding::Rgb8`). An `=` outside one is an
+  // initialiser, which makes this a statement. Strip balanced parens, then look.
+  let outside = joined;
+  for (let n = 0; n < 12; n += 1) {
+    const stripped = outside.replace(/\([^()]*\)/g, '');
+    if (stripped === outside) break;
+    outside = stripped;
+  }
+  if (/[^=!<>]=[^=]/.test(outside)) return false;
   // `operator""_hz` is a declaration whose name contains an empty string
   // literal; drop it before looking for literals.
   const bare = joined.replace(/operator""/g, 'operator_');
@@ -150,6 +159,9 @@ function contextOnly(output, code) {
     // Cascades from an undeclared name on the same line carry no information.
     if (/^expected primary-expression before/.test(e)) continue;
     if (/^expected [';,)]/.test(e)) continue;
+    // A statement placed at file scope produces this, and so does the closing
+    // line of a call whose receiver was undeclared. Both are shape noise.
+    if (/^expected unqualified-id before/.test(e)) continue;
     const m = /^[‘'"]([A-Za-z_][A-Za-z0-9_]*)[’'"] (?:was not declared in this scope|does not name a type)/.exec(e);
     if (!m) return null;
     const name = m[1];
@@ -244,11 +256,18 @@ try {
         : '#include <horus/horus.hpp>\n#include <horus/messages.hpp>\n') +
       (needsLiterals ? 'using namespace horus::literals;\n' : '');
     const hasMain = /\bint\s+main\s*\(/.test(code);
+    // Both a void and an int body, because fragments are written as if inside
+    // whichever the surrounding function was: `if (!client) return;` needs void,
+    // and a snippet ending `return 0;` needs int.
     const shapes = hasMain
       ? [prelude + code]
       : [
           prelude + code + '\n',
-          `${prelude}int __horus_docs_body() {\n${code}\nreturn 0;\n}\n`,
+          `${prelude}void __horus_docs_body() {\n${code}\n}\n`,
+          `${prelude}int __horus_docs_body_i() {\n${code}\nreturn 0;\n}\n`,
+          // A member shown on its own — `void tick() override { ... }` is not
+          // legal at file scope or inside a function, only inside a class.
+          `${prelude}struct __HorusDocsNode : horus::Node {\n${code}\n};\n`,
         ];
 
     checked += 1;
