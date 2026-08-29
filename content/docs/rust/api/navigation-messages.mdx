@@ -310,23 +310,27 @@ if let Some(wp) = plan.waypoint(0) {
 
 ## OccupancyGrid
 
-2D occupancy grid map for navigation. Uses `Vec<i8>` data (Serde-based, not Pod).
+2D occupancy grid map for navigation. The `i8` cells live in a shared-memory tensor
+allocated from the global pool, not in a `Vec` — what travels on a topic is the
+serde-encoded descriptor (dimensions, resolution, origin, frame, timestamp) plus a
+handle to that tensor.
 
 ```rust
 use horus::prelude::*;
 
 // Create 10m x 10m map at 5cm resolution
-let origin = Pose2D::origin();
 let mut grid = OccupancyGrid::new(
     200,   // width (200 * 0.05 = 10m)
     200,   // height
     0.05,  // resolution (5cm per cell)
-    origin
-);
+)?;
+
+// The origin defaults to (0, 0, 0); move it if the map is not world-aligned
+grid.set_origin(0.0, 0.0, 0.0);
 
 // Set occupancy (-1=unknown, 0=free, 100=occupied)
-grid.set_occupancy(100, 100, 0);    // Free cell
-grid.set_occupancy(150, 150, 100);  // Occupied cell (obstacle)
+grid.set_cell(100, 100, 0);    // Free cell
+grid.set_cell(150, 150, 100);  // Occupied cell (obstacle)
 
 // World to grid coordinate conversion
 if let Some((gx, gy)) = grid.world_to_grid(5.0, 5.0) {
@@ -349,7 +353,7 @@ if grid.is_free(test_x, test_y) {
 
 // Get occupancy value
 if let Some((gx, gy)) = grid.world_to_grid(test_x, test_y) {
-    if let Some(value) = grid.occupancy(gx, gy) {
+    if let Some(value) = grid.get_cell(gx, gy) {
         println!("Occupancy: {}", value);
     }
 }
@@ -365,57 +369,71 @@ if let Some((gx, gy)) = grid.world_to_grid(test_x, test_y) {
 | `50-99` | Probably occupied |
 | `100` | Occupied |
 
-**Fields:**
+**Accessors:** the two struct fields (`descriptor` and `pool`) are private, so every
+value below is reached through a method call, not field access.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `resolution` | `f32` | Meters per pixel |
-| `width` | `u32` | Map width in pixels |
-| `height` | `u32` | Map height in pixels |
-| `origin` | `Pose2D` | Map origin (bottom-left) |
-| `data` | `Vec<i8>` | Occupancy values |
-| `frame_id` | `[u8; 32]` | Coordinate frame |
-| `metadata` | `[u8; 64]` | Map metadata |
-| `timestamp_ns` | `u64` | Nanoseconds since epoch |
+| Accessor | Returns | Description |
+|----------|---------|-------------|
+| `resolution()` | `f32` | Meters per cell |
+| `width()` | `u32` | Map width in cells |
+| `height()` | `u32` | Map height in cells |
+| `cell_count()` | `usize` | `width * height` |
+| `origin_x()` / `origin_y()` / `origin_theta()` | `f64` | Map origin pose, one component per call |
+| `set_origin(x, y, theta)` | `&mut Self` | Move the origin |
+| `cells()` / `cells_mut()` | `&[i8]` / `&mut [i8]` | The occupancy cells |
+| `metadata()` | `&[u8; 64]` | Map metadata |
+| `frame_id()` | `&str` | Coordinate frame |
+| `timestamp_ns()` | `u64` | Nanoseconds since epoch |
 
 **Methods:**
 
 | Method | Description |
 |--------|-------------|
-| `new(width, height, resolution, origin)` | Create a new grid (initialized to unknown) |
-| `world_to_grid(x, y)` | Convert world coordinates to grid indices |
-| `grid_to_world(grid_x, grid_y)` | Convert grid indices to world coordinates (cell center) |
-| `occupancy(grid_x, grid_y)` | Get occupancy value at grid coordinates (`Option<i8>`) |
-| `set_occupancy(grid_x, grid_y, value)` | Set occupancy value (clamped to -1..100) |
+| `new(width, height, resolution)` | Create a new grid, initialized to unknown (returns `HorusResult<Self>`) |
+| `world_to_grid(x, y)` | Convert world coordinates to grid indices (`Option<(u32, u32)>`) |
+| `grid_to_world(grid_x, grid_y)` | Convert grid indices to world coordinates, cell center (`Option<(f64, f64)>`) |
+| `get_cell(grid_x, grid_y)` | Get occupancy value at grid coordinates (`Option<i8>`) |
+| `set_cell(grid_x, grid_y, value)` | Set occupancy value, clamped to -1..100 (returns `bool`) |
 | `is_free(x, y)` | Check if world point is free (occupancy 0-49) |
 | `is_occupied(x, y)` | Check if world point is occupied (occupancy >= 50) |
+| `is_unknown(grid_x, grid_y)` | Check if a grid cell is still unknown |
+| `row(y)` | One row of cells (`Option<&[i8]>`) |
+| `fill(value)` / `clear()` / `reset()` | Bulk cell writes |
 
 ## CostMap
 
-Navigation cost map with obstacle inflation. Uses `Vec<u8>` cost data (Serde-based, not Pod).
+Navigation cost map with obstacle inflation. A `CostMap` owns **both** layers itself
+— an occupancy layer (`i8`) and a cost layer (`u8`) — each in its own shared-memory
+tensor. It does not wrap a separate `OccupancyGrid`.
 
 ```rust
 use horus::prelude::*;
 
-// Create occupancy grid first
-let grid = OccupancyGrid::new(200, 200, 0.05, Pose2D::origin());
+// Create the costmap directly: it allocates both layers
+let mut costmap = CostMap::new(
+    200,   // width
+    200,   // height
+    0.05,  // resolution (5cm per cell)
+    0.55,  // inflation radius (55cm)
+)?;
 
-// Create costmap with inflation radius
-let costmap = CostMap::from_occupancy_grid(grid, 0.55);  // 55cm inflation
+// Mark an obstacle on the occupancy layer, then project it onto the cost layer
+costmap.set_occupancy(150, 150, 100);
+costmap.apply_from_occupancy();
 
-// Get cost at world coordinates (0-255, 253=lethal)
-if let Some(cost) = costmap.cost(5.0, 5.0) {
-    if cost >= costmap.lethal_cost {
-        println!("Position is in obstacle!");
-    } else {
-        println!("Cost: {}", cost);
+// Cost lookups are by GRID coordinates, so convert world coordinates first
+if let Some((gx, gy)) = costmap.world_to_grid(5.0, 5.0) {
+    if let Some(cost) = costmap.get_cost(gx, gy) {
+        if cost >= costmap.lethal_cost() {
+            println!("Position is in obstacle!");
+        } else {
+            println!("Cost: {}", cost);
+        }
     }
 }
 
-// Access underlying grid
-println!("Map size: {}x{}",
-    costmap.occupancy_grid.width,
-    costmap.occupancy_grid.height);
+// Dimensions live on the costmap itself
+println!("Map size: {}x{}", costmap.width(), costmap.height());
 ```
 
 **Cost Values:**
@@ -423,27 +441,38 @@ println!("Map size: {}x{}",
 | Value | Meaning |
 |-------|---------|
 | `0` | Free space |
-| `1-252` | Increasing cost (near obstacles) |
-| `253` | Lethal (default lethal_cost) |
-| `254` | Unused at the default `lethal_cost` |
-| `255` | Unknown cell (above lethal — treat as blocked) |
+| `1-253` | Increasing cost (near obstacles) |
+| `254` | Lethal (the default `lethal_cost`) |
+| `255` | Above lethal — treat as blocked |
 
-**Fields:**
+**Accessors:** `descriptor` and `pool` are the only fields and both are private, so
+each value below is a method call.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `occupancy_grid` | `OccupancyGrid` | Base occupancy map |
-| `costs` | `Vec<u8>` | Cost values (0-255) |
-| `inflation_radius` | `f32` | Inflation radius (meters) |
-| `cost_scaling_factor` | `f32` | Cost decay factor |
-| `lethal_cost` | `u8` | Lethal obstacle threshold (default 253) |
+| Accessor | Returns | Description |
+|----------|---------|-------------|
+| `width()` / `height()` | `u32` | Map dimensions in cells |
+| `resolution()` | `f32` | Meters per cell |
+| `cell_count()` | `usize` | `width * height` |
+| `inflation_radius()` | `f32` | Inflation radius in meters (default 0.3) |
+| `cost_scaling_factor()` | `f32` | Cost decay factor (default 10.0) |
+| `lethal_cost()` | `u8` | Lethal obstacle threshold (default 254) |
+| `occupancy_cells()` / `occupancy_cells_mut()` | `&[i8]` / `&mut [i8]` | The occupancy layer |
+| `cost_cells()` / `cost_cells_mut()` | `&[u8]` / `&mut [u8]` | The cost layer |
+| `origin_x()` / `origin_y()` / `origin_theta()` | `f64` | Map origin pose |
+| `frame_id()` | `&str` | Coordinate frame |
+| `timestamp_ns()` | `u64` | Nanoseconds since epoch |
 
 **Methods:**
 
 | Method | Description |
 |--------|-------------|
-| `from_occupancy_grid(grid, inflation_radius)` | Create costmap from occupancy grid with inflation |
-| `cost(x, y)` | Get cost at world coordinates (returns lethal for out-of-bounds) |
+| `new(width, height, resolution, inflation_radius)` | Create a costmap, allocating both layers (returns `HorusResult<Self>`) |
+| `get_cost(grid_x, grid_y)` / `set_cost(grid_x, grid_y, value)` | Read/write the cost layer at grid coordinates |
+| `get_occupancy(grid_x, grid_y)` / `set_occupancy(grid_x, grid_y, value)` | Read/write the occupancy layer |
+| `apply_from_occupancy()` | Copy the occupancy layer onto the cost layer (occupancy >= 50 becomes lethal) |
+| `is_lethal(grid_x, grid_y)` / `is_traversable(grid_x, grid_y)` | Threshold tests against `lethal_cost()` |
+| `world_to_grid(x, y)` / `grid_to_world(grid_x, grid_y)` | Coordinate conversion |
+| `clear_costs()` / `reset_occupancy()` | Bulk resets of one layer |
 
 ## VelocityObstacle
 
