@@ -75,6 +75,16 @@ export interface DocFrontmatter {
   description?: string;
   section?: string;
   order?: number;
+  /**
+   * Translated pages only. `current` means the file covers its English source;
+   * `partial` means it covers only part of it, and the reader is told so by
+   * `TranslationNotice`. Declared here because `app/[locale]/[...slug]/page.tsx`
+   * branches on it — a locale file that omits it is treated as `current`.
+   */
+  translation_status?: 'current' | 'partial';
+  /** Short SHA of the English revision a translation was written against. */
+  source_revision?: string;
+  locale?: string;
 }
 
 export interface DocContent {

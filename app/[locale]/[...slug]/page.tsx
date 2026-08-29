@@ -38,12 +38,16 @@ export default async function LocalizedDocPage({ params }: PageProps) {
   const locale = rawLocale as Locale;
   const doc = await getDoc(['docs', ...slug], locale);
   if (!doc) notFound();
+  const pathName = `/${slug.join('/')}`;
 
   return (
     <DocsLayout>
       <LocaleSync locale={locale} />
       <main className="flex-1 w-full max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         {doc.isFallback && <TranslationNotice locale={locale} />}
+        {!doc.isFallback && doc.frontmatter.translation_status === 'partial' && (
+          <TranslationNotice locale={locale} variant="partial" href={pathName} />
+        )}
         <article className="prose max-w-none prose-headings:scroll-mt-20 prose-p:text-[var(--text-secondary)] prose-p:leading-relaxed prose-li:text-[var(--text-secondary)]">
           {doc.content}
         </article>

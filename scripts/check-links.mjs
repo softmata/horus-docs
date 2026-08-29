@@ -215,4 +215,47 @@ if (dead.length) {
   process.exit(1);
 }
 
-console.log(`OK — ${checked} internal links across ${routes.size} routes all resolve.`);
+// ─── Every page has to be reachable from the sidebar ────────────────────────
+//
+// `components/DocsSidebar.tsx` calls itself "the one navigation order", and it
+// is: the `order`/`weight` frontmatter keys are read by nothing (`getDocsList`
+// in lib/mdx.tsx is the only reader and has no callers). So a page that is not
+// listed there is reachable only by typing its URL — it is in the build, in the
+// sitemap and in search, and absent from navigation. That is how
+// /concepts/hframe, /learn/coming-from-ros2 and the recipes and tutorials index
+// pages went missing before; adding a page and forgetting the sidebar is a
+// single, easy, silent mistake.
+//
+// EXEMPT lists the pages that are deliberately unlisted. Today that is the one
+// redirect stub kept so older links keep resolving.
+const EXEMPT = new Set(['/concepts/hframe']);
+
+const sidebarSrc = fs.readFileSync(path.join(componentsDir, 'DocsSidebar.tsx'), 'utf8');
+const sidebarHrefs = new Set(
+  [...sidebarSrc.matchAll(/href:\s*["'`](\/[^"'`]*)["'`]/g)].map((m) => m[1])
+);
+if (sidebarHrefs.size < 50) {
+  console.error(`only ${sidebarHrefs.size} sidebar links found — the sidebar parse is broken`);
+  process.exit(2);
+}
+
+const orphans = [...routes.keys()].filter((r) => !sidebarHrefs.has(r) && !EXEMPT.has(r));
+const phantoms = [...sidebarHrefs].filter((h) => !routes.has(h));
+
+if (orphans.length || phantoms.length) {
+  if (orphans.length) {
+    console.error(`${orphans.length} page(s) exist but are not in the sidebar:\n`);
+    for (const o of orphans) console.error(`  ${o}`);
+    console.error('\nAdd them to components/DocsSidebar.tsx, or to EXEMPT in this script.');
+  }
+  if (phantoms.length) {
+    console.error(`\n${phantoms.length} sidebar link(s) point at no page:\n`);
+    for (const p of phantoms) console.error(`  ${p}`);
+  }
+  process.exit(1);
+}
+
+console.log(
+  `OK — ${checked} internal links across ${routes.size} routes all resolve, ` +
+    `and every page is reachable from the sidebar.`
+);
