@@ -1,6 +1,6 @@
 ---
 title: Real-Time Nodes
-description: Build time-critical robotics applications with guaranteed response times using per-node timing constraints
+description: Build time-critical robotics applications with per-node timing constraints and deadline monitoring
 ---
 
 # Real-Time Nodes
@@ -9,11 +9,15 @@ HORUS provides industrial-grade real-time support for time-critical robotics app
 
 ## Overview
 
-Real-time nodes enable deterministic execution for:
-- **Surgical robots** requiring guaranteed response times
-- **Industrial robots** with hard real-time control loops
-- **Aerospace and defense systems** with strict deadlines
-- **Safety-critical autonomous vehicles**
+Real-time nodes give a node an explicit timing contract — a period, a tick budget and a
+deadline — plus a declared response when it is missed. Reach for them when:
+- A loop has to run at a fixed rate, and a late tick is a fault rather than a delay
+- A hung node has to be *detected* rather than waited on
+- A deadline miss needs a defined response (warn, skip, safe state, stop) instead of silent drift
+
+The contract is enforced, not guaranteed: HORUS measures overruns and reacts to them, but nothing
+in the repository bounds worst-case latency. See
+[Certification Status](/advanced/deterministic-execution#certification-status).
 
 ## Key Features
 
@@ -75,14 +79,15 @@ The safety monitor provides comprehensive runtime protection:
 
 - **WCET Monitoring**: measures each tick against its budget and reports overruns. Under the
   default `BudgetPolicy::Warn` an overrun is only logged — nothing stops the tick. Use
-  `.budget_policy(BudgetPolicy::Enforce)` to have the node stopped after an overrun
+  `.budget_policy(BudgetPolicy::Enforce)` to have the node stopped once a tick exceeds
+  **twice** its budget (a single 1x overrun is logged but not acted on)
 - **Deadline Monitoring**: Tracks and responds to deadline misses
 - **Watchdog Timers**: Detects hung or crashed nodes
 - **Emergency Stop**: Immediate shutdown for critical failures
 
 Budget and deadline monitoring are active for any node registered with `.rate()`,
 `.budget()` or `.deadline()` — no flag needed. Watchdog timers additionally require
-`Scheduler::watchdog(Duration)`, shown under [Safety-Critical Configuration](#safety-critical-configuration).
+`Scheduler::watchdog(Duration)`, shown under [Watchdog and Safe-Mode Configuration](#watchdog-and-safe-mode-configuration).
 
 ## Basic Usage
 
@@ -113,21 +118,21 @@ scheduler.add(SensorNode::new()).order(10).build()?;
 scheduler.run()?;
 ```
 
-### Safety-Critical Configuration
+### Watchdog and Safe-Mode Configuration
 
-For medical or aerospace applications:
+For a fixed-rate loop that must fail into a safe state rather than drift:
 
 ```rust
 use horus::prelude::*;
 use std::time::Duration;
 
-// Configure for safety-critical operation (1kHz tick rate)
+// 1 kHz tick, RT where the OS allows it, watchdog armed
 let mut scheduler = Scheduler::new()
     .tick_rate(1000_u64.hz())
     .prefer_rt()        // mlockall + SCHED_FIFO where available
     .watchdog(Duration::from_millis(100));
 
-scheduler.add(SurgicalRobotControl::new())
+scheduler.add(ControlLoopNode::new())
     .order(0)
     .rate(1000_u64.hz())
     .budget(Duration::from_micros(50))
@@ -136,24 +141,22 @@ scheduler.add(SurgicalRobotControl::new())
     .build()?;
 ```
 
-<Callout type="warning" title="`.watchdog()` overrides `.on_miss()` for RT nodes">
+<Callout type="info" title="`.watchdog()` does not override `.on_miss()`">
 
-`Scheduler::watchdog(..)` registers **every RT node as a critical node**. For a critical
-node, the *first* tick-budget overrun or deadline miss latches a system-wide emergency
-stop and ends the run — before the per-node `Miss` policy is consulted, and regardless of
-`max_deadline_misses`.
+`Scheduler::watchdog(..)` registers **every RT node as a critical node**, but that no
+longer short-circuits the per-node `Miss` policy. A critical node's tick-budget overrun is
+recorded and reported without escalating on its own — the per-node `BudgetPolicy` decides,
+and the default `BudgetPolicy::Warn` only logs. A deadline miss is counted and fed to the
+graduated degradation ladder, then dispatched through `Miss`; the safety monitor stops the
+run only when the process-wide miss total crosses `max_deadline_misses` (default 100).
 
-So the configuration above does not safe the node and keep ticking, which is what
-`Miss::SafeMode` reads like. It stops the whole scheduler on the first overrun:
+So the configuration above does what `Miss::SafeMode` reads like: the node is safed once on
+the way into safe mode and keeps ticking.
 
-```text
- EMERGENCY STOP: Critical node ... exceeded tick budget: 5.06ms > 100µs
- Emergency stop activated - shutting down scheduler
-```
-
-That is often the right behaviour for a surgical robot — but decide it deliberately.
-Drop `.watchdog(..)` if you want the graduated `Miss` policy instead; the safety monitor
-still runs, and `Miss::SafeMode` then safes the node once and keeps ticking as documented.
+The watchdog latches a system-wide emergency stop when a critical node stops ticking for
+more than **3x** its watchdog timeout — a hung node, not a late one. The other opt-in
+escalations are `BudgetPolicy::EmergencyStop` (e-stop on any budget violation) and
+`Miss::Stop`.
 
 </Callout>
 
@@ -208,9 +211,9 @@ so a node under sustained overload is safed once rather than every cycle. The la
 clears as soon as the node meets its deadline again, so a later degradation is caught
 too and a flapping node produces one entry per episode. The node is not isolated and
 keeps ticking, and the scheduler does not poll `is_safe_state()` for automatic
-recovery. This is the behaviour when no scheduler watchdog is configured — with
-`.watchdog(..)`, an RT node's first miss latches an emergency stop instead (see
-above).
+recovery. This is the behaviour whether or not a scheduler watchdog is configured; a
+watchdog adds a system-wide emergency stop only when a critical node stops ticking for 3x
+its watchdog timeout (see above).
 
 ### Custom Deadline Policies
 
@@ -290,7 +293,7 @@ let mut scheduler = Scheduler::new();
 // Default 100Hz tick; add .watchdog() and per-node .failure_policy() as needed
 ```
 
-### Medical/Surgical Robot
+### 1 kHz Control Loop
 ```rust
 let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz());
 // 1kHz control, add per-node .rate()/.budget()/.deadline() for budget enforcement
@@ -548,7 +551,7 @@ impl Node for MotorControlNode {
 }
 
 fn main() -> Result<()> {
-    // Configure for safety-critical operation (1kHz tick rate)
+    // 1 kHz tick rate; per-node budget and deadline are enforced below
     let mut scheduler = Scheduler::new().tick_rate(1000_u64.hz());
 
     // Add RT control node with fluent API

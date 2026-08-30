@@ -21,13 +21,37 @@ npm run build
 # Start production server
 npm start
 
-# Contract checks — both gate CI, both run in about a second
-npm run check           # links + performance claims
-npm run check:links     # every internal link and #anchor resolves
-npm run check:claims    # no retracted performance claim anywhere
+# Contract checks — all gate CI, all run in about a second
+npm run check           # everything below except check:rendered
+npm run check:links     # every internal link and #anchor resolves, and every
+                        #   page is reachable from the sidebar
+npm run check:claims    # no retracted performance claim anywhere, and the
+                        #   headline latency figures agree with benchmarks.mdx
+npm run check:parity    # every class of claim is either enforced by a named
+                        #   check or explained as needing a reader
+npm run check:mdx       # every `{...}` an author wrote survives compilation
+npm run check:routes    # no two app routes can match the same URL
+
+# The one check that opens a page. Needs a build and a browser, so it is its own
+# CI job rather than part of `npm run check`:
+#
+#   npm run build && npx playwright install chromium
+#   npm run check:rendered
+#
+# Everything else here reads source or served HTML. That gap is why all 17
+# diagrams on the site rendered nothing while every check stayed green — the
+# pages returned 200 and the HTML still carried the <figure> and its caption.
+npm run check:rendered  # every page shows what its source says it shows
 
 # Include the framework README's links in the check
 node scripts/check-links.mjs ../horus/README.md
+
+# Compile the code samples against a HORUS checkout at ../horus
+npm run verify:code     # extract, then Rust + Python + C++
+npm run verify:rust     # compiles the self-contained Rust blocks
+npm run verify:python   # py_compile, then the API check below
+npm run verify:python:api # every horus name and keyword argument is real
+npm run verify:cpp      # -fsyntax-only against horus_cpp/include
 ```
 
 Visit `http://localhost:3009` to view the documentation.
@@ -60,8 +84,10 @@ Routes come from the file tree: `content/docs/a/b.mdx` is served at `/a/b`, and
 `npm run check:links` is the guard for that.
 
 Adding a page means adding it to `sections` in `components/DocsSidebar.tsx` as well:
-`PrevNextNav` derives its order from that list, and a contract test in the framework
-repo fails on any page nothing links to.
+`PrevNextNav` derives its order from that list, and `npm run check:links` fails on a
+page that is not listed there (and on a sidebar entry with no page behind it). That
+list is the only navigation order — the `order:` frontmatter key is inert, because
+`getDocsList` in `lib/mdx.tsx` is its only reader and nothing calls it.
 
 ## Tech Stack
 
@@ -131,6 +157,12 @@ Competitor numbers (iceoryx, CycloneDDS, FastDDS, ROS 2) are **published referen
 values**, not measurements taken here, and the pages quoting them say so.
 `npm run check:claims` fails on the ratios that were previously asserted without either.
 See [Benchmarks](content/docs/performance/benchmarks.mdx) for the method.
+
+It also holds the pages that *quote* a figure to the page that *measures* it. The
+headline latencies live on `performance/benchmarks.mdx`; anywhere else they appear,
+they have to be the same number. Quote the 151 ns cross-process row when comparing
+against ROS 2's end-to-end reference — the 75 ns CmdVel median is send-only, and
+putting it beside a round-trip figure is the mistake that check catches.
 
 ## Links
 

@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import type { MetadataRoute } from 'next';
-import { locales, localizedHref } from '@/lib/i18n';
+import { localizedHref } from '@/lib/i18n';
+import { translatedLocales } from '@/lib/translations';
 
 const baseUrl = 'https://docs.horusrobotics.dev';
 
@@ -23,13 +24,21 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   visit(contentDir);
 
-  return documents.flatMap(document => locales.map(locale => ({
-    url: `${baseUrl}${localizedHref(document.slug, locale)}`,
-    lastModified: document.modified,
-    changeFrequency: 'weekly' as const,
-    priority: document.slug.includes('getting-started') ? 0.9 : 0.7,
-    alternates: {
-      languages: Object.fromEntries(locales.map(value => [value, `${baseUrl}${localizedHref(document.slug, value)}`])),
-    },
-  })));
+  // Only the URLs that are canonical. This used to be every page times every
+  // locale -- 1120 entries, 954 of which serve the English file under a
+  // localized URL and name the English page as their canonical one. Submitting
+  // a URL that points somewhere else for its canonical is asking a crawler to
+  // resolve a contradiction the site created on purpose.
+  return documents.flatMap(document => {
+    const available = translatedLocales(document.slug);
+    return available.map(locale => ({
+      url: `${baseUrl}${localizedHref(document.slug, locale)}`,
+      lastModified: document.modified,
+      changeFrequency: 'weekly' as const,
+      priority: document.slug.includes('getting-started') ? 0.9 : 0.7,
+      alternates: {
+        languages: Object.fromEntries(available.map(value => [value, `${baseUrl}${localizedHref(document.slug, value)}`])),
+      },
+    }));
+  });
 }

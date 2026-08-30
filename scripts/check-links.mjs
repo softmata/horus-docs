@@ -30,8 +30,8 @@
  *   - the `#fragment`, against the heading ids the site actually renders
  *   - both route spellings lib/mdx.tsx accepts: `x.mdx` and `x/index.mdx`
  *
- * Other external URLs, mailto:, and bare anchors on the same page are checked
- * for the fragment only where the page is known.
+ * Other external URLs and mailto: are left alone. A bare `#anchor` is resolved
+ * against the page it is written on.
  *
  * Run: node scripts/check-links.mjs
  *      node scripts/check-links.mjs ../horus/README.md   # extra files to check
@@ -155,6 +155,17 @@ for (const file of sources) {
     const patterns = [
       /\]\((\/[^)\s]*)\)/g,
       /href=["'](\/[^"']*)["']/g,
+      // Bare `#fragment` links, which resolve against the page they sit on.
+      //
+      // Every pattern here used to require a leading `/`, so `](#anchor)` matched
+      // nothing at all and the `slug === ''` branch below was unreachable — this
+      // checker reported "all links resolve" while four hand-written anchors on
+      // /development/cli-reference and /development/static-analysis pointed at
+      // ids that were never rendered. They were GitHub's slug spelling, which
+      // keeps a run of separators as a run of dashes ("a - b" -> "a---b"); the
+      // site collapses the run to one dash, so every one of them was dead.
+      /\]\((#[^)\s]*)\)/g,
+      /href=["'](#[^"']*)["']/g,
       // `url: '/x'` — how the web-app manifest names its shortcut targets.
       /\burl:\s*["'](\/[^"']*)["']/g,
       // Absolute links to this site, in markdown or in an href.
@@ -215,4 +226,86 @@ if (dead.length) {
   process.exit(1);
 }
 
-console.log(`OK — ${checked} internal links across ${routes.size} routes all resolve.`);
+// ─── Every page has to be reachable from the sidebar ────────────────────────
+//
+// `components/DocsSidebar.tsx` calls itself "the one navigation order", and it
+// is: the `order`/`weight` frontmatter keys are read by nothing (`getDocsList`
+// in lib/mdx.tsx is the only reader and has no callers). So a page that is not
+// listed there is reachable only by typing its URL — it is in the build, in the
+// sitemap and in search, and absent from navigation. That is how
+// /concepts/hframe, /learn/coming-from-ros2 and the recipes and tutorials index
+// pages went missing before; adding a page and forgetting the sidebar is a
+// single, easy, silent mistake.
+//
+// EXEMPT lists the pages that are deliberately unlisted. Today that is the one
+// redirect stub kept so older links keep resolving.
+const EXEMPT = new Set(['/concepts/hframe']);
+
+const sidebarSrc = fs.readFileSync(path.join(componentsDir, 'DocsSidebar.tsx'), 'utf8');
+const sidebarHrefs = new Set(
+  [...sidebarSrc.matchAll(/href:\s*["'`](\/[^"'`]*)["'`]/g)].map((m) => m[1])
+);
+if (sidebarHrefs.size < 50) {
+  console.error(`only ${sidebarHrefs.size} sidebar links found — the sidebar parse is broken`);
+  process.exit(2);
+}
+
+const orphans = [...routes.keys()].filter((r) => !sidebarHrefs.has(r) && !EXEMPT.has(r));
+const phantoms = [...sidebarHrefs].filter((h) => !routes.has(h));
+
+if (orphans.length || phantoms.length) {
+  if (orphans.length) {
+    console.error(`${orphans.length} page(s) exist but are not in the sidebar:\n`);
+    for (const o of orphans) console.error(`  ${o}`);
+    console.error('\nAdd them to components/DocsSidebar.tsx, or to EXEMPT in this script.');
+  }
+  if (phantoms.length) {
+    console.error(`\n${phantoms.length} sidebar link(s) point at no page:\n`);
+    for (const p of phantoms) console.error(`  ${p}`);
+  }
+  process.exit(1);
+}
+
+// ─── The committed search index has to cover the pages that exist ──────────
+//
+// `public/search-index.json` is a build artifact that is *committed*, so it goes
+// stale in the repo whenever content changes and nobody runs `npm run
+// build:search`. It had: built 2026-08-28 against 151 pages while 160 existed,
+// so nine pages were unsearchable, and the text it served still carried wording
+// the docs had already corrected. `npm run build` regenerates it, so a deploy
+// was fine — but the file in git, which is what a reader of the repo and any
+// tooling reading it sees, was not.
+//
+// check:claims already scans public/ for retracted wording, which catches the
+// stale-text half. This is the structural half.
+const indexPath = path.join(root, 'public', 'search-index.json');
+if (fs.existsSync(indexPath)) {
+  let index;
+  try {
+    index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  } catch (e) {
+    console.error(`public/search-index.json is not valid JSON: ${e.message}`);
+    process.exit(1);
+  }
+  const indexed = new Set((index.docs || []).map((d) => d.slug));
+  const unsearchable = [...routes.keys()].filter((r) => !indexed.has(r));
+  const phantomDocs = [...indexed].filter((slug) => !routes.has(slug));
+  if (unsearchable.length || phantomDocs.length) {
+    if (unsearchable.length) {
+      console.error(`${unsearchable.length} page(s) are missing from the search index:\n`);
+      for (const u of unsearchable.slice(0, 20)) console.error(`  ${u}`);
+      if (unsearchable.length > 20) console.error(`  ... and ${unsearchable.length - 20} more`);
+    }
+    if (phantomDocs.length) {
+      console.error(`\n${phantomDocs.length} indexed slug(s) no longer have a page:\n`);
+      for (const p of phantomDocs.slice(0, 20)) console.error(`  ${p}`);
+    }
+    console.error('\nRun `npm run build:search` and commit the result.');
+    process.exit(1);
+  }
+}
+
+console.log(
+  `OK — ${checked} internal links across ${routes.size} routes all resolve, ` +
+    `every page is reachable from the sidebar, and the search index covers them all.`
+);

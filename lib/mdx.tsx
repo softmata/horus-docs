@@ -75,6 +75,16 @@ export interface DocFrontmatter {
   description?: string;
   section?: string;
   order?: number;
+  /**
+   * Translated pages only. `current` means the file covers its English source;
+   * `partial` means it covers only part of it, and the reader is told so by
+   * `TranslationNotice`. Declared here because `app/[locale]/[...slug]/page.tsx`
+   * branches on it — a locale file that omits it is treated as `current`.
+   */
+  translation_status?: 'current' | 'partial';
+  /** Short SHA of the English revision a translation was written against. */
+  source_revision?: string;
+  locale?: string;
 }
 
 export interface DocContent {
@@ -146,6 +156,23 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
       source: mdxContent,
       options: {
         parseFrontmatter: true,
+        // next-mdx-remote 6 added `blockJS`, defaulting to true, which runs a
+        // remark plugin that deletes every `{...}` from the tree -- including
+        // JSX attribute expressions. It is aimed at sites whose MDX comes from
+        // an untrusted CMS. Ours is first-party and lives in this repository,
+        // compiled at build time from files that go through review.
+        //
+        // Left on, it silently dropped `chart={`...`}` from all 17
+        // <MermaidDiagram> tags on 11 pages. The prop arrived as `undefined`,
+        // the component's `if (!chart) return` fired before it ever imported
+        // mermaid, and every diagram on the site sat on "Loading diagram..."
+        // forever -- no console error, no failed request, nothing for a test
+        // that only checks status codes or HTML to catch.
+        // `scripts/check-mdx-props.mjs` fails the build if this regresses.
+        //
+        // `blockDangerousJS` still defaults to true, so eval/Function/process
+        // and friends remain blocked inside those expressions.
+        blockJS: false,
         mdxOptions: {
           remarkPlugins: [remarkGfm],
           rehypePlugins: [],
@@ -193,37 +220,31 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
             </h3>
           );
         },
+        // Every fenced block goes through CodeBlock, labelled or not.
+        //
+        // This used to branch on the language: ```rust got CodeBlock, a bare
+        // ``` got a hand-rolled <pre>. Six blocks on the site take that path --
+        // three on /troubleshooting and three on
+        // /tutorials/realtime-control-python -- and they came out without the
+        // Copy button every other block has, with their <code> carrying the
+        // inline-code classes from the `code` override below, because that
+        // branch was the only one that rendered `children` rather than a
+        // string. The hardcoded #1e1e1e and #d4d4d4 it also set were dead:
+        // globals.css styles `pre` with `!important`, so they never applied.
+        // CodeBlock already falls back to `language = 'text'` when the class is
+        // missing, which is exactly what an unlabelled block wants.
         pre: ({ children, ...props }: any) => {
           const codeElement = children?.props;
-          const className = codeElement?.className || '';
-          const code = codeElement?.children?.toString() || '';
+          const code = codeElement?.children;
 
-          // If we have a code block with language, use CodeBlock
-          if (className) {
-            return <CodeBlock className={className}>{code}</CodeBlock>;
+          // A fenced block arrives as <pre><code>…</code></pre> with a string
+          // inside. Anything else is markup this override should not flatten.
+          if (typeof code === 'string' || typeof code === 'number') {
+            return <CodeBlock className={codeElement?.className || ''}>{String(code)}</CodeBlock>;
           }
 
-          // Otherwise render plain pre
           return (
-            <pre
-              className="code-block"
-              style={{
-                fontFamily: '"Courier New", Courier, monospace',
-                fontVariantLigatures: 'none',
-                fontFeatureSettings: '"liga" 0, "calt" 0',
-                letterSpacing: '0',
-                textRendering: 'optimizeSpeed',
-                WebkitFontSmoothing: 'none',
-                fontWeight: 'normal',
-                backgroundColor: '#1e1e1e',
-                padding: '1rem',
-                borderRadius: '0.375rem',
-                overflow: 'auto',
-                marginBottom: '1.5rem',
-                color: '#d4d4d4',
-              }}
-              {...props}
-            >
+            <pre className="code-block" {...props}>
               {children}
             </pre>
           );

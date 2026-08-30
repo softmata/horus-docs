@@ -185,7 +185,7 @@ What follows is the portable substitute: a request topic and an ack topic, corre
 - **`horus service call` cannot reach it.** The CLI delivers requests through a JSON file gateway that only the Rust `ServiceServer` polls, so a call to a Python "service" times out with *Is a server registered for 'estop'?*
 - **`horus service list` will list it anyway, and lie.** Service discovery works by scanning shared memory for a topic whose name ends in `.request`, so `estop.request` below shows up as a service named `estop` — with 0 servers and status `waiting`, forever.
 
-You also lose the request-ID matching `ServiceClient` does for you, so with more than one caller in flight you have to correlate replies yourself; `EmergencyStop.source` is the obvious field to key on. If you need real services, host them in a Rust node and drive the robot's Python nodes over topics.
+You also lose the request-ID matching `ServiceClient` does for you, so with more than one caller in flight you have to correlate replies yourself. Python cannot help here: `EmergencyStop` has `with_source()` to *write* the field but no `source` getter to read it back, so put the caller's id in the reason string and key on `reason_str()`. If you need real services, host them in a Rust node and drive the robot's Python nodes over topics.
 </Callout>
 
 The server side is the `estop.request` drain in `SafetyMonitor.tick()` above: read every pending request, act on it, and publish an ack. The client side is a plain script — no scheduler, no node, just two topics:
@@ -216,7 +216,7 @@ sys.exit(1)
 
 `recv()` returns `None` rather than blocking, so the timeout is the `while` loop — there is no exception to catch and nothing to cancel if the safety process is not running. The 5 ms sleep matters: without it this loop spins a core flat while it waits.
 
-`EmergencyStop.engage(reason)` and `.release()` are constructors that stamp `timestamp_ns` for you, and `.with_source(name)` returns a *new* message rather than mutating in place — chain them as above. On the receiving side, `reason` and `source` are fixed-size byte arrays, so read them back with `reason_str()` rather than treating them as Python strings.
+`EmergencyStop.engage(reason)` and `.release()` are constructors that stamp `timestamp_ns` for you, and `.with_source(name)` returns a *new* message rather than mutating in place — chain them as above. On the receiving side, `reason` already comes back as a Python `str` — `reply.reason` and `reply.reason_str()` are the same value. `source` has no accessor at all: `with_source()` writes the field for a Rust or C++ reader, but Python cannot read it back.
 
 ## Running Multi-Process
 
@@ -237,7 +237,7 @@ horus service list    # shows estop with 0 servers — see the callout above
 
 ## Startup Order and SHM Lifetime
 
-Startup order does not affect correctness — a subscriber can join a topic that is already being published to and will start receiving on its next `recv()`. What does matter is process *lifetime*: the first process to open a topic owns its SHM file and unlinks it on exit, so if the publisher is the sole owner and exits, the ring buffer disappears with it.
+Startup order does not affect correctness — a subscriber can join a topic that is already being published to and will start receiving on its next `recv()`. What does matter is process *lifetime*: the SHM file survives as long as *any* process still has it mapped, and whichever process is the last one out unlinks it. A publisher that exits while its subscribers keep running leaves the ring buffer in place, so the restarted publisher rejoins the same memory.
 
 When a process genuinely does need another one up first (a driver that must claim a device, say), express it in `horus launch` with `depends_on` and `start_delay` rather than by hand-sequencing shell commands.
 
@@ -280,7 +280,7 @@ horus launch --stop robot                  # stop this session by name
 
 - Each process has its own `Scheduler` — they don't share a scheduler
 - Topics are shared via SHM files (`/dev/shm/horus_default/topics/`); pass `endpoint=` so every process agrees on the name
-- Any process can start first; whichever opens a topic first creates (and on exit unlinks) its SHM ring buffer
+- Any process can start first; whichever opens a topic first creates its SHM ring buffer, and whichever process is *last* to exit unlinks it
 - `horus topic list` shows topics from ALL processes, including ones created by Rust and C++ nodes
 - No message broker — direct SHM ring buffer, ~170ns cross-process latency
 - Python has no service API; use a request topic plus an ack topic, or host the service in a Rust node. `horus service list` will still list a `.request` topic as a service, but `horus service call` has nothing to talk to

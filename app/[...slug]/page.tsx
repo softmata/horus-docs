@@ -1,14 +1,49 @@
 import { getDoc } from '@/lib/mdx';
 import { DocsLayout } from '@/components/DocsLayout';
+import { LocaleSync } from '@/components/LocaleSync';
 import { TableOfContents } from '@/components/TableOfContents';
 import { PrevNextNav } from '@/components/PrevNextNav';
-import { notFound } from 'next/navigation';
+import { TranslationNotice } from '@/components/TranslationNotice';
+import { notFound, redirect } from 'next/navigation';
 import type { Metadata } from 'next';
-import { locales, localizedHref } from '@/lib/i18n';
+import {
+  defaultLocale,
+  isLocale,
+  locales,
+  localizedHref,
+  openGraphLocales,
+  type Locale,
+} from '@/lib/i18n';
+import { translatedLocales } from '@/lib/translations';
 
 // Only serve pre-rendered pages - return 404 for unknown paths
 // Unknown paths must 404 rather than render an empty shell.
 export const dynamicParams = false;
+
+/**
+ * Every documentation route is served from this one catch-all, localized or not.
+ *
+ * It used to be four: `app/page.tsx`, `app/[...slug]`, `app/[locale]` and
+ * `app/[locale]/[...slug]`. Next matches a named segment ahead of a catch-all,
+ * so `/concepts/architecture` resolved as `locale="concepts"`,
+ * `slug=["architecture"]` -- and with `dynamicParams = false` on both routes,
+ * "concepts" is not a locale, so the request 404'd instead of falling through to
+ * the English route that owns it. Production never showed it, because every page
+ * is prerendered to static HTML at build time and served by path, but `next dev`
+ * resolves the matcher per request: an English page answered once while it was
+ * compiling and 404'd on every reload after that. Nobody could browse the site
+ * they were writing, which is how 17 blank diagrams stayed unnoticed.
+ *
+ * With one route there is nothing to disambiguate. A leading segment that is a
+ * real locale is the locale; anything else is the start of the document path.
+ */
+function splitRoute(slug: string[]): { locale: Locale; rest: string[] } {
+  const head = slug[0];
+  if (head && isLocale(head) && head !== defaultLocale) {
+    return { locale: head, rest: slug.slice(1) };
+  }
+  return { locale: defaultLocale, rest: slug };
+}
 
 interface PageProps {
   params: Promise<{
@@ -29,7 +64,15 @@ interface PageProps {
 // here measures ROS 2 without `-F dds` and a DDS implementation installed.
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const { slug } = await params;
-  const docPath = ['docs', ...slug];
+  const { locale, rest } = splitRoute(slug);
+
+  if (locale !== defaultLocale) {
+    // `/{locale}` on its own redirects; it has no page of its own to describe.
+    if (rest.length === 0) return {};
+    return localizedMetadata(locale, rest);
+  }
+
+  const docPath = ['docs', ...rest];
   const doc = await getDoc(docPath);
 
   if (!doc) {
@@ -42,8 +85,8 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const baseTitle = doc.frontmatter.title || 'HORUS Documentation';
   const title = `${baseTitle} | HORUS Robotics`;
   const description = doc.frontmatter.description || 'Build real-time robots with HORUS — zero-copy shared memory IPC for Rust, Python and C++, with a measured 151 ns cross-process median. FREE & open source.';
-  const url = `https://docs.horusrobotics.dev/${slug.join('/')}`;
-  const pathName = `/${slug.join('/')}`;
+  const url = `https://docs.horusrobotics.dev/${rest.join('/')}`;
+  const pathName = `/${rest.join('/')}`;
 
   return {
     title,
@@ -109,7 +152,8 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     },
     alternates: {
       canonical: url,
-      languages: Object.fromEntries(locales.map(locale => [locale, localizedHref(pathName, locale)])),
+      // Only the locales that actually hold this page; see lib/translations.ts.
+      languages: Object.fromEntries(translatedLocales(pathName).map(locale => [locale, localizedHref(pathName, locale)])),
     },
     robots: {
       index: true,
@@ -125,11 +169,63 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   };
 }
 
+/**
+ * Metadata for a page under a locale prefix.
+ *
+ * `canonical` follows what was actually rendered, not what the URL asked for.
+ * Six of the 960 localized routes have a translation; the other 954 fall back to
+ * the English file and serve English prose at a Spanish, German or Japanese URL.
+ * Pointing each of those at itself told search engines there were 955 distinct
+ * pages carrying the same text -- the textbook duplicate-content shape, and one
+ * the site was generating on purpose. A fallback now names the English page as
+ * the canonical one, which is what it is a copy of. `languages` still lists
+ * every locale, so a real translation is still discoverable from any of them.
+ */
+async function localizedMetadata(locale: Locale, rest: string[]): Promise<Metadata> {
+  const doc = await getDoc(['docs', ...rest], locale);
+  if (!doc) return {};
+  const pathName = `/${rest.join('/')}`;
+  const languages = Object.fromEntries(translatedLocales(pathName).map(value => [value, localizedHref(pathName, value)]));
+  return {
+    title: `${doc.frontmatter.title} | HORUS Documentation`,
+    description: doc.frontmatter.description,
+    alternates: {
+      canonical: localizedHref(pathName, doc.isFallback ? defaultLocale : locale),
+      languages,
+    },
+    openGraph: { locale: openGraphLocales[locale], type: 'article' },
+  };
+}
+
 export default async function DocPage({ params }: PageProps) {
   const { slug } = await params;
+  const { locale, rest } = splitRoute(slug);
+
+  if (locale !== defaultLocale) {
+    // `/{locale}` with nothing after it is the locale's front door.
+    if (rest.length === 0) redirect(`/${locale}/concepts/what-is-horus`);
+    const doc = await getDoc(['docs', ...rest], locale);
+    if (!doc) notFound();
+    return (
+      <DocsLayout>
+        <LocaleSync locale={locale} />
+        <main className="flex-1 w-full max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
+          {doc.isFallback && <TranslationNotice locale={locale} />}
+          {!doc.isFallback && doc.frontmatter.translation_status === 'partial' && (
+            <TranslationNotice locale={locale} variant="partial" href={`/${rest.join('/')}`} />
+          )}
+          <article className="prose max-w-none prose-headings:scroll-mt-20 prose-p:text-[var(--text-secondary)] prose-p:leading-relaxed prose-li:text-[var(--text-secondary)]">
+            {doc.content}
+          </article>
+          <PrevNextNav />
+        </main>
+        <TableOfContents />
+      </DocsLayout>
+    );
+  }
 
   // Always prepend 'docs' to the path
-  const docPath = ['docs', ...slug];
+  const docPath = ['docs', ...rest];
 
   const doc = await getDoc(docPath);
 
@@ -187,5 +283,16 @@ export async function generateStaticParams() {
 
   findMdxFiles(contentDir);
 
-  return routes;
+  // Every English route, then the same set under each non-English locale, then
+  // the bare `/{locale}` front doors. These used to live in `app/[locale]` and
+  // `app/[locale]/[...slug]`; both are gone, so the params they produced have to
+  // be produced here or those 966 routes stop being generated.
+  const localized = locales
+    .filter(locale => locale !== defaultLocale)
+    .flatMap(locale => [
+      { slug: [locale] },
+      ...routes.map(route => ({ slug: [locale, ...route.slug] })),
+    ]);
+
+  return [...routes, ...localized];
 }
