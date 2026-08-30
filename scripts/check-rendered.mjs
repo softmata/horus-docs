@@ -40,12 +40,11 @@ const routesArg = (() => {
 const PORT = Number(process.env.DOCS_PORT || 3210);
 const CONCURRENCY = Number(process.env.DOCS_CONCURRENCY || 4);
 
-/** Every documentation route, and how many diagrams its source asks for. */
-function corpus() {
+function mdxRoutes(dir) {
   const out = [];
-  (function walk(dir, base) {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, entry.name);
+  (function walk(d, base) {
+    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, entry.name);
       if (entry.isDirectory()) { walk(p, [...base, entry.name]); continue; }
       if (!entry.name.endsWith('.mdx')) continue;
       const stem = entry.name.replace(/\.mdx$/, '');
@@ -57,8 +56,43 @@ function corpus() {
         diagrams: (source.match(/<MermaidDiagram\b/g) || []).length,
       });
     }
-  })(path.join(root, 'content', 'docs'), []);
-  return out.sort((a, b) => a.route.localeCompare(b.route));
+  })(dir, []);
+  return out;
+}
+
+/**
+ * Every documentation route, and how many diagrams its source asks for.
+ *
+ * All 160 English pages, then the localized ones. The 960 locale routes are not
+ * all worth a browser each -- 954 of them fall back to the English file and
+ * render the same MDX -- but the localized path is not the English one: it adds
+ * LocaleSync and TranslationNotice, and it is where a fallback's canonical tag
+ * is decided. So each locale contributes its translated page (real translated
+ * MDX, its own diagrams) and one fallback page that carries diagrams, which is
+ * the combination that would break silently.
+ */
+function corpus() {
+  const english = mdxRoutes(path.join(root, 'content', 'docs'));
+  const localesDir = path.join(root, 'content', 'locales');
+  const localized = [];
+
+  if (fs.existsSync(localesDir)) {
+    for (const locale of fs.readdirSync(localesDir)) {
+      const docs = path.join(localesDir, locale, 'docs');
+      if (!fs.existsSync(docs)) continue;
+      for (const page of mdxRoutes(docs)) {
+        localized.push({ route: `/${locale}${page.route}`, diagrams: page.diagrams });
+      }
+      // One English fallback served under this locale, chosen for its diagrams.
+      const fallback = english.find(p => p.diagrams > 0);
+      if (fallback) localized.push({ route: `/${locale}${fallback.route}`, diagrams: fallback.diagrams });
+    }
+  }
+
+  const seen = new Set();
+  return [...english, ...localized]
+    .filter(p => (seen.has(p.route) ? false : seen.add(p.route)))
+    .sort((a, b) => a.route.localeCompare(b.route));
 }
 
 /** What the browser reports back about one page. */

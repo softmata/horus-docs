@@ -14,6 +14,7 @@ import {
   openGraphLocales,
   type Locale,
 } from '@/lib/i18n';
+import { translatedLocales } from '@/lib/translations';
 
 // Only serve pre-rendered pages - return 404 for unknown paths
 // Unknown paths must 404 rather than render an empty shell.
@@ -151,7 +152,8 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     },
     alternates: {
       canonical: url,
-      languages: Object.fromEntries(locales.map(locale => [locale, localizedHref(pathName, locale)])),
+      // Only the locales that actually hold this page; see lib/translations.ts.
+      languages: Object.fromEntries(translatedLocales(pathName).map(locale => [locale, localizedHref(pathName, locale)])),
     },
     robots: {
       index: true,
@@ -183,7 +185,7 @@ async function localizedMetadata(locale: Locale, rest: string[]): Promise<Metada
   const doc = await getDoc(['docs', ...rest], locale);
   if (!doc) return {};
   const pathName = `/${rest.join('/')}`;
-  const languages = Object.fromEntries(locales.map(value => [value, localizedHref(pathName, value)]));
+  const languages = Object.fromEntries(translatedLocales(pathName).map(value => [value, localizedHref(pathName, value)]));
   return {
     title: `${doc.frontmatter.title} | HORUS Documentation`,
     description: doc.frontmatter.description,
