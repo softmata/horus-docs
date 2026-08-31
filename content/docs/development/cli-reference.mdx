@@ -19,7 +19,7 @@ horus build [files...]     # Build without running
 horus test [filter]        # Run tests
 horus check [path]         # Validate horus.toml and workspace
 horus clean                # Clean build artifacts and shared memory
-horus lock                 # Pin every dependency version in horus.lock
+horus lock                 # Record the resolved dependency versions in horus.lock
 horus scripts [name]       # Run a script from [scripts] in horus.toml
 
 # Monitoring & Debugging
@@ -1219,7 +1219,7 @@ horus env --init
 horus env --uninstall
 ```
 
-> **Note**: `horus env` does not snapshot, save, or restore package environments. To pin exact dependency versions for reproducible builds, use `horus lock`.
+> **Note**: `horus env` does not snapshot, save, or restore package environments. `horus lock` records the versions resolution picked — a reviewable record, not yet an enforced pin; see [`horus lock`](#horus-lock-record-the-resolved-dependency-versions).
 
 ---
 
@@ -2518,10 +2518,10 @@ horus add proptest --dev
 
 ---
 
-## `horus lock` - Pin Every Dependency Version
+## `horus lock` - Record the Resolved Dependency Versions
 
-**What it does**: resolves the dependency graph and writes `horus.lock`, so the same
-source builds the same way on the robot as it did on your laptop.
+**What it does**: resolves the dependency graph and writes `horus.lock`, a record
+of the versions that resolution picked.
 
 ```bash
 # Generate or refresh horus.lock
@@ -2537,6 +2537,26 @@ disagree, which is the shape a CI job wants.
 | Flag | What it does |
 |------|--------------|
 | `--check` | Verify the lockfile is up to date instead of regenerating it |
+
+<Callout type="warning" title="The pins are recorded, not yet enforced">
+
+`horus.lock` is not yet a reproducibility guarantee. The `[[package]]` entries
+are written by the resolver, but no install path reads them back: the pip,
+crates.io and registry installers still take their versions from `horus.toml`
+and fall back to `latest`. So checking out a committed `horus.lock` on a clean
+machine can install different versions than the ones recorded — and the next
+`horus lock` on that machine overwrites the committed pin with whatever `latest`
+resolved to there.
+
+`checksum` is written too (always empty today) and never compared against a
+download. The one field that *is* consulted is `config_hash`, which only decides
+whether resolution can be skipped.
+
+Until the resolver applies the pins before installing, treat `horus.lock` as a
+record of what **was** resolved, not a guarantee of what **will** be. For a
+dependency that must not move, write an exact version in `horus.toml`.
+
+</Callout>
 
 ---
 
@@ -2566,15 +2586,64 @@ define them.
 
 ## `horus self update` - Update the CLI Itself
 
-**What it does**: replaces the running `horus` binary with the latest release.
+**What it does**: moves the CLI **and** the cached source tree to the latest
+release, together.
 
 ```bash
-horus self update
+horus self update           # install the latest release
+horus self update --check   # report current vs latest, install nothing
 ```
 
+In order, it:
+
+1. Resolves the newest release from the GitHub releases API
+2. Fetches that tag's source and caches it at `~/.horus/cache/horus@<version>`
+3. Downloads the platform asset for the **same** tag and verifies it against that
+   release's `SHA256SUMS` — a missing or unreadable checksum file is a refusal,
+   never a reason to install unverified
+4. Replaces the running binary in place, wherever it actually lives
+5. Re-runs the installed binary and refuses to record success unless it reports
+   the expected version
+6. Writes `~/.horus/installed_version` and `~/.horus/install_manifest.toml`
+
+The source half is not optional. `horus run` and `horus build` compile your
+projects against `~/.horus/cache/horus@<version>` as a **path** dependency, so a
+binary-only update leaves a CLI that cannot build a single Rust project — and,
+worse, one that compiles projects against the previous release's shared-memory
+headers. The source is fetched *before* the binary is swapped, so a failure
+partway leaves the old CLI working.
+
+On a platform with no published asset it compiles that same tag instead of
+downloading it (~3-5 min). See
+[Prebuilt Binaries](/getting-started/installation#prebuilt-binaries) for which
+platforms have one.
+
+| Flag | What it does |
+|------|--------------|
+| `--check` | Report the current and latest versions; download and install nothing |
+
+`--check` exits **0** whether or not an update is available. A non-zero exit
+means the check itself failed — GitHub unreachable, rate-limited, or an
+unparseable response — so a CI job can gate on it. Those used to be reported as
+"could not determine latest version" on the way to exit 0, indistinguishable
+from being up to date.
+
+A build whose version is *ahead* of the latest release (a source build from a
+branch) is left alone rather than moved backwards.
+
+### Related
+
 This is the CLI, not your project: `horus update` moves your **dependencies**
-forward, `horus self update` moves **horus** forward. If HORUS was installed from a
-package manager, update it there instead.
+forward, `horus self update` moves **horus** forward.
+
+`self update` only goes to the newest release. To install a **specific** version,
+or to roll back, re-run the installer with the tag pinned:
+
+```bash
+curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | HORUS_VERSION=v0.4.0 bash
+```
+
+See [Upgrading HORUS](/getting-started/installation#upgrading-horus).
 
 ---
 
@@ -2634,7 +2703,7 @@ horus run --release
 # Clean build
 horus run --clean --release
 
-# Pin exact dependency versions
+# Record what resolved, for the diff and for `horus lock --check` in CI
 horus lock
 
 # Run in production mode
@@ -2728,9 +2797,17 @@ horus run --verbose
 Beyond the `horus` CLI, the repository includes helpful scripts:
 
 ```bash
-./install.sh             # Install or update HORUS
-./uninstall.sh           # Remove HORUS from this machine
+# Install, or reinstall a specific release (both the binary and the cached source)
+curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | bash
+curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | HORUS_VERSION=v0.4.0 bash
+
+# Remove HORUS from this machine (prompts first; --dry-run lists, --yes is unattended)
+curl -fsSL https://github.com/softmata/horus/raw/main/uninstall.sh | bash
 ```
+
+Windows has native PowerShell equivalents, `install.ps1` and `uninstall.ps1`.
+To move to the latest release once HORUS is installed, use `horus self update` —
+it is the same job with one command.
 
 See **[Troubleshooting & Maintenance](/troubleshooting)** for complete details.
 

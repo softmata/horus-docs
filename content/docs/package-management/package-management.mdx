@@ -739,15 +739,15 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-
+      # No Rust toolchain step: the installer downloads a checksum-verified
+      # prebuilt binary for linux-amd64. Pin the release — a job that resolves
+      # "latest" starts testing something new the moment a tag is cut, and the
+      # failure lands on whoever pushed next.
       - name: Install HORUS
         run: |
-          git clone https://github.com/softmata/horus.git /tmp/horus
-          cd /tmp/horus && ./install.sh
+          curl -fsSL https://github.com/softmata/horus/raw/main/install.sh \
+            | HORUS_VERSION=v0.4.0 bash
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Publish Package
         env:
@@ -774,10 +774,21 @@ jobs:
 ```yaml
 publish:
   stage: deploy
-  image: rust:latest
+  image: debian:bookworm-slim
+  variables:
+    # A GitLab job runs as root, and the installer refuses to guess whose
+    # install a root install is: with no SUDO_USER it would put the binary, the
+    # source cache and the state under /root and report success. HORUS_PREFIX
+    # says where it should go instead.
+    HORUS_PREFIX: /opt/horus
+    HORUS_VERSION: v0.4.0
   before_script:
-    - git clone https://github.com/softmata/horus.git /tmp/horus
-    - cd /tmp/horus && ./install.sh
+    - apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates
+    - curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | bash
+    - export PATH="/opt/horus/bin:$PATH"
+    # The source cache moves with the prefix, but `horus run` does not look
+    # there on its own. Name it, or the first build cannot find HORUS.
+    - export HORUS_SOURCE=/opt/horus/cache/horus@0.4.0
     - mkdir -p ~/.config/horus
     - cp "$HORUS_AUTH_JSON" ~/.config/horus/auth.json
     - chmod 600 ~/.config/horus/auth.json
@@ -786,6 +797,12 @@ publish:
   only:
     - tags
 ```
+
+`HORUS_PREFIX` also relocates the source cache to `/opt/horus/cache`, which is
+what you want in a container — it survives into any later stage that copies the
+prefix, and `horus build` needs it. It does mean setting `HORUS_SOURCE` yourself:
+`horus run` searches `~/.cache/horus` and `~/.horus/cache` for the cached tree
+and does not consult `HORUS_PREFIX`.
 
 **Setup:**
 1. Generate key: `horus auth api-key --name "GitLab CI"`
@@ -799,12 +816,28 @@ publish:
 
 Dockerfile:
 ```dockerfile
-FROM rust:1.70
+# The workspace MSRV is 1.90. An older base image cannot compile HORUS at all,
+# and the failure arrives as a cargo error about a transitive crate rather than
+# as "your Rust is too old".
+FROM rust:1.90-slim-bookworm
 
-# Install HORUS
-RUN git clone https://github.com/softmata/horus.git /tmp/horus \
-    && cd /tmp/horus && ./install.sh \
-    && rm -rf /tmp/horus
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl libudev-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install HORUS. Two things are deliberate here:
+#   HORUS_VERSION  — an image that resolves "latest" at build time is a
+#                    different image every time it is built.
+#   HORUS_PREFIX   — a Docker build runs as root with no SUDO_USER, and the
+#                    installer refuses that rather than putting everything under
+#                    /root and calling it done. This says where it should go.
+RUN curl -fsSL https://github.com/softmata/horus/raw/main/install.sh \
+    | HORUS_VERSION=v0.4.0 HORUS_PREFIX=/opt/horus bash
+ENV PATH="/opt/horus/bin:${PATH}"
+# `horus run`/`horus build` look for the cached source under ~/.cache/horus and
+# ~/.horus/cache; they do not know about HORUS_PREFIX. Point them at it, or the
+# first build fails with "HORUS source not found".
+ENV HORUS_SOURCE=/opt/horus/cache/horus@0.4.0
 
 # Copy project
 COPY . /app
@@ -1750,5 +1783,5 @@ curl -o pkg.tar.gz https://api.horusrobotics.dev/api/packages/pid-controller/1.2
 
 ## Next Steps
 
-- **[Environment Management](/package-management/environment-management)** - Pin dependencies with `horus.lock` and share the global cache
+- **[Environment Management](/package-management/environment-management)** - Record dependency versions with `horus.lock` and share the global cache
 - **[CLI Reference](/development/cli-reference)** - Complete command documentation
