@@ -19,7 +19,7 @@ horus build [files...]     # Build without running
 horus test [filter]        # Run tests
 horus check [path]         # Validate horus.toml and workspace
 horus clean                # Clean build artifacts and shared memory
-horus lock                 # Pin every dependency version in horus.lock
+horus lock                 # Record the resolved dependency versions in horus.lock
 horus scripts [name]       # Run a script from [scripts] in horus.toml
 
 # Monitoring & Debugging
@@ -1074,6 +1074,30 @@ horus doctor -v               # Detailed output for each check
 real-time configuration and then measures actual jitter and IPC latency, rather than only
 reporting what the system claims to support.
 
+### The Installation check
+
+The first check is HORUS itself, and it is the one to read when the CLI behaves as
+though it is not the version you installed. It reports:
+
+- **Every `horus` on `PATH`, in `PATH` order**, with what each answers to
+  `--version`. Two installs at different versions — typically a `~/.local/bin`
+  one and a `~/.cargo/bin` one — shadow each other silently, and `PATH` order
+  alone decides which `horus` means.
+- **The install record** (`~/.horus/install_manifest.toml`): version, release
+  tag, source commit and how it was installed. An older install that predates
+  the record reads as "no install record", which is not an error.
+- **Whether the two halves agree.** The CLI binary and the cached source tree
+  that `horus run` compiles Rust projects against are separate artifacts, and
+  the check compares their versions *and* their shared-memory `TOPIC_VERSION`.
+  A CLI that cannot read the topics its own libraries write is the failure this
+  exists to name — it otherwise shows up as `horus topic list` reporting zero
+  messages on a topic that is publishing normally. Fix it with `horus self
+  update`, or reinstall pinning `HORUS_VERSION`.
+- **Orphaned source caches** under `~/.horus/cache`, with sizes. These are left
+  behind by upgrades and are frequently a few hundred megabytes.
+- **Whether the package registry is reachable**, so a `horus search` that finds
+  nothing is distinguishable from a registry that is down.
+
 Toolchains are graded per language, and each language is graded against the tools the
 HORUS commands actually invoke. For C++ that means cmake *and* a compiler (`g++`,
 `clang++` or MSVC) *and* a build program (`make` or `ninja`): `horus build` runs
@@ -1219,7 +1243,7 @@ horus env --init
 horus env --uninstall
 ```
 
-> **Note**: `horus env` does not snapshot, save, or restore package environments. To pin exact dependency versions for reproducible builds, use `horus lock`.
+> **Note**: `horus env` does not snapshot, save, or restore package environments. `horus lock` records the versions resolution picked — a reviewable record, not yet an enforced pin; see [`horus lock`](#horus-lock-record-the-resolved-dependency-versions).
 
 ---
 
@@ -2059,9 +2083,40 @@ Options:
   -p, --port <PORT>          SSH port (default: 22)
   -i, --identity <IDENTITY>  SSH identity file
   -n, --dry-run              Show what would be done without doing it
+      --print-service        Write a systemd unit for this deploy to stdout
       --list                 List configured deployment targets
   -h, --help                 Print help
 ```
+
+### Surviving a reboot
+
+`--run` starts the project over the ssh session that `horus deploy` opened, so it
+stops when that session does. Nothing a deploy starts comes back after a power
+cycle on its own.
+
+`--print-service` writes a systemd unit for the deploy to stdout — the same host,
+directory and command the deploy itself would use. It prints; it does not
+install, because where the unit belongs and whether it needs lingering is the
+robot owner's decision:
+
+```bash
+horus deploy pi@raspberrypi.local --print-service > horus-horus_deploy.service
+
+# As a user service (needs lingering to start without a login):
+scp horus-horus_deploy.service pi@raspberrypi.local:~/.config/systemd/user/
+ssh pi@raspberrypi.local 'systemctl --user daemon-reload \
+  && systemctl --user enable --now horus-horus_deploy.service'
+ssh pi@raspberrypi.local 'sudo loginctl enable-linger $USER'
+
+# Or system-wide:
+scp horus-horus_deploy.service pi@raspberrypi.local:/tmp/
+ssh pi@raspberrypi.local 'sudo mv /tmp/horus-horus_deploy.service /etc/systemd/system/ \
+  && sudo systemctl enable --now horus-horus_deploy.service'
+```
+
+The unit sets `Restart=on-failure`. It takes one target at a time: each host's
+unit names that host, so `--print-service` with several targets is refused rather
+than concatenating units onto one stream.
 
 ### Examples
 
@@ -2092,6 +2147,23 @@ Then deploy with:
 ```bash
 horus deploy jetson --run
 ```
+
+**Commit `.horus/deploy.yaml`.** The rest of `.horus/` is build output and is
+gitignored, but this file is not — it is the fleet inventory, and `horus deploy`
+trusts the hosts and identity paths in it precisely because they arrived through
+the checkout and were reviewed like the rest of it. HORUS writes the negation
+into `.horus/.gitignore` for you. A target name that is *not* in the inventory is
+treated as a bare hostname and warned about, because the sync runs
+`rsync --delete` against whatever that name resolves to.
+
+**Python projects install their dependencies on the robot.** Cross-compilation
+covers a Rust or C++ artifact, but Python imports need wheels built for the
+robot's own architecture, so `horus deploy` runs `pip install --target
+.horus/packages` over ssh after the transfer and puts that directory on
+`PYTHONPATH` when it runs the entry point. The versions come from `horus.lock`
+when the project has one, so a fleet installs what the project recorded rather
+than whatever PyPI serves that day. Your local `.horus/venv` is never shipped —
+it records host-absolute paths and an interpreter for the wrong architecture.
 
 ---
 
@@ -2518,10 +2590,10 @@ horus add proptest --dev
 
 ---
 
-## `horus lock` - Pin Every Dependency Version
+## `horus lock` - Record the Resolved Dependency Versions
 
-**What it does**: resolves the dependency graph and writes `horus.lock`, so the same
-source builds the same way on the robot as it did on your laptop.
+**What it does**: resolves the dependency graph and writes `horus.lock`, a record
+of the versions that resolution picked.
 
 ```bash
 # Generate or refresh horus.lock
@@ -2537,6 +2609,23 @@ disagree, which is the shape a CI job wants.
 | Flag | What it does |
 |------|--------------|
 | `--check` | Verify the lockfile is up to date instead of regenerating it |
+
+<Callout type="info" title="What `--check` compares">
+
+`--check` reads the packages actually installed under `.horus/` and compares them
+against the `[[package]]` entries, exiting non-zero on any drift: a package pinned
+at one version and installed at another, a matching version whose digest differs,
+or an installed package the lockfile does not pin at all. Each line names the
+package, so the failure says which dependency to look at.
+
+It writes nothing, which is the shape a CI job wants. It previously only checked
+that the file parsed, so a lockfile naming versions nobody had installed passed.
+
+`[toolchain]` and `[[system]]` pins are reported but not enforced — nothing
+installs or switches toolchains — and `features` records what was active at lock
+time rather than constraining the next build.
+
+</Callout>
 
 ---
 
@@ -2566,15 +2655,64 @@ define them.
 
 ## `horus self update` - Update the CLI Itself
 
-**What it does**: replaces the running `horus` binary with the latest release.
+**What it does**: moves the CLI **and** the cached source tree to the latest
+release, together.
 
 ```bash
-horus self update
+horus self update           # install the latest release
+horus self update --check   # report current vs latest, install nothing
 ```
 
+In order, it:
+
+1. Resolves the newest release from the GitHub releases API
+2. Fetches that tag's source and caches it at `~/.horus/cache/horus@<version>`
+3. Downloads the platform asset for the **same** tag and verifies it against that
+   release's `SHA256SUMS` — a missing or unreadable checksum file is a refusal,
+   never a reason to install unverified
+4. Replaces the running binary in place, wherever it actually lives
+5. Re-runs the installed binary and refuses to record success unless it reports
+   the expected version
+6. Writes `~/.horus/installed_version` and `~/.horus/install_manifest.toml`
+
+The source half is not optional. `horus run` and `horus build` compile your
+projects against `~/.horus/cache/horus@<version>` as a **path** dependency, so a
+binary-only update leaves a CLI that cannot build a single Rust project — and,
+worse, one that compiles projects against the previous release's shared-memory
+headers. The source is fetched *before* the binary is swapped, so a failure
+partway leaves the old CLI working.
+
+On a platform with no published asset it compiles that same tag instead of
+downloading it (~3-5 min). See
+[Prebuilt Binaries](/getting-started/installation#prebuilt-binaries) for which
+platforms have one.
+
+| Flag | What it does |
+|------|--------------|
+| `--check` | Report the current and latest versions; download and install nothing |
+
+`--check` exits **0** whether or not an update is available. A non-zero exit
+means the check itself failed — GitHub unreachable, rate-limited, or an
+unparseable response — so a CI job can gate on it. Those used to be reported as
+"could not determine latest version" on the way to exit 0, indistinguishable
+from being up to date.
+
+A build whose version is *ahead* of the latest release (a source build from a
+branch) is left alone rather than moved backwards.
+
+### Related
+
 This is the CLI, not your project: `horus update` moves your **dependencies**
-forward, `horus self update` moves **horus** forward. If HORUS was installed from a
-package manager, update it there instead.
+forward, `horus self update` moves **horus** forward.
+
+`self update` only goes to the newest release. To install a **specific** version,
+or to roll back, re-run the installer with the tag pinned:
+
+```bash
+curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | HORUS_VERSION=v0.4.0 bash
+```
+
+See [Upgrading HORUS](/getting-started/installation#upgrading-horus).
 
 ---
 
@@ -2634,7 +2772,7 @@ horus run --release
 # Clean build
 horus run --clean --release
 
-# Pin exact dependency versions
+# Record what resolved, for the diff and for `horus lock --check` in CI
 horus lock
 
 # Run in production mode
@@ -2728,9 +2866,17 @@ horus run --verbose
 Beyond the `horus` CLI, the repository includes helpful scripts:
 
 ```bash
-./install.sh             # Install or update HORUS
-./uninstall.sh           # Remove HORUS from this machine
+# Install, or reinstall a specific release (both the binary and the cached source)
+curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | bash
+curl -fsSL https://github.com/softmata/horus/raw/main/install.sh | HORUS_VERSION=v0.4.0 bash
+
+# Remove HORUS from this machine (prompts first; --dry-run lists, --yes is unattended)
+curl -fsSL https://github.com/softmata/horus/raw/main/uninstall.sh | bash
 ```
+
+Windows has native PowerShell equivalents, `install.ps1` and `uninstall.ps1`.
+To move to the latest release once HORUS is installed, use `horus self update` —
+it is the same job with one command.
 
 See **[Troubleshooting & Maintenance](/troubleshooting)** for complete details.
 
