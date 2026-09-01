@@ -1074,6 +1074,30 @@ horus doctor -v               # Detailed output for each check
 real-time configuration and then measures actual jitter and IPC latency, rather than only
 reporting what the system claims to support.
 
+### The Installation check
+
+The first check is HORUS itself, and it is the one to read when the CLI behaves as
+though it is not the version you installed. It reports:
+
+- **Every `horus` on `PATH`, in `PATH` order**, with what each answers to
+  `--version`. Two installs at different versions — typically a `~/.local/bin`
+  one and a `~/.cargo/bin` one — shadow each other silently, and `PATH` order
+  alone decides which `horus` means.
+- **The install record** (`~/.horus/install_manifest.toml`): version, release
+  tag, source commit and how it was installed. An older install that predates
+  the record reads as "no install record", which is not an error.
+- **Whether the two halves agree.** The CLI binary and the cached source tree
+  that `horus run` compiles Rust projects against are separate artifacts, and
+  the check compares their versions *and* their shared-memory `TOPIC_VERSION`.
+  A CLI that cannot read the topics its own libraries write is the failure this
+  exists to name — it otherwise shows up as `horus topic list` reporting zero
+  messages on a topic that is publishing normally. Fix it with `horus self
+  update`, or reinstall pinning `HORUS_VERSION`.
+- **Orphaned source caches** under `~/.horus/cache`, with sizes. These are left
+  behind by upgrades and are frequently a few hundred megabytes.
+- **Whether the package registry is reachable**, so a `horus search` that finds
+  nothing is distinguishable from a registry that is down.
+
 Toolchains are graded per language, and each language is graded against the tools the
 HORUS commands actually invoke. For C++ that means cmake *and* a compiler (`g++`,
 `clang++` or MSVC) *and* a build program (`make` or `ninja`): `horus build` runs
@@ -2059,9 +2083,40 @@ Options:
   -p, --port <PORT>          SSH port (default: 22)
   -i, --identity <IDENTITY>  SSH identity file
   -n, --dry-run              Show what would be done without doing it
+      --print-service        Write a systemd unit for this deploy to stdout
       --list                 List configured deployment targets
   -h, --help                 Print help
 ```
+
+### Surviving a reboot
+
+`--run` starts the project over the ssh session that `horus deploy` opened, so it
+stops when that session does. Nothing a deploy starts comes back after a power
+cycle on its own.
+
+`--print-service` writes a systemd unit for the deploy to stdout — the same host,
+directory and command the deploy itself would use. It prints; it does not
+install, because where the unit belongs and whether it needs lingering is the
+robot owner's decision:
+
+```bash
+horus deploy pi@raspberrypi.local --print-service > horus-horus_deploy.service
+
+# As a user service (needs lingering to start without a login):
+scp horus-horus_deploy.service pi@raspberrypi.local:~/.config/systemd/user/
+ssh pi@raspberrypi.local 'systemctl --user daemon-reload \
+  && systemctl --user enable --now horus-horus_deploy.service'
+ssh pi@raspberrypi.local 'sudo loginctl enable-linger $USER'
+
+# Or system-wide:
+scp horus-horus_deploy.service pi@raspberrypi.local:/tmp/
+ssh pi@raspberrypi.local 'sudo mv /tmp/horus-horus_deploy.service /etc/systemd/system/ \
+  && sudo systemctl enable --now horus-horus_deploy.service'
+```
+
+The unit sets `Restart=on-failure`. It takes one target at a time: each host's
+unit names that host, so `--print-service` with several targets is refused rather
+than concatenating units onto one stream.
 
 ### Examples
 
@@ -2092,6 +2147,23 @@ Then deploy with:
 ```bash
 horus deploy jetson --run
 ```
+
+**Commit `.horus/deploy.yaml`.** The rest of `.horus/` is build output and is
+gitignored, but this file is not — it is the fleet inventory, and `horus deploy`
+trusts the hosts and identity paths in it precisely because they arrived through
+the checkout and were reviewed like the rest of it. HORUS writes the negation
+into `.horus/.gitignore` for you. A target name that is *not* in the inventory is
+treated as a bare hostname and warned about, because the sync runs
+`rsync --delete` against whatever that name resolves to.
+
+**Python projects install their dependencies on the robot.** Cross-compilation
+covers a Rust or C++ artifact, but Python imports need wheels built for the
+robot's own architecture, so `horus deploy` runs `pip install --target
+.horus/packages` over ssh after the transfer and puts that directory on
+`PYTHONPATH` when it runs the entry point. The versions come from `horus.lock`
+when the project has one, so a fleet installs what the project recorded rather
+than whatever PyPI serves that day. Your local `.horus/venv` is never shipped —
+it records host-absolute paths and an interpreter for the wrong architecture.
 
 ---
 
@@ -2538,23 +2610,20 @@ disagree, which is the shape a CI job wants.
 |------|--------------|
 | `--check` | Verify the lockfile is up to date instead of regenerating it |
 
-<Callout type="warning" title="The pins are recorded, not yet enforced">
+<Callout type="info" title="What `--check` compares">
 
-`horus.lock` is not yet a reproducibility guarantee. The `[[package]]` entries
-are written by the resolver, but no install path reads them back: the pip,
-crates.io and registry installers still take their versions from `horus.toml`
-and fall back to `latest`. So checking out a committed `horus.lock` on a clean
-machine can install different versions than the ones recorded — and the next
-`horus lock` on that machine overwrites the committed pin with whatever `latest`
-resolved to there.
+`--check` reads the packages actually installed under `.horus/` and compares them
+against the `[[package]]` entries, exiting non-zero on any drift: a package pinned
+at one version and installed at another, a matching version whose digest differs,
+or an installed package the lockfile does not pin at all. Each line names the
+package, so the failure says which dependency to look at.
 
-`checksum` is written too (always empty today) and never compared against a
-download. The one field that *is* consulted is `config_hash`, which only decides
-whether resolution can be skipped.
+It writes nothing, which is the shape a CI job wants. It previously only checked
+that the file parsed, so a lockfile naming versions nobody had installed passed.
 
-Until the resolver applies the pins before installing, treat `horus.lock` as a
-record of what **was** resolved, not a guarantee of what **will** be. For a
-dependency that must not move, write an exact version in `horus.toml`.
+`[toolchain]` and `[[system]]` pins are reported but not enforced — nothing
+installs or switches toolchains — and `features` records what was active at lock
+time rather than constraining the next build.
 
 </Callout>
 
