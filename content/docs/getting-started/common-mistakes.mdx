@@ -148,26 +148,38 @@ else's tick. Work that is genuinely slow belongs in `.compute()` or
 
 ---
 
-## 4. Wrong Priority Order
+## 4. Expecting `.order()` to Sequence Main-Loop Nodes
 
 **The Problem:**
 ```rust
-// WRONG - Logger runs before sensor!
-scheduler.add(logger).order(0).build()?;       // Order 0 (runs first)
-scheduler.add(sensor).order(10).build()?;      // Order 10
-scheduler.add(controller).order(5).build()?;   // Order 5
+// This does NOT reliably run the sensor before the controller
+scheduler.add(sensor).order(0).build()?;
+scheduler.add(controller).order(5).build()?;
 ```
 
-**Why:** Lower order number = runs first. Safety-critical code should be order 0.
+**Why:** For nodes on the main loop, execution order comes from the **topic dependency
+graph**, not from `.order()`. The scheduler reads `.order()` tiers only while it has no
+topic metadata at all — the first tick, and programs whose nodes never publish or
+subscribe. Once any node has published or subscribed, the graph is rebuilt from the
+topics and the order numbers are not read again.
 
-**The Fix:**
+So two independent BestEffort nodes run concurrently on worker threads whatever numbers
+you gave them, and a node with a low number does not "go first" unless something makes it
+a dependency.
+
+**The Fix:** express the ordering as a data dependency — the controller subscribes to what
+the sensor publishes, so it cannot run first:
+
 ```rust
-// CORRECT - Proper ordering
-scheduler.add(safety_monitor).order(0).build()?;   // Safety first!
-scheduler.add(sensor).order(5).build()?;           // Then sensors
-scheduler.add(controller).order(10).build()?;      // Then control
-scheduler.add(logger).order(100).build()?;         // Logging last
+// sensor publishes "robot.imu"; controller subscribes to it.
+// That subscription is what sequences them.
+scheduler.add(sensor).build()?;
+scheduler.add(controller).build()?;
 ```
+
+`.order()` still does real work on the RT, compute and async I/O executors, which start
+their pools sorted by it, and as the tie-break before any topic metadata exists. Keep
+using it there — just do not rely on it to sequence main-loop nodes that talk over topics.
 
 **Could the API prevent this?** No, and probably never. Nothing in a type says
 a watchdog matters more than a logger — that is domain knowledge only the

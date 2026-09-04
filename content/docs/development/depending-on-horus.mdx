@@ -1,0 +1,492 @@
+---
+title: "Depending on HORUS"
+description: "Using HORUS from a hand-written Cargo.toml — the path dependency, the two patch tables it needs, and what breaks when the tree moves"
+order: 42
+---
+
+# Depending on HORUS
+
+`horus new`, `horus build` and `horus run` write your Cargo manifest for you. If
+you are not using them — an existing crate, a member of a workspace you already
+have, a build script, CI that runs plain `cargo test` — you write it yourself,
+and no `cargo add` invocation produces a manifest that resolves. This page gives
+you one that does, says where each line came from, and names what will break it.
+
+## `horus = "0.4"` is somebody else's crate
+
+Start here, because this is the failure that costs the most time.
+
+The name `horus` on crates.io is taken, by an unrelated project. Queried on
+2026-09-03, `https://crates.io/api/v1/crates/horus` returns the description "A
+small, modular Rust framework for building coding agents", the repository
+`https://github.com/citizenhicks/horus`, and 45 published versions with 0.9.0 as
+the newest. One of those versions is 0.4.0. So `horus = "0.4"` does not fail to
+resolve. It resolves and downloads, and then your first `use horus::prelude::*;`
+fails, because that crate has no such module: its published 0.4.0 declares
+`agent`, `backend`, `middleware` and `protocol` and nothing else. A missing
+prelude reads like a mistake in your own code rather than a mistake in your
+manifest.
+
+None of HORUS's own crates are on crates.io at all. Also checked on 2026-09-03:
+
+| Crate name | On crates.io |
+|---|---|
+| `horus` | Yes — a different project's coding-agent framework |
+| `horus_core` | "crate `horus_core` does not exist" |
+| `horus_types` | "crate `horus_types` does not exist" |
+| `horus_macros` | "crate `horus_macros` does not exist" |
+| `horus_net` | "crate `horus_net` does not exist" |
+| `horus_sys` | "crate `horus_sys` does not exist" |
+| `horus_manager` | "crate `horus_manager` does not exist" |
+
+They cannot be published as they stand. The `horus` crate depends on two git
+repositories — `horus-robotics` through the workspace (`horus/Cargo.toml:21`,
+resolved at `Cargo.toml:40`) and `horus-tf` directly (`horus/Cargo.toml:25`) —
+and cargo refuses to package a crate whose dependency carries no version
+requirement. Reproduced on 2026-09-03 with `cargo package --no-verify` on a
+crate carrying nothing but the `horus-tf` git dependency:
+
+```text
+error: failed to verify manifest at `.../Cargo.toml`
+
+Caused by:
+  all dependencies must have a version requirement specified when packaging.
+  dependency `horus-tf` does not specify a version
+  Note: The packaged dependency will use the version from crates.io,
+  the `git` specification will be removed from the dependency declaration.
+```
+
+The project README states this in one paragraph (`README.md:70-73`), and
+[Using Prebuilt Nodes](/package-management/using-prebuilt-nodes) carries a
+callout saying the same. Take the manifest from this page rather than from that
+callout: the snippet at `using-prebuilt-nodes.mdx:153-159` gives the path
+dependency on its own, without the two `[patch]` tables, and that does not
+resolve. The next two sections say why.
+
+## Where the source tree is
+
+The installer clones HORUS and keeps the tree, because the whole build model
+depends on it: `horus run` compiles user projects against horus as path
+dependencies, "so the source must outlive the install or no Rust project can
+ever be built" (`install.sh:256-260`).
+
+It lands at `<state root>/cache/horus@<version>`. The state root is
+`$HORUS_PREFIX` when that is set and non-empty, and `~/.horus` otherwise
+(`install.sh:245-255`, mirrored on the CLI side by `state_root` and `cache_root`
+in `horus_manager/src/version.rs:47-87`). The version in the directory name is
+read out of `horus_core/Cargo.toml` in the tree that was just cloned, not from
+the tag you asked for (`install.sh:458-462`). On a default Linux install that
+gives you:
+
+```
+~/.horus/cache/horus@0.4.0/
+```
+
+holding the entire workspace — `horus/`, `horus_core/`, `horus_macros/`,
+`horus_types/`, `horus_sys/`, `horus_net/`, `horus_cpp/`, `horus_py/`,
+`examples/`, `tests/` and the rest — not a packaged subset.
+
+Get the version from the directory listing, not from the CLI:
+
+```bash
+ls ~/.horus/cache
+```
+
+`horus --version` prints the version of the binary on your `PATH`, which is not
+required to be the version of any tree in the cache. The machine this page was
+checked on had a 0.2.2 CLI and two cached trees, `horus@0.2.2` and `horus@0.4.0`
+— nothing prunes the old one, and nothing repoints your manifest at the new one.
+
+The CLI does not go straight to a fixed path either. `find_horus_source_dir`
+(`horus_manager/src/commands/run/run_rust.rs:1046-1117`) tries `$HORUS_SOURCE`
+first, then the fixed development locations `/horus`, `~/softmata/horus`,
+`~/horus`, `/opt/horus`, `/usr/local/horus`, and only then the cache roots — up
+to three of them: a `HORUS_PREFIX` root when it differs from the legacy one, the
+XDG cache, and `~/.horus/cache` (`run_rust.rs:1023-1043`). Within those it
+prefers `horus@<CLI version>` and otherwise accepts any `horus@*` tree it finds.
+Every candidate has to contain `horus/Cargo.toml` to be accepted.
+
+**None of that search applies to you.** It runs inside the CLI, to build the
+manifest in `.horus/`. A hand-written `Cargo.toml` is read by cargo, which
+resolves nothing on your behalf: the path you write is the path used.
+`HORUS_SOURCE` will not redirect it, and a developer checkout at
+`~/softmata/horus` will not be picked up. Most of the fragility described below
+follows from that one fact.
+
+## What `horus new` generates
+
+`horus new my_robot --rust` writes `horus.toml` (`new.rs:120`), `.gitignore`
+(`new.rs:110`) and `src/main.rs` (`new.rs:686-688`). Use the long flag: `-r` is
+still accepted on `horus new` as a deprecated alias and prints a notice, because
+the same letter is `--release` on `horus build`, `horus run` and `horus test`
+(`main.rs:164-166`, `main.rs:2052-2070`). Add `--yes` in a script — the bare
+command prompts (`main.rs:194-199`).
+
+It writes no root `Cargo.toml`. Native build files "are generated automatically
+from horus.toml by the build pipeline (cargo_gen/pyproject_gen)"
+(`new.rs:123-124`), and a test asserts the absence: "horus new should NOT create
+Cargo.toml in project root" (`new.rs:2009-2010`). The Cargo manifest is
+`.horus/Cargo.toml`, written by `cargo_gen::generate`
+(`horus_manager/src/cargo_gen.rs:35-166`) and gitignored as a build artefact
+(`new.rs:349`). `horus new` pre-generates it once, best-effort, so an editor has
+a project to load on first open (`new.rs:143-153`, `cargo_gen::ensure` at
+`cargo_gen.rs:1612-1659`); `horus build`, `horus run` and `horus test`
+regenerate it.
+
+To read one, use a generated project — a project that has a root `Cargo.toml`
+takes a different path entirely, described further down:
+
+```bash
+horus build
+cat .horus/Cargo.toml
+```
+
+What `generate` emits, in the order it emits it:
+
+| Emitted | Written by | Why it is there |
+|---|---|---|
+| `[workspace]`, empty | `cargo_gen.rs:64` | Stops the generated manifest being adopted by a parent workspace |
+| A `[[bin]]` per entry point | `cargo_gen.rs:67-97` | The sources live outside `.horus/`, so each target needs an explicit `path` |
+| `horus`, `horus_core`, `horus_macros` as path dependencies | `cargo_gen.rs:1062-1093` | Without them the section is emitted empty and the build fails with a wall of "cannot find type Topic/Scheduler" instead of an actionable message (`cargo_gen.rs:108-113`) |
+| `serde = { version = "1", features = ["derive"] }` | `cargo_gen.rs:970-988`, literal at `:984` | The `message!` macro expands to `serde::Serialize`, so serde has to be a **direct** dependency of your crate; transitive is not enough |
+| `[patch."…horus-robotics.git"]` and `[patch."…horus-tf.git"]` | `cargo_gen.rs:1100-1109` and `:1260-1325`, called last at `:146` | The next section |
+
+Two details worth knowing. The path-dependency loop at `cargo_gen.rs:1066` tries
+four names — `horus`, `horus_core`, `horus_library`, `horus_macros` — and emits
+only those that have a `Cargo.toml` on disk (`:1068`). There is no
+`horus_library` directory in the workspace or in a cached tree, so three lines
+come out, not four. And on Windows the path is written with forward slashes,
+because a backslash in a TOML string is an escape and `C:\Users\…` made the
+generated manifest unparseable before cargo could read it
+(`cargo_gen.rs:941-959`).
+
+## The two `[patch]` tables, and why nothing resolves without them
+
+`horus` depends on `horus-robotics` and `horus-tf` as git dependencies. Both of
+those repositories reference `horus_core` and its siblings by *relative* path,
+which resolves inside a HORUS checkout and not at all in a bare clone of either
+repo. The HORUS workspace root compensates with two `[patch]` tables pointing at
+the local crates (`Cargo.toml:104-115`, comment at `:105-107`).
+
+Cargo honours `[patch]` only from the workspace root of the build actually
+running, and never inherits it through a path dependency
+(`cargo_gen.rs:1239-1243`). Your project is its own workspace root, so those
+tables do not reach it. Verified on 2026-09-03: a project whose only dependency
+is `horus = { path = "/home/you/.horus/cache/horus@0.4.0/horus" }` and which
+declares no patches fails `cargo metadata` outright, exit 101, before any
+compilation:
+
+```text
+error: no matching package named `horus_core` found
+location searched: Git repository https://github.com/softmata/horus-robotics.git?rev=631483a2...
+required by package `horus-robotics v0.2.0 (https://github.com/softmata/horus-robotics.git?rev=631483a2...)`
+    ... which satisfies git dependency `horus-robotics` of package `horus v0.4.0 (/home/you/.horus/cache/horus@0.4.0/horus)`
+    ... which satisfies path dependency `horus` of package `nopatch v0.1.0 (...)`
+```
+
+This is not a corner case you might avoid. It is the first thing that happens to
+any project that depends on `horus` by path and does nothing else. Re-emitting
+the tables is what keeps generated projects buildable, and
+`horus_cpp/fuzz/Cargo.toml:26-35` solves the identical problem by hand for the
+same reason.
+
+## The manifest
+
+```toml
+[package]
+name = "my-robot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+horus = { path = "/home/you/.horus/cache/horus@0.4.0/horus" }
+serde = { version = "1", features = ["derive"] }
+
+[patch."https://github.com/softmata/horus-robotics.git"]
+horus_core = { path = "/home/you/.horus/cache/horus@0.4.0/horus_core" }
+horus_types = { path = "/home/you/.horus/cache/horus@0.4.0/horus_types" }
+horus_macros = { path = "/home/you/.horus/cache/horus@0.4.0/horus_macros" }
+
+[patch."https://github.com/softmata/horus-tf.git"]
+horus_core = { path = "/home/you/.horus/cache/horus@0.4.0/horus_core" }
+horus_macros = { path = "/home/you/.horus/cache/horus@0.4.0/horus_macros" }
+```
+
+The crate lists in the two tables are not interchangeable and are not guesses:
+they mirror `GIT_PATCH_TARGETS` (`cargo_gen.rs:1100-1109`) and the workspace
+root (`Cargo.toml:104-115`). `horus-tf` needs two crates redirected, `horus-robotics`
+three.
+
+Substitute your own home directory and the version your installer actually
+cached. Every path is absolute; see the fragility section below for why, and
+what to do about it.
+
+Verified on 2026-09-03 against `~/.horus/cache/horus@0.4.0`: a crate with
+exactly that manifest and this `src/main.rs` passes `cargo check`, and
+`cargo build` links a binary.
+
+```rust
+use horus::prelude::*;
+
+message! {
+    Ping { seq: u64 }
+}
+
+fn main() {
+    let _ = Scheduler::new();
+    let _ = Ping { seq: 0 };
+}
+```
+
+Three notes on it.
+
+`horus_core` and `horus_macros` are not in the stanza. `cargo_gen` emits them
+into every generated project because it cannot know what you will import; a
+hand-written manifest needs them only if you name those crates directly. Add
+them the same way, as path dependencies into the same tree, if you do — both
+forms were checked and both compile.
+
+The toolchain floor is `rust-version = "1.90"` (`Cargo.toml:28`), inherited by
+every workspace member that writes `rust-version.workspace = true`.
+
+No C++ toolchain or CMake is needed for the Rust dependency. `horus_cpp` is not
+in the resolved graph. From `cargo metadata` and the build artefacts of the check
+above, the HORUS-side crates that get built are `horus`, `horus_core`,
+`horus_types`, `horus_macros`, `horus_sys`, `horus-robotics`, `horus-tf` and
+`softmata-core`, plus their crates.io dependencies. `horus_macros` is there even
+though you did not name it: the `macros` feature is on by default. `horus_net` is
+not. The C++ and Python routes into the same cached tree are separate and are
+described in `README.md:61-68`.
+
+### Turning on networking
+
+`horus` ships five features — `default`, `macros`, `telemetry`, `blackbox` and
+`net` — where `default = ["macros", "telemetry", "blackbox"]`
+(`horus/Cargo.toml:32-56`; the same list is written out in a comment at
+`cargo_gen.rs:1008`). LAN replication is the opt-in one:
+
+```toml
+horus = { path = "/home/you/.horus/cache/horus@0.4.0/horus", features = ["net"] }
+```
+
+It has to go on the `horus` dependency, not on your own crate. Asking for
+`--features net` on your own crate is rejected — on cargo 1.97.1, with
+`error: the package 'my-robot' does not contain this feature: net` — which is
+the reasoning that put the flag inside the generated dependency rather than on
+the command line (`cargo_gen.rs:999-1001`). If you want it for one build without
+editing the manifest, `cargo check --features horus/net` works; that was checked
+and it pulls `horus_net` into the graph.
+
+## What is fragile about this
+
+**The path is absolute and belongs to one machine.** Nothing in cargo resolves
+it, and nothing in HORUS rewrites it. A teammate with a different home
+directory, or a CI runner with no `~/.horus`, gets a resolution failure before
+any compilation:
+
+```text
+error: failed to get `horus` as a dependency of package `missing v0.1.0 (...)`
+
+Caused by:
+  failed to read `/home/you/.horus/cache/horus@0.4.0/horus/Cargo.toml`
+```
+
+The generated manifest has the same property and gets away with it because it is
+regenerated per machine and gitignored; yours is committed. The CLI at least
+notices when a generated manifest has gone stale — `cargo_gen::is_stale` reads
+back the `path = "…"` values and reports true when an absolute one no longer
+exists (`cargo_gen.rs:1687-1709`). Nothing performs that check on a manifest you
+wrote.
+
+`cargo add` does not save you here either. Run on 2026-09-03,
+`cargo add --path <tree>/horus` wrote a dependency carrying a *relative* path
+and `version = "0.4.0"` — a requirement that the unrelated crates.io crate
+happens to have a release for — and added no patch tables, so the command
+finished by failing with the same "no matching package named `horus_core`" error
+as above.
+
+The workable answer is a stable absolute path that every machine provides: a
+symlink at a fixed location pointing at whichever tree that machine has.
+Verified on 2026-09-03 — a manifest whose paths run through a symlink compiles
+exactly as one naming the real directory does. `/opt/horus` is a reasonable
+choice because it is also in the CLI's own search list (`run_rust.rs:1063`), so
+`horus run` and your plain `cargo build` then agree about which tree they are
+using. It is a convention you enforce; HORUS neither creates nor checks it.
+
+**`horus@<version>` is a directory name, not a version requirement.** Cargo
+checks that the directory exists and stops there. Reinstalling the same version
+replaces the tree in place — `install.sh:481` and `install_source_cache`
+(`horus_manager/src/commands/upgrade.rs:681-692`) both remove the destination
+before moving the new tree in — so the same path can hold different code
+tomorrow under the same name. Upgrading to a new version leaves your pin
+untouched, because the cache is versioned by directory "so multiple installs
+coexist" (`install.sh:458-459`): your project keeps compiling against 0.4.0
+while the CLI on your `PATH` is newer, and nothing says so.
+
+**The crate version is not the identity that matters.** The number that decides
+whether your binary can attach to the shared memory another HORUS process wrote
+is the topic-header version, mirrored on the CLI side as
+`CLI_TOPIC_VERSION = 4` (`horus_manager/src/version.rs:15-24`). Two trees that
+both called themselves 0.4.0 were once 93 commits apart with different topic
+ABIs, and the first symptom was a node that could not attach to the shared
+memory its own libraries wrote (`run_rust.rs:1119-1129`). The CLI prints a
+warning when its source search falls back to a tree whose version is not its own
+(`run_rust.rs:1133-1160`). A plain `cargo build` never runs that search, so you
+get no warning at all. `install_manifest.toml` in the state root records the
+version, tag, commit and the tree's `topic_version` when the installer could
+read them (`install.sh:790-839`, fields at `version.rs:115-135`) — treat it as
+optional evidence rather than a guarantee: readers "must tolerate its absence
+(older installs) and the absence of individual keys" (`install.sh:787-789`), and
+it was absent on the machine this page was checked on.
+
+**`[patch]` must live in the workspace root.** If you are adding HORUS to a
+member of a workspace you already have, both tables go in the root `Cargo.toml`,
+not the member's. Cargo warns and then fails anyway (reproduced 2026-09-03):
+
+```text
+warning: patch for the non root package will be ignored, specify patch at the workspace root:
+package:   .../app/Cargo.toml
+workspace: .../Cargo.toml
+error: no matching package named `horus_core` found
+```
+
+**The cache path and the tool that clears it disagree.** `clean_horus_cache`
+prints "Removing ~/.horus/cache/" but resolves the directory through
+`paths::cache_dir()` → `horus_sys::platform::cache_dir()`, which on Linux is
+`$XDG_CACHE_HOME/horus` or `~/.cache/horus`
+(`horus_manager/src/commands/clean.rs:432-466`, `horus_manager/src/paths.rs:25-27`,
+`horus_sys/src/platform/mod.rs:243-262`). The installer writes to
+`~/.horus/cache` (`install.sh:260`, `:475`). On a default Linux install those
+are two different directories, which `platform/mod.rs:235-242` says in as many
+words. Trust neither the message nor the command about which tree is at risk;
+check the path your own manifest names.
+
+## Keeping a `horus.toml` beside your `Cargo.toml`
+
+If your project has a root `Cargo.toml`, `horus build` and `horus run` build
+from it directly with `cargo build`, and never generate `.horus/Cargo.toml`
+(`run_rust.rs:238-248`). Artefacts still go to `.horus/target`, because every
+cargo spawn gets `CARGO_TARGET_DIR` set (`build_dirs.rs:51-61`, `:73-85`). Two
+consequences.
+
+A `[rust]` section in `horus.toml` is then parsed, accepted by `horus check`,
+and ignored. The CLI warns about exactly this — "horus.toml has a [rust]
+section, but this project has its own Cargo.toml, so HORUS builds from that and
+the section has no effect" (`run_rust.rs:1173-1196`). Your profile, lints and
+features belong in the Cargo manifest you now own.
+
+`horus build` also passes `--features` to *your* crate, computed from
+`[drivers]` and `enable` in `horus.toml` (`run_rust.rs:257-258`,
+`features::get_all_cargo_features` at `features.rs:323-348`). An unrecognised
+capability is passed through verbatim (`features.rs:278-279`), so a name your
+crate does not declare as a feature fails the build. `net` and `network` are
+mapped to nothing on purpose, with the reason in the source: passing it here
+yields "the package does not contain this feature: net" (`features.rs:264-268`).
+
+Both paragraphs of this section are read out of the 0.4.0 source and were not
+exercised against a running CLI; the binary on the machine this page was checked
+on was 0.2.2, which predates them.
+
+### `enable = ["net"]` in a generated multi-package workspace does nothing
+
+This concerns generated projects rather than your hand-written manifest, and is
+here because it is the same feature reaching the same crate by a different
+route.
+
+For a generated single-package project it works. `horus_dep_features`
+(`cargo_gen.rs:1002-1040`) reads `enable` from the manifest and `HORUS_ENABLE`
+from the environment — `net` or `network`, case-insensitively (`:1025-1034`) —
+and `write_horus_path_deps` puts `features = ["net"]` on the `horus` dependency
+(`:1064`, `:1069-1080`).
+
+For a generated multi-package workspace nothing does. The root's
+`[workspace.dependencies]` writer emits `name = { path = "…" }` with no features
+branch (`cargo_gen.rs:1808-1819`), and every member writes
+`horus.workspace = true` (`:1979-1981`). `horus_dep_features` has exactly one
+non-test call site, `:1064`, on the single-package path. So `enable = ["net"]`
+in a workspace `horus.toml` produces a binary containing no `horus_net`,
+silently — the same failure the function's own comment records for the older
+`horus run --net` flag: "the built binary contained no horus_net symbols at all.
+A developer wiring two robots saw a normal run with zero networking output and
+concluded multicast was blocked" (`cargo_gen.rs:992-997`).
+
+In a hand-written manifest you write `features = ["net"]` yourself, so the hole
+is not yours. If you are converting a workspace project and wondering why
+networking never worked, this is why.
+
+## `panic = "abort"` deletes the per-node fault isolation
+
+The `[rust.profile.release]` example on the
+[Configuration](/package-management/configuration) page carries
+`panic = "abort"` (`configuration.mdx:1150-1171`, the line at `:1161`) with
+nothing said against it there or in the table below it. If you are writing your
+own profile, decide this one deliberately.
+
+Every node tick runs inside `std::panic::catch_unwind`: `NodeRunner::run_tick`
+(`horus_core/src/scheduling/primitives.rs:226-238`, the `catch_unwind` at
+`:229`) holds the only call to a node's `tick()` in `horus_core` outside test
+modules. A node that panics is caught, and the rest of the schedule keeps
+running. With `panic = "abort"` there is nothing to catch, and the first panic
+in any node takes the whole process with it.
+
+Seven comments in the shipped runtime name that assumption
+(`grep -rn 'panic = "abort"' horus_core/src horus_types/src horus_net/src`; an
+eighth is in a `horus_net` test). Three of them:
+
+- A panic inside a compute node's tick "killed only that executor thread (there
+  is no `panic = "abort"` in the release profile)"
+  (`horus_core/src/scheduling/compute_executor.rs:570-573`; the async I/O
+  executor says the same at `async_executor.rs:71-74`).
+- A duplicate node name is recorded and returned as an error from `run()` rather
+  than panicked, because panicking "in a robot process, in a release profile
+  with no `panic = "abort"`, would be a worse failure than the one being fixed"
+  (`horus_core/src/scheduling/scheduler/mod.rs:2064-2070`).
+- A malformed topic header indexes past the end of a mapping, which "with no
+  `panic = "abort"` … silently kills just that thread"
+  (`horus_core/src/communication/topic/header.rs:1497-1499`).
+
+`horus_net` relies on it twice more, and there the consequence is stated
+plainly: an unwinding panic leaves "the process alive with networking
+permanently dead", including networked e-stop, "while
+`ReplicatorHandle::is_running()` kept returning true"
+(`horus_net/src/wire.rs:434-441`, `horus_net/src/heartbeat.rs:582-586`).
+
+Set `panic = "abort"` only if you have decided that a robot should stop dead on
+any node fault. That is a legitimate choice for some machines. It is not a
+build-time optimisation, and the example does not say so.
+
+## What is not checked
+
+Nothing verifies the manifest on this page. It cannot be verified as it stands:
+the docs extractor treats `toml` as a reference language, extracted and never
+compiled or resolved, while `rust` and `python` are the verifiable ones
+(`horus-docs/scripts/extract-code-blocks.mjs:43-46`, `:239-249`). The Rust block
+above is compiled against a real HORUS checkout on every documentation pull
+request (`horus-docs/.github/workflows/verify-docs.yml:85-162`). The TOML block
+beside it is read by nobody but you.
+
+The nearest guard is one step removed. `horus_manager/tests/docs_examples.rs:820-863`
+builds a scratch crate with the same shape of manifest — the three path deps,
+serde, both patch tables — and `project_deps_match_cargo_gen` (`:1266-1300`)
+keeps that list in step with the generator; CI runs it at
+`.github/workflows/docs-contract.yml:138`. Read what it asserts before trusting
+it: for each of `horus`, `horus_core` and `horus_macros` it checks that the name
+still appears in `write_horus_path_deps`'s literal list and in the test's own
+`PROJECT_DEPS`, and that `write_implicit_deps` still mentions serde. It does not
+assert the converse. The literal list already carries a fourth name,
+`horus_library`, that matches nothing on disk, and a fifth would pass unnoticed.
+So that test protects the test harness against a removal. It protects neither
+the harness nor this page against an addition, and it never reads this page at
+all.
+
+The authority is therefore the generator, not this document. In a throwaway
+project:
+
+```bash
+horus new scratch --rust --yes && cd scratch
+horus build
+cat .horus/Cargo.toml
+```
+
+Whatever that prints is what your own manifest should mirror, with the version
+and the home directory changed to match your machine.

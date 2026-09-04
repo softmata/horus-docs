@@ -15,19 +15,20 @@ Performance validation with real-world robotics workloads.
 - **Statistical sampling**: Criterion.rs micro-benchmarks, sample sizes 10-1000 depending on the group
 - **Confidence intervals**: Bootstrap 95% CI with Tukey IQR outlier detection
 - **Controlled methodology**: 2-10s measurement windows per group, Criterion's default 3s warm-up
-- **Standalone binaries**: RDTSC-timed, 50,000-100,000 samples per scenario
+- **Standalone binaries**: 20,000-1,000,000 samples per scenario depending on the binary; `all_paths_latency`, `robotics_messages_benchmark`, `determinism_benchmark` and `cross_process_benchmark` are RDTSC-timed with calibrated overhead subtraction, `topic_probe` uses `CLOCK_MONOTONIC` (producer and consumer are threads in one process, so it is offset-free by construction)
 - **Comprehensive coverage**: 4 robotics message types, 10 backend routes
 
 ### Workload Testing
 - **Real workloads**: Control loops, sensor fusion, manipulator commands, lidar scans
-- **Fault injection**: Per-node `FailurePolicy` (`Restart` / `Skip`) recovery testing
-- **Scale testing**: Validated up to 100 concurrent nodes and 1,000 topics
+- **Scale testing**: node counts 0-20 and background-topic counts 0-10 (`scheduler_ipc_latency`); 1-8 producers and 1-8 consumers (`scalability_benchmark`, `all_paths_latency` stress scenarios)
 - **Topology coverage**: Same-thread, cross-thread and cross-process, 1:1 through N:N
 - **Contention**: Multi-producer and multi-consumer paths measured under contention
 
 ## Executive Summary
 
 **`send()` costs tens of nanoseconds for typical robotics messages.**
+
+Measured with `robotics_messages_benchmark` on an Intel Core i7-10750H (6C/12T, `powersave` governor), 50,000 iterations per message type after 5,000 warmup iterations — except LaserScan, which runs one fifth of each (10,000 iterations after 1,000 warmup), so its p99 rests on one fifth the samples the other rows do. These are the four message types the benchmark actually runs:
 
 <Callout type="warning" title="What these numbers are, and what they are not">
 `robotics_messages_benchmark` times **`tx.send()` enqueue cost only**. A
@@ -288,9 +289,22 @@ Run any benchmark with:
 ```bash
 cargo run --release -p horus_benchmarks --bin <name>
 
-# JSON output for CI/regression tracking
+# JSON output for CI/regression tracking. Accepted by all_paths_latency,
+# cross_process_benchmark, determinism_benchmark, robotics_messages_benchmark
+# and scalability_benchmark only.
 cargo run --release -p horus_benchmarks --bin <name> -- --json results.json
+
+# competitor_comparison writes CSV instead
+cargo run --release -p horus_benchmarks --bin competitor_comparison -- --csv comparison.csv
+
+# topic_probe prints per-repetition lines instead
+cargo run --release -p horus_benchmarks --bin topic_probe -- --raw
 ```
+
+`topic_probe`, `competitor_comparison` and `iceoryx2_comparison` do not parse `--json`: the first
+two scan the command line only for their own flags, and `iceoryx2_comparison` never reads it at
+all. Passing `-- --json results.json` to one of them produces an ordinary run, no error and no
+file, so a CI step that collects the file has to check that it exists.
 
 Criterion micro-benchmarks:
 
@@ -398,14 +412,22 @@ The run also prints a `SUMMARY BY MESSAGE TYPE` table with throughput and a `REA
 <MermaidDiagram
   chart={`%%{init: {'sequence': {'padding': 15}}}%%
 sequenceDiagram
-    participant P as Producer (Core 2)
-    participant C as Consumer (Core 6)
+    participant P as Producer
+    participant C as Consumer
 
-    Note left of P: 1. t0 = rdtsc()
-    P->>C: 2. send(msg), rdtsc() stamped into CmdVel.timestamp_ns
-    Note left of P: 3. send latency = rdtsc() - t0 - overhead
-    Note right of C: 4. recv(), t1 = rdtscp()
-    Note right of C: 5. one-way latency = t1 - msg.timestamp_ns - overhead
+    rect rgba(6, 182, 212, 0.08)
+    Note over P,C: SEND — same process. The producer times itself.
+    Note left of P: t0 = rdtsc()
+    P->>C: send(msg) into the SHM ring
+    Note left of P: send = cycles_to_ns(rdtscp() - t0 - overhead)
+    end
+
+    rect rgba(139, 92, 246, 0.08)
+    Note over P,C: ONE-WAY — separate processes. The consumer measures.
+    Note left of P: stamp t into CmdVel.timestamp_ns
+    P->>C: send(CmdVel)
+    Note right of C: one-way = cycles_to_ns(rdtscp() - timestamp_ns - overhead)
+    end
 `}
   caption="Send-side and one-way latency measurement"
 />
@@ -417,12 +439,17 @@ sequenceDiagram
 - **Conservative for cross-process**: the timestamp is written before `send()` and read after `recv()`, so serialization, IPC and deserialization are all inside the measurement
 
 **What we measure:**
-- **send** — producer-side `send()` latency via RDTSC with calibrated overhead subtraction (same-process scenarios)
+- **send** — producer-side `send()` latency via RDTSC. The subtracted overhead is the *minimum* of 10,000 back-to-back `rdtsc()`/`rdtscp()` pairs with no work between them, calibrated once per process (same-process scenarios)
 - **one-way** — producer → consumer latency from an RDTSC timestamp carried in `CmdVel.timestamp_ns` (cross-process scenarios)
 - **broadcast** — one-way latency on latest-value PodShm paths, plus read freshness and skip-ahead counts
 
 **What we DON'T measure:**
-- Round-trip / request-response time — no scenario sends an ACK
+- Round-trip as the headline number. The offset-free cross-process scenario
+  (`Topic_cross_process_oneway_pingpong`) *does* send a reply — that is how it
+  cancels the two cores' TSC offset, NTP-style — but it reports
+  `(fwd + rev) / 2`, a one-way figure. `rtt / 2` is printed beside it, labelled
+  as a halved round trip, and is the larger of the two because it also carries
+  the responder's recv→send turnaround.
 - Burst throughput (no backpressure)
 - Same-core communication (unrealistic for multi-process IPC)
 
@@ -432,7 +459,7 @@ sequenceDiagram
 - **CPU Governor**: `performance` mode recommended; the figures quoted on this page were captured under `powersave`, which inflates cross-process latencies
 - **CPU Affinity**: Producer and consumer pinned to separate physical cores (`all_paths_latency` reads `thread_siblings_list` to pick five distinct physical cores, falling back to 0/2/4/6/8 only when the kernel will not report topology)
 - **Process Isolation**: Dedicated topics per benchmark
-- **Warmup**: 5,000 iterations discarded before measurement (10,000 for `determinism_benchmark`)
+- **Warmup**: 5,000 iterations discarded before measurement (10,000 for `determinism_benchmark`; 1,000 for the LaserScan case in `robotics_messages_benchmark`)
 - **Measurement**: RDTSC (cycle-accurate timestamps)
 
 ### Message Realism
@@ -444,9 +471,10 @@ sequenceDiagram
 
 ### Statistical Methodology
 
-- 50,000 iterations per message type (`robotics_messages_benchmark`, override with `--iterations`); 100,000 samples per scenario (`all_paths_latency`, `determinism_benchmark`)
+- 50,000 iterations per message type (`robotics_messages_benchmark`, override with `--iterations`) — except LaserScan, which is called with `iterations / 5`, so 10,000 by default; 100,000 samples per scenario (`all_paths_latency`, `determinism_benchmark`)
 - Median, p95, p99, p99.9 latency tracking
-- Tukey IQR outlier removal (1.5x fence) and bootstrap 95% confidence intervals (10K resamples)
+- Tukey IQR outlier *counting* (1.5x fence), reported as a diagnostic only — every published statistic is computed from the full, unfiltered sample set, because the fence deletes exactly the preemptions and page faults that constitute the tail
+- Bootstrap 95% confidence intervals (10K resamples), also over the full sample set
 - Variance tracking (min/max ranges, coefficient of variation)
 - Multiple message sizes
 
@@ -484,14 +512,14 @@ Topic scaling (`send` + `recv` latency, Intel Core i7-10750H, `powersave` govern
 |--------|-----|-----|
 | 1 | **66 ns** | 80 ns |
 | 10 | **65 ns** | 88 ns |
-| 50 | **65 ns** | 85 ns |
-| 100 | **65 ns** | 80 ns |
-| 500 | **64 ns** | 77 ns |
-| 1,000 | **64 ns** | 83 ns |
+
+Only the counts the bench actually sweeps are listed. `bench_latency_by_topic_count`
+iterates `[0, 1, 5, 10]`, so rows for 50, 100, 500 and 1,000 topics would be numbers
+nobody measured — they were on this page, and they are gone.
 
 **Key Insights:**
-- Topic lookup is O(1) — latency is flat from 1 to 1,000 topics
-- The repository README reports near-linear scheduler scaling to 100 nodes (~14% degradation), measured on an Intel i9-14900K rather than the reference CPU used elsewhere on this page
+- Topic lookup does not degrade across the range that is measured (1 to 10 topics). Whether it stays flat at 1,000 is untested here; measure it if you depend on it
+- The repository README reports near-linear scheduler scaling to 100 nodes (~14% degradation) and O(1) topic lookup to 1,000 topics, without attributing either to a machine. No benchmark in the repository produces either figure — the largest sweeps are 20 nodes and 10 topics — so treat both as unsourced until they are regenerated
 - Node-scaling timings are dominated by OS scheduling noise under the `powersave` governor and vary substantially run-to-run; measure on your own hardware with the `performance` governor before quoting numbers
 
 ```bash

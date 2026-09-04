@@ -47,10 +47,16 @@ let mut scheduler = Scheduler::new()
 | Method | Description | Example |
 |--------|-------------|---------|
 | `.watchdog(duration)` | Arm the watchdogs and set the default timeout | `.watchdog(Duration::from_millis(100))` |
-| `.max_deadline_misses(n)` | Emergency stop after `n` deadline misses, counted cumulatively across **every** RT node — critical or not. A critical node does **not** e-stop on its first miss; per-node escalation is the `Miss` policy's job, and this ceiling is the only deadline-driven e-stop | `.max_deadline_misses(10)` |
+| `.max_deadline_misses(n)` | Emergency stop when **one node** misses its deadline `n` times **consecutively**. The count is per node and is reset by any tick that does not violate, so a node that misses intermittently never reaches the ceiling. A critical node does **not** e-stop on its first miss; per-node escalation is the `Miss` policy's job, and `Miss::Stop` e-stops on the first miss without consulting this ceiling | `.max_deadline_misses(10)` |
 | `.blackbox(size_mb)` | Enable the flight recorder ring buffer (size in MB) | `.blackbox(64)` |
 | `.prefer_rt()` | Try `mlockall()` + SCHED_FIFO, warn on failure | `.prefer_rt()` |
 | `.require_rt()` | Require `mlockall()` + SCHED_FIFO; panics if unavailable | `.require_rt()` |
+
+Watchdog resolution is 1 ms — the scheduler config stores whole milliseconds. `Duration::ZERO`
+disables the watchdog entirely. A non-zero timeout below 1 ms is raised to 1 ms and logged as a
+warning, because truncating it to 0 would silently turn the watchdog off. Anything else truncates
+toward zero with no diagnostic, so `.watchdog(1500_u64.us())` runs a 1 ms watchdog and e-stops at
+3 ms rather than the 4.5 ms you asked for. Sub-millisecond watchdogs are not supported.
 
 ## Configuring Critical Nodes
 
@@ -89,26 +95,33 @@ Watchdogs monitor node liveness. The response to a missed heartbeat is **graduat
 single expiry only warns; an emergency stop is triggered for a critical node once it is 3×
 past its watchdog timeout.
 
-**Where the node runs decides what the watchdog actually detects.** A node on an executor
-(RT, compute, event, async I/O) is fed *after* a successful tick, so a panic or a hang lets
-its watchdog expire — which is the behaviour you want. A node on the main loop — a
-BestEffort node given its own `.watchdog()`, and every node under `.deterministic(true)` —
-is fed *before* its tick runs. Its watchdog therefore detects a hang, but not repeated tick
-failures: the feed has already happened by the time the tick fails.
+Every node is fed the same way, wherever it runs: **after** its tick, and only if that
+tick returned `Ok`. A panic or a hang therefore lets the watchdog expire, which is the
+behaviour you want.
 
 ```
-Executor-owned node:
-  Node tick → success → watchdog fed → timer reset
-
-Main-loop node:
-  watchdog fed → Node tick (success or failure) → timer already reset
+Any node, executor-owned or main-loop:
+  Node tick → Ok → watchdog fed → timer reset
+              ↓
+            Err / panic / hang → not fed → timer runs out
 
 Failure scenario:
   1× timeout → Warning   (logged, node keeps ticking)
-  2× timeout → Unhealthy (node skipped in the tick loop)
+  2× timeout → Unhealthy
   3× timeout → Critical  (node isolated; EMERGENCY STOP latched
                           for critical nodes)
 ```
+
+<Callout type="warning" title="Unhealthy does not stop an RT node ticking">
+The health state gates ticking on the **main loop only**. `should_tick_node` refuses a
+node marked `Unhealthy` or `Isolated` and admits it again on a periodic probe tick.
+
+The RT executor does not consult health state at all — its only gate is the failure
+policy — and neither do the compute, event or async I/O executors. A node on one of
+those keeps running at full rate while it is marked `Unhealthy`; what changes is that
+the state is recorded, escalation continues, and `Kill` (the flag every executor does
+honour) will eventually stop it.
+</Callout>
 
 <Callout type="warning" title="At 3× it is the emergency stop that protects you, not the node's safe state">
 
@@ -159,6 +172,7 @@ Emergency stop is triggered automatically by:
 - A budget violation on a node configured with `.budget_policy(BudgetPolicy::EmergencyStop)`
 - A critical node that panics in `enter_safe_state()` or `shutdown()` and so cannot reach a safe state
 - Exceeding the `max_deadline_misses` threshold
+- A deadline miss on a node configured with `.on_miss(Miss::Stop)` — this fires on the **first** miss, on both the main loop and the RT executor, and does not wait for `max_deadline_misses`
 
 When emergency stop triggers:
 1. All node execution is halted
