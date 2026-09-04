@@ -124,40 +124,41 @@ Nodes transition through well-defined states during their lifetime:
 
 ### Lifecycle States
 
-**Uninitialized**: Node created but not added to scheduler
+**Uninitialized**: The node exists but has not ticked yet. Your `init()` runs
+while the node is still in this state — the scheduler calls it before the first
+tick, and the state does not change until that tick begins.
 
-**Initializing**: Running `init()` method
+**Running**: The node has ticked at least once. `start_tick()` promotes a node
+from `Uninitialized` on its first tick.
 
-**Running**: Executing `tick()` in main loop
+**Error**: A tick returned an error or panicked. What happens next is decided by
+the node's [`FailurePolicy`](/advanced/circuit-breaker), not by this state.
 
-**Paused**: Temporarily suspended (future feature)
+**Crashed**: `init()` or a re-initialisation failed with `Severity::Fatal`. This
+is reached only from initialisation — a failing `tick()` produces `Error`, never
+`Crashed`.
 
-**Stopping**: Running `shutdown()` method
+**Stopped**: The scheduler shut the node down.
 
-**Stopped**: Clean shutdown complete
-
-**Error**: Recoverable error occurred
-
-**Crashed**: Unrecoverable error, node terminated
+Two more variants exist on the `NodeState` enum but are not currently produced by
+the runtime, so no transition below leads to them: **Initializing** is set and
+overwritten within a single call and is never externally observable, and
+**Stopping** is never assigned at all. Treat them as reserved.
 
 ### State Transitions
 
 <MermaidDiagram
-  chart={`%%{init: {'flowchart': {'padding': 15}}}%%
-flowchart LR
-    UN["Uninitialized"]
-    INIT["Initializing"]
-    RUN["Running"]
-    STOP["Stopping"]
-    DONE["Stopped"]
-    ERR["Error"]
-    CRASH["Crashed"]
-
-    UN --> INIT --> RUN --> STOP --> DONE
-    RUN --> ERR
-    ERR --> RUN
-    RUN --> CRASH
-    ERR --> CRASH
+  chart={`stateDiagram-v2
+    [*] --> Uninitialized
+    Uninitialized --> Running: first tick
+    Uninitialized --> Error: init() failed
+    Uninitialized --> Crashed: init() failed, fatal
+    Running --> Error: tick failed (main-thread nodes)
+    Running --> Stopped: scheduler stops
+    Error --> Crashed: re-init failed, fatal
+    Error --> Stopped: scheduler stops
+    Crashed --> [*]
+    Stopped --> [*]
 `}
   caption="Node State Transitions"
 />
@@ -871,14 +872,15 @@ The scheduler intercepts termination signals and ensures proper cleanup:
 <MermaidDiagram
   chart={`%%{init: {'flowchart': {'padding': 15}}}%%
 flowchart TB
-    CTRL["User presses Ctrl+C"]
-    SIG["Signal Handler<br/>(SIGINT/SIGTERM)"]
-    FLAG["scheduler.running = false"]
-    BREAK["Break out of tick loop"]
-    SHUT["For each node:<br/>node.shutdown()"]
-    EXIT["Application exits cleanly"]
-
-    CTRL --> SIG --> FLAG --> BREAK --> SHUT --> EXIT
+    CTRL["Ctrl+C (SIGINT)"] --> H1["ctrlc handler<br/>running = false"]
+    TERM["kill / timeout (SIGTERM)"] --> H2["SIGTERM handler<br/>sets SIGTERM_RECEIVED"]
+    H1 --> LOOP["Tick loop exits"]
+    H2 --> LOOP
+    LOOP --> STOPEX["Stop the four executors,<br/>reclaim their nodes (3s each)"]
+    STOPEX --> SHUT["shutdown() every node<br/>that was initialized"]
+    SHUT --> FIN["Flush blackbox, export telemetry,<br/>clean session"]
+    FIN --> EXIT["run() returns"]
+    H1 -.->|"if shutdown outlasts the 6s watchdog"| FORCE["Force exit<br/>shutdown() skipped"]
 `}
   caption="Signal Handling Flow"
 />

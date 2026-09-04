@@ -194,6 +194,17 @@ const CLASSES = [
     // mismatches and six code blocks with no Copy button on its first run.
   },
   {
+    class: 'structure/diagram-legibility',
+    what: 'a mermaid diagram that renders is also readable: no HTML escaped into a subgraph title, no hardcoded fill its own text fails contrast against',
+    enforced: { where: 'scripts/check-diagrams.mjs', needle: 'which mermaid escapes' },
+    direction: 'n/a',
+    // structure/rendered-output proves a diagram produced an <svg>. It cannot
+    // see a diagram that renders perfectly and is wrong on the screen. A
+    // <small> in a subgraph title drew its own tags as visible text, and three
+    // diagrams paired white labels with 500-weight fills at 2.15:1 and 2.54:1 —
+    // valid SVG, clean render, unreadable picture.
+  },
+  {
     class: 'structure/route-uniqueness',
     what: 'no two app routes can match the same URL',
     enforced: { where: 'scripts/check-routes.mjs', needle: 'can match the same URL' },
