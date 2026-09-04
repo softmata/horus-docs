@@ -371,12 +371,33 @@ if (scanned < 50) {
 // A count is a weak guard: a walk that lost `components/` still reads 180 files
 // from `content/` and passes. Name the files that carried the original defect,
 // so a rename or a re-rooted walk fails loudly instead of going quiet.
+// components/BenchmarkCharts.tsx was here, and is gone. All thirteen of its
+// charts were unused by every page while still registered into the MDX scope,
+// and each carried hardcoded performance data naming no benchmark — a 200-node
+// scaling curve the suite sweeps to 20, a 0% deadline-miss claim nothing
+// measures. It is the file the four retracted ratios below came from. The
+// entry is not simply deleted: it is recorded here so that re-adding a chart
+// component without a named benchmark is a decision someone has to make
+// deliberately rather than a file quietly reappearing.
 const MUST_SCAN = [
-  'components/BenchmarkCharts.tsx',
   'app/[...slug]/page.tsx',
   'content/docs/performance/benchmarks.mdx',
   'scripts/build-search-index.js',
 ];
+
+// The charts must not come back unsourced. If components/ grows a file with
+// chart data again, it has to be scanned, so fail if one appears and MUST_SCAN
+// has not been updated to name it.
+const chartFiles = files
+  .map((f) => path.relative(root, f).replace(/\\/g, '/'))
+  .filter((f) => f.startsWith('components/') && /Chart|chartData|recharts/.test(fs.readFileSync(path.join(root, f), 'utf8')));
+if (chartFiles.length) {
+  console.error(
+    `chart component(s) reappeared without being named in MUST_SCAN: ${chartFiles.join(', ')}. ` +
+      `Every series needs a benchmark that produces it; add the file to MUST_SCAN once it does.`
+  );
+  process.exit(2);
+}
 const relFiles = new Set(files.map((f) => path.relative(root, f).replace(/\\/g, '/')));
 const missed = MUST_SCAN.filter((f) => !relFiles.has(f));
 if (missed.length) {

@@ -194,6 +194,19 @@ const CLASSES = [
     // mismatches and six code blocks with no Copy button on its first run.
   },
   {
+    class: 'structure/toml-fence',
+    what: 'every TOML block parses, and every manifest example agrees with the schema this site publishes',
+    enforced: { where: 'scripts/check_toml_fences.py', needle: 'agrees with the published schema' },
+    direction: 'both',
+    // compiles/rust|cpp|python cover 1,256 of roughly 2,000 fenced blocks. TOML
+    // was in the uncovered half, which mattered because
+    // public/schema/horus.toml.schema.json is served at a stable URL and
+    // configuration.mdx tells readers to point their editor at it — so a
+    // manifest example the schema rejects shows up as an error on a line the
+    // reader copied from us. The same check re-derives the schema with
+    // `horus schema` and fails when the published copy has drifted from it.
+  },
+  {
     class: 'structure/diagram-legibility',
     what: 'a mermaid diagram that renders is also readable: no HTML escaped into a subgraph title, no hardcoded fill its own text fails contrast against',
     enforced: { where: 'scripts/check-diagrams.mjs', needle: 'which mermaid escapes' },
