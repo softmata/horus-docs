@@ -655,35 +655,47 @@ let topic = Topic::new("camera.front.raw")?;
 
 ---
 
-### "No such file or directory" when creating Topic
+### Topic name rejected as an absolute path
 
-**Symptom**: Application crashes with:
+**Symptom**: `Topic::new` fails and the message repeats the name back:
 ```
-thread 'main' panicked at 'Failed to create publisher 'camera': No such file or directory'
-```
-
-**Cause**: You're using **slashes (`/`)** in your topic name. While slashes work on Linux (parent directories are created automatically), they fail on **macOS** where shared memory uses `shm_open()` which doesn't support embedded slashes.
-
-HORUS topic names map to files under `/dev/shm/horus_<namespace>/topics/` on Linux (the namespace is `default` unless `HORUS_NAMESPACE` is set):
-
-```
-Topic: "sensors.camera"  →  /dev/shm/horus_default/topics/sensors.camera  (cross-platform)
-Topic: "sensors/camera"  →  /dev/shm/horus_default/topics/sensors/camera  (Linux only, fails on macOS)
+SHM region name must be relative, got absolute path "/sensors/camera"
 ```
 
-**Fix**: Use dots instead of slashes for cross-platform compatibility:
+**Cause**: A leading slash. Topic names are relative — they are joined onto the shared
+memory topics directory, and a name beginning with `/` would discard that directory and
+put the region at an arbitrary path, so the name validator rejects it on every platform
+(along with `..` and `.` components).
+
+Interior slashes are accepted everywhere. On Linux they nest a directory under
+`/dev/shm/horus_<namespace>/topics/` (the namespace is `default` unless `HORUS_NAMESPACE`
+is set); on macOS the whole name is hashed into one flat `shm_open` object, so the
+separator never reaches the filesystem.
+
+```
+Topic: "sensors.camera"   →  /dev/shm/horus_default/topics/sensors.camera
+Topic: "sensors/camera"   →  /dev/shm/horus_default/topics/sensors/camera
+Topic: "/sensors/camera"  →  rejected: SHM region name must be relative
+```
+
+**Fix**: Drop the leading slash. Prefer dots, which is the convention the rest of HORUS
+follows:
 
 ```rust
-// NOT RECOMMENDED - fails on macOS
-let topic: Topic<f32> = Topic::new("sensors/camera")?;
-let topic: Topic<Twist> = Topic::new("robot/cmd_vel")?;
+// REJECTED - a leading slash is an absolute path
+let topic: Topic<f32> = Topic::new("/sensors/camera")?;
 
-// RECOMMENDED - works on all platforms
+// ACCEPTED, but off-convention: the fan-out lock filename flattens `/` to `_`,
+// so "sensors/camera" and "sensors_camera" share one lock file
+let topic: Topic<f32> = Topic::new("sensors/camera")?;
+
+// RECOMMENDED
 let topic: Topic<f32> = Topic::new("sensors.camera")?;
 let topic: Topic<Twist> = Topic::new("robot.cmd_vel")?;
 ```
 
-**Coming from ROS?** ROS uses slashes (`/sensor/lidar`) because it uses network-based naming. HORUS uses dots because topic names map directly to shared memory file names. See [Topic Naming](/concepts/core-concepts-topic#use-dots-not-slashes) for details.
+**Coming from ROS?** ROS topic names are absolute (`/sensor/lidar`). HORUS names are
+relative, and use dots. See [Topic Naming](/concepts/core-concepts-topic#use-dots-not-slashes) for details.
 
 ---
 
@@ -844,23 +856,7 @@ Starting application...
    }
    ```
 
-4. **Circular Priority Dependencies**
-   - Node A waits for Node B, Node B waits for Node A
-
-   **Fix**: Ensure data flows one direction:
-   ```rust
-   // BAD: Circular dependency
-   // Node A (priority 0) subscribes to "data_b"
-   // Node B (priority 1) subscribes to "data_a"
-   // Both wait for each other!
-
-   // GOOD: Unidirectional flow
-   // Node A (priority 0) publishes to "data_a"
-   // Node B (priority 1) subscribes to "data_a", publishes to "data_b"
-   // Node C (priority 2) subscribes to "data_b"
-   ```
-
-5. **Debug with Logging**
+4. **Debug with Logging**
    ```rust
    fn tick(&mut self) {
        hlog!(debug, "Tick started");
@@ -869,6 +865,13 @@ Starting application...
    }
    ```
    If you see "Tick started" but never "Tick completed", the hang is in your code.
+
+**Not a hang: a cycle in the pub/sub graph.** Node A subscribing to what node B
+publishes while node B subscribes to what node A publishes does not freeze anything —
+`recv()` never blocks, so no node waits on another. The scheduler's topological sort
+cannot order the cycle, so it prints `WARNING: Dependency graph error: ... Falling back
+to sequential.` and ticks every node one at a time in `.order()` order. What you lose is
+parallel dispatch, not liveness.
 
 ---
 

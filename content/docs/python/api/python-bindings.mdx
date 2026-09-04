@@ -466,7 +466,7 @@ horus.run(sensor, controller, logger, duration=10)
 horus.run(node, verbose=False)  # Quieter output
 ```
 
-`horus.run()` creates a `Scheduler` (with `deterministic=False` unless you pass otherwise), adds each node in the order given, and runs it. `Node(order=N)` is a registration order, not a tick sequence. Every Python node carries a rate (30 Hz by default; `rate <= 0` raises `ValueError`), and unless the node is declared `compute=True`, `on="topic"`, or has an `async def` tick, that rate makes it real-time and gives it a thread of its own — so nodes tick concurrently and the executor provides no ordering guarantee between them, whatever `order` says. `order` sequences ticks only under `deterministic=True`, where every node stays on the main thread; even there, the scheduler derives its execution steps from pub/sub topic metadata when any has been registered, and falls back to `order` tiers only when none exists.
+`horus.run()` creates a `Scheduler` (with `deterministic=False` unless you pass otherwise), adds each node in the order given, and runs it. `Node(order=N)` is a registration order, not a tick sequence. Every Python node carries a rate (30 Hz by default; `rate <= 0` raises `ValueError`), and unless the node is declared `compute=True`, `on="topic"`, or has an `async def` tick, that rate makes it real-time and gives it a thread of its own — so nodes tick concurrently and the executor provides no ordering guarantee between them, whatever `order` says. `order` sequences ticks only under `deterministic=True`, where every node stays on the main thread; even there, the scheduler derives its execution steps from pub/sub metadata registered during `init()`, and falls back to `order` tiers when there is none — which is the usual case, since a topic first used inside the tick function registers too late to enter the graph.
 
 ### Message Timestamps
 
@@ -657,13 +657,13 @@ named_topic = Topic(CmdVel, endpoint="cmdvel")
 | `topic.send(msg, node=None)` | Send a message. Pass optional `node` for automatic IPC logging. Always returns `True` — it does not report a drop, so use `try_send()` when you need to know |
 | `topic.recv(node=None)` | Receive one message. Returns the message or `None` if empty. |
 | `topic.name` | Property: the topic name string |
-| `topic.backend_type` | Property: the active backend name (e.g., `"PodShm"`, `"SpmcShm"`); `"Unknown"` until the backend resolves |
+| `topic.backend_type` | Property: the active backend name (e.g., `"PodShm"`, `"SpscShm"`); `"Unknown"` until the backend resolves |
 | `topic.is_network_topic` | Property: always `False`. Python topics are never networked, so the flag reports the transport rather than the spelling of the endpoint |
 | `topic.endpoint` | Property: the endpoint string, or `None` for local topics |
 | `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `missed_count`, `dropped_count`, `is_network` (always `False`), `backend`. `messages_sent`/`messages_received` stay at `0` unless verbose content logging is on — use `horus topic hz` for traffic |
 | `topic.is_generic()` | Returns `True` if this is a generic (string-name) topic |
 | `topic.try_send(msg, node=None)` | Like `send()`, but reports the outcome: returns `True` if the message went into the ring, `False` if it did not |
-| `topic.send_blocking(msg, timeout_s, node=None)` | Waits up to `timeout_s` seconds for room. Raises `horus.HorusTimeoutError` on timeout, `ValueError` for a negative, NaN or infinite timeout, and `NotImplementedError` on Image, PointCloud, DepthImage and Tensor topics |
+| `topic.send_blocking(msg, timeout_s, node=None)` | Waits up to `timeout_s` seconds for room. Raises `horus.HorusTimeoutError` on timeout, `ValueError` for a negative, NaN or infinite timeout, and `NotImplementedError` on Image, PointCloud, DepthImage and Tensor topics. On a broadcast-backed topic (`backend_type` `"PodShm"` or `"FanoutShm"`) it never sends at all: the backend overwrites unread messages and has no full condition to wait on, so the call is refused before the first write attempt and raises the same `HorusTimeoutError`. Python has no separate exception for it — a `HorusTimeoutError` that comes back in roughly zero seconds means the topic is broadcast-backed, not saturated |
 | `topic.try_recv()` | Like `recv()`, without the logging path |
 | `topic.read_latest()` | Newest value without consuming the queue — for state-like data. POD message types only: raises `RuntimeError` on generic (string-name) topics and on `Image`, `PointCloud`, `DepthImage`, `OccupancyGrid`, `CostMap`, `Tensor`, `CompressedImage`, `PlaneArray` and `TactileArray`; use `recv()` there |
 | `topic.pending_count()` | Messages waiting to be read |
@@ -686,7 +686,7 @@ if msg:
 
 # Check topic properties
 print(f"Name: {topic.name}")           # "cmd_vel"
-print(f"Backend: {topic.backend_type}") # e.g. "SpmcShm"
+print(f"Backend: {topic.backend_type}") # "SpscShm" here — "Unknown" before the first send/recv
 print(f"Stats: {topic.stats()}")
 ```
 
@@ -766,7 +766,9 @@ exists in the enum but backend detection never chooses it — its consumers shar
 and compete for messages, which is queue semantics rather than pub/sub.
 
 `topic.backend_type` reports the resolved cross-process backend once it is known — one of
-`"Unknown"`, `"PodShm"`, `"SpscShm"`, `"SpmcShm"`, `"MpscShm"`, or `"FanoutShm"`.
+`"Unknown"`, `"PodShm"`, `"SpscShm"`, `"MpscShm"`, or `"FanoutShm"`. The enum's sixth
+name, `"SpmcShm"`, is not among them in practice: nothing a Python program can call
+selects it.
 
 ### When to Use What
 
@@ -790,7 +792,7 @@ horus run --net
 
 The Python program itself stays exactly as it is above — `Topic(Odometry)` — with no
 endpoint. Which topics cross the network is decided by the `[network]` section of
-`horus.toml`, not in Python: see
+`horus.toml`, not in Python — and that table only reaches the runtime when `horus run` launches several executables; a single-binary run needs the `HORUS_NET_*` environment variables instead. See
 [Networking](/package-management/configuration#networking) for `import`, `deny_export`
 and the peer filter.
 
@@ -1271,11 +1273,14 @@ maturin develop --release
 ### Slow Performance
 
 ```bash
-# Use release build (not debug)
+# Use a release build, not debug
 maturin develop --release
+```
 
-# Check tick rate isn't too high
-node = horus.Node(tick=fn, rate=30)  # 30Hz is reasonable
+Then check the tick rate is not higher than the work needs:
+
+```python
+node = horus.Node(tick=fn, rate=30)  # 30 Hz is reasonable
 ```
 
 ### Memory Issues

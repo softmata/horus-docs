@@ -129,15 +129,21 @@ Use `horus run --release` to measure.
 
 ### Link-Time Optimization (LTO)
 
-Enable LTO in your `Cargo.toml` for additional 10-20% speedup:
+Enable LTO in your `horus.toml` for additional 10-20% speedup:
 
 ```toml
-# Cargo.toml
-[profile.release]
+# horus.toml
+[rust.profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 ```
+
+HORUS splices `[rust.profile.release]` into the generated `.horus/Cargo.toml`. Put the
+profile there and not in `.horus/Cargo.toml` itself: that file is rewritten from
+`horus.toml` on every `horus build` or `horus run`, and the build prints the settings it
+just discarded along with the `horus.toml` key each one belongs under. A `horus new`
+project has no root `Cargo.toml` to edit at all.
 
 **Warning**: Slower compilation, but faster execution.
 
@@ -145,9 +151,15 @@ codegen-units = 1
 
 Release builds target a baseline CPU so the binary runs anywhere. For maximum performance on a machine you control, compile targeting its specific CPU:
 
-```bash
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+```toml
+# horus.toml
+[rust]
+rustflags = ["-C", "target-cpu=native"]
 ```
+
+Cargo.toml has no slot for rustflags, so HORUS writes this one to a generated
+`.cargo/config.toml` that `horus build --release` picks up. An exported `RUSTFLAGS`
+environment variable still overrides it.
 
 **Gains**: 5-15% from CPU-specific instructions. The resulting binary only runs on CPUs with the same feature set, so build this way on (or for) the deployment machine.
 
@@ -451,18 +463,18 @@ horus clean --shm
 
 ### Topic Memory Usage
 
-Topics carrying inline (Pod) messages use shared memory slots proportional to message size. Keep those messages small to reduce memory footprint:
+Topics carrying inline (Pod) messages hold the whole struct in the ring slot, but a POD of 56 bytes or less **whose alignment is 8 or less** is padded to a single 64-byte cache line, so every such type costs the same 64 bytes per slot. Alignment is a hard gate: a small but over-aligned POD (a `u128` field, `#[repr(align(16))]`, an SSE vector) takes the split layout instead — a slot exactly `size_of::<T>()` wide plus an 8-byte sequence entry — so for those, shrinking the message does change the per-slot cost. Shrinking a message below that threshold saves nothing:
 
 ```rust
 // Inline (Pod) messages: the ring slot holds the whole struct
-let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;       // 16B per slot
+let cmd: Topic<CmdVel> = Topic::new("cmd_vel")?;       // 64B per slot (16B payload padded to one cache line)
 
 // Pool-backed types are zero-copy: the ring slot holds a fixed-size
 // descriptor, the point data lives in the shared TensorPool
 let cloud: Topic<PointCloud> = Topic::new("cloud")?;    // 272B descriptor per slot
 ```
 
-**Balance**: For inline Pod messages, message size directly affects shared memory consumption. Pool-backed types (`Image`, `PointCloud`, `DepthImage`, `OccupancyGrid`, `CostMap`) keep only a fixed-size descriptor in the ring, so their slot cost does not grow with the payload.
+**Balance**: For inline Pod messages, footprint tracks message size only above 56 bytes; at or below that every type occupies one 64-byte slot. Pool-backed types (`Image`, `PointCloud`, `DepthImage`, `OccupancyGrid`, `CostMap`) keep only a fixed-size descriptor in the ring, so their slot cost does not grow with the payload.
 
 ## Profiling and Measurement
 

@@ -281,46 +281,42 @@ a warning naming the replacement. See
 
 ### Using --enable for Capabilities
 
-The `--enable` flag lets you quickly enable features without editing `horus.toml`:
+The `--enable` flag sets Cargo features for one run, without editing `horus.toml`. It takes
+a comma-separated list, and it replaces the top-level `enable = [...]` key for that run
+rather than adding to it.
 
 ```bash
-# Enable CUDA GPU acceleration
-horus run --enable cuda
+# LAN replication — the one capability HORUS itself implements
+horus run --enable net
 
-# Enable multiple capabilities
-horus run --enable cuda,editor,python
+# Several at once
+horus run --enable net,my_own_feature
 ```
 
-**Available capabilities:**
+**Capabilities HORUS handles:**
 
-| Capability | Description |
-|------------|-------------|
-| `cuda`, `gpu` | CUDA GPU acceleration |
-| `editor` | Scene editor UI |
-| `visual` | Visualization support |
-| `python`, `py` | Python bindings |
-| `headless` | No rendering (for training) |
-| `opencv` | OpenCV backend |
-| `io-uring` | io_uring networking backend |
-| `ultra-low-latency` | Ultra-low-latency tuning |
-| `sim`, `simulation` | Simulation mode (no hardware features) |
-| `net`, `network` | LAN replication — same as `horus run --net` |
-| `full` | All features |
+| Capability | Effect |
+|------------|--------|
+| `net`, `network` | LAN replication — same as `horus run --net`. Applied to the `horus` dependency in the generated manifest, not to your crate |
+| `sim`, `simulation` | Accepted and expands to nothing |
 
-Anything not in this list is passed straight through to `cargo --features`, so an
-unrecognised name fails the build. `net`/`network` and `sim`/`simulation` are recognised
-names that add no feature to your own crate — `net` is applied to the `horus` dependency
-in the generated manifest instead, which is why `horus run --enable net` works. **Hardware backends are not capabilities** —
-select those with `-d/--drivers`:
+Every other name is forwarded to `cargo build --features <name>` against the crate HORUS
+generates for **your** code in `.horus`, a few renamed on the way: `gpu` → `cuda`,
+`py` → `python`, `opencv` → `opencv-backend`, `io-uring` → `io-uring-net`. Unrecognised
+names go through unchanged. Either way, no HORUS crate declares those features, so unless
+you declare one yourself under `[rust.features]` the build fails with cargo reporting that
+none of the selected packages contains it. In particular `--enable cuda` does not add GPU
+support: there is no CUDA capability anywhere in HORUS. **Hardware backends are not
+capabilities** — select those with `-d/--drivers`:
 
 ```bash
 horus run -d camera,lidar,imu --release
 ```
 
-**Or configure in horus.toml:**
+**Or configure in horus.toml** — `enable` is a top-level key, not a table:
 
 ```toml
-enable = ["cuda", "editor"]
+enable = ["net"]
 ```
 
 **`--enable sim` is not `--sim`.** The `sim` capability only tells the build to
@@ -1116,7 +1112,10 @@ optional tool as degraded:
 
 Either way it is a warning, not a pass — `horus doctor` exits `1` when any check warns and
 `2` when any check fails, so an incomplete language never renders as a green tick next to
-a healthy one. Run `horus doctor -v` to see every tool, its version, and the command that
+a healthy one. Both exit codes are suppressed by `--fix`: `horus doctor --fix` returns `0`
+however many checks warned or failed, including when the fixing pass could not install
+what was missing. Anything gating on the result has to run a plain `horus doctor` after
+the fixing pass. Run `horus doctor -v` to see every tool, its version, and the command that
 installs the ones that are missing:
 
 ```text
@@ -1489,7 +1488,7 @@ horus topic list              # List all active topics
 horus topic echo <topic>      # Print messages as they arrive
 horus topic info <topic>      # Show topic details (type, publishers, subscribers)
 horus topic hz <topic>        # Measure publishing rate (-w/--window N, default 10)
-horus topic bw <topic>        # Measure bandwidth (bytes/sec; -w/--window N)
+horus topic bw <topic>        # Measure bandwidth (bytes/sec; -w/--window N, default 100)
 horus topic pub <topic> <msg> # Publish a message
 ```
 
@@ -1503,9 +1502,9 @@ horus topic list
 #
 #   NAME                                 SIZE       MSGS     RATE       STATUS
 #   --------------------------------------------------------------------------
-#   /cmd_vel                             16 B       1240  50.0 Hz       active
-#   /scan                              1.4 KB        248  10.0 Hz       active
-#   /odom                               736 B        620  25.0 Hz       active
+#   cmd_vel                              16 B       1240  50.0 Hz       active
+#   scan                               1.4 KB        248  10.0 Hz       active
+#   odom                                736 B        620  25.0 Hz       active
 #
 #   Total: 3 topic(s)
 ```
@@ -1515,19 +1514,19 @@ instead of the compact table.
 
 **Monitor a topic in real-time**:
 ```bash
-horus topic echo /scan
+horus topic echo scan
 # Prints each LaserScan message as it arrives
 ```
 
 **Check publishing rate**:
 ```bash
-horus topic hz /cmd_vel
+horus topic hz cmd_vel
 # Output:   average rate: 50.00 Hz (window: 10)
 ```
 
 **Publish test message**:
 ```bash
-horus topic pub /cmd_vel '{"timestamp_ns": 0, "linear": 1.0, "angular": 0.5}'
+horus topic pub cmd_vel '{"timestamp_ns": 0, "linear": 1.0, "angular": 0.5}'
 ```
 
 `horus topic pub` sends the JSON you hand it as-is — it does not validate the
@@ -1601,8 +1600,9 @@ horus action cancel-goal <name>          # Cancel goals on an action server
 # Send a goal and block until the result arrives
 horus action send-goal navigate '{"x": 2.0, "y": 1.0}' --wait
 
-# Cancel one goal, or every goal if --goal-id is omitted
-horus action cancel-goal navigate --goal-id 7
+# Cancel one goal, or every goal if --goal-id is omitted.
+# --goal-id must be a UUID — take it from `horus action list` or the send-goal output.
+horus action cancel-goal navigate --goal-id 6f1c1a4e-2b90-4b6c-9f4a-6b0f1e0b8a11
 horus action cancel-goal navigate
 ```
 
@@ -1633,16 +1633,20 @@ horus node resume <node>      # Resume a paused node
 ```bash
 horus node list
 # Output:
-#   NAME                        STATUS   PRIORITY   RATE        TICKS   SOURCE
-#   ---------------------------------------------------------------------------
-#   SensorNode                 Running         50    100 Hz      12043    12345
-#   ControllerNode             Running         40     50 Hz       6021    12346
-#   LoggerNode                  Paused          0     10 Hz       1204    12347
+#   NAME                     STATUS    HEALTH PRIORITY      RATE    ACTUAL    TICKS   SOURCE
+#   ----------------------------------------------------------------------------------------
+#   SensorNode              Running   Healthy        50    100 Hz   99.8 Hz    12043    12345
+#   ControllerNode          Running   Warning        40     50 Hz   41.2 Hz     6021    12346
+#   LoggerNode               Paused         —         0     10 Hz         —     1204    12347
 ```
 
-`SOURCE` carries the PID for a local node, or a marker such as `[bridged:…]` /
-`[horus_net:…]` for one reached through a bridge or the network. CPU and memory are not
-in this table — `horus node info <node>` reports those.
+`HEALTH` is the node's health grade — `Healthy`, `Warning`, `Error`, `Critical`, or `—`
+when no heartbeat has arrived. `RATE` is the rate the node was configured for and `ACTUAL`
+is the rate it is measured at, coloured by how far it has fallen behind (green at 90% of
+the configured rate or better, yellow above 60%, red below); `—` means nothing has been
+measured yet, which is not the same as 0 Hz. `SOURCE` carries the PID for a local node, or
+a marker such as `[bridged:…]` / `[horus_net:…]` for one reached through a bridge or the
+network. CPU and memory are not in this table — `horus node info <node>` reports those.
 
 **Get detailed node info**:
 ```bash
@@ -1781,7 +1785,7 @@ horus param list                  # List all parameters
 horus param get <key>             # Get parameter value
 horus param set <key> <value>     # Set parameter value
 horus param delete <key>          # Delete a parameter
-horus param reset                 # Reset all parameters to defaults
+horus param reset --force         # Reset all parameters to defaults; --force is required
 horus param load <file>           # Load parameters from YAML file
 horus param save [<file>]         # Save parameters to YAML file (default: .horus/config/params.yaml)
 horus param dump                  # Dump all parameters as YAML to stdout
@@ -2060,9 +2064,13 @@ nodes:
 `namespace`, `depends_on`, `start_delay`, `restart` (`never`, `always`, `on-failure`),
 and `priority`.
 
-> **Note**: `priority` is currently inert — it is exported to the child process but
-> nothing reads it. Set priority with `.priority()` on the Rust builder or `priority=`
-> on the Python `Node` instead, both of which reach the scheduler.
+> **Note**: `priority` and `rate_hz` are both inert. Each is exported to the child process
+> — as `HORUS_NODE_PRIORITY` and `HORUS_NODE_RATE_HZ` — and nothing in the workspace reads
+> either one, so a launch file cannot set a node's priority or its tick rate. Both values
+> still appear in `--dry-run` and `--list` output. Set priority with `.priority()` on the
+> Rust builder or `priority=` on the Python `Node`; set the rate with
+> `Scheduler::tick_rate()` or `.rate()` on the Rust node builder, or `.rate()` on the
+> Python `scheduler.add(...)` chain.
 
 ### Examples
 
@@ -2437,18 +2445,18 @@ horus record inject <session>  # Inject recorded data into live scheduler
 ```bash
 horus record list
 # Output:
-# ✓ Found 2 recording session(s):
+# * Found 2 recording session(s):
 #
-#   rec_001
-#   rec_002
+#   > rec_001
+#   > rec_002
 
 # With -l/--long, each line gains a file count and size:
 horus record list --long
 # Output:
-# ✓ Found 2 recording session(s):
+# * Found 2 recording session(s):
 #
-#   rec_001 (4 files, 45.0 MB)
-#   rec_002 (3 files, 18.2 MB)
+#   > rec_001 (4 files, 45.0 MB)
+#   > rec_002 (3 files, 18.2 MB)
 ```
 
 There is no date, duration or node count in this listing — `--long` adds only the file
@@ -2679,7 +2687,9 @@ horus scripts calibrate -- --sensor front
 ```
 
 `horus script` (singular) is an alias for the same command. Everything after `--` is
-handed to the script untouched.
+handed to the script untouched. `horus run <name>` runs the same entry: `horus run`
+checks the `[scripts]` table before it looks for any file, so a script name shadows a
+file or directory called the same thing.
 
 See [Configuration → \[scripts\]](/package-management/configuration) for how to
 define them.

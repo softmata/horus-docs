@@ -194,6 +194,34 @@ const CLASSES = [
     // mismatches and six code blocks with no Copy button on its first run.
   },
   {
+    class: 'structure/shell-fence',
+    what: 'every ```bash block is shell and parses',
+    enforced: { where: 'scripts/check_shell_fences.py', needle: 'Every shell block parses' },
+    direction: 'n/a',
+    // 592 bash blocks and nothing opened one. docs_cli_contract checks that a
+    // documented command and its flags exist, not that the fence contains
+    // shell. Three blocks carried a Rust or Python line appended to a recipe
+    // under "# Or from code" — which a reader cannot paste, and which
+    // verify:rust never sees, because it is inside a ```bash fence. Three more
+    // were sample output. This does not check that a recipe does what the prose
+    // says; that needs a fixture project, and the recipes found broken by hand
+    // (an install landing where the next command does not look) are evidence
+    // the class is worth one.
+  },
+  {
+    class: 'structure/toml-fence',
+    what: 'every TOML block parses, and every manifest example agrees with the schema this site publishes',
+    enforced: { where: 'scripts/check_toml_fences.py', needle: 'agrees with the published schema' },
+    direction: 'both',
+    // compiles/rust|cpp|python cover 1,256 of roughly 2,000 fenced blocks. TOML
+    // was in the uncovered half, which mattered because
+    // public/schema/horus.toml.schema.json is served at a stable URL and
+    // configuration.mdx tells readers to point their editor at it — so a
+    // manifest example the schema rejects shows up as an error on a line the
+    // reader copied from us. The same check re-derives the schema with
+    // `horus schema` and fails when the published copy has drifted from it.
+  },
+  {
     class: 'structure/diagram-legibility',
     what: 'a mermaid diagram that renders is also readable: no HTML escaped into a subgraph title, no hardcoded fill its own text fails contrast against',
     enforced: { where: 'scripts/check-diagrams.mjs', needle: 'which mermaid escapes' },

@@ -17,21 +17,6 @@ import { compileMDX } from 'next-mdx-remote/rsc';
 import remarkGfm from 'remark-gfm';
 import CodeBlock from '@/components/CodeBlock';
 import Callout from '@/components/Callout';
-import {
-  LatencyComparisonChart,
-  LatencyScalingChart,
-  ScalabilityChart,
-  SpeedupChart,
-  ThroughputChart,
-  RealTimeChart,
-  PythonComparisonChart,
-  PythonThroughputChart,
-  PythonStressChart,
-  PythonRustComparisonChart,
-  TransformFrameLatencyChart,
-  TransformFrameSpeedupChart,
-  TransformFrameMemoryChart,
-} from '@/components/BenchmarkCharts';
 import MermaidDiagram from '@/components/MermaidDiagram';
 import { defaultLocale, type Locale } from '@/lib/i18n';
 
@@ -181,27 +166,15 @@ export async function getDoc(slug: string[], locale: Locale = defaultLocale): Pr
       components: {
         // Callout component for notes, warnings, etc.
         Callout,
-        // Benchmark charts
-        LatencyComparisonChart,
-        LatencyScalingChart,
-        ScalabilityChart,
-        SpeedupChart,
-        ThroughputChart,
-        RealTimeChart,
-        PythonComparisonChart,
-        PythonThroughputChart,
-        PythonStressChart,
-        PythonRustComparisonChart,
-        // TransformFrame charts
-        TransformFrameLatencyChart,
-        TransformFrameSpeedupChart,
-        TransformFrameMemoryChart,
-        // TransformFrameConcurrentChart was removed: every point in it was
-        // invented, including a TF2 curve for the one row
-        // /concepts/transform-frame says has no TF2 comparison. A component in
-        // this map is a component any page can drop in, so an unrendered chart
-        // is still a live surface — see the note where it used to be in
-        // components/BenchmarkCharts.tsx.
+        // The benchmark charts were removed. All thirteen were unused by every
+        // page, and each carried hardcoded performance data that named no
+        // benchmark -- 200-node scaling the suite never sweeps, and a 0%
+        // deadline-miss claim nothing measures. TransformFrameConcurrentChart
+        // had already gone the same way for the same reason: every point in it
+        // was invented. A component in this map is a component any page can
+        // drop in, so an unrendered chart is still a live surface, and these
+        // were one <ScalabilityChart /> away from publishing numbers with no
+        // source. If charts come back, each series needs a named benchmark.
         // Diagrams
         MermaidDiagram,
         h2: ({ children, ...props }: any) => {

@@ -131,9 +131,11 @@ sched.run()
 <Callout type="warning" title="Order matters: replay settings after add_replay()">
 `stop_at_tick()` and `set_replay_speed()` write into the replay state that
 `add_replay()` (or `replay_from()`) creates. Called on a scheduler that has no
-recording loaded yet they are silently ignored — you get a full-speed replay of
-the whole recording and no error. `horus record inject` applies them in this
-same order internally.
+recording loaded yet they do nothing and raise no error — you get a full-speed
+replay of the whole recording. `set_replay_speed()` gives you no sign of this at
+all; `stop_at_tick()` prints `[REPLAY] Will stop at tick N` whether or not the
+tick was stored, so that line is not evidence the setting took effect.
+`horus record inject` applies them in this same order internally.
 </Callout>
 
 `horus.Scheduler.replay_from(scheduler_path)` is the whole-session version — it
@@ -149,7 +151,7 @@ The key pattern: separate your **processing nodes** from your **hardware drivers
 
 ```python
 import horus
-from horus import CmdVel, LaserScan, Topic
+from horus import CmdVel, LaserScan
 
 
 # This controller works identically with live OR recorded data
@@ -159,17 +161,15 @@ class Controller(horus.Node):
             name="controller",
             rate=100,
             order=10,
-            subs=["lidar.scan"],
-            pubs=["cmd_vel"],
+            subs=[horus.Sub("lidar.scan", LaserScan)],
+            pubs=[horus.Pub("cmd_vel", CmdVel)],
         )
-        self.scan = Topic(LaserScan, endpoint="lidar.scan")
-        self.cmd = Topic(CmdVel, endpoint="cmd_vel")
 
     def tick(self, info=None):
         # Drain to the freshest scan on the topic; do nothing if none arrived.
         scan = None
         while True:
-            msg = self.scan.recv()
+            msg = self.recv("lidar.scan")
             if msg is None:
                 break
             scan = msg
@@ -181,7 +181,7 @@ class Controller(horus.Node):
         min_range = min((r for r in scan.ranges if r > 0.01), default=999.0)
 
         linear = 0.3 if min_range > 0.5 else 0.0
-        self.cmd.send(CmdVel(linear=linear, angular=0.0))
+        self.send("cmd_vel", CmdVel(linear=linear, angular=0.0))
 
 
 sched = horus.Scheduler(tick_rate=100, name="replay_demo", deterministic=True)
@@ -190,6 +190,13 @@ sched.add(Controller())
 print("Controller running at 100 Hz (Ctrl+C to stop)")
 sched.run()
 ```
+
+Declare the message type inside `subs=`/`pubs=` rather than declaring the name
+there and building a separate `Topic` for it. A bare `subs=["lidar.scan"]`
+opens the topic as an untyped `GenericMessage` ring, and a following
+`Topic(LaserScan, endpoint="lidar.scan")` on that same name is then rejected —
+the ring holds 4364-byte messages and `LaserScan` is 1480, so the constructor
+raises before the node is built.
 
 The node names matter here: `horus record inject --nodes lidar_node` matches on
 the `name=` a node was constructed with, and that is also the filename the

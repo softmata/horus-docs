@@ -41,9 +41,10 @@ query it, a dependency on `horus` alone is enough.
 Depend on `horus-tf` directly for the rest of its surface — `FrameId`,
 `timestamp_now`, `TransformFramePublisher`, `TransformQuery` — none of which the
 `horus` prelude re-exports. The listing below calls `timestamp_now()`, so it takes
-the direct dependency. `horus-tf` declares `horus_core` and `horus_macros` as relative path dependencies that do not exist inside its git checkout, so a `[patch]` section pointing at your local HORUS checkout is required alongside it:
+the direct dependency. `horus-tf` declares `horus_core` and `horus_macros` as relative path dependencies that do not exist inside its git checkout, so a plain-cargo project has to redirect them itself, in its own `Cargo.toml`:
 
 ```toml
+# Cargo.toml — a plain-cargo project, not horus.toml
 [dependencies]
 horus-tf = { git = "https://github.com/softmata/horus-tf.git", rev = "d525dfcf58b99ee9c015ed5b0b3f20450b7c1e0c" }
 
@@ -52,6 +53,12 @@ horus-tf = { git = "https://github.com/softmata/horus-tf.git", rev = "d525dfcf58
 horus_core = { path = "/path/to/horus/horus_core" }
 horus_macros = { path = "/path/to/horus/horus_macros" }
 ```
+
+A `horus.toml` project needs none of that: `horus-tf` is one of the build's fixed patch
+targets, so the generated `.horus/Cargo.toml` carries that same table on every build. Do
+not copy the block into `horus.toml` — `patch` is not a top-level key there, `horus check`
+rejects it as unknown, and the table never reaches the build. Extra patch entries of your
+own go under `[rust.patch."…"]`.
 
 ```rust
 use horus_tf::prelude::*; // TransformFrame, TransformFrameConfig, Transform, FrameId, timestamp_now
@@ -252,8 +259,12 @@ unchanged, and it looks exactly like a successful lookup. Ask for a pose from an
 and you get the oldest sample you still have, silently.
 
 The window is `history_len` samples deep (32 by default), so at 100 Hz it covers about
-320 ms. If you query further back than your update rate covers, either raise `history_len`
-or compare the returned transform's own timestamp against what you asked for.
+320 ms. To have an out-of-window query reported instead of clamped, use `tf_at_strict`,
+which returns `Err(HorusError::Transform(TransformError::Extrapolation { .. }))` when any
+hop in the chain would have to extrapolate, or `tf_at_with_tolerance`, which clamps only
+while the nearest stored sample is within `tolerance_ns` of the timestamp you asked for.
+Both have `_by_id` forms. Raising `history_len` widens the window; it does not tell you
+when you have left it.
 
 ---
 
@@ -262,33 +273,45 @@ or compare the returned transform's own timestamp against what you asked for.
 ### Presets
 
 ```rust
-// Default / Small (256 frames, ~550KB)
+// Default / Small (256 frames, ~2MB)
 let hf = TransformFrame::new();       // Same as TransformFrame::small()
 let hf = TransformFrame::small();
 
-// Medium (1024 frames, ~2.2MB)
+// Medium (1024 frames, ~8MB)
 let hf = TransformFrame::medium();
 
-// Large (4096 frames, ~9MB)
+// Large (4096 frames, ~32MB)
 let hf = TransformFrame::large();
 ```
 
 | Preset | Frames | Static | History | Cache | Memory |
 |--------|--------|--------|---------|-------|--------|
-| `small()` | 256 | 128 | 32 | 64 | ~550KB |
-| `medium()` | 1024 | 512 | 32 | 128 | ~2.2MB |
-| `large()` | 4096 | 2048 | 32 | 256 | ~9MB |
+| `small()` | 256 | 128 | 32 | 64 | ~2MB |
+| `medium()` | 1024 | 512 | 32 | 128 | ~8MB |
+| `large()` | 4096 | 2048 | 32 | 256 | ~32MB |
+
+The Memory column is what the constructor allocates, not what the frames in use cost.
+Every preset sets `enable_overflow`, and the constructor pushes all `4 × max_frames`
+slots up front — each one a `history_len`-long array of 64-byte entries — so `small()`
+claims 1024 × 32 × 64 B before you register a single frame.
+Divide by four if you turn overflow off.
 
 Additional presets for simulation:
 
 ```rust
-// Massive (16384 frames, ~35MB) - 100+ robot simulations
+// Massive (16384 frames, ~128MB) - 100+ robot simulations
 let hf = TransformFrame::with_config(TransformFrameConfig::massive());
 
-// Grow-on-demand: pre-allocates 4x the configured frame count and lets the
-// limit grow into it, up to a hard ceiling of 65536 frames
+// Grow-on-demand: max_frames 4096 pre-allocated 4x, so the limit doubles
+// into that space and stops at 16384 frames
 let hf = TransformFrame::with_config(TransformFrameConfig::unlimited());
 ```
+
+65536 (`MAX_SUPPORTED_FRAMES`) is the cap applied to that 4x pre-allocation, not
+`unlimited()`'s own ceiling — only `massive()` reaches it. Register more frames than
+the pre-allocation holds and the call returns `Maximum frame limit (16384) reached
+(physical capacity exhausted)`. Every preset on this page sets `enable_overflow`, so
+`unlimited()` differs from `large()` only in its chain cache (512 entries against 256).
 
 ### Custom Configuration
 
@@ -297,7 +320,8 @@ let hf = TransformFrame::with_config(TransformFrameConfig {
     max_frames: 2048,           // Total frames (16-65536)
     max_static_frames: 1024,    // Static frames (less memory, faster)
     history_len: 64,            // Past transforms per dynamic frame (4-256)
-    enable_overflow: false,     // Allow HashMap for unlimited frames
+    enable_overflow: false,     // false: hard ceiling at max_frames (2048 here).
+                                // true: pre-allocate 4x and let the limit double into it
     chain_cache_size: 256,      // LRU cache for chain lookups
 });
 ```

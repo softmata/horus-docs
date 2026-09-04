@@ -87,10 +87,18 @@ A **typed** topic (`Topic(CmdVel)`, or `pubs={"cmd_vel": {"type": CmdVel}}`) car
 message as a fixed-size struct. A **generic** topic (a bare name with no type, carrying a
 dict) carries MessagePack bytes. They are different wire formats on the same topic name.
 
-Connect one to the other and nothing complains: the typed subscriber reinterprets the
-MessagePack bytes as the struct and returns plausible-looking nonsense. There is no
-exception and no log, because at the shared-memory level both sides did exactly what they
-were told.
+Mix the two on one name and the second handle refuses to open. The ring records the size
+of the message it was created for, and the generic carrier (`GenericMessage`, 4364 bytes)
+does not fit a `CmdVel` ring (16 bytes) — in either order. Construction raises:
+
+```
+RuntimeError: Failed to create Topic 'cmd_vel': Communication error: Failed to create
+topic 'cmd_vel': type size mismatch — the topic holds 16 byte messages, this build's
+'GenericMessage' is 4364 bytes. Common causes: ...
+```
+
+That lands at `Topic(...)` or `Node(...)` construction, before the first `send()` or
+`recv()`, so a mismatched pair never starts rather than exchanging garbage.
 
 Pick one per topic and keep both ends on it. Use typed topics for anything a Rust or C++
 node also touches — a dict topic is Python-to-Python only.
@@ -109,7 +117,8 @@ cmd.send(CmdVel(linear=1.0, angular=0.5))
 
 # With functional nodes, use node.send().
 # Declare the type so this stays a typed topic — a bare `pubs=["cmd_vel"]`
-# would make it a generic MessagePack topic that typed subscribers misread.
+# opens a generic MessagePack topic, which fails to attach to an existing
+# typed `cmd_vel` ring with a size-mismatch RuntimeError.
 def my_tick(node):
     node.send("cmd_vel", {"linear": 1.0, "angular": 0.0})
 
@@ -222,7 +231,7 @@ Run them together:
 horus run motor_control.rs planner.py logger.py
 ```
 
-All processes communicate through shared memory — sub-microsecond between Rust nodes (198–304ns p50 cross-process), a few microseconds once Python is in the path.
+All processes communicate through shared memory — sub-microsecond between Rust nodes (151–304ns p50 cross-process), a few microseconds once Python is in the path.
 
 ## Complete Example: Sensor Pipeline
 
@@ -243,9 +252,11 @@ def avoider_tick(node):
         else:
             cmd_topic.send(CmdVel(linear=1.0, angular=0.0))
 
+# No `subs=`/`pubs=` here: the tick already holds typed handles to both rings.
+# Naming them again as bare strings would open generic topics on the same names
+# and fail with a size mismatch.
 avoider = horus.Node(name="obstacle_avoider", tick=avoider_tick,
-                     rate=30, order=0,
-                     subs=["scan"], pubs=["cmd_vel"])
+                     rate=30, order=0)
 horus.run(avoider)
 ```
 
