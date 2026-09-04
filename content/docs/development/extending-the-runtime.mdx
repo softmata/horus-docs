@@ -1,0 +1,680 @@
+---
+title: "Extending the Runtime"
+description: "The seams a customiser can actually use — the exec driver, the node registry, Scheduler::on_start, failure policies and the e-stop hooks — and which of them are public API"
+order: 32
+---
+
+# Extending the Runtime
+
+There are five places where you can put your own code into a running HORUS
+graph without editing `horus_core`. This page names all five, says what each one
+can and cannot do, and marks which are public API and which are merely reachable.
+It also names two seams that read as pluggable in the source and are not wired
+to anything, so you do not spend an afternoon implementing a trait that nothing
+will ever call.
+
+## Which seams are public
+
+`horus_core` marks almost every module `#[doc(hidden)]`: the comment above the
+list says "Public modules — accessible cross-crate but hidden from user docs.
+Users should go through `horus::prelude`, not import from `horus_core` directly"
+(`horus_core/src/lib.rs:18-19`). `doc(hidden)` does not stop your code
+compiling. It means the item is not rendered in the crate's documentation and
+carries no stability promise. Read the column below as "how likely is this to
+change under you", not "can I call it".
+
+| Seam | You reach it as | Status |
+|------|-----------------|--------|
+| `[hardware]` config and `exec:` | `horus::hardware::load()` | `horus_core::drivers` is `pub` but `#[doc(hidden)]` (`horus_core/src/lib.rs:26-27`); the `horus::hardware` alias carries its own doc comment (`horus/src/lib.rs:359-371`) |
+| Node registry | `horus::register_driver!`, or `horus::hardware::registry::register` | The macro is `#[macro_export]` and re-exported with documentation at `horus/src/lib.rs:391-396`; `registry` is a plain `pub mod` (`horus_core/src/drivers/mod.rs:23`) |
+| `Scheduler::on_start` | `horus::prelude::Scheduler` | Public method, no `doc(hidden)` (`horus_core/src/scheduling/scheduler/mod.rs:960-982`) |
+| `FailurePolicy` | `horus::prelude::FailurePolicy` | Public, in the prelude (`horus/src/lib.rs:601`) |
+| E-stop and safe-state hooks | `horus::scheduling::set_emergency_stop_hook` and four siblings | The module is `pub(crate)` (`horus_core/src/scheduling/mod.rs:26`); the five functions are re-exported under `#[doc(hidden)]` (`horus_core/src/scheduling/mod.rs:285-290`, alongside `BudgetPolicy`, `SafetyState` and `SafetyStats`) |
+
+The prelude entries are the two you can lean on. The rest work, and the exec
+driver in particular is the intended answer for non-Rust hardware, but nothing
+in the repository holds their signatures still.
+
+## The exec driver
+
+Any program that publishes to HORUS shared-memory topics is a valid driver
+whatever it is written in. `ExecDriver` wraps that program as a `Node`: it
+launches it, watches it, restarts it, and signals it on shutdown.
+
+### Declaring one
+
+```toml
+[hardware.lidar]
+use  = "exec:./drivers/rplidar"
+args = ["--serial", "/dev/ttyUSB0"]
+
+# everything below reaches the child as an environment variable
+baudrate = 115200
+frame_id = "laser"
+
+# except these three, which the driver consumes itself
+max_retries        = 5
+restart_delay_ms   = 250
+shutdown_timeout_ms = 2000
+```
+
+The prefix is parsed at `horus_core/src/drivers/mod.rs:217`: anything after
+`exec:` is taken as a path and handed to `ExecDriver::from_config`
+(`drivers/mod.rs:229`). The legacy spelling `exec = "./drivers/rplidar"` is
+rewritten to the same `exec:` form at `drivers/mod.rs:182-187`, and `[drivers]`
+is still accepted as an alias for `[hardware]` (`drivers/mod.rs:87-89`).
+
+<Callout type="warning" title="`[hardware]` starts nothing until your program asks">
+No HORUS command turns a `[hardware]` entry into a running node. The only code
+that builds a `Node` from the section is `horus_core::drivers::load_from`
+(`drivers/mod.rs:78`), and outside `horus_core`'s own tests and the Python
+binding nothing in the workspace calls it — the caller is your `main`.
+
+`horus_manager` does read the section, for two other things: `horus doctor`
+probes the declared devices (`horus_manager/src/commands/doctor.rs:1159-1200`),
+and dependency sync pulls the `package` and `crate` keys out of it to keep
+`Cargo.toml` in step (`horus_manager/src/native_sync.rs:313-327`). Neither
+constructs a node. A `[hardware]` table in a project whose `main.rs` never calls
+`hardware::load()` is inert, and nothing warns you.
+</Callout>
+
+```rust,ignore
+use horus::prelude::*;   // Node, Scheduler, Result, hlog!, DurationExt
+
+fn main() -> Result<()> {
+    let mut sched = Scheduler::new().tick_rate(100_u64.hz()).name("robot");
+
+    for (name, node) in horus::hardware::load()? {
+        hlog!(info, "loading hardware node {}", name);
+        sched.add(node).build()?;
+    }
+
+    sched.run()
+}
+```
+
+`load()` returns `(table key, node)` pairs, and `Box<dyn Node>` satisfies
+`Scheduler::add` directly (`horus_core/src/scheduling/node_builder.rs:91-95`).
+It searches for `horus.toml` in the current directory and then upwards, ten
+directories in total — the current one plus at most nine parents, because the
+loop is `for _ in 0..10` and checks a candidate before stepping up
+(`drivers/mod.rs:384-398`). Use `load_from(path)` when you want an explicit
+file — a multi-robot layout, or a test.
+
+`Result` here is the prelude's alias for `HorusResult` (`horus_core/src/error.rs:849`).
+`HorusResult` itself is **not** in the prelude glob; it is reachable as
+`horus::HorusResult` (`horus/src/lib.rs:404`), so use one name or import the
+other.
+
+### Reserved keys
+
+Eleven keys never become parameters. The loader filters them out before it
+builds `NodeParams` (`drivers/mod.rs:112-124`, applied at `:210`):
+
+`use`, `sim`, `args`, `terra`, `package`, `node`, `crate`, `source`, `pip`,
+`exec`, `simulated`.
+
+Of those, the loader itself reads `use`, `sim` and `args`, and — as fallbacks
+when `use` is absent, in this order — `terra`, `node`, `package`, `exec`, `pip`
+and `crate` (`drivers/mod.rs:158-194`). The remaining two, `source` and
+`simulated`, are consulted nowhere. They are declared on the manifest struct as
+well (`horus_manager/src/manifest.rs:932` and `:941`, the latter with the serde
+alias `sim3d`) and nothing in either crate reads those fields either. Setting
+one has no effect beyond keeping it out of your parameters.
+
+`args` must be an array of strings. Non-string elements are dropped without a
+message: the parser is `as_array()` followed by `filter_map(as_str)`
+(`drivers/mod.rs:219-227`), so `args = [1, "--fast"]` silently launches the
+child with one argument. `args` is read there and nowhere else — it is reserved,
+so it never reaches `NodeParams` and never becomes an environment variable.
+
+Three more keys are reserved by `ExecDriver` rather than by the loader. They
+reach `NodeParams` and the driver then consumes them, so they are **not**
+forwarded to the child:
+
+| Key | Default | What it controls |
+|-----|---------|------------------|
+| `max_retries` | `3` | Total relaunch attempts for the whole run, not consecutive failures — see below |
+| `restart_delay_ms` | `1000` | Base backoff, doubled per attempt, capped at 30,000 ms |
+| `shutdown_timeout_ms` | `5000` | How long `shutdown()` waits after SIGTERM before the force kill |
+
+Read at `horus_core/src/drivers/exec_driver.rs:82-84`; excluded from the
+environment by the `matches!` at `:88-91`. The defaults are the same three
+constants as `ExecDriverConfig::default()` (`exec_driver.rs:37-39`).
+
+<Callout type="warning" title="A mistyped value for these three is silent">
+All three are read with `NodeParams::get_or`, which is
+`.and_then(|v| T::from_toml(v).ok()).unwrap_or(default)`
+(`horus_core/src/drivers/params.rs:74-79`). The conversion error is discarded.
+So `max_retries = "five"` gives you 3; `restart_delay_ms = 0.5` gives you 1000,
+because `u64::from_toml` goes through `i64::from_toml` and a TOML float is not
+an integer (`params.rs:132-138`, `:148-155`); and `max_retries = -1` gives you 3
+again, because `u32::try_from(-1)` fails (`params.rs:157-163`). The driver
+starts, the value you wrote is gone, and nothing is logged. Use
+`params.get::<T>(key)?` in your own factories when a wrong type should be an
+error rather than a default (`params.rs:58-64`).
+</Callout>
+
+### What the child process gets
+
+The child inherits the scheduler's own environment — `launch()` sets no
+`env_clear` (`exec_driver.rs:167-171`) — and on top of that gets one variable
+per non-reserved key, named `HORUS_PARAM_<KEY IN UPPERCASE>`. The value is
+stringified in this order: a string as-is, then `i64`, then `f64`, then `bool`
+via `to_string`, and otherwise the raw TOML rendering of the value
+(`exec_driver.rs:86-109`, the name built at `:106`).
+
+That is the same prefix `RuntimeParams` reads on the way in: the third and
+highest-precedence layer of `RuntimeParams::new()` strips `HORUS_PARAM_` and
+lowercases the remainder (`horus_core/src/params.rs:180-188`). So
+`baudrate = 115200` in the table arrives in a HORUS Rust child as the runtime
+parameter `baudrate`, and a child in any other language can read the variable
+directly. What the C++ and Python bindings do with `HORUS_PARAM_*` is not
+covered here; only the Rust-side `RuntimeParams` behaviour above is verified.
+
+<Callout type="warning" title="Dashes do not survive, and `HORUS_DRIVER_NAME` is not set">
+`exec_driver.rs:106` uppercases the key and does nothing else. It does not
+translate `-` to `_` the way the launch-file path does
+(`horus_manager/src/commands/launch.rs:1173`, which is
+`k.to_uppercase().replace('-', "_")`), so `serial-port = "/dev/ttyUSB0"` becomes
+a variable literally named `HORUS_PARAM_SERIAL-PORT`. It is set, and a Rust
+child's `RuntimeParams` will see it as `serial-port`, but no POSIX shell can
+name it. Prefer underscores in `[hardware]` keys.
+
+Separately: [Environment Variables](/development/environment-variables) lists
+`HORUS_DRIVER_NAME` as set by "every exec driver"
+(`environment-variables.mdx:180`). It is not. The only assignment is
+`exec_driver.rs:139`, inside `ExecDriver::from_params`, and the only caller of
+that function anywhere in the workspace is the unit test at `exec_driver.rs:355`.
+The live path is `from_config` (`drivers/mod.rs:229`), which never sets it. The
+same claim is repeated in a comment in the docs-contract suite
+(`horus_manager/tests/docs_contract.rs:774`), where it is prose, not an
+assertion. Do not write a child that depends on reading the variable.
+</Callout>
+
+### Lifecycle
+
+| `Node` method | What `ExecDriver` does |
+|---------------|------------------------|
+| `init()` | Spawns the binary with `args` and the `HORUS_PARAM_*` environment, `stdout` and `stderr` inherited from the scheduler (`exec_driver.rs:166-184`, called at `:212-219`) |
+| `tick()` | Polls the child with `try_wait()`; if it has exited, schedules a relaunch for a deadline in the future and returns (`exec_driver.rs:187-204`, `:221-268`) |
+| `shutdown()` | `SIGTERM` on Unix, `Child::kill` elsewhere; polls every 50 ms; force kill once `shutdown_timeout_ms` has passed (`exec_driver.rs:270-314`) |
+
+Because health is a poll inside `tick()`, a crash is noticed at the node's tick
+rate, not the instant it happens. Whether the child's inherited `stdout` and
+`stderr` end up anywhere `horus log` can read is not established here; all that
+is verified is that `Stdio::inherit()` is used.
+
+`tick()` never sleeps. The backoff is stored as a deadline in `next_restart_at`
+and checked on each subsequent tick (`exec_driver.rs:233-242`). It used to be a
+`std::thread::sleep` on the shared executor thread, which meant one flapping
+device stalled every co-scheduled node for up to 30 seconds; the field's own
+comment records that (`exec_driver.rs:56-60`). The delay is
+`restart_delay_ms << min(attempt - 1, 20)`, saturating, then clamped to 30,000 ms
+(`exec_driver.rs:253-258`) — the shift is clamped before the multiply, because
+the earlier `restart_delay_ms * 2u64.pow(restart_count - 1)` applied `.min(30_000)`
+too late and overflowed first: a panic inside `tick()` in debug, and in release a
+wrap to roughly zero that turned the backoff into an unthrottled respawn loop
+(`exec_driver.rs:246-252`). The regression test is
+`restart_backoff_is_non_blocking_and_cannot_overflow` (`exec_driver.rs:388-422`).
+
+<Callout type="danger" title="`max_retries` is a lifetime budget, and running out is silent">
+`restart_count` is set to zero once, at construction (`exec_driver.rs:70`), and
+outside tests the only other write is the increment at `:245`. A successful
+relaunch does not reset it. So `max_retries = 5` means five relaunches across
+the entire run, not five consecutive failures.
+
+Once the count reaches `max_retries`, the `if` at `exec_driver.rs:244` stops
+matching: `tick()` detects the dead child, finds no scheduled restart, falls
+through, and returns. Nothing is logged, no error is raised, no failure policy
+fires. The node stays in the graph, ticking and doing nothing, and the topics
+the child was publishing stop updating.
+</Callout>
+
+<Callout type="warning" title="A launch failure does not stop the scheduler">
+When `init()` cannot spawn the binary it returns
+`Error::Config(ConfigError::Other(..))` with the text
+`exec driver '<name>' failed to launch: <io error>` (`exec_driver.rs:212-219`).
+That variant falls into the catch-all arm of `Error::severity()` and classifies
+as `Permanent` (`horus_core/src/error.rs:1227`). The scheduler stops the run
+only for `Fatal` (`scheduler/mod.rs:3437-3444`); for anything else it prints
+`Failed to initialize node '…'`, moves the node's context to error
+(`scheduler/mod.rs:3426-3433`, `:3451`) and carries on. The node is left with
+`initialized == false`, and `should_tick_node` returns false for exactly that
+(`scheduler/mod.rs:4687-4689`), so there is no retry either. A typo in an
+`exec:` path costs you one line of output at startup and a permanently absent
+driver.
+</Callout>
+
+### The node's name is the binary's, not the table key's
+
+`load()` hands you the table key as the tuple's first element, but the node's
+own `name()` comes from the binary's file stem (`exec_driver.rs:111-115`). So
+`[hardware.camera]` with `use = "exec:/bin/echo"` yields the pair
+`("camera", node)` where `node.name()` is `"echo"`; the test asserting both is
+`load_exec_prefix` (`horus_core/src/drivers/tests.rs:322-335`). `name()` is what
+appears in `horus node list` and in scheduler diagnostics, so give two exec
+drivers two differently-named binaries or you will not be able to tell them
+apart.
+
+### Simulation
+
+`sim = true` on an entry, plus `HORUS_SIM_MODE` set to anything other than
+empty, `0` or `false` — the comparison is `eq_ignore_ascii_case`, so `FALSE`
+counts too (`drivers/mod.rs:99-101`) — replaces the entry with an inert
+`SimStubNode` named `<key>_sim_stub` and never launches the child
+(`drivers/mod.rs:139-156`). `horus run --sim` sets `HORUS_SIM_MODE=1`
+(`horus_manager/src/main.rs:2568`). `HORUS_SIM_TARGETS`, a comma-separated list,
+narrows the substitution to named entries (`drivers/mod.rs:103-109`, filtered at
+`:142-145`); `horus run --sim lidar camera` sets it from the argument list
+(`main.rs:2569-2571`).
+
+The value parsing is deliberate: presence alone used to mean "on", so a deploy
+script setting `HORUS_SIM_MODE=0` to force real hardware got stub nodes instead
+— actuators never commanded, sensors never read, nothing logged
+(`drivers/mod.rs:94-98`).
+
+### Which languages reach which path
+
+| Caller | `use = "SomeType"` | `use = "exec:./bin"` |
+|--------|--------------------|----------------------|
+| Rust, via `horus::hardware::load()` | Looks up the registry, calls your factory (`drivers/mod.rs:232-233`) | Launches the subprocess |
+| Python, via `horus.drivers.load()` | Instantiates a class registered with `horus.drivers.register_driver` (`horus_py/src/drivers.rs:72-82`) | **No subprocess.** The Python path calls `load_config_entries`, which parses entries into `(name, use_name, params)` with no `exec:` dispatch (`drivers/mod.rs:290-381`); an `exec:` entry comes back as a bare `NodeParams` object (`horus_py/src/drivers.rs:83-86`) |
+| C++ | No path. The string `hardware` does not occur anywhere in `horus_cpp` | No path |
+
+The Python module is exposed as `horus.drivers`, not `horus.hardware`: the
+package imports only that name (`horus_py/horus/__init__.py:226`, listed in
+`__all__` at `:1968`), even though the Rust side registers the submodule under
+both names in `sys.modules` (`horus_py/src/drivers.rs:125-126`).
+
+`load_config_entries` also has no simulation handling of any kind, so `sim = true`
+and `HORUS_SIM_MODE` do nothing on the Python path — the entry is returned like
+any other.
+
+So `exec:` is how a C++ or Go or shell driver joins the graph, and it has to be
+a Rust `main` that loads it.
+
+## The node registry
+
+For a driver written in Rust, register a factory and refer to it by name from
+`[hardware]`:
+
+```rust,ignore
+use horus::prelude::*;
+use horus::hardware::NodeParams;
+
+impl ImuDriver {
+    fn from_params(params: &NodeParams) -> Result<Self> {
+        let port = params.get::<String>("port")?;      // required; errors if absent or wrong type
+        let baud = params.get_or("baudrate", 115200u32); // optional; falls back silently
+        Ok(Self { /* ... */ })
+    }
+}
+
+horus::register_driver!(ImuDriver, ImuDriver::from_params);
+```
+
+The name the registry stores is `stringify!($name)` — the type name you passed,
+not a string you choose (`horus_core/src/drivers/registry.rs:133`).
+`[hardware.imu]` then needs `use = "ImuDriver"` exactly. Registration is a
+`HashMap::insert`, so a repeat overwrites silently (`registry.rs:53-58`; the test
+that pins the behaviour is `register_overwrites` at `:190-197`).
+
+An unknown `use` value is a hard error listing what is registered
+(`drivers/mod.rs:232-247`). If the registry is empty the message instead reads
+"No node types are registered. Call `register!()` or `terra_horus::register_all()`
+first" (`drivers/mod.rs:238`) — and there is no `register!` macro: the only
+`macro_rules!` in `horus_core` on this path is `register_driver!`
+(`registry.rs:123`). Ignore the name in the message and use `register_driver!`
+or `registry::register`.
+
+<Callout type="warning" title="`register_driver!` emits an ELF constructor with no `cfg` guard">
+The macro registers by emitting a static into `.init_array` — the ELF
+constructor section — with no `cfg` guard of any kind
+(`horus_core/src/drivers/registry.rs:122-145`, the `link_section` attribute at
+`:129`, which is the only occurrence of that string anywhere in the workspace).
+[Installation](/getting-started/installation) lists macOS and Windows as
+supported platforms (`installation.mdx:25-26`), and neither uses ELF. Compare
+the umbrella crate's own link-time hook, which does the same job through the
+`ctor` crate rather than by hand (`horus/src/lib.rs:213-215`,
+`horus/Cargo.toml:30`).
+
+What happens on those two targets is not established here. The macro has no call
+site in this repository outside doc comments. Its one compilable call site
+anywhere is a plain ```rust block in the docs
+(`horus-docs/content/docs/tutorials/10-write-a-driver-rust.mdx:240`, inside the
+block spanning `:45-266`), which the example sweep does compile — but only in
+the `examples-compile` job, which is gated
+`if: github.event_name == 'schedule' || inputs.run_compile_sweep`
+(`.github/workflows/docs-contract.yml:338`) and runs on `ubuntu-latest` (`:339`).
+No macOS or Windows job runs that sweep: `docs_examples` is invoked nowhere else
+in `.github/workflows/`. Treat the macro as Linux-only until someone builds it
+elsewhere and reports what the constructor does.
+
+The portable route is the plain function the macro would have called. It is
+`pub`, it is ordinary code, and it runs when you run it (`registry.rs:53`,
+re-exported at `drivers/mod.rs:27`):
+
+```rust,ignore
+horus::hardware::registry::register("ImuDriver", |params| {
+    Ok(Box::new(ImuDriver::from_params(params)?))
+});
+```
+
+Call it at the top of `main`, before `hardware::load()`.
+</Callout>
+
+## `Scheduler::on_start`
+
+`on_start` is the only lifecycle-extension hook the scheduler exposes — it is
+the sole `pub fn on_*` on the type; the only other matches in
+`horus_core/src/scheduling` are `NodeBuilder::on_miss`. It takes a `FnOnce`
+returning `Option<Box<dyn Any + Send>>`, and any handle you return is held for
+the scheduler's lifetime (`scheduler/mod.rs:960-982`).
+
+```rust,ignore
+scheduler.on_start(|| {
+    let handle = start_background_service();
+    Some(Box::new(handle))  // dropped at shutdown, LIFO
+});
+```
+
+What it can do: start a background thread, open a connection, take a lock —
+anything whose teardown you can express as `Drop`. Handles are popped and dropped
+in reverse registration order at the end of the run
+(`scheduler/mod.rs:3227-3229`), and that happens **before** the nodes'
+`shutdown()` runs (`:3231`), so a service your nodes still need during their own
+teardown is already gone.
+
+<Callout type="warning" title="Hooks run after every node's `init()`, not before">
+The doc comment says the hook is invoked "after signal handlers are set up but
+before the tick loop begins" (`scheduler/mod.rs:962-965`), and that is exactly
+what it means — the tick loop, not node initialisation.
+
+`run()` delegates to `run_with_filter` (`scheduler/mod.rs:2624-2625`), whose
+first statement is `finalize_and_init()` (`:2776`). That applies the deferred
+config and then calls `initialize_filtered_nodes(None)`, which runs every node's
+`init()` (`:2352-2362`) — all of it before the Tokio `block_on` at `:2810` where
+the hooks live. Inside the block-on the order is `install_panic_hook`,
+`setup_signal_handlers` (`:2825-2826`), the network auto-wire guard (`:2834`),
+then the hooks (`:2843-2848`). The `initialize_filtered_nodes` call at `:2850`
+is a second pass that skips anything already initialised (`:3358-3363`), so it
+does nothing on a normal `run()`.
+
+The practical consequence: an `on_start` hook cannot prepare state a node's
+`init()` depends on. If you need that ordering, do the work before you call
+`run()`.
+</Callout>
+
+What it cannot do: touch the nodes. The hook takes no arguments and returns no
+error, so it cannot inspect the graph, cannot refuse to start, and cannot
+report a failure other than by panicking. There is no `on_stop` — the string
+does not appear in `horus_core/src` at all; the `Drop` on your returned handle
+is the shutdown half.
+
+<Callout type="danger" title="Registering any `on_start` hook disables network auto-wiring">
+The scheduler auto-starts `horus_net` only when no hook has been registered:
+the guard is `if self.network_enabled && self.lifecycle_start_hooks.is_empty()`
+(`scheduler/mod.rs:2834`). The `horus` umbrella crate registers the auto-wire
+function at load time through a `ctor` (`horus/src/lib.rs:213-225`); it is that
+function, invoked at `:2836`, which then calls `scheduler.on_start(..)` to add
+the replicator hook. The guard exists so a manual `horus::net::wire_with_config`
+is not doubled up.
+
+The consequence is that one unrelated `on_start` — a metrics exporter, a
+watchdog thread — turns off LAN replication for the whole process, with no
+warning. If you need both, wire the network yourself inside your own hook.
+
+This only bites when the `net` feature is on. It is opt-in, not default:
+`default = ["macros", "telemetry", "blackbox"]` (`horus/Cargo.toml:39`, `net` at
+`:44`).
+</Callout>
+
+## The `Node` trait
+
+`Node` is what a customiser implements. `tick` is the only required method; the
+rest have defaults (`horus_core/src/core/node.rs:971-1066`).
+
+| Method | Line | Called by the scheduler? | Notes |
+|--------|------|--------------------------|-------|
+| `tick(&mut self)` | `:992` | Yes, every scheduled cycle | The only required method. Returns `()`, so a node reports failure only by panicking |
+| `name(&self) -> &str` | `:976` | Yes | Defaults to `type_name` with everything before the last `::` stripped |
+| `init(&mut self)` | `:987` | Yes, once, before any `on_start` hook | An `Err` stops the run only if its severity is `Fatal`; see the exec-driver note above |
+| `shutdown(&mut self)` | `:997` | Yes, once, and only for nodes that initialised (`scheduler/mod.rs:4156`) | A panic becomes `NodeError::ShutdownPanic` and is printed as `Error shutting down node '…'` (`scheduler/mod.rs:4169-4176`, `:4192`); the presence file is removed either way (`:4181`, `:4191`) |
+| `enter_safe_state(&mut self)` | `:1024` | Yes — see the call sites below | The hook that safes hardware. Write it idempotent: `Miss::SafeMode` once called it 18 times across 17 ticks before an `in_safe_mode` latch was added (`horus_core/src/scheduling/types.rs:515-528`) |
+| `is_safe_state(&self) -> bool` | `:1019` | **No.** Nothing in `horus_core/src` calls it except a unit test at `core/rt_node.rs:261` | `core/rt_node.rs:36` says so outright: "The scheduler does not poll `is_safe_state()`" |
+| `on_error(&mut self, &str)` | `:1016` | Yes, after a tick panic | `#[doc(hidden)]` and advisory; see below |
+| `on_parameter_change(...)` | `:1058` | **No.** Not wired | Its own doc comment says the scheduler does not call it and that overriding it has no effect today (`:1030-1035`). Use `RuntimeParams::on_change()` instead (`horus_core/src/params.rs:205`) |
+
+### Where `enter_safe_state` is called from
+
+Six places, and which one fires decides whether the scheduler keeps running:
+
+- The external safe-state path, when a `safe_state` link-loss request arrives —
+  every node the scheduler still owns is driven directly
+  (`scheduler/mod.rs:3598-3612`).
+- The emergency-stop path, likewise (`scheduler/mod.rs:3754-3763`).
+- `StalePolicy::SafeState` on a stale subscription (`scheduler/mod.rs:5163-5168`).
+- A fatal failure policy after a tick panic
+  (`horus_core/src/scheduling/types.rs:594-599`), and the failed-restart path
+  (`types.rs:617-628`).
+- The watchdog ladder, for nodes an executor owns. `enter_safe_state()` needs
+  `&mut dyn Node`, which only the owning thread has, so the main thread raises a
+  flag and the executor consumes it in `honor_safe_state_request`
+  (`horus_core/src/scheduling/primitives.rs:56-88`); `DegradationAction::Isolate`
+  is the same shape (`primitives.rs:148-157`).
+- `Miss::SafeMode` on an RT deadline miss, once per episode, behind the
+  `in_safe_mode` latch (`horus_core/src/scheduling/rt_executor.rs:1452-1462`).
+
+Panics are handled differently in different places, which is worth knowing
+before you write the body. On the two scheduler-owned paths a panic is caught
+and reported — `'…' panicked in enter_safe_state(); it did NOT reach a safe
+state` on the e-stop path (`scheduler/mod.rs:3758-3763`) and
+`SAFE STATE: '…' PANICKED in enter_safe_state; node stopped` on the external
+safe-state path (`:3607-3610`); on the stale path the node is marked via
+`note_safing_failure`, which stops it and escalates to a system e-stop for a
+critical node (`scheduler/mod.rs:5163-5168`, `:5502-5507`). On the executor
+paths the panic is caught and the node is stopped (`primitives.rs:69-79`,
+`:151-156`).
+
+### `on_error` is advisory, on the main thread
+
+`on_error` returns nothing and is `#[doc(hidden)]` (`node.rs:1015-1016`). Its
+default body is empty on purpose: every caller runs `record_tick_failure` first,
+which already logs the error, so the old default printed the same text twice
+(`node.rs:1005-1014`).
+
+It fires only after a tick **panic** — `tick()` cannot return an error — from
+five sites: the main-thread path (`scheduler/mod.rs:5574`, inside
+`handle_tick_failure` at `:5536`) and the four executors
+(`event_executor.rs:505`, `rt_executor.rs:1589`, `compute_executor.rs:885`,
+`async_executor.rs:378`).
+
+<Callout type="warning" title="Only one of the five `on_error` call sites is panic-guarded">
+The comment at `scheduler/mod.rs:5571-5572` — "on_error is advisory — a panic
+here is isolated and logged, not escalated (unlike enter_safe_state/shutdown,
+which safe hardware)" — describes the main-thread call, which is wrapped in
+`guard_fault_callback`, a `catch_unwind` (`scheduler/mod.rs:5498-5500`), and
+prints `Node '…' also panicked in on_error() — ignoring (advisory callback)`
+before continuing (`:5574-5579`).
+
+The four executor call sites call `node.node.on_error(&error_msg)` with no such
+wrapper, inside the arm that is already handling a caught panic
+(`rt_executor.rs:1516`, `:1589`). What a second panic does on those threads is
+not established here; do not rely on it being isolated. Keep `on_error` bodies
+free of anything that can panic, and put recovery in them, not reporting.
+</Callout>
+
+## Failure policies
+
+`FailurePolicy` is a per-node choice made at registration time via
+`NodeBuilder::failure_policy` (`horus_core/src/scheduling/node_builder.rs:430`),
+and one of the two seams in the prelude (`horus/src/lib.rs:601`).
+
+| Variant | Constructor | Effect |
+|---------|-------------|--------|
+| `Fatal` | `FailurePolicy::Fatal` | First failure safes the node and stops the scheduler |
+| `Restart { max_restarts, initial_backoff }` | `FailurePolicy::restart(n, d)` | Re-runs `init()` with exponential backoff; escalates to a fatal stop once the budget is gone |
+| `Skip { max_failures, cooldown }` | `FailurePolicy::skip(n, d)` | After `max_failures` consecutive failures, the node is skipped for `cooldown`, then retried |
+| `Ignore` | `FailurePolicy::Ignore` | Failures are swallowed; the node keeps ticking every cycle |
+
+Defined at `horus_core/src/scheduling/fault_tolerance/failure_policy.rs:29-58`,
+constructors at `:62-75`.
+
+Two things to know before you plan around it. First, the enum is closed: it is
+not `#[non_exhaustive]` and there is no trait behind it, so this is a choice
+among four, not a seam you extend. A fifth behaviour means editing `horus_core`.
+
+Second, the default is neither `Fatal` nor `Ignore` — it is *no handler at all*.
+`apply_failure_policy_after_panic` returns early on `None` with the comment "no
+policy → legacy log-and-continue" (`types.rs:589-593`). A node you never called
+`.failure_policy(...)` on logs its panic and keeps being ticked.
+
+`Restart` reports a failed re-init rather than hiding it: if `init()` errors or
+panics on the way back up, the scheduler writes to stderr
+`[horus] node '…' failed to restart: …. Driving it to its safe state; it is NOT
+running.` and calls `enter_safe_state()` (`types.rs:601-628`). Both outcomes used
+to be dropped on the floor — `let _ = ...` twice over — so a node whose device
+handle failed to reopen went straight back into the rotation, uninitialised,
+looking exactly like one that had recovered.
+
+Note that the exec driver sits outside all of this. Its `tick()` handles a dead
+child internally and neither panics nor returns an error, so no failure policy
+on an exec-driver node will ever fire for a subprocess crash.
+
+## Emergency-stop hooks
+
+Five process-global functions in `scheduling::safety_monitor`, re-exported at
+`horus_core/src/scheduling/mod.rs:285-290` under `#[doc(hidden)]`:
+
+| Function | Line | What it does |
+|----------|------|--------------|
+| `set_emergency_stop_hook` | `safety_monitor.rs:27` | Installs the callback that a latching, run-ending e-stop invokes. Last set wins |
+| `trigger_external_emergency_stop` | `:35` | Fires it. With no hook installed it only prints `[horus] External emergency stop (no scheduler): …` — to **stdout**, via `terminal::print_line` (`horus_sys/src/terminal/mod.rs:35-40`) |
+| `set_safe_state_hook` | `:62` | Installs the milder response: ask nodes to safe themselves, keep the scheduler running |
+| `trigger_external_safe_state` | `:73` | Fires that. With no hook it says so and escalates to the full e-stop, because failing safe is the correct direction (`:74-84`) |
+| `take_pending_local_estop` | `:127` | Drains this robot's own e-stop reason once, for network broadcast. Remote-origin stops are never re-queued (`:91-96`) |
+
+Both hooks that the scheduler installs write their own diagnostics straight to
+stderr (`safety_monitor.rs:1393-1397`, `:1406-1407`), so the stream a message
+lands on tells you whether a scheduler was listening.
+
+The storage is an `RwLock`, not a `OnceLock`, precisely so it can be re-set:
+each scheduler's `run()` wires it to its own monitor, and a `OnceLock` latched
+the first scheduler in the process forever, so a second one could never receive
+a networked e-stop (`safety_monitor.rs:14-19`).
+
+<Callout type="danger" title="`run()` overwrites a hook you installed first">
+`run()` (`scheduler/mod.rs:2624-2625`) reaches `finalize_config` by way of
+`run_with_filter` and `finalize_and_init` (`:2776`, `:2356`, `:2649`), and
+`finalize_config` calls `safety.install_emergency_stop_hook()` and
+`safety.install_safe_state_hook()` (`:2671-2676`). Those call the same
+`set_emergency_stop_hook` / `set_safe_state_hook` you would
+(`safety_monitor.rs:1380-1387`, `:1400-1408`), and both setters are a plain
+overwrite (`safety_monitor.rs:28`, `:63`).
+
+The install is guarded by `if let Some(ref safety) = self.monitor.safety`, but
+`apply_safety_config` constructs the monitor unconditionally
+(`scheduler/mod.rs:1479`, assigned at `:1533`), so in practice it always runs.
+That was a deliberate change: the monitor used to exist only when
+`watchdog_active || has_rt_nodes`, which quietly made emergency stop a property
+of having configured a watchdog — on a scheduler of purely non-RT nodes a
+networked e-stop had nothing to latch and the robot kept running
+(`scheduler/mod.rs:1464-1477`).
+
+"Last set wins", and the scheduler sets last. A hook you install before
+`sched.run()` is discarded. To add your own behaviour, install it from inside an
+`on_start` hook, which runs after `finalize_config` (`:2776` then `:2843-2848`),
+and chain to the scheduler's behaviour yourself if you still want the run to
+stop.
+</Callout>
+
+## Seams that look open and are not
+
+Two traits in the tree read as extension points and cannot be routed to from
+configuration or from the public API. Implementing them today gets you a type
+nothing calls.
+
+**`PoolBackend`.** Its module documentation says "Users can implement
+[`PoolBackend`] for custom memory backends (Vulkan compute, FPGA, RDMA, etc.)
+without modifying horus_core" (`horus_core/src/memory/backend.rs:17-20`), and
+`TensorPool::with_backend` really does accept one
+(`horus_core/src/memory/tensor_pool.rs:674-678`) — though nothing in the
+workspace calls it; the only other occurrence of the name is its own doc example
+at `:672`. Every pool a `Topic` uses comes from `get_or_create_pool`
+(`horus_core/src/communication/topic/pool_registry.rs:56`, reached from
+`topic/mod.rs:2369`, `:4641`, `topic/dispatch.rs:1095`, `:1136` and
+`topic/tensor_ext.rs:58`), and that builds its config with `auto_pool_config()`
+— a function whose entire body is `TensorPoolConfig::default()` under the
+comment "currently always mmap-backed" (`pool_registry.rs:42-45`, used at `:66`).
+The same function's doc comment claims GPU hardware is auto-detected and the
+optimal allocator backend chosen (`:53-55`); it is not. There is no
+configuration key and no API that puts a custom backend behind a topic.
+
+**`horus_net::transport::Transport`.** The trait is `pub`
+(`horus_net/src/transport/mod.rs:9`), but `Replicator` holds a concrete
+`transport: UdpTransport` field (`horus_net/src/replicator.rs:75`), constructed
+by name in `Replicator::new` (`:131`). Substituting a transport means editing
+that field and its call sites, not implementing a trait.
+
+Both are worth knowing about if you are planning a port. Neither is worth
+starting from today.
+
+## What none of this is checked by
+
+Be clear-eyed about the enforcement behind this page.
+
+The docs-contract suites live in `.github/workflows/docs-contract.yml`. It has
+six jobs: `CLI contract (hermetic)` (`:110`), `CLI contract (live docs)` (`:173`),
+`Shipped examples build` (`:290`), `Rust examples compile` (`:337`),
+`Python API references exist` (`:440`), and the aggregate
+`Docs Contract Success` (`:508`), which gates on the first three only. The
+comment above that aggregate calls it "the single check branch protection points
+at" (`:502`). It is not. `main` requires seven contexts — `CI Success`,
+`Multi-Platform Success`, `Integration Tests Success`, `Feature Matrix Success`,
+`Parity CI Success`, `All Distros Pass`, `Run Benchmarks` — and
+`Docs Contract Success` is not among them. The docs-contract jobs run on every
+pull request (`:29`) and turn the PR page red; they do not block a merge.
+
+More specifically:
+
+- Nothing asserts that the three keys `ExecDriver` reads with `get_or` are the
+  three named above: `max_retries`, `restart_delay_ms` and `shutdown_timeout_ms`
+  appear in no test under `horus_manager/tests/`. Adding a fourth would fail
+  nothing.
+- Nothing in this repository expands `register_driver!`. The only compiler that
+  ever sees an expansion is the scheduled example sweep, on Linux, compiling a
+  block that lives in the other repository.
+- The `[hardware]` reserved-key list is duplicated verbatim in two functions in
+  the same file — `drivers/mod.rs:112-124` and `:307-319` are byte-for-byte
+  identical — with no test tying them together. A checker that parses only the
+  first will pass while the second drifts.
+- The claim that the scheduler never polls `is_safe_state()` *is* machine-checked,
+  but only against the README: `horus_manager/tests/readme_contract.rs:515-545`
+  asserts the phrase appears in both `core/rt_node.rs` and `README.md`. It
+  checks that two documents agree, not what the scheduler does.
+
+The unit tests inside `horus_core` — `load_exec_prefix`, the backoff regression,
+the registry tests — do run on every PR under `CI Success`
+(`.github/workflows/ci.yml:203`, `cargo test --workspace --exclude horus_py --lib`),
+and the integration suites under `Integration Tests Success`
+(`.github/workflows/integration-tests.yml:127`). So the behaviour this page
+describes is defended. The prose describing it is not.
+
+If you change one of these, change this page in the same commit. Nothing else
+will notice.
+
+## See also
+
+- [Environment Variables](/development/environment-variables) — the full
+  `HORUS_*` surface, including `HORUS_SIM_MODE` and `HORUS_PARAM_*`
+- [Write a Driver in Rust](/tutorials/10-write-a-driver-rust) — the registry
+  path end to end, with a real device. Note that its line on reserved keys names
+  only `use`, `sim` and `args` (`:358`); the real list is the eleven above, plus
+  the three `ExecDriver` consumes
+- [Configuration](/package-management/configuration) — the manifest reference
+- [Circuit Breaker](/advanced/circuit-breaker) — failure policies in operational
+  context
+- [Safety Monitor](/advanced/safety-monitor) — watchdogs, budgets, and what an
+  e-stop does once it latches
+- [Nodes](/concepts/core-concepts-nodes) — the `Node` trait as a whole

@@ -48,15 +48,16 @@ match topic.try_send(CmdVel::new(0.5, 0.1)) {
 // Block up to 10ms waiting for space
 match topic.send_blocking(CmdVel::new(1.0, 0.0), 10_u64.ms()) {
     Ok(()) => { /* sent */ }
-    Err(SendBlockingError::Timeout) => { /* timed out */ }
+    Err(SendBlockingError::Timeout) => { /* ring stayed full for 10ms */ }
+    Err(SendBlockingError::NoBackpressure) => { /* broadcast topic: nothing was sent */ }
 }
 ```
 
 | Method | Behavior |
 |--------|----------|
-| `send(msg)` | Never returns an error. On a broadcast ring the producer overwrites the oldest slot; on a point-to-point ring it retries briefly (64 spins + 4 yields) and then drops the **new** message, counting it in `dropped_count()` |
+| `send(msg)` | Never returns an error. On a broadcast ring the producer overwrites the oldest slot. On a point-to-point ring it retries briefly (64 spins + 4 yields), then drops the **new** message if a live subscriber is draining — but if nothing is draining the ring (nothing subscribed yet, the subscriber's process gone, or `tail` frozen for a 5s lease) it retires the **oldest** unread slot and accepts the new message. Either way the loss counts in `dropped_count()` |
 | `try_send(msg)` | Returns `Err(msg)` if the ring is full. Point-to-point only — a broadcast ring overwrites rather than filling, so it never reports full and this never returns `Err` |
-| `send_blocking(msg, timeout)` | Blocks until space is available or timeout elapses |
+| `send_blocking(msg, timeout)` | On a point-to-point ring, blocks until space is available or the timeout elapses. On a broadcast ring it does **not** send: it returns `Err(SendBlockingError::NoBackpressure)` immediately |
 
 ## Receiving Messages
 
@@ -100,10 +101,12 @@ many messages this subscriber was lapped past, tallied per handle on the
 consumer side. What stays at `0` is `dropped_count()` — it reports send-side
 failures only, and an overwriting producer never fails a send.
 
-`send_blocking()` does **not** help here. It applies backpressure by retrying a
-`try_send` that failed, and a broadcast ring never fails a send — it overwrites
-— so the first attempt succeeds and the call returns in nanoseconds while the
-slow subscriber is lapped exactly as before. Backpressure only exists on a
+`send_blocking()` does **not** help here, and it is worse than a no-op: on a
+broadcast ring it refuses before it tries. It resolves the backend, sees that it
+cannot apply backpressure, and returns `Err(SendBlockingError::NoBackpressure)`
+without sending the message at all. So swapping `send()` for `send_blocking()`
+on a lapped topic turns dropped messages into *no* messages, plus an error your
+code may be reading as a transient full ring. Backpressure only exists on a
 point-to-point ring.
 
 What does work on a broadcast topic: keep the consumer fast enough to drain the

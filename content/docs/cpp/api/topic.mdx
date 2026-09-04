@@ -28,6 +28,9 @@ HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` w
 | `.publish(LoanedSample<T>&&)` | `void` | Make a loaned sample visible to subscribers |
 | `.send(const T&)` | `void` | Send a message by copy (simpler API) |
 | `.name()` | `const string&` | Get the topic name |
+| `.dropped_count()` | `uint64_t` | Messages this publisher gave up on rather than blocking -- a rising value means send-side loss |
+| `.is_valid()` | `bool` | False if the SHM ring could not be opened; `advertise` does not throw |
+| `.error()` | `const string&` | Why the topic failed to open; empty while `is_valid()` |
 
 ## Quick Reference -- `Subscriber<T>`
 
@@ -36,6 +39,9 @@ HORUS uses shared memory (SHM) for inter-process communication. `Publisher<T>` w
 | `.recv()` | `optional<BorrowedSample<T>>` | Receive the next message (nullopt if none) |
 | `.has_msg()` | `bool` | Check if a message is available without consuming |
 | `.name()` | `const string&` | Get the topic name |
+| `.missed_count()` | `uint64_t` | Messages this subscriber was lapped past -- a full ring overwrites the oldest unconsumed slot |
+| `.is_valid()` | `bool` | False if the SHM ring could not be opened; `subscribe` does not throw |
+| `.error()` | `const string&` | Why the topic failed to open; empty while `is_valid()` |
 
 ## Quick Reference -- `LoanedSample<T>`
 
@@ -123,10 +129,10 @@ auto pub = sched.advertise<horus::msg::Odometry>("odom");
 sched.add("localizer")
     .rate(100_hz)
     .tick([&] {
-        // Step 1: Loan a writable slot from shared memory
+        // Step 1: Get an empty sample (a stack-local message today, not an SHM slot)
         auto sample = pub.loan();
 
-        // Step 2: Write directly into SHM (zero copy)
+        // Step 2: Fill it in place
         sample->pose.x = current_x;
         sample->pose.y = current_y;
         sample->pose.theta = current_theta;
@@ -246,6 +252,43 @@ The `BorrowedSample` owns the message `recv()` handed it and is valid until it g
 
 ---
 
+## Detecting Message Loss
+
+`advertise()` and `subscribe()` never throw and never return an error. If the SHM ring
+could not be opened they hand back a handle whose `send()` drops every message and whose
+`recv()` always returns `std::nullopt`. `is_valid()` and `error()` are the only way to
+tell that apart from an idle topic, and `send()` is lossy even on a healthy topic:
+
+```cpp
+auto pub = sched.advertise<horus::msg::CmdVel>("motor.cmd");
+auto sub = sched.subscribe<horus::msg::LaserScan>("lidar.scan");
+
+if (!pub.is_valid()) {
+    std::fprintf(stderr, "motor.cmd did not open: %s\n", pub.error().c_str());
+}
+
+// Inside the tick, periodically:
+if (pub.dropped_count() > 0) {
+    std::fprintf(stderr, "dropped %llu on %s\n",
+                 static_cast<unsigned long long>(pub.dropped_count()),
+                 pub.name().c_str());
+}
+if (sub.missed_count() > 0) {
+    std::fprintf(stderr, "missed %llu on %s\n",
+                 static_cast<unsigned long long>(sub.missed_count()),
+                 sub.name().c_str());
+}
+```
+
+`dropped_count()` counts send-side failures only: `send()` retries briefly and then gives
+up rather than blocking. On a broadcast POD topic -- a fixed-size message with more than
+one subscriber -- the publisher never fails, it overwrites the oldest slot instead, so
+`dropped_count()` stays at `0` while subscribers lose messages. `missed_count()` is what
+catches that case. On a handle that never opened, both counters report the calls they
+could not serve rather than `0`, so a dead link does not read as a quiet one.
+
+---
+
 ## Move Semantics
 
 All topic types are **move-only**. Copy constructors and copy assignment operators are deleted. This enforces single ownership, matching Rust's ownership model:
@@ -289,7 +332,7 @@ All message types live in the `horus::msg` namespace. They are `#[repr(C)]` comp
 
 Vision types (`CameraInfo`, `RegionOfInterest`, `StereoInfo`) are **not available from C++** -- they are `repr(Rust)` upstream and have been withdrawn from the C ABI (see `horus_cpp/include/horus/msg/vision.hpp`).
 
-`SimSync` and `RateRequest` are declared as plain structs in `<horus/msg/time.hpp>` but have no `Publisher`/`Subscriber` specialization, so they cannot be used with `advertise` / `subscribe`.
+`SimSync` and `RateRequest` are declared as plain structs in `<horus/msg/time.hpp>`, and `NavPath` in `<horus/msg/navigation.hpp>`, but none of the three has a `Publisher`/`Subscriber` specialization, so they cannot be used with `advertise` / `subscribe`. `NavPath` does have a Rust C-ABI entry point in `c_api.rs`, but no `HORUS_TOPIC_IMPL` line and no declaration in `horus_c.h`, so it is unreachable from C++ -- send its waypoints as `Waypoint` or `PathPlan` instead.
 
 `DiagnosticValue` and `DiagnosticReport` are declared as structs in `<horus/msg/diagnostics.hpp>` and `impl/topic_impl.hpp` does emit a `Publisher`/`Subscriber` specialization for each, but `c_api.rs` has no `impl_pod_topic_c_api!` entry for either -- so `advertise` / `subscribe` on them compiles and then fails to link with undefined references to `horus_publisher_diagnostic_value_new` and friends.
 
