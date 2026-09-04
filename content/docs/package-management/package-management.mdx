@@ -173,12 +173,21 @@ cache uses `<name>@<version>` names.
 
 **System-wide** (the default — `horus install` is global unless you pass `-t <workspace-name>`):
 ```
-~/.horus/
-── cache/
-    ── pid-controller@1.0.0/         # HORUS registry
-    ── cratesio_serde@1.0.200/       # crates.io
-    ── pypi_numpy@1.24.0/            # PyPI packages
+~/.cache/horus/
+── pid-controller@1.0.0/         # HORUS registry
+── cratesio_serde@1.0.200/       # crates.io
+── pypi_numpy@1.24.0/            # PyPI packages
 ```
+
+<Callout type="note" title="Two cache roots exist">
+`horus install` writes the XDG cache — `~/.cache/horus`, or `$XDG_CACHE_HOME/horus`
+when that is set, or `~/Library/Caches/horus` on macOS.
+
+`horus run`'s own dependency installer still writes the older root,
+`~/.horus/cache`, for Python packages. Both are real, and every reader searches
+both, which is why a package installed by one command is found by the other. If
+you are clearing a cache by hand, clear both.
+</Callout>
 
 **Naming conventions by source:**
 | Source | Directory Format | Example |
@@ -210,24 +219,23 @@ When resolving packages, HORUS checks in this order:
 - Shared across all projects
 - Version-specific directories (e.g., `cratesio_serde@1.0.228/`)
 
-**Smart Installation Behavior:**
+**Where an install lands:**
 
-When you run `horus install`, HORUS automatically chooses the best strategy:
+There is no automatic choice. The `-t` flag decides, and nothing else does — the
+installer does not check whether the package is already cached:
 
 ```bash
-# Default behavior (no flags)
+# No -t: always the global cache, symlinked into this project
 horus install serde
+#    Unpacks into the global cache
+#    Creates a symlink: .horus/packages/serde -> <global cache>/cratesio_serde@1.0.228/
 
-# If package exists in global cache:
-#    Install to global cache
-#    Create symlink: .horus/packages/serde -> ~/.cache/horus/cratesio_serde@1.0.228/
-#    Disk efficient!
-
-# If package NOT in global cache:
-#    Install directly to .horus/packages/serde/
-#    No symlink, real directory
-#    Isolated from global!
+# With -t: into that workspace's own .horus/packages/, not shared
+horus install serde -t my_robot_project
 ```
+
+The symlink is what makes the disk saving: several projects depending on the same
+version share one unpacked copy.
 
 **Override Broken Global Cache:**
 
@@ -237,14 +245,18 @@ Local packages always win, so you can override corrupted global packages:
 # Scenario: Global cache has broken serde@1.0.228
 ~/.cache/horus/cratesio_serde@1.0.228/  # Corrupted
 
-# Fix: Install working version locally
+# Fix: Install working version into this workspace
 rm .horus/packages/serde  # Remove symlink to broken global
-horus install serde@1.0.150  # Install working version locally
+horus install serde@1.0.150 -t my_robot_project
 
 # Result:
-.horus/packages/serde/  # Real directory, not symlink
+.horus/packages/serde/  # Real directory — only with -t
 # horus run will use this, ignoring broken global!
 ```
+
+`-t` is what makes the copy local. Without it the install goes to the global
+cache as `cratesio_serde@1.0.150` and `.horus/packages/serde` is recreated as a
+symlink to it.
 
 **Benefits:**
 - **Local override** - Bypass broken global packages
@@ -557,6 +569,15 @@ Authentication is required for publishing packages and accessing private registr
 - Installing public packages (`horus install`)
 - Searching registry (`horus search`)
 - Using installed packages
+
+Installing needs no login, but it is not unconditional. Once you have trusted a
+publisher key for a package (`horus auth trust-publisher`, see the [CLI
+reference](/development/cli-reference#horus-auth-login-to-registry)), that
+package must verify against it: an unsigned download or a signature that does
+not match is refused outright, with no override flag. Trusting the key is the
+statement that the package must be signed, so an unsigned download is a
+downgrade rather than a fallback. With no key on file, a signed package installs
+behind a warning that the signature could not be checked.
 
 ### Quick Authentication Setup
 
@@ -1160,6 +1181,18 @@ Before publishing:
    horus run --release
    ```
 
+4. **Replace any `path` dependencies.** `horus publish` refuses a manifest that
+   declares one and stops before uploading anything — a path dependency resolves
+   to a directory on your machine and cannot be reproduced by anyone else:
+
+   ```text
+   Cannot publish package with path dependencies!
+   Please publish path dependencies to the registry first, then use version
+   requirements in horus.toml.
+   ```
+
+   Publish the dependency first, then depend on it by version.
+
 ### `horus publish`
 
 **Usage:**
@@ -1332,27 +1365,20 @@ repository recorded in `horus.toml` are used as-is.
 
 #### How Users See Your Links
 
-On the registry, your package will display:
+`horus publish` sends each link only when you supplied one, as separate form
+fields: `source_url`, and `docs_url` paired with a `docs_type` of either
+`external` or `local`. `source_url` falls back to `repository` in your
+`horus.toml` when you skip the prompt; the documentation fields have no such
+fallback.
 
-<MermaidDiagram
-  chart={`%%{init: {'flowchart': {'padding': 20}}}%%
-flowchart TB
-    subgraph CARD["Package Card"]
-        direction TB
-        TITLE["<b>my-sensor-package</b> v1.0.0"]
-        DESC["High-performance sensor fusion"]
-        BTNS["[View Details] [Docs] [Source]"]
-        LINKS["Markdown Viewer | GitHub Repo"]
-    end
-`}
-  caption="Registry package display with documentation and source links"
-/>
+How a registry renders those fields is up to that registry — the CLI's
+responsibility ends at uploading them:
 
-- **Docs Button**: Only appears if you added documentation
-  - External URL: Opens in new tab
-  - Local docs: Opens built-in markdown viewer
-- **Source Button**: Only appears if you added source URL
-  - Opens repository in new tab
+- **Documentation** — sent as `docs_url` + `docs_type`. `external` is a URL you
+  own; `local` means the `/docs` markdown was bundled into the tarball itself,
+  so it travels with the package rather than being fetched.
+- **Source** — sent as `source_url`. Any repository host works; GitHub, GitLab
+  and a plain public URL are all accepted verbatim.
 
 ### Version Management
 

@@ -31,8 +31,7 @@
  *   - both route spellings lib/mdx.tsx accepts: `x.mdx` and `x/index.mdx`
  *
  * Other external URLs and mailto: are left alone. A bare `#anchor` is resolved
- * against the page it is written on — and for an extra file such as the project
- * README, against that file's own headings rather than against a route here.
+ * against the page it is written on.
  *
  * Run: node scripts/check-links.mjs
  *      node scripts/check-links.mjs ../horus/README.md   # extra files to check
@@ -78,28 +77,6 @@ function headingText(raw) {
     .trim();
 }
 
-/**
- * The heading ids a markdown document offers.
- *
- * Fenced code is skipped: a `# comment` inside a bash block is not a heading,
- * and counting it would bless anchors the renderer never emits.
- */
-function anchorsIn(text) {
-  const anchors = new Set();
-  let inFence = false;
-  for (const line of text.split('\n')) {
-    const t = line.trim();
-    if (t.startsWith('```')) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-    const m = /^(#{1,6})\s+(.*)$/.exec(t);
-    if (m) anchors.add(headingId(headingText(m[2])));
-  }
-  return anchors;
-}
-
 function walk(dir, out = []) {
   if (!fs.existsSync(dir)) return out;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -112,6 +89,23 @@ function walk(dir, out = []) {
 
 // ─── The routes that exist, and the anchors each one offers ─────────────────
 
+/** The heading ids a markdown file renders, skipping fenced code. */
+function headingIdsIn(file) {
+  const anchors = new Set();
+  let inFence = false;
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('```')) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const m = /^(#{1,6})\s+(.*)$/.exec(t);
+    if (m) anchors.add(headingId(headingText(m[2])));
+  }
+  return anchors;
+}
+
 const routes = new Map(); // "/concepts/goals" -> Set of heading ids
 
 for (const file of walk(contentDir)) {
@@ -119,7 +113,7 @@ for (const file of walk(contentDir)) {
   const rel = path.relative(contentDir, file).replace(/\\/g, '/').replace(/\.mdx$/, '');
   const route = '/' + (rel.endsWith('/index') ? rel.slice(0, -'/index'.length) : rel);
 
-  routes.set(route, anchorsIn(fs.readFileSync(file, 'utf8')));
+  routes.set(route, headingIdsIn(file));
 }
 
 // ─── Every internal link, and where it was written ──────────────────────────
@@ -136,14 +130,6 @@ const OWN_HOSTS = [
   'http://docs.horusrobotics.dev',
 ];
 
-const ownAnchorCache = new Map();
-function ownAnchors(file) {
-  if (!ownAnchorCache.has(file)) {
-    ownAnchorCache.set(file, anchorsIn(fs.readFileSync(file, 'utf8')));
-  }
-  return ownAnchorCache.get(file);
-}
-
 const extra = process.argv.slice(2).map((p) => path.resolve(root, p));
 for (const f of extra) {
   if (!fs.existsSync(f)) {
@@ -151,6 +137,22 @@ for (const f of extra) {
     process.exit(2);
   }
 }
+
+/**
+ * Headings of the extra files, keyed by absolute path.
+ *
+ * A bare `](#anchor)` resolves against the page it is written on. For a file
+ * under content/docs that page is a route, but an extra file — the project
+ * README — is not on this site at all, and the route spelling computed for it
+ * is a `../../..` path that matches nothing. Every bare anchor in the README
+ * therefore reported "no page" however correct it was: `#get-started` and
+ * `#install-upgrade-uninstall` both name real `##` headings in that same file
+ * and both resolve fine on GitHub, which is where that file is read.
+ *
+ * So an extra file's bare anchors are checked against its own headings, which
+ * is what the link actually means, and still fail when the heading is absent.
+ */
+const selfAnchors = new Map(extra.map((f) => [f, headingIdsIn(f)]));
 
 const sources = [
   ...walk(contentDir).filter((f) => f.endsWith('.mdx')),
@@ -204,18 +206,9 @@ for (const file of sources) {
         const [slug, fragment] = href.split('#');
         checked += 1;
 
-        // A bare `#fragment` in an EXTRA file resolves against that file's own
-        // headings, not against a route on this site.
-        //
-        // The target below is built from `path.relative(contentDir, file)`,
-        // which for `../horus/README.md` produces `/../../horus/README.md` —
-        // never a key in `routes`, so every same-file anchor in the project
-        // README was reported "no page". Both of the README's were: it does
-        // have `## Get Started` and `## Install, Upgrade, Uninstall`. The
-        // extra-file form exists to check the README, and it could not check
-        // the one link shape a README uses most.
-        if (slug === '' && !file.startsWith(contentDir + path.sep)) {
-          if (fragment && !ownAnchors(file).has(fragment)) {
+        // A bare `#fragment` in an extra file names a heading in that file.
+        if (slug === '' && selfAnchors.has(file)) {
+          if (fragment && !selfAnchors.get(file).has(fragment)) {
             dead.push(`${rel}:${i + 1}: ${href} — no heading in this file`);
           }
           continue;
@@ -258,9 +251,7 @@ if (dead.length) {
   for (const d of dead) console.error(`  ${d}`);
   console.error(
     '\nRoutes come from content/docs/**/*.mdx; anchors come from the headings on ' +
-      'the target page. Fix the link, or add the page.\n' +
-      'A "no heading in this file" line is a bare #anchor in an extra file ' +
-      '(e.g. the project README) that names no heading in that same file.'
+      'the target page. Fix the link, or add the page.'
   );
   process.exit(1);
 }

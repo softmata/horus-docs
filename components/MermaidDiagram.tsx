@@ -195,7 +195,15 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
           nodeSpacing: 50,
           rankSpacing: 50,
           curve: 'basis',
-          useMaxWidth: true,
+          // false, deliberately. With `useMaxWidth: true` mermaid emits
+          // `width: 100%` and a max-width, so the SVG can never exceed its
+          // container -- which makes the `overflow-x: auto` below unreachable
+          // dead code and silently scales wide diagrams down instead. The
+          // perception pipeline is 1761px natural against an ~850px column:
+          // scaled, its labels render at ~6.8px, and on a 390px phone every
+          // diagram on the site does the same. Keeping the natural width lets
+          // the container scroll, which is legible at any viewport.
+          useMaxWidth: false,
         },
         ...(isDark ? darkThemeConfig : lightThemeConfig),
       } as MermaidConfig);
@@ -268,7 +276,7 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
     <figure className="my-8">
       <div
         ref={containerRef}
-        className="overflow-x-auto p-6 rounded-lg border flex justify-center"
+        className="overflow-x-auto p-6 rounded-lg border"
         style={{
           backgroundColor: isDark ? '#111827' : '#f9fafb',
           borderColor: isDark ? '#374151' : '#e5e7eb',
@@ -277,9 +285,9 @@ export default function MermaidDiagram({ chart, caption }: MermaidDiagramProps) 
         <div
           className="mermaid-svg-container"
           style={{
-            display: 'flex',
-            justifyContent: 'center',
-            width: '100%',
+            width: 'fit-content',
+            minWidth: '100%',
+            marginInline: 'auto',
           }}
           dangerouslySetInnerHTML={{ __html: svg }}
         />

@@ -150,8 +150,9 @@ fn main() -> Result<()> {
     // Add both nodes using the fluent API
     // rate(1 Hz) puts the sensor on its own real-time thread, ticking once
     // per second. The monitor sets no .rate(), so it stays best-effort and
-    // ticks on the scheduler's main loop at the default 100 Hz — order() only
-    // sequences nodes that share that loop.
+    // ticks on the scheduler's main loop at the default 100 Hz. order()
+    // sequences main-loop nodes only until they publish or subscribe — after
+    // that the scheduler orders them by the topics they share.
     // The topic still connects them: the monitor sees whatever the sensor
     // has published by the time it reads.
     scheduler.add(TemperatureSensor::new()?)
@@ -210,7 +211,10 @@ That is **not** a failure — the message says so at the end. Calling `.rate()` 
 node to the real-time class, and HORUS then asks the kernel for `SCHED_FIFO`, which an
 unprivileged user cannot have. It falls back to normal scheduling and your program runs
 exactly as written; on a desktop that is fine, since nothing here depends on real-time
-priority. Grant the capability with `horus setup-rt` when you get to a robot that does.
+priority. On a robot that does depend on RT priority, run `horus setup-rt`: it writes an
+`rtprio 99` / `memlock unlimited` limits entry for your user, and offers to install a
+PREEMPT_RT kernel. To give only this one binary the capability instead,
+`sudo setcap cap_sys_nice+ep $(which horus)`.
 
 </Callout>
 
@@ -248,17 +252,17 @@ impl Node for TemperatureSensor {
 
 ### The Scheduler - Running Everything
 
-The scheduler runs your nodes in priority order:
+The scheduler works out what depends on what, from the topics your nodes publish and subscribe to. Here the monitor subscribes to what the sensor publishes, so the sensor runs first:
 
 ```rust
 let mut scheduler = Scheduler::new();
 
-// order(0) = highest priority (runs first)
+// publishes "robot.sensor"
 scheduler.add(SensorNode::new()?)
     .order(0)
     .build()?;
 
-// order(1) = lower priority (runs after 0)
+// subscribes to "robot.sensor" — so it runs after the sensor
 scheduler.add(MonitorNode::new()?)
     .order(1)
     .build()?;
@@ -266,6 +270,16 @@ scheduler.add(MonitorNode::new()?)
 // Run forever
 scheduler.run()?;
 ```
+
+<Callout type="note" title="`.order()` is a fallback, not the ordering rule">
+For nodes on the main loop, execution order comes from the topic dependency graph.
+`.order()` tiers are used only while the scheduler has **no** topic metadata at all —
+the very first tick, and programs whose nodes never publish or subscribe. After that the
+graph is rebuilt from the topics and `.order()` is not read.
+
+It still matters on the RT, compute and async I/O executors, which start their pools
+sorted by it. On the main loop, express "this runs first" by what a node subscribes to.
+</Callout>
 
 The fluent API lets you chain configuration:
 - `.order(n)` - Set execution priority (lower = runs first)

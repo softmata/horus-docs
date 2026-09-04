@@ -102,14 +102,19 @@ node = horus.Node(
 
 **Parameters**:
 - `name` (str, optional): Node name (auto-generated if omitted)
-- `pubs` (str | list[str] | dict, optional): Topics to publish to. A dict maps a topic name to its message type — `{"cmd": horus.CmdVel}` — which is how you declare a typed topic
-- `subs` (str | list[str] | dict, optional): Topics to subscribe from (same forms as `pubs`)
+- `pubs` (str | list[str | type | Sub | Pub] | dict, optional): Topics to publish to. A dict maps a topic name to its message type — `{"cmd": horus.CmdVel}` — which is how you declare a typed topic. A list element may also be a bare message class (`pubs=[horus.CmdVel]`, whose topic name comes from the class's `__topic_name__` — `CmdVel` gives `"cmd_vel"`) or a `horus.Pub` / `horus.Sub` declaration; anything else raises `TypeError`
+- `subs` (str | list[str | type | Sub | Pub] | dict, optional): Topics to subscribe from (same forms as `pubs`)
 - `tick` (callable): Function called each cycle, receives `(node)` as argument
 - `rate` (float, optional): Execution rate in Hz (default: 30)
 - `init` (callable, optional): Setup function, called once at start
 - `shutdown` (callable, optional): Cleanup function, called once at end
-- `on_error` (callable, optional): Error handler, called if tick raises an exception
+- `on_error` (callable, optional): Notification hook `on_error(node, exception)`, called when `tick` raises. It does not suppress the error — the exception is re-raised afterwards so `failure_policy` still applies. An exception thrown inside the hook is discarded, including the `TypeError` from a one-argument handler, so a handler with the wrong arity never runs and nothing says why. To swallow errors, wrap the body of `tick` in `try`/`except` instead
 - `default_capacity` (int, optional): Buffer capacity for auto-created topics (default: 1024)
+
+`horus.Sub(topic, msg_type=None, capacity=1024)` and `horus.Pub(topic, msg_type=None, capacity=1024)`
+are the declaration form of a list entry — an explicit topic name paired with its message
+type, and the only spelling that sets the ring capacity of one topic rather than every
+auto-created topic on the node: `subs=[horus.Sub("camera.frames", horus.Tensor, capacity=4)]`.
 
 ### Alternative: Class-Based Inheritance
 
@@ -396,6 +401,14 @@ scheduler.add(motor_ctrl).add(planner).add(telemetry)
 | `core` | `int` | `None` | Pin to a CPU core index |
 | `watchdog` | `float` | `None` | Per-node watchdog timeout in seconds |
 
+`budget`, `deadline`, `on_miss`, `priority` and `core` apply to real-time nodes only — the
+class a node lands in by default once it has a `rate`. `compute=True`, `on="topic"` and an
+`async def` tick each move it to a different execution class, and the knobs then part ways:
+`budget` or `deadline` raises `RuntimeError: Invalid node configuration: ... has
+budget/deadline set but uses a non-RT execution class` from `scheduler.add()`, while
+`priority` and `core` are dropped with only a log warning, and `on_miss` has no deadline to
+fire against. See [Set Node Budgets](/advanced/deployment#section-3-set-node-budgets).
+
 Async ticks need no flag — an `async def` tick is auto-detected and run on the async I/O pool.
 
 ### Safe state
@@ -618,7 +631,7 @@ does not link `horus_net`, so a Python topic never leaves the machine it was cre
 `@`, everything from the `@` onward is **discarded** and a normal shared-memory topic is
 created from the part before it. `Topic(CmdVel, endpoint="cmdvel@192.168.1.100:8000")`
 constructs successfully, opens no socket, and talks only to other processes on the same
-machine. Earlier versions of this page documented UDP, Unix-socket and router forms;
+machine; the constructor emits a `RuntimeWarning` naming the host it ignored. Earlier versions of this page documented UDP, Unix-socket and router forms;
 none of them were ever implemented.
 
 For cross-machine topics today, use the Rust replicator — build with `--features net` or
@@ -641,17 +654,21 @@ named_topic = Topic(CmdVel, endpoint="cmdvel")
 
 | Method | Description |
 |--------|-------------|
-| `topic.send(msg, node=None)` | Send a message. Pass optional `node` for automatic IPC logging. Returns `True`. |
+| `topic.send(msg, node=None)` | Send a message. Pass optional `node` for automatic IPC logging. Always returns `True` — it does not report a drop, so use `try_send()` when you need to know |
 | `topic.recv(node=None)` | Receive one message. Returns the message or `None` if empty. |
 | `topic.name` | Property: the topic name string |
 | `topic.backend_type` | Property: the active backend name (e.g., `"PodShm"`, `"SpmcShm"`); `"Unknown"` until the backend resolves |
-| `topic.is_network_topic` | Property: `True` when the endpoint string contains an `@`. Cosmetic only — no topic uses a network transport (see above) |
+| `topic.is_network_topic` | Property: always `False`. Python topics are never networked, so the flag reports the transport rather than the spelling of the endpoint |
 | `topic.endpoint` | Property: the endpoint string, or `None` for local topics |
-| `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `is_network`, `backend`. `messages_sent`/`messages_received` stay at `0` unless verbose content logging is on — use `horus topic hz` for traffic |
+| `topic.stats()` | Returns a dict with `messages_sent`, `messages_received`, `send_failures`, `recv_failures`, `missed_count`, `dropped_count`, `is_network` (always `False`), `backend`. `messages_sent`/`messages_received` stay at `0` unless verbose content logging is on — use `horus topic hz` for traffic |
 | `topic.is_generic()` | Returns `True` if this is a generic (string-name) topic |
+| `topic.try_send(msg, node=None)` | Like `send()`, but reports the outcome: returns `True` if the message went into the ring, `False` if it did not |
+| `topic.send_blocking(msg, timeout_s, node=None)` | Waits up to `timeout_s` seconds for room. Raises `horus.HorusTimeoutError` on timeout, `ValueError` for a negative, NaN or infinite timeout, and `NotImplementedError` on Image, PointCloud, DepthImage and Tensor topics |
 | `topic.try_recv()` | Like `recv()`, without the logging path |
-| `topic.read_latest()` | Newest value without consuming the queue — for state-like data |
+| `topic.read_latest()` | Newest value without consuming the queue — for state-like data. POD message types only: raises `RuntimeError` on generic (string-name) topics and on `Image`, `PointCloud`, `DepthImage`, `OccupancyGrid`, `CostMap`, `Tensor`, `CompressedImage`, `PlaneArray` and `TactileArray`; use `recv()` there |
 | `topic.pending_count()` | Messages waiting to be read |
+| `topic.missed_count()` | Messages this subscriber never saw because a publisher lapped it. Per-handle and monotonic; the only signal that a gap happened, since every message `recv()` hands back is still well-formed. Raises `RuntimeError` on a poisoned lock rather than answering `0` |
+| `topic.dropped_count()` | Messages this publisher gave up on after its retries — the ring is saturated. Same `RuntimeError` on a poisoned lock |
 | `topic.pub_count()` / `topic.sub_count()` | Publishers and subscribers currently attached |
 
 **Example:**
