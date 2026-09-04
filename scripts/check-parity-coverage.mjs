@@ -106,7 +106,7 @@ const CLASSES = [
     what: 'documented variables are read, and variables the code reads are documented',
     // enforced: { where: 'horus:horus_manager/tests/docs_parity.rs',
     //             needle: 'every_env_var_the_code_reads_is_documented' },
-    manual: 'Written and committed in the HORUS repository as `horus_manager/tests/docs_parity.rs` (7fe9081b, branch perf/latency-round-1), but not on horus `main`, which is what CI clones. Until that merges the class is not enforced for anyone but the author, and saying otherwise here is the exact failure this checker exists to catch. Restore the `enforced` block below when 7fe9081b lands: `every_env_var_the_code_reads_is_documented`',
+    manual: '`horus_manager/tests/docs_parity.rs` is now on horus `main`, so the test exists — but nothing runs it. All three of its tests carry `#[ignore]`, and although the `--test *` sweep in integration-tests.yml selects the target, an all-ignored binary exits 0 reporting "0 passed; 3 ignored", which reads as coverage. No workflow names `docs_parity` at all, despite the ignore reason on each test saying it is wired into the docs-contract workflow. softmata/horus#178 adds that step; restore the `enforced` block above once it merges: `every_env_var_the_code_reads_is_documented`',
     direction: 'both',
   },
   {
@@ -126,7 +126,7 @@ const CLASSES = [
     what: 'every benchmark the docs tell a reader to run exists',
     // enforced: { where: 'horus:horus_manager/tests/docs_parity.rs',
     //             needle: 'documented_benchmark_binaries_exist' },
-    manual: 'Written and committed in the HORUS repository as `horus_manager/tests/docs_parity.rs` (7fe9081b, branch perf/latency-round-1), but not on horus `main`, which is what CI clones. Until that merges the class is not enforced for anyone but the author, and saying otherwise here is the exact failure this checker exists to catch. Restore the `enforced` block below when 7fe9081b lands: `documented_benchmark_binaries_exist`',
+    manual: '`horus_manager/tests/docs_parity.rs` is now on horus `main`, so the test exists — but nothing runs it. All three of its tests carry `#[ignore]`, and although the `--test *` sweep in integration-tests.yml selects the target, an all-ignored binary exits 0 reporting "0 passed; 3 ignored", which reads as coverage. No workflow names `docs_parity` at all, despite the ignore reason on each test saying it is wired into the docs-contract workflow. softmata/horus#178 adds that step; restore the `enforced` block above once it merges: `documented_benchmark_binaries_exist`',
     direction: 'docs->code',
   },
   {
@@ -134,7 +134,7 @@ const CLASSES = [
     what: 'a documented `horus = "x.y"` can resolve to the crate this repo ships',
     // enforced: { where: 'horus:horus_manager/tests/docs_parity.rs',
     //             needle: 'documented_horus_version_pins_resolve_to_this_crate' },
-    manual: 'Written and committed in the HORUS repository as `horus_manager/tests/docs_parity.rs` (7fe9081b, branch perf/latency-round-1), but not on horus `main`, which is what CI clones. Until that merges the class is not enforced for anyone but the author, and saying otherwise here is the exact failure this checker exists to catch. Restore the `enforced` block below when 7fe9081b lands: `documented_horus_version_pins_resolve_to_this_crate`',
+    manual: '`horus_manager/tests/docs_parity.rs` is now on horus `main`, so the test exists — but nothing runs it. All three of its tests carry `#[ignore]`, and although the `--test *` sweep in integration-tests.yml selects the target, an all-ignored binary exits 0 reporting "0 passed; 3 ignored", which reads as coverage. No workflow names `docs_parity` at all, despite the ignore reason on each test saying it is wired into the docs-contract workflow. softmata/horus#178 adds that step; restore the `enforced` block above once it merges: `documented_horus_version_pins_resolve_to_this_crate`',
     direction: 'both',
   },
 
