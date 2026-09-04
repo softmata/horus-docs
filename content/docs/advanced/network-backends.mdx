@@ -26,7 +26,7 @@ let topic = Topic::<CmdVel>::new("motors.cmd_vel")?;
 topic.send(CmdVel::new(1.0, 0.0));
 ```
 
-No configuration needed. The backend upgrades and downgrades dynamically as participants join and leave.
+No configuration needed. The backend upgrades as participants join.
 
 ## Shared-Memory Backends
 
@@ -48,7 +48,7 @@ The backend is selected based on:
 
 ## Dynamic Migration
 
-HORUS dynamically migrates between backends as topology changes:
+HORUS migrates to a wider backend as participants join:
 
 ```
 Single publisher + single subscriber
@@ -59,15 +59,17 @@ Second subscriber joins (non-POD payload)
 
 A second publisher joins as well
   → FanoutShm, ~40ns (no migration — non-POD broadcast already uses the fanout matrix)
-
-The extra subscriber leaves — two publishers, one subscriber
-  → MpscShm, ~65ns
-
-All but one publisher and one subscriber disconnect
-  → SpscShm, ~85ns
 ```
 
 Migration is transparent — `send()` and `recv()` calls are unaffected.
+
+The ladder only climbs. Backend detection reads the topic's registration counts, and nothing on
+the send or receive path decrements them: dropping a `Topic` releases its keep-alives but does not
+deregister. A participant's slot is retired only after its 5-second lease has expired and
+something sweeps for it — in practice a new registration on that topic — and the sweep retires a
+slot only if the owning process is dead. A slot left behind by an ended thread of the current
+process is reclaimed only by a later registration in that same process. Until one of those
+happens, a topic that reached FanoutShm stays on FanoutShm however many subscribers have gone.
 
 ## Performance Characteristics
 
@@ -88,6 +90,8 @@ Cross-machine topics are replicated by the `horus_net` UDP replicator. It is opt
 | UDP LAN replication (`net` feature) | ~50μs | Multi-robot, cross-machine topics |
 
 `Topic::new()` continues to auto-select the optimal SHM backend either way. With the `net` feature enabled, replication auto-starts on `scheduler.run()` and discovers peers by UDP multicast (default group `224.0.69.72`, port `9100`); topics you subscribe to but do not publish are imported by default (`import = "auto"`). Configure it with the `[network]` section of `horus.toml` or the `HORUS_NET_*` environment variables: opt out with `.network(false)`, `HORUS_NO_NETWORK=1`, or `[network] enabled = false`; narrow the surface with `[network] import` / `HORUS_NET_IMPORT` and `[network] deny_export`.
+
+The `[network]` section is translated into `HORUS_NET_*` variables on one path only: a `horus run` that launches several executables. A single-file run, a directory run, a `horus.toml` run, a workspace run and `horus launch` perform no translation, so on an ordinary single-binary robot `[network] enabled = false` does not stop replication and `deny_export` does not keep the topic it names on the machine. There, use `.network(false)` or the environment variables, which are read directly by the runtime in every case. See [Configuration](/package-management/configuration) and [Environment Variables](/development/environment-variables).
 
 Zenoh is not the transport. It is an optional bridge package (`horus install horus-zenoh`) for cases UDP multicast cannot reach — cross-subnet or WiFi links.
 

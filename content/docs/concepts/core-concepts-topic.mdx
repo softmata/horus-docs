@@ -41,8 +41,8 @@ HORUS auto-selects the fastest communication path based on your topology. You ne
 
 | Topology | Ring HORUS selects | When the ring is full |
 |----------|--------------------|-----------------------|
-| 1 publisher, 1 subscriber | point-to-point | FIFO — the newest message is rejected |
-| Many publishers, 1 subscriber | multi-producer point-to-point | FIFO — the newest message is rejected |
+| 1 publisher, 1 subscriber | point-to-point | newest rejected while a live subscriber drains; oldest retired when nothing is |
+| Many publishers, 1 subscriber | multi-producer point-to-point | newest rejected while a live subscriber drains; oldest retired when nothing is |
 | 1 publisher, many subscribers | broadcast | latest-wins — the oldest slot is overwritten |
 | Many publishers, many subscribers | broadcast | latest-wins — the oldest slot is overwritten |
 
@@ -426,8 +426,7 @@ stream independently rather than competing for messages. One slow subscriber doe
 starve the others.
 
 That is independence, not a delivery guarantee. The ring is latest-wins: a publisher that
-laps a subscriber overwrites slots that subscriber has not read, and the subscriber
-jumps forward, usually to the current head, and the skipped messages are lost.
+laps a subscriber overwrites slots that subscriber has not read, and the subscriber jumps forward to about half a ring back from the head — not to the newest message — and the skipped messages are lost. Landing next to the write cursor would put the consumer on the slot the producer overwrites next, so it would lap again on the following poll.
 
 The skip raises no error, but it **is** counted: `missed_count()` returns how many messages
 this subscriber was lapped past, tallied per handle on the consumer side. What stays at `0`
@@ -731,15 +730,15 @@ By default, `Topic::new()` auto-sizes capacity based on message type size:
 | `Twist` (56 bytes) | 128 slots | ~8.6 KB |
 | `Imu` (304 bytes) | 16 slots | ~5.5 KB |
 
-Auto capacity is always clamped to `[16, 1024]` and rounded up to the next power of two. A fixed-size (POD) type of 56 bytes or less gets a padded 64-byte slot — one cache line holding an 8-byte readiness stamp next to the payload; a larger POD type gets a slot exactly `size_of::<T>()` wide. Only non-POD (heap-owning) types fall back to the 8 KB default slot.
+Auto capacity is always clamped to `[16, 1024]` and rounded up to the next power of two. A fixed-size (POD) type of 56 bytes or less **whose alignment is 8 or less** gets a padded 64-byte slot — one cache line holding an 8-byte readiness stamp next to the payload. A POD type that is larger, or aligned above 8 (a `u128` field, `#[repr(align(16))]`, an SSE vector), gets a slot exactly `size_of::<T>()` wide instead: the co-located payload always starts 8 bytes into a cache-line-aligned slot, and nothing rounds that up, so a 16-aligned type placed there would be written through a misaligned vector store. Only non-POD (heap-owning) types fall back to the 8 KB default slot.
 
-The region is a 640-byte header plus the slots. A co-located slot carries its own stamp, so the first four rows above are `640 + capacity × 64` and nothing more; the wider layouts allocate a separate 8-byte sequence entry per slot on top of the data, which is why `Imu` at 16 × 304 bytes still comes to ~5.5 KB.
+The region is a 640-byte header plus the slots. A co-located slot carries its own stamp, so the first four rows above are `640 + capacity × 64` and nothing more; the split layouts — anything over 56 bytes, and anything aligned above 8 — allocate a separate 8-byte sequence entry per slot on top of the data, which is why `Imu` at 16 × 304 bytes still comes to ~5.5 KB.
 
 For most robotics applications, memory usage per topic is under 1 MB.
 
 ### Cleaning Up
 
-Shared memory files persist after processes exit (by design — allows new processes to join existing topics). Clean up between sessions:
+A topic's shared memory file survives as long as any process still has it mapped, so a publisher can exit and restart without taking the ring away from its subscribers. What outlives a whole run is the session namespace directory and the non-topic files under it. Clean up between sessions:
 
 ```bash
 # Clean shared memory only (recommended)
@@ -752,7 +751,9 @@ horus clean --shm --dry-run
 horus clean --all
 ```
 
-A stale topic file left by a dead process is **reused**, not deleted: its header is re-initialised when a live process next opens the same topic. Nothing removes the file itself, so `/dev/shm` accumulates entries across runs — clear them with `horus clean --shm`.
+The last process to release a topic **unlinks** its file. Every holder keeps a shared `flock` on the backing file for the life of its mapping, and the region's drop takes a non-blocking exclusive lock as a last-one-out test: if it succeeds, the file is removed. Only a crash — where drop never ran — leaves a topic file behind, and that one is **reused**, not deleted: its header is re-initialised when a live process next opens the same topic.
+
+What accumulates in `/dev/shm` across runs is the per-session namespace directory and the artifacts under it that nothing unlinks — fanout locks, log files, tensor pool files. `horus clean --shm` clears those.
 
 ### Troubleshooting
 
