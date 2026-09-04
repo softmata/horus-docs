@@ -31,7 +31,8 @@
  *   - both route spellings lib/mdx.tsx accepts: `x.mdx` and `x/index.mdx`
  *
  * Other external URLs and mailto: are left alone. A bare `#anchor` is resolved
- * against the page it is written on.
+ * against the page it is written on — and for an extra file such as the project
+ * README, against that file's own headings rather than against a route here.
  *
  * Run: node scripts/check-links.mjs
  *      node scripts/check-links.mjs ../horus/README.md   # extra files to check
@@ -77,6 +78,28 @@ function headingText(raw) {
     .trim();
 }
 
+/**
+ * The heading ids a markdown document offers.
+ *
+ * Fenced code is skipped: a `# comment` inside a bash block is not a heading,
+ * and counting it would bless anchors the renderer never emits.
+ */
+function anchorsIn(text) {
+  const anchors = new Set();
+  let inFence = false;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('```')) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const m = /^(#{1,6})\s+(.*)$/.exec(t);
+    if (m) anchors.add(headingId(headingText(m[2])));
+  }
+  return anchors;
+}
+
 function walk(dir, out = []) {
   if (!fs.existsSync(dir)) return out;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -96,19 +119,7 @@ for (const file of walk(contentDir)) {
   const rel = path.relative(contentDir, file).replace(/\\/g, '/').replace(/\.mdx$/, '');
   const route = '/' + (rel.endsWith('/index') ? rel.slice(0, -'/index'.length) : rel);
 
-  const anchors = new Set();
-  let inFence = false;
-  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-    const t = line.trim();
-    if (t.startsWith('```')) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence) continue;
-    const m = /^(#{1,6})\s+(.*)$/.exec(t);
-    if (m) anchors.add(headingId(headingText(m[2])));
-  }
-  routes.set(route, anchors);
+  routes.set(route, anchorsIn(fs.readFileSync(file, 'utf8')));
 }
 
 // ─── Every internal link, and where it was written ──────────────────────────
@@ -124,6 +135,14 @@ const OWN_HOSTS = [
   'https://docs.horusrobotics.dev',
   'http://docs.horusrobotics.dev',
 ];
+
+const ownAnchorCache = new Map();
+function ownAnchors(file) {
+  if (!ownAnchorCache.has(file)) {
+    ownAnchorCache.set(file, anchorsIn(fs.readFileSync(file, 'utf8')));
+  }
+  return ownAnchorCache.get(file);
+}
 
 const extra = process.argv.slice(2).map((p) => path.resolve(root, p));
 for (const f of extra) {
@@ -183,12 +202,30 @@ for (const file of sources) {
         // not documentation routes.
         if (href.startsWith('//') || href.startsWith('/_') || href.startsWith('/api/')) continue;
         const [slug, fragment] = href.split('#');
+        checked += 1;
+
+        // A bare `#fragment` in an EXTRA file resolves against that file's own
+        // headings, not against a route on this site.
+        //
+        // The target below is built from `path.relative(contentDir, file)`,
+        // which for `../horus/README.md` produces `/../../horus/README.md` —
+        // never a key in `routes`, so every same-file anchor in the project
+        // README was reported "no page". Both of the README's were: it does
+        // have `## Get Started` and `## Install, Upgrade, Uninstall`. The
+        // extra-file form exists to check the README, and it could not check
+        // the one link shape a README uses most.
+        if (slug === '' && !file.startsWith(contentDir + path.sep)) {
+          if (fragment && !ownAnchors(file).has(fragment)) {
+            dead.push(`${rel}:${i + 1}: ${href} — no heading in this file`);
+          }
+          continue;
+        }
+
         // A bare `#fragment` link resolves within the page it is written on.
         const target = slug === '' ? '/' + path.relative(contentDir, file)
           .replace(/\\/g, '/')
           .replace(/\.mdx$/, '')
           .replace(/\/index$/, '') : slug;
-        checked += 1;
 
         // Assets under public/ are served at the site root and are not routes.
         if (fs.existsSync(path.join(root, 'public', target.slice(1)))) continue;
@@ -221,7 +258,9 @@ if (dead.length) {
   for (const d of dead) console.error(`  ${d}`);
   console.error(
     '\nRoutes come from content/docs/**/*.mdx; anchors come from the headings on ' +
-      'the target page. Fix the link, or add the page.'
+      'the target page. Fix the link, or add the page.\n' +
+      'A "no heading in this file" line is a bare #anchor in an extra file ' +
+      '(e.g. the project README) that names no heading in that same file.'
   );
   process.exit(1);
 }
