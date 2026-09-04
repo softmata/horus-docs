@@ -484,7 +484,68 @@ if (drift.length) {
   process.exit(1);
 }
 
+// ─── send() enqueue cost must not be resold as end-to-end latency ───────────
+//
+// robotics_messages_benchmark times `tx.send()` and nothing else. A cross-thread
+// consumer drains in the background and no sample waits for delivery. The binary
+// says so three times per run -- in the run banner, in its summary header
+// ("SUMMARY BY MESSAGE TYPE — send() ENQUEUE COST, not end-to-end latency"), and
+// in its real-time block, which additionally prints "gate not discriminating" on
+// every control-period comparison so that a pass by four orders of magnitude
+// cannot be read as a result.
+//
+// benchmarks.mdx quoted those figures under a column headed "Median", added a
+// "Headroom" column dividing a control period by them, and concluded "75 ns
+// median latency supports 1000Hz+ control loops with over 12,000x headroom".
+// The binary's own caveat was already on the page -- 200 lines further down, in
+// the "Expected Output" block -- so the page contradicted itself and the
+// summary won.
+//
+// Two guards, both cheap and both aimed at the specific way this comes back.
+const enqueueCaveat = /not end-to-end/i.test(benchmarksText);
+if (!enqueueCaveat) {
+  console.error(
+    'content/docs/performance/benchmarks.mdx no longer says that its send()\n' +
+      'figures are not end-to-end latencies.\n\n' +
+      'The binary prints that caveat on every run. A page that quotes the\n' +
+      'numbers without it is telling the reader they are control-loop\n' +
+      'latencies, which they are not.'
+  );
+  process.exit(1);
+}
+
+// "12,140x headroom" and friends. The benchmark grades p99 send() cost against a
+// whole control period, which is why it labels every such comparison "gate not
+// discriminating" -- the ratio measures the absence of a bottleneck, not the
+// presence of headroom, because the receive side, node compute and scheduler
+// jitter are all unmeasured.
+const HEADROOM_RATIO = /\b\d[\d,]*\s*x\s+headroom\b/i;
+const headroomClaims = [];
+for (const file of files) {
+  const rel = path.relative(root, file).replace(/\\/g, '/');
+  if (rel === 'scripts/check-claims.mjs') continue;
+  const text = fs.readFileSync(file, 'utf8');
+  text.split('\n').forEach((line, i) => {
+    if (HEADROOM_RATIO.test(line)) {
+      headroomClaims.push(`${rel}:${i + 1} — ${line.trim().slice(0, 140)}`);
+    }
+  });
+}
+if (headroomClaims.length) {
+  console.error(
+    `${headroomClaims.length} headroom multiplier(s) derived from send() cost:\n`
+  );
+  for (const h of headroomClaims) console.error(`  ${h}\n`);
+  console.error(
+    'The benchmark prints "gate not discriminating" for exactly these\n' +
+      'comparisons. Say what the enqueue cost is; do not divide a control\n' +
+      'period by it and present the quotient as headroom.'
+  );
+  process.exit(1);
+}
+
 console.log(
-  `OK — ${scanned} files carry no retracted performance claim, and the ` +
-    `${CANONICAL.length} headline figures agree with benchmarks.mdx.`
+  `OK — ${scanned} files carry no retracted performance claim, the ` +
+    `${CANONICAL.length} headline figures agree with benchmarks.mdx, and the ` +
+    `send()-cost figures carry their not-end-to-end caveat.`
 );

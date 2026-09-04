@@ -26,16 +26,65 @@ Performance validation with real-world robotics workloads.
 
 ## Executive Summary
 
-**HORUS delivers sub-microsecond latency for production robotics applications.**
+**`send()` costs tens of nanoseconds for typical robotics messages.**
 
 Measured with `robotics_messages_benchmark` on an Intel Core i7-10750H (6C/12T, `powersave` governor), 50,000 iterations per message type after 5,000 warmup iterations — except LaserScan, which runs one fifth of each (10,000 iterations after 1,000 warmup), so its p99 rests on one fifth the samples the other rows do. These are the four message types the benchmark actually runs:
 
-| Message Type | Size | Median | p99 | Throughput | Typical Rate | Headroom |
-|--------------|------|--------|-----|------------|--------------|----------|
-| **CmdVel** | 16 B | **75 ns** | 135 ns | 12.14M msg/s | 1000 Hz | 12,140x |
-| **Imu** | 304 B | **121 ns** | 235 ns | 7.46M msg/s | 500 Hz | 14,920x |
-| **JointCommand** | 928 B | **135 ns** | 226 ns | 6.89M msg/s | 500 Hz | 13,780x |
-| **LaserScan** | 1480 B | **210 ns** | 283 ns | 4.42M msg/s | 40 Hz | 110,500x |
+<Callout type="warning" title="What these numbers are, and what they are not">
+`robotics_messages_benchmark` times **`tx.send()` enqueue cost only**. A
+cross-thread consumer drains in the background and **no sample waits for
+delivery**, so these are *not* end-to-end latencies. The binary says so on every
+run:
+
+```text
+SUMMARY BY MESSAGE TYPE — send() ENQUEUE COST, not end-to-end latency
+```
+
+An end-to-end control loop additionally pays the receive side, the node's own
+compute, and the scheduler's jitter — **none of which is measured here**. Do not
+read a figure below as a control-loop guarantee, and do not divide a control
+period by it to get "headroom": the benchmark's own real-time section prints
+`gate not discriminating` on every such comparison for exactly that reason.
+
+For end-to-end numbers see [Performance](/performance/performance), which
+reports one-way publish→receive latency.
+</Callout>
+
+Measured with `robotics_messages_benchmark` on an Intel Core i7-10750H (6C/12T,
+`powersave` governor), 50,000 iterations after 5,000 warmup iterations —
+except **LaserScan, which runs 10,000** (`benchmark_laserscan(iterations / 5)`).
+
+| Message Type | Size | `send()` median | `send()` p99 | Sustained publish rate |
+|--------------|------|--------|-----|------------|
+| **CmdVel** | 16 B | **75 ns** | 135 ns | 12.14M msg/s |
+| **Imu** | 304 B | **121 ns** | 235 ns | 7.46M msg/s |
+| **JointCommand** | 928 B | **135 ns** | 226 ns | 6.89M msg/s |
+| **LaserScan** | 1480 B | **210 ns** | 283 ns | 4.42M msg/s |
+
+"Sustained publish rate" is wall-clock over the measured loop, including batch
+drain-waits. It is the rate **this one producer/consumer pair** achieved on that
+host — not a bus capacity, and not additive across publishers.
+
+<Callout type="note" title="Reproducing these figures">
+```bash
+cargo build --release --bin robotics_messages_benchmark
+./target/release/robotics_messages_benchmark
+```
+
+The medians above reproduce, and are conservative: on the same CPU model with
+the `performance` governor, four runs gave medians of 50–82 ns (CmdVel), 64–74 ns
+(Imu), 73–115 ns (JointCommand) and 97–194 ns (LaserScan) — at or below the
+published figures.
+
+**The sustained-rate column did not reproduce.** The same four runs peaked at
+7.00M (CmdVel), 4.53M (Imu), 3.33M (JointCommand) and 1.46M msg/s (LaserScan) —
+1.6x to 3.0x below the table, with the gap widening as messages get larger. Those
+runs were on a loaded desktop, and this metric is wall-clock, so load depresses it
+directly; that is enough to explain some of the gap but not obviously all of it.
+Treat the rate column as an upper bound observed on an idle machine rather than
+as a figure you should expect to see. Tracked in
+[softmata/horus#176](https://github.com/softmata/horus/issues/176).
+</Callout>
 
 ---
 
@@ -43,21 +92,28 @@ Measured with `robotics_messages_benchmark` on an Intel Core i7-10750H (6C/12T, 
 
 ### Key Findings
 
-- **Sub-microsecond latency** for messages up to 1.5KB
-- **Serde integration** works flawlessly with complex nested structs
-- **Graceful scaling** with message size (predictable performance)
-- **Massive headroom** for all typical robotics frequencies
+- **Tens of nanoseconds to enqueue** a message up to 1.5 KB
+- **Serde integration** works with complex nested structs
+- **Graceful scaling** with message size (predictable, roughly linear in payload)
+- Enqueue cost is **far below** any robotics control period — small enough that
+  it is not the term that decides whether a loop meets its deadline
 
 ### Production Readiness
 
-- **Real-time control**: 75 ns median latency supports 1000Hz+ control loops with over 12,000x headroom
-- **Sensor fusion**: 304-byte Imu messages at 121 ns median, 235 ns p99
+- **Real-time control**: 75 ns to enqueue a CmdVel; the loop's deadline budget is
+  spent on compute, the receive side and scheduling, not on `send()`
+- **Sensor fusion**: 304-byte Imu messages enqueue in 121 ns median, 235 ns p99
 - **Manipulator control**: kilobyte-scale JointCommand payloads at 135 ns median
-- **Multi-robot systems**: multi-million msg/s throughput on a single node
+- **Multi-robot systems**: millions of messages/s from a single producer/consumer
+  pair on one host
 
 ---
 
 ## Detailed Results
+
+Every figure in this section is `send()` enqueue cost, as described in the
+[Executive Summary](#executive-summary). "Iterations" is the count that message
+type actually runs, which is not the same for all four.
 
 ### CmdVel (Motor Control Command)
 
@@ -65,12 +121,13 @@ Measured with `robotics_messages_benchmark` on an Intel Core i7-10750H (6C/12T, 
 **Size**: 16 bytes
 
 ```
-Median latency:  75 ns
-p99 latency:     135 ns
-Throughput:      12.14M msg/s
+send() median:           75 ns
+send() p99:              135 ns
+Sustained publish rate:  12.14M msg/s
+Iterations:              50,000
 ```
 
-**Analysis**: Sub-microsecond performance suitable for 1000Hz control loops with over 12,000x headroom.
+**Analysis**: 16 bytes enqueues in well under a microsecond. At a 1000 Hz control period, `send()` is a rounding error against the 1 ms budget — the loop's timing is decided by the receive side, the node's compute and the scheduler, not by this number.
 
 ---
 
@@ -80,12 +137,13 @@ Throughput:      12.14M msg/s
 **Size**: 304 bytes (`size_of`; 296 bytes declared)
 
 ```
-Median latency:  121 ns
-p99 latency:     235 ns
-Throughput:      7.46M msg/s
+send() median:           121 ns
+send() p99:              235 ns
+Sustained publish rate:  7.46M msg/s
+Iterations:              50,000
 ```
 
-**Analysis**: Sub-microsecond performance with complex nested arrays and three 9-element (3x3) covariance matrices.
+**Analysis**: Complex nested arrays and three 9-element (3x3) covariance matrices, still enqueued in nanoseconds. Serde handling of the nested structure adds no visible cost over a flat payload of the same size.
 
 ---
 
@@ -95,12 +153,13 @@ Throughput:      7.46M msg/s
 **Size**: 928 bytes (`size_of`; 1032 bytes declared)
 
 ```
-Median latency:  135 ns
-p99 latency:     226 ns
-Throughput:      6.89M msg/s
+send() median:           135 ns
+send() p99:              226 ns
+Sustained publish rate:  6.89M msg/s
+Iterations:              50,000
 ```
 
-**Analysis**: Sub-microsecond latency for kilobyte-scale command payloads, with room for 500Hz+ manipulator loops.
+**Analysis**: Kilobyte-scale command payloads enqueue in roughly the same time as the 304-byte Imu, so per-message overhead dominates the per-byte copy at this size.
 
 ---
 
@@ -110,12 +169,13 @@ Throughput:      6.89M msg/s
 **Size**: 1480 bytes
 
 ```
-Median latency:  210 ns
-p99 latency:     283 ns
-Throughput:      4.42M msg/s
+send() median:           210 ns
+send() p99:              283 ns
+Sustained publish rate:  4.42M msg/s
+Iterations:              10,000
 ```
 
-**Analysis**: Still sub-microsecond at 1.5KB. Easily handles 40Hz lidar updates with enormous headroom.
+**Analysis**: At 1.5 KB the payload copy starts to show — the median is about 2.8x CmdVel's for 92x the bytes. This type runs 10,000 iterations, not 50,000 (`benchmark_laserscan(iterations / 5)`).
 
 ---
 
@@ -140,18 +200,18 @@ Throughput:      4.42M msg/s
 
 ## Latency by Message Size
 
-> **Measurement Note**: All latencies below are **send-only** (one-direction publish), measured by `robotics_messages_benchmark` with an auto-selected `Topic` backend. Sizes are `size_of` at runtime.
+> **Measurement Note**: The HORUS column is `send()` **enqueue cost** measured by `robotics_messages_benchmark` with an auto-selected `Topic` backend — no sample waits for delivery, so it is not even a full one-way latency. Sizes are `size_of` at runtime.
 >
 > The ROS 2 column divides that send-only figure by ROS 2's ~5 µs REP 2014 reference, which is an **end-to-end** number we did not measure. The two sides are therefore not like-for-like and the ratios are indicative, not a benchmark result. For a one-way-to-one-way comparison use the cross-process row above (151 ns), which gives roughly 33x.
 
-| Message Size | Message Type | Median | p99 | Throughput | vs ROS2 default (~5 μs) |
+| Message Size | Message Type | `send()` median | `send()` p99 | Sustained publish rate | vs ROS2 default (~5 μs) |
 |-------------|--------------|--------|-----|------------|--------------------------|
 | 16 B | CmdVel | **75 ns** | 135 ns | 12.14 M msg/s | **~67x faster** |
 | 304 B | Imu | **121 ns** | 235 ns | 7.46 M msg/s | **~41x faster** |
 | 928 B | JointCommand | **135 ns** | 226 ns | 6.89 M msg/s | **~37x faster** |
 | 1,480 B | LaserScan | **210 ns** | 283 ns | 4.42 M msg/s | **~24x faster** |
 
-**Observation**: Latency grows far more slowly than message size — 92x more bytes costs under 3x latency — reflecting efficient serialization and IPC.
+**Observation**: Enqueue cost grows far more slowly than message size — 92x more bytes costs under 3x — because the per-message overhead dominates the per-byte copy across this whole range.
 
 ---
 
