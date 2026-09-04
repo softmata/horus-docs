@@ -194,6 +194,21 @@ const CLASSES = [
     // mismatches and six code blocks with no Copy button on its first run.
   },
   {
+    class: 'structure/shell-fence',
+    what: 'every ```bash block is shell and parses',
+    enforced: { where: 'scripts/check_shell_fences.py', needle: 'Every shell block parses' },
+    direction: 'n/a',
+    // 592 bash blocks and nothing opened one. docs_cli_contract checks that a
+    // documented command and its flags exist, not that the fence contains
+    // shell. Three blocks carried a Rust or Python line appended to a recipe
+    // under "# Or from code" — which a reader cannot paste, and which
+    // verify:rust never sees, because it is inside a ```bash fence. Three more
+    // were sample output. This does not check that a recipe does what the prose
+    // says; that needs a fixture project, and the recipes found broken by hand
+    // (an install landing where the next command does not look) are evidence
+    // the class is worth one.
+  },
+  {
     class: 'structure/toml-fence',
     what: 'every TOML block parses, and every manifest example agrees with the schema this site publishes',
     enforced: { where: 'scripts/check_toml_fences.py', needle: 'agrees with the published schema' },
