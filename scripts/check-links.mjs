@@ -89,13 +89,8 @@ function walk(dir, out = []) {
 
 // ─── The routes that exist, and the anchors each one offers ─────────────────
 
-const routes = new Map(); // "/concepts/goals" -> Set of heading ids
-
-for (const file of walk(contentDir)) {
-  if (!file.endsWith('.mdx')) continue;
-  const rel = path.relative(contentDir, file).replace(/\\/g, '/').replace(/\.mdx$/, '');
-  const route = '/' + (rel.endsWith('/index') ? rel.slice(0, -'/index'.length) : rel);
-
+/** The heading ids a markdown file renders, skipping fenced code. */
+function headingIdsIn(file) {
   const anchors = new Set();
   let inFence = false;
   for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
@@ -108,7 +103,17 @@ for (const file of walk(contentDir)) {
     const m = /^(#{1,6})\s+(.*)$/.exec(t);
     if (m) anchors.add(headingId(headingText(m[2])));
   }
-  routes.set(route, anchors);
+  return anchors;
+}
+
+const routes = new Map(); // "/concepts/goals" -> Set of heading ids
+
+for (const file of walk(contentDir)) {
+  if (!file.endsWith('.mdx')) continue;
+  const rel = path.relative(contentDir, file).replace(/\\/g, '/').replace(/\.mdx$/, '');
+  const route = '/' + (rel.endsWith('/index') ? rel.slice(0, -'/index'.length) : rel);
+
+  routes.set(route, headingIdsIn(file));
 }
 
 // ─── Every internal link, and where it was written ──────────────────────────
@@ -132,6 +137,22 @@ for (const f of extra) {
     process.exit(2);
   }
 }
+
+/**
+ * Headings of the extra files, keyed by absolute path.
+ *
+ * A bare `](#anchor)` resolves against the page it is written on. For a file
+ * under content/docs that page is a route, but an extra file — the project
+ * README — is not on this site at all, and the route spelling computed for it
+ * is a `../../..` path that matches nothing. Every bare anchor in the README
+ * therefore reported "no page" however correct it was: `#get-started` and
+ * `#install-upgrade-uninstall` both name real `##` headings in that same file
+ * and both resolve fine on GitHub, which is where that file is read.
+ *
+ * So an extra file's bare anchors are checked against its own headings, which
+ * is what the link actually means, and still fail when the heading is absent.
+ */
+const selfAnchors = new Map(extra.map((f) => [f, headingIdsIn(f)]));
 
 const sources = [
   ...walk(contentDir).filter((f) => f.endsWith('.mdx')),
@@ -183,12 +204,21 @@ for (const file of sources) {
         // not documentation routes.
         if (href.startsWith('//') || href.startsWith('/_') || href.startsWith('/api/')) continue;
         const [slug, fragment] = href.split('#');
+        checked += 1;
+
+        // A bare `#fragment` in an extra file names a heading in that file.
+        if (slug === '' && selfAnchors.has(file)) {
+          if (fragment && !selfAnchors.get(file).has(fragment)) {
+            dead.push(`${rel}:${i + 1}: ${href} — no heading in this file`);
+          }
+          continue;
+        }
+
         // A bare `#fragment` link resolves within the page it is written on.
         const target = slug === '' ? '/' + path.relative(contentDir, file)
           .replace(/\\/g, '/')
           .replace(/\.mdx$/, '')
           .replace(/\/index$/, '') : slug;
-        checked += 1;
 
         // Assets under public/ are served at the site root and are not routes.
         if (fs.existsSync(path.join(root, 'public', target.slice(1)))) continue;
