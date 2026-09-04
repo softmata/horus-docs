@@ -156,7 +156,16 @@ For multi-machine communication, HORUS supports zero-configuration peer discover
 pub fn send(&self, msg: T)
 ```
 
-Publishes a message to the topic. Fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (any number of publishers, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead. Use `try_send()` to detect the drop, or `send_blocking(msg, timeout)` to wait for room on critical topics.
+Publishes a message to the topic. Fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed.
+
+On a **broadcast** topology (multiple subscribers) the ring is latest-wins: the oldest slot is overwritten and the new message always lands.
+
+On a **point-to-point** topology (one subscriber) a full ring first retries — immediately, then a short spin, then a bounded yield. What happens next depends on whether anything is draining the ring:
+
+- **A live subscriber is draining it, just slowly.** `send()` gives up and drops the new message. Queued messages keep their FIFO order.
+- **Nothing is draining it** — no subscriber has registered, the subscriber's process is gone, or `tail` has not moved for a full 5-second lease. `send()` retires the oldest unread slot and accepts the new message, so the ring holds the most recent `capacity` messages rather than the first ones. Every retired message is counted in `dropped_count()`.
+
+The second case is the common one for a node run on its own, before anything subscribes. Use `try_send()` to detect a drop, and read `dropped_count()` to see how many messages were retired.
 
 ```rust
 // send() returns no Result — but the message can still be dropped
@@ -198,17 +207,48 @@ match topic.try_send(data) {
 pub fn send_blocking(&self, msg: T, timeout: std::time::Duration) -> Result<(), SendBlockingError>
 ```
 
-Sends a message, waiting for room in the ring instead of dropping it. It tries once immediately, then spins, then yields, then sleeps in 100µs steps until the deadline. The only error is `SendBlockingError::Timeout`, returned when the ring stayed full for the whole timeout — the message is not handed back. Use this on critical topics (emergency stop, motor setpoints) where a dropped message is unacceptable.
+Sends a message, waiting for room in the ring instead of dropping it. It tries once immediately, then spins, then yields, then sleeps in 100µs steps until the deadline.
 
-It only does anything on a **point-to-point** ring. A broadcast ring (multiple subscribers) never reports a full ring — it overwrites the oldest slot — so the first internal attempt always succeeds and `send_blocking` returns immediately, applying no backpressure at all.
+`SendBlockingError` has two variants, and the second one is the one to plan for:
+
+| Variant | Meaning | Was the message sent? |
+|---|---|---|
+| `Timeout` | The ring stayed full for the whole timeout | No |
+| `NoBackpressure` | This topic's backend cannot apply backpressure at all | **No — it was never attempted** |
+
+<Callout type="warning" title="send_blocking does nothing on a broadcast topic">
+`send_blocking` refuses before it tries. If the resolved backend is `PodShm` or
+`FanoutShm` — which is what a topic with **two or more subscribers** gets — it
+returns `Err(SendBlockingError::NoBackpressure)` and does not send the message.
+
+This matters because the second subscriber does not have to be part of your
+design. Attaching a logger, or running `horus topic echo`, is enough to move a
+topic onto a broadcast backend. A command path that worked in testing then
+stops delivering, and returns an error your code may be treating as "the ring
+was briefly full".
+
+Call `provides_backpressure()` on the handle — after its first send, since an
+unresolved backend answers permissively — to find out which kind of topic you
+actually have.
+</Callout>
 
 `SendBlockingError` is not in the prelude; import it from `horus::communication::SendBlockingError` if you need to match on it.
 
 ```rust
 use std::time::Duration;
 
-if topic.send_blocking(command, Duration::from_millis(5)).is_err() {
-    // ring stayed full for 5ms — escalate rather than continue silently
+use horus::communication::SendBlockingError;
+
+match topic.send_blocking(command, Duration::from_millis(5)) {
+    Ok(()) => {}
+    Err(SendBlockingError::Timeout) => {
+        // the ring stayed full for 5ms — escalate rather than continue silently
+    }
+    Err(SendBlockingError::NoBackpressure) => {
+        // this topic is broadcast-backed: nothing was sent, and no timeout will
+        // help. Use send() and accept latest-wins, or give the command path its
+        // own single-subscriber topic.
+    }
 }
 ```
 
@@ -463,7 +503,7 @@ Avoid using these patterns:
 
 ### Send Behavior
 
-`send()` is fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On point-to-point topologies (1 publisher / 1 subscriber, or many publishers / 1 subscriber) a full ring **rejects the new message**: `send()` retries briefly (spin, then yield) and then drops it; queued messages are preserved in FIFO order. On broadcast topologies (any number of publishers, multiple subscribers) the ring is latest-wins and the **oldest** slot is overwritten instead.
+`send()` is fire-and-forget — it returns nothing, so there is no `Result` to handle, but delivery is not guaranteed. On broadcast topologies (multiple subscribers) the ring is latest-wins: the oldest slot is overwritten. On point-to-point topologies a full ring retries briefly, then either drops the new message (if a live subscriber is draining) or retires the oldest unread slot to make room (if nothing is draining it — including the case where nothing has subscribed yet). See [`send()`](#send) above for the full rule.
 
 ```rust
 // send() returns no Result — but the message can still be dropped
