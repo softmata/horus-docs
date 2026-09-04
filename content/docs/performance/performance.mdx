@@ -39,13 +39,13 @@ All performance features use **graceful degradation** - your code runs everywher
 
 ### Optimized Data Structures
 
-HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — cross-process single-producer paths measure ~198ns p50, contended multi-producer paths ~304ns p50.
+HORUS uses carefully optimized memory layouts to minimize latency. The communication paths are designed for maximum throughput with predictable timing — cross-process single-producer paths measure ~151ns p50, contended multi-producer paths ~279ns p50.
 
 ## Benchmark Results
 
 ### Measured Latency
 
-> **Measurement Note**: These are the HORUS repository's own published results (Intel Core i7-10750H @ 2.60 GHz, `powersave` governor, 100K iterations per scenario, RDTSC timing with Tukey IQR outlier removal). All latencies are **one-way** (publish → receive). For round-trip, approximately double these values.
+> **Measurement Note**: These are the HORUS repository's own published results (Intel Core i7-10750H @ 2.60 GHz, `powersave` governor, 100K iterations per scenario, RDTSC timing, no outlier filtering — Tukey's fence is counted as a diagnostic and no published statistic is computed from what survives it). All latencies are **one-way** (publish → receive). For round-trip, approximately double these values.
 
 Every topic is shared-memory backed, so every backend below is cross-process.
 There is no intra-process or same-thread path — the heap ring-buffer backends
@@ -56,10 +56,11 @@ with the single-digit-nanosecond figures that came with them.
 
 | Scenario | Backend | p50 | p99 |
 |----------|---------|-----|-----|
-| 1 pub, 2 sub | PodShm | 198ns | 298ns |
-| 1 pub, 8 sub | PodShm | 276ns | 510ns |
-| 4 pub, 4 sub | PodShm | 304ns | 1.5µs |
-| Raw SHM atomic (hardware floor) | — | 167ns | 319ns |
+| 1 pub, 1 sub (`CrossProc-1P1C`) | SpscShm | 151ns | 181ns |
+| 2 pub, 1 sub (`CrossProc-2P1C`) | MpscShm | 279ns | 374ns |
+| 1 pub, 2 sub (`CrossProc-1PMC`) | PodShm | 191ns | 209ns |
+| broadcast (`CrossProc-PodShm`) | PodShm | 223ns | 270ns |
+| Raw SHM atomic (hardware floor) | — | 79ns | 102ns |
 
 The Backend column is the route auto-detection actually picked, read back from
 `Topic::backend_name()` after the topology settled. A 1-publisher /
@@ -72,15 +73,15 @@ consumers compete for messages rather than each receiving the stream.
 |---------|------|--------|-----|
 | CmdVel | 16B | 75ns | 135ns |
 
-**Key insight**: cross-process shared memory adds only ~31ns of framework overhead over the raw shared-memory hardware floor.
+**Key insight**: framework overhead is the gap to the raw shared-memory floor — 72ns for cross-process 1:1.
 
 Reproduce these numbers yourself with `cargo run --release -p horus_benchmarks --bin all_paths_latency` (backend scenarios) and `--bin robotics_messages_benchmark` (real message types); the methodology lives in `benchmarks/README.md` in the HORUS repository, which has withdrawn its own published result tables and tells you to regenerate them.
 
 ### Throughput
 
-> **No published throughput table.** `benchmarks/README.md` publishes no measured numbers at all — its result tables were withdrawn. The HORUS repository has no throughput result for a 1 KB or 100 KB payload and none for a many-publisher / many-subscriber topology — no benchmark in it even sends a 100 KB message. The largest payloads anywhere in `benchmarks/` are 4 KB (`topic_probe --bulk 4096`), 1 KB (`ThroughputPayload1K` in `benches/topic_throughput.rs`) and the 1,480-byte `LaserScan` in `robotics_messages_benchmark`.
+> **No published throughput table.** `benchmarks/README.md` publishes no measured numbers at all — its result tables were withdrawn. The HORUS repository has no throughput result for a 1 KB or 100 KB payload and none for a many-publisher / many-subscriber topology — no benchmark in it copies a 100 KB message **by value**. The largest by-value payloads are 4 KB (`topic_probe --bulk 4096`), 1 KB (`ThroughputPayload1K` in `benches/topic_throughput.rs`) and the 1,480-byte `LaserScan` in `robotics_messages_benchmark`. `topic_probe --image WxH` does publish frames of any size — the repository README publishes 640x480 (307 KB) and 1920x1080 (2 MB) one-way p50 rows taken with it — but those are pool-backed: only a small descriptor crosses the ring, so they measure the zero-copy path rather than a large copy.
 
-The only per-message throughput figures HORUS publishes come from the same `robotics_messages_benchmark` run as the latency row above. They are **send-only** — producer-side `send()`, one publisher, derived from the median send time — not a sustained pub/sub rate:
+The only per-message throughput figures HORUS publishes come from the same `robotics_messages_benchmark` run as the latency row above (LaserScan is called with one fifth the iterations and warmup of the other three, so its row rests on 10,000 samples, not 50,000). They are **send-only** — producer-side `send()`, one publisher, derived from the median send time — not a sustained pub/sub rate:
 
 | Message | Size | Send-only throughput |
 |---------|------|----------------------|
@@ -186,7 +187,7 @@ pub struct BadLaserScan {
 // FAST: Small, fixed-size struct
 let topic: Topic<Pose2D> = Topic::new("pose")?;
 topic.send(Pose2D::new(1.0, 2.0, 0.5));
-// Cross-process IPC latency: ~198-304ns p50 depending on topology
+// Cross-process IPC latency: ~151-279ns p50 depending on topology
 
 // SLOWER: Larger struct with more data
 let topic: Topic<SensorBundle> = Topic::new("sensors")?;
@@ -389,8 +390,8 @@ Local communication goes through shared memory; cross-machine communication goes
 
 | Transport | Latency (one-way, p50) | Requirements |
 |-----------|------------------------|--------------|
-| Shared Memory (Topic, 1 pub : N sub) | ~198ns | Local only |
-| Shared Memory (Topic, N pub : N sub) | ~304ns | Local only |
+| Shared Memory (Topic, 1 pub : 2 sub) | ~191ns | Local only |
+| Shared Memory (Topic, 2 pub : 1 sub) | ~279ns | Local only |
 | UDP (`horus_net`, cross-machine) | Network-bound | `net` feature |
 
 ### Enable Cross-Machine Networking

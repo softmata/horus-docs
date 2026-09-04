@@ -600,7 +600,7 @@ Sets the scheduler name for logging/monitoring. Defaults to `"Scheduler"`, overr
 pub fn deterministic(self, enabled: bool) -> Self
 ```
 
-Runs all nodes sequentially on the main thread in `.order()` order (ties broken by registration order) — no thread pools, no watcher threads, no executors. Intended for simulation and testing with `tick_once()`.
+Runs all nodes sequentially on the main thread — no thread pools, no watcher threads, no executors. The sequence is the topological order of the topic dependency graph, so producers run before their consumers; `.order()` tiers are only a fallback, used when no node has registered any topic. Intended for simulation and testing with `tick_once()`.
 
 ---
 
@@ -671,9 +671,16 @@ pub fn watchdog(self, timeout: Duration) -> Self
 ```
 
 Arms a watchdog for every **RT** node — anything with `.rate()`, `.budget()` or
-`.deadline()` — and marks it critical. Setting it auto-creates the safety monitor: if a
-watched node does not tick within the timeout, the watchdog triggers graduated
-degradation (warn → reduce rate → isolate → safe state).
+`.deadline()` — and marks it critical. The safety monitor exists on every scheduler
+regardless of configuration, so emergency stop always works; `.watchdog()` is what arms
+the frozen-node detector.
+
+The watchdog escalates by timeout multiple: at 1x the node is marked Warning, at 2x
+Unhealthy and skipped, at 3x isolated with `enter_safe_state()` called on it — and if that
+call panics the node did not reach a safe state, so the scheduler latches an emergency
+stop. Sustained **deadline misses** drive a separate ladder counted in consecutive misses:
+warn at 3, halve the node's rate at 5, isolate and enter safe state at 10, kill at 20
+(`shutdown()` and permanent removal from execution).
 
 <Callout type="warning" title="Best-effort nodes are not covered by this">
 A scheduler-level `.watchdog()` registers RT nodes only. A node without an execution
@@ -818,6 +825,35 @@ Runs all nodes for a specified duration.
 - `duration` - How long to run
 
 **Returns:** `Result<()>`
+
+---
+
+#### `tick_once`
+
+```rust
+pub fn tick_once(&mut self) -> Result<()>
+```
+
+Executes exactly one tick cycle for all nodes, then returns. It does not loop and does not
+sleep, so the caller owns the timing — that is what lets an external physics step drive
+the schedule instead of a wall clock. Lazily initialises on the first call: deferred
+config is applied and every node's `init()` runs there, not at `build()`.
+
+**Returns:** `Result<()>` — `HorusError::InvalidInput` for a duplicate node name,
+`HorusError::Resource` when `require_rt()` was set and real-time could not be acquired,
+and `HorusError::Internal` when the tick did not complete (a node panic whose failure
+policy said stop, an RT budget or deadline escalation, or the safety monitor latching).
+Treat every `Internal` as fatal and stop the loop: those causes share one variant, and the
+message is diagnostic text rather than something to match on.
+
+**Example:**
+```rust
+let mut scheduler = Scheduler::new().tick_rate(100_u64.hz());
+// ... add nodes and build, then drive the loop yourself
+for _ in 0..1000 {
+    scheduler.tick_once()?;
+}
+```
 
 ---
 
@@ -1151,7 +1187,7 @@ pub struct TopicMetadata {
 
 ## Performance
 
-Every topic is shared-memory backed, so every figure below is a cross-process number — there is no same-thread or intra-process fast path.
+Every topic is shared-memory backed, so the figures below are cross-process numbers — there is no separate intra-process transport to select. One handle that both sends and receives a POD message is the exception: it takes a shorter inlined path inside the same SHM backend, which is the 20 ns same-thread figure in the [benchmarks](/performance/benchmarks).
 
 | Scenario | send() Latency |
 |----------|---------------|

@@ -228,7 +228,7 @@ stops delivering, and returns an error your code may be treating as "the ring
 was briefly full".
 
 Call `provides_backpressure()` on the handle — after its first send, since an
-unresolved backend answers permissively — to find out which kind of topic you
+unresolved backend also answers `false` — to find out which kind of topic you
 actually have.
 </Callout>
 
@@ -286,6 +286,39 @@ pub fn pending_count(&self) -> u64
 ```
 
 Returns the number of messages waiting to be consumed.
+
+### missed_count()
+
+```rust
+pub fn missed_count(&self) -> u64
+```
+
+Returns how many messages this subscriber was lapped past by the producer. It is counted per
+handle on the consumer side, where the loss happens, so two subscribers on the same topic
+report independently. This is the counter that detects a slow consumer — `dropped_count()`
+stays at `0` on a broadcast topic, because an overwriting producer never fails a send.
+
+### provides_backpressure()
+
+```rust
+pub fn provides_backpressure(&self) -> bool
+```
+
+Whether a full ring can make this topic's `try_send` refuse a message. It is `false` on the
+broadcast backends — which is what a topic silently becomes once a second subscriber attaches
+— and therefore `false` wherever `send_blocking()` will return `NoBackpressure`.
+
+Call it *after* the first `send()` or `recv()`. A handle does not resolve its backend until it
+moves a message, and an unresolved backend also answers `false`, so an assertion placed before
+the first send fires on every topic including the ones that are fine.
+
+```rust
+estop.send(command);   // resolves the backend
+assert!(
+    estop.provides_backpressure(),
+    "e-stop settled on a lossy backend"
+);
+```
 
 ### Runtime Debug Logging
 
@@ -394,10 +427,18 @@ starve the others.
 
 That is independence, not a delivery guarantee. The ring is latest-wins: a publisher that
 laps a subscriber overwrites slots that subscriber has not read, and the subscriber
-jumps forward, usually to the current head, and the skipped messages are lost. The loss is silent —
-`dropped_count()` counts send-side failures, and on a broadcast ring the publisher never
-fails to send, so it stays at `0`. Keep subscribers fast enough to drain the ring, or use
-`send_blocking()` where a gap is unacceptable.
+jumps forward, usually to the current head, and the skipped messages are lost.
+
+The skip raises no error, but it **is** counted: `missed_count()` returns how many messages
+this subscriber was lapped past, tallied per handle on the consumer side. What stays at `0`
+is `dropped_count()` — it reports send-side failures only, and an overwriting producer never
+fails a send.
+
+`send_blocking()` does not close the gap: on a broadcast ring it returns
+`Err(SendBlockingError::NoBackpressure)` without sending, so it turns lost messages into no
+message at all. What works is keeping the subscriber fast enough to drain the ring, giving
+the topic more capacity with `Topic::with_capacity`, or moving the slow work off the
+subscriber's tick.
 
 ```rust
 // One publisher
@@ -684,13 +725,15 @@ By default, `Topic::new()` auto-sizes capacity based on message type size:
 
 | Message Type | Auto Capacity | Approximate Memory |
 |--------------|---------------|--------------------|
-| `f32` (4 bytes) | 1024 slots | ~73 KB |
-| `CmdVel` (16 bytes) | 256 slots | ~19 KB |
-| `Pose2D` (32 bytes) | 128 slots | ~10 KB |
-| `Twist` (56 bytes) | 128 slots | ~10 KB |
+| `f32` (4 bytes) | 1024 slots | ~65 KB |
+| `CmdVel` (16 bytes) | 256 slots | ~17 KB |
+| `Pose2D` (32 bytes) | 128 slots | ~8.6 KB |
+| `Twist` (56 bytes) | 128 slots | ~8.6 KB |
 | `Imu` (304 bytes) | 16 slots | ~5.5 KB |
 
 Auto capacity is always clamped to `[16, 1024]` and rounded up to the next power of two. A fixed-size (POD) type of 56 bytes or less gets a padded 64-byte slot — one cache line holding an 8-byte readiness stamp next to the payload; a larger POD type gets a slot exactly `size_of::<T>()` wide. Only non-POD (heap-owning) types fall back to the 8 KB default slot.
+
+The region is a 640-byte header plus the slots. A co-located slot carries its own stamp, so the first four rows above are `640 + capacity × 64` and nothing more; the wider layouts allocate a separate 8-byte sequence entry per slot on top of the data, which is why `Imu` at 16 × 304 bytes still comes to ~5.5 KB.
 
 For most robotics applications, memory usage per topic is under 1 MB.
 
@@ -735,13 +778,13 @@ Every topic is shared-memory backed, so these are end-to-end one-way IPC figures
 
 | Scenario | p50 | p99 |
 |----------|-----|-----|
-| Cross-process, 1 publisher / 2 subscribers | ~198ns | ~298ns |
+| Cross-process, 1 publisher / 2 subscribers | ~191ns | ~209ns |
 | Cross-process, 1 publisher / 4 subscribers | ~236ns | ~417ns |
 | Cross-process, 1 publisher / 8 subscribers | ~276ns | ~510ns |
 | Cross-process, 4 publishers / 4 subscribers | ~304ns | ~1.5µs |
-| Raw shared-memory atomic (hardware floor) | ~167ns | ~319ns |
+| Raw shared-memory atomic (hardware floor) | ~79ns | ~102ns |
 
-The ~167ns row is the bare atomic round of a shared-memory handoff with no framework on top — a bound HORUS approaches, not a latency any topic achieves.
+The ~79ns row is the bare atomic round of a shared-memory handoff with no framework on top — a bound HORUS approaches, not a latency any topic achieves.
 
 ### Latency by Message Type
 
