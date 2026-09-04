@@ -55,5 +55,19 @@ try {
   fs.rmSync(work, { recursive: true, force: true });
 }
 
+// A pass that examined nothing is not a pass. See verify-rust-local.mjs for the
+// reasoning; this selection is `language === "python" && verifiable`, so it
+// hangs on one attribute name. 214 of the 220 python blocks currently qualify.
+//
+// Skipped on a filtered run, where examining a handful of blocks is the point.
+if (!options.filter && blocks.length < 150) {
+  console.error(
+    `only ${blocks.length} Python blocks selected — the selection is broken. ` +
+      'Blocks are chosen by `language === "python" && verifiable`; if that ' +
+      'attribute was renamed or its meaning changed, nothing is being verified.'
+  );
+  process.exit(2);
+}
+
 console.log(`Python documentation verification: ${blocks.length - failures.length}/${blocks.length} passed`);
 if (failures.length) process.exit(1);
