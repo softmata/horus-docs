@@ -70,5 +70,26 @@ try {
   fs.rmSync(work, { recursive: true, force: true });
 }
 
+// A pass that examined nothing is not a pass.
+//
+// verify-cpp-local.mjs has carried this guard for a while; these two never got
+// it, and they are the ones that need it most. The selection here is narrow --
+// 54 of the 790 rust blocks in the docs survive
+// `verifiable && !flags.includes('needs-wrapper')` -- so it rests entirely on
+// two attribute names staying spelled the way the extractor writes them. Rename
+// `verifiable`, or start emitting `needs-wrapper` more widely, and this script
+// prints "0/0 passed" and exits 0. The job goes green having compiled nothing.
+//
+// Skipped on a filtered run, where examining a handful of blocks is the point.
+if (!options.filter && blocks.length < 40) {
+  console.error(
+    `only ${blocks.length} Rust blocks selected — the selection is broken. ` +
+      'Blocks are chosen by `language === "rust" && verifiable && ' +
+      '!flags.includes("needs-wrapper")`; if those attributes were renamed or ' +
+      'their meaning changed, nothing is being verified.'
+  );
+  process.exit(2);
+}
+
 console.log(`Rust documentation verification: ${blocks.length - failures.length}/${blocks.length} passed`);
 if (failures.length) process.exit(1);
