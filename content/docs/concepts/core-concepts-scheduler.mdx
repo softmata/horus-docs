@@ -147,9 +147,14 @@ Priorities are `u32` values where **lower numbers = higher priority**:
 | 200+ | Background | Telemetry, data recording |
 
 `order` sequences nodes on the **main tick loop**, and whether it applies is decided
-globally for the whole program rather than pair by pair: if *no* node registered a topic
-during `init()`, the graph falls back to tiers and every main-loop node is ordered by
-them.
+globally for the whole program rather than pair by pair: if *no* node has registered a
+topic, the graph falls back to tiers and every main-loop node is ordered by them.
+
+That decision is re-taken after the first tick, not settled at `init()`. Registration is
+lazy — it happens on the first `send()`/`recv()`, not in `Topic::new` — so a program whose
+nodes exchange messages inside `tick()` runs tick 1 on tiers, and the scheduler then
+rebuilds the graph from the topic metadata at the start of tick 2 and keeps it. From that
+point the pub/sub graph decides the sequence and `order` no longer applies.
 
 ```rust
 let mut scheduler = Scheduler::new();
@@ -180,8 +185,12 @@ TICK Sensor(order 50)  at  1.96ms
 TICK Safety(order 0)   at 32.18ms     # subscribes to Sensor's topic
 ```
 
-`order` tiers are the fallback used when no node registered a topic during `init()` — the usual case, since registration happens on the first `send()`/`recv()` and not in `Topic::new`. A graph
-from. If you need a strict sequence, use `.deterministic(true)`.
+`order` tiers are the fallback used only while no topic metadata exists. Registration is
+lazy — it happens on the first `send()`/`recv()`, not in `Topic::new` — so the trace above
+is tick 1. At the start of tick 2 the scheduler rebuilds the dependency graph from the
+topics those sends registered, and Safety, which subscribes to Sensor's topic, is ordered
+after Sensor by the graph from then on regardless of its tier. If you need a sequence that
+holds for the whole run, use `.deterministic(true)`.
 
 </Callout>
 
@@ -258,7 +267,10 @@ for deg in scheduler.degradations() {
 When `.prefer_rt()` is set, the scheduler attempts, in order:
 1. **Memory locking** (mlockall) — if permitted
 2. **RT priority** (SCHED_FIFO, priority 50) — if available
-3. **CPU affinity** — only if you also called `.cores(&[2, 3])`
+3. **CPU affinity** — RT executor threads are pinned whether or not you call `.cores()`. With
+   `.cores(&[2, 3])` those are the cores; without it the scheduler derives them from the machine
+   (`recommended_rt_cpus`, else the highest-numbered CPU), and `HORUS_RT_CORES="2,3"` sets them
+   from the environment when `.cores()` was not called
 
 Features that fail are recorded as degradations, not errors. `.require_rt()` applies the same features but panics when the system supports neither SCHED_FIFO nor mlockall.
 
@@ -299,7 +311,7 @@ scheduler.add(motor_ctrl)
 |--------|-------------|
 | `.name(name)` | Set scheduler name for logging/monitoring |
 | `.deterministic(bool)` | Run all nodes sequentially on the main thread (replay/testing) |
-| `.cores(&[usize])` | Pin the scheduler to specific CPU cores |
+| `.cores(&[usize])` | Choose which CPU cores the RT threads pin to. Without it they still pin, to cores derived from the machine; `HORUS_RT_CORES` sets them from the environment |
 | `.max_deadline_misses(n)` | Deadline misses tolerated before emergency stop (default 100) |
 | `.verbose(bool)` | Enable/disable non-emergency logging from executor threads |
 | `.telemetry(endpoint)` | Export telemetry to a UDP or file URI |
@@ -506,7 +518,7 @@ scheduler.add(diagnostics).order(200).done()?;
 let mut scheduler = Scheduler::new()
     .tick_rate(1000_u64.hz())  // 1 kHz control loop
     .prefer_rt()               // Attempt RT priority + mlockall (degrade if unavailable)
-    .cores(&[2, 3])            // Pin to these CPU cores (required for affinity)
+    .cores(&[2, 3])            // Choose the cores; RT threads are pinned either way
     .blackbox(16)              // Flight recorder
     .watchdog(500_u64.ms());   // Frozen-node watchdog
 
