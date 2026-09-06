@@ -264,6 +264,27 @@ const CLASSES = [
 
   // ── value: a documented value matches the source ────────────────────────
   {
+    class: 'value/rust-signature',
+    what: 'a Rust signature printed in the API reference is the one the crate declares',
+    // Handing eight agents nothing but these docs produced 78 recorded guesses,
+    // almost all of the form "no page prints this signature, so I inferred it
+    // from the call sites". `DurationExt` was guessed nine times. Publishing a
+    // signature makes it a second copy of something in the crate, so the copies
+    // are diffed rather than trusted.
+    enforced: { where: 'scripts/check-rust-signatures.mjs', needle: 'no longer match the crate' },
+    direction: 'both',
+  },
+  {
+    class: 'existence/agent-entrypoint',
+    what: 'llms.txt lists every documentation page, with the description the page carries',
+    // Generated from the same frontmatter the site renders, so a new or renamed
+    // page cannot go missing from it; the check fails when the committed copy is
+    // stale. Without this the only machine-readable artifact was
+    // search-index.json, which truncates every page to 2000 characters.
+    enforced: { where: 'scripts/build-llms-txt.mjs', needle: 'is out of date' },
+    direction: 'both',
+  },
+  {
     class: 'value/site-metadata',
     what: "the site's own JSON-LD advertises the version HORUS ships and every language it documents",
     // `app/` is not `content/`, so no code or link checker ever looked at it.
