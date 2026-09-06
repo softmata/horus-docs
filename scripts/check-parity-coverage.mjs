@@ -104,9 +104,13 @@ const CLASSES = [
   {
     class: 'existence/env-var',
     what: 'documented variables are read, and variables the code reads are documented',
-    // enforced: { where: 'horus:horus_manager/tests/docs_parity.rs',
-    //             needle: 'every_env_var_the_code_reads_is_documented' },
-    manual: '`horus_manager/tests/docs_parity.rs` is now on horus `main`, so the test exists — but nothing runs it. All three of its tests carry `#[ignore]`, and although the `--test *` sweep in integration-tests.yml selects the target, an all-ignored binary exits 0 reporting "0 passed; 3 ignored", which reads as coverage. No workflow names `docs_parity` at all, despite the ignore reason on each test saying it is wired into the docs-contract workflow. softmata/horus#178 adds that step; restore the `enforced` block above once it merges: `every_env_var_the_code_reads_is_documented`',
+    // Two facts, not one: the test exists, and the docs-contract workflow
+    // actually runs it with `--ignored`. Asserting only the first is what let
+    // this class sit in `manual` while the case was written but never executed.
+    enforced: [
+      { where: 'horus:horus_manager/tests/docs_parity.rs', needle: 'fn every_env_var_the_code_reads_is_documented' },
+      { where: 'horus:.github/workflows/docs-contract.yml', needle: '--test docs_parity' },
+    ],
     direction: 'both',
   },
   {
@@ -124,17 +128,25 @@ const CLASSES = [
   {
     class: 'existence/benchmark-binary',
     what: 'every benchmark the docs tell a reader to run exists',
-    // enforced: { where: 'horus:horus_manager/tests/docs_parity.rs',
-    //             needle: 'documented_benchmark_binaries_exist' },
-    manual: '`horus_manager/tests/docs_parity.rs` is now on horus `main`, so the test exists — but nothing runs it. All three of its tests carry `#[ignore]`, and although the `--test *` sweep in integration-tests.yml selects the target, an all-ignored binary exits 0 reporting "0 passed; 3 ignored", which reads as coverage. No workflow names `docs_parity` at all, despite the ignore reason on each test saying it is wired into the docs-contract workflow. softmata/horus#178 adds that step; restore the `enforced` block above once it merges: `documented_benchmark_binaries_exist`',
+    // Two facts, not one: the test exists, and the docs-contract workflow
+    // actually runs it with `--ignored`. Asserting only the first is what let
+    // this class sit in `manual` while the case was written but never executed.
+    enforced: [
+      { where: 'horus:horus_manager/tests/docs_parity.rs', needle: 'fn documented_benchmark_binaries_exist' },
+      { where: 'horus:.github/workflows/docs-contract.yml', needle: '--test docs_parity' },
+    ],
     direction: 'docs->code',
   },
   {
     class: 'existence/version-pin',
     what: 'a documented `horus = "x.y"` can resolve to the crate this repo ships',
-    // enforced: { where: 'horus:horus_manager/tests/docs_parity.rs',
-    //             needle: 'documented_horus_version_pins_resolve_to_this_crate' },
-    manual: '`horus_manager/tests/docs_parity.rs` is now on horus `main`, so the test exists — but nothing runs it. All three of its tests carry `#[ignore]`, and although the `--test *` sweep in integration-tests.yml selects the target, an all-ignored binary exits 0 reporting "0 passed; 3 ignored", which reads as coverage. No workflow names `docs_parity` at all, despite the ignore reason on each test saying it is wired into the docs-contract workflow. softmata/horus#178 adds that step; restore the `enforced` block above once it merges: `documented_horus_version_pins_resolve_to_this_crate`',
+    // Two facts, not one: the test exists, and the docs-contract workflow
+    // actually runs it with `--ignored`. Asserting only the first is what let
+    // this class sit in `manual` while the case was written but never executed.
+    enforced: [
+      { where: 'horus:horus_manager/tests/docs_parity.rs', needle: 'fn documented_horus_version_pins_resolve_to_this_crate' },
+      { where: 'horus:.github/workflows/docs-contract.yml', needle: '--test docs_parity' },
+    ],
     direction: 'both',
   },
 
@@ -314,18 +326,34 @@ for (const entry of CLASSES) {
     continue;
   }
   if (entry.enforced) {
-    const file = resolve(entry.enforced.where);
-    if (!fs.existsSync(file)) {
-      missingCheck.push(`${entry.class} — ${entry.enforced.where} does not exist`);
-      continue;
+    // One check, or several that must ALL hold.
+    //
+    // A class whose check is a test in the horus repo needs two separate facts,
+    // and this file used to be able to state only the first: that the test
+    // exists, and that something runs it. That gap is not hypothetical -- the
+    // three docs_parity classes below sat in `manual` for exactly it, because
+    // the test existed while every one of its cases was `#[ignore]`d and no
+    // workflow named the target. An all-ignored binary exits 0 reporting
+    // "0 passed; 3 ignored", which reads as coverage from the outside.
+    const checks = Array.isArray(entry.enforced) ? entry.enforced : [entry.enforced];
+    let satisfied = true;
+    for (const check of checks) {
+      const file = resolve(check.where);
+      if (!fs.existsSync(file)) {
+        missingCheck.push(`${entry.class} — ${check.where} does not exist`);
+        satisfied = false;
+        break;
+      }
+      const text = fs.readFileSync(file, 'utf8');
+      if (!text.includes(check.needle)) {
+        missingCheck.push(
+          `${entry.class} — ${check.where} no longer contains "${check.needle}"`
+        );
+        satisfied = false;
+        break;
+      }
     }
-    const text = fs.readFileSync(file, 'utf8');
-    if (!text.includes(entry.enforced.needle)) {
-      missingCheck.push(
-        `${entry.class} — ${entry.enforced.where} no longer contains "${entry.enforced.needle}"`
-      );
-      continue;
-    }
+    if (!satisfied) continue;
     enforced += 1;
   } else if (entry.manual) {
     manual += 1;
@@ -358,7 +386,10 @@ if (verbose) {
   console.log('enforced:');
   for (const e of CLASSES.filter((c) => c.enforced)) {
     const arrow = { both: '<->', 'docs->code': '-->', 'code->docs': '<--', 'n/a': '   ' }[e.direction] || '   ';
-    console.log(`  ${arrow} ${e.class.padEnd(32)} ${e.enforced.where}`);
+    const where = (Array.isArray(e.enforced) ? e.enforced : [e.enforced])
+      .map((c) => c.where)
+      .join(' + ');
+    console.log(`  ${arrow} ${e.class.padEnd(32)} ${where}`);
   }
   console.log('\nleft to a reader:');
   for (const e of CLASSES.filter((c) => c.manual)) console.log(`  --- ${e.class}`);
