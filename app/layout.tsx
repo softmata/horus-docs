@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   metadataBase: new URL('https://docs.horusrobotics.dev'),
   title: "HORUS Documentation | Real-Time Robotics Framework",
-  description: "Documentation for HORUS, a high-performance robotics framework. Sub-microsecond IPC latency, zero-copy messaging, multi-language support (Rust/Python). Open source under Apache 2.0.",
+  description: "Documentation for HORUS, a high-performance robotics framework. Sub-microsecond IPC latency, zero-copy messaging, multi-language support (Rust, Python, C++). Open source under Apache 2.0.",
   keywords: [
     'horus robotics',
     'horus framework',
@@ -88,15 +88,15 @@ export default function RootLayout({
     applicationCategory: 'DeveloperApplication',
     applicationSubCategory: 'Robotics Framework',
     operatingSystem: ['Linux', 'macOS', 'Windows'],
-    description: 'HORUS is an open-source robotics framework with sub-microsecond IPC latency, zero-copy shared memory messaging, and multi-language support (Rust, Python).',
-    softwareVersion: '0.1.7',
+    description: 'HORUS is an open-source robotics framework with sub-microsecond IPC latency, zero-copy shared memory messaging, and multi-language support (Rust, Python, C++).',
+    softwareVersion: '0.4.1',
     url: 'https://docs.horusrobotics.dev',
     downloadUrl: 'https://github.com/softmata/horus',
     installUrl: 'https://docs.horusrobotics.dev/getting-started/installation',
     softwareHelp: 'https://docs.horusrobotics.dev',
     releaseNotes: 'https://github.com/softmata/horus/releases',
-    keywords: 'robotics framework, real-time, rust, python, IPC, shared memory',
-    programmingLanguage: ['Rust', 'Python'],
+    keywords: 'robotics framework, real-time, rust, python, c++, IPC, shared memory',
+    programmingLanguage: ['Rust', 'Python', 'C++'],
     license: 'https://opensource.org/licenses/Apache-2.0',
     creator: {
       '@type': 'Organization',
@@ -113,7 +113,7 @@ export default function RootLayout({
       'Sub-microsecond IPC latency',
       'Zero-copy shared memory architecture',
       'Deterministic real-time control',
-      'Multi-language support (Rust, Python)',
+      'Multi-language support (Rust, Python, C++)',
       'Native hardware integration',
     ],
   };

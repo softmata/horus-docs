@@ -264,6 +264,16 @@ const CLASSES = [
 
   // ── value: a documented value matches the source ────────────────────────
   {
+    class: 'value/site-metadata',
+    what: "the site's own JSON-LD advertises the version HORUS ships and every language it documents",
+    // `app/` is not `content/`, so no code or link checker ever looked at it.
+    // Both fields it asserts had drifted: softwareVersion said 0.1.7 against a
+    // shipped 0.4.1, and programmingLanguage omitted C++ while the docs carry
+    // 18 C++ API pages. Search engines read this block directly.
+    enforced: { where: 'scripts/check-site-metadata.mjs', needle: 'is what search engines are told' },
+    direction: 'both',
+  },
+  {
     class: 'value/performance-figure',
     what: 'headline latencies agree with the page that measures them, and retracted ones stay gone',
     enforced: { where: 'scripts/check-claims.mjs', needle: 'agree with benchmarks.mdx' },
