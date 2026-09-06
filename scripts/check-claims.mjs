@@ -565,6 +565,62 @@ if (headroomClaims.length) {
   process.exit(1);
 }
 
+// A latency RANGE whose bounds are not both published.
+//
+// `CANONICAL` above asserts that each headline figure still exists on
+// benchmarks.mdx. It cannot catch a range, because a range is two numbers and
+// only one of them has to be real for the sentence to look sourced. Two pages
+// said "151-304ns p50 cross-process": 151 is the SpscShm 1P1C median, and 304
+// is the byte size of the `Imu` message, which the docs quote that way in
+// fifteen other places. A byte count had been transposed into nanoseconds.
+// Another said "~200-300ns", which understates the floor and overstates the
+// ceiling of a table it never cites.
+//
+// Both bounds of a cross-process range must appear as a latency on
+// performance.mdx, which is the page that publishes the topology table every
+// such sentence is summarising. This is the `consistency/cross-page` class:
+// each page was individually plausible and only disagreed with the source.
+const CROSS_PROCESS_CONTEXT = /cross-process|between separate processes|across processes/i;
+const NS_RANGE = /\b(\d{2,4})\s?[–-]\s?(\d{2,4})\s?ns\b/g;
+const perfPage = path.join(root, 'content/docs/performance/performance.mdx');
+const rangeProblems = [];
+if (fs.existsSync(perfPage)) {
+  const perfText = fs.readFileSync(perfPage, 'utf8');
+  const published = new Set(
+    [...perfText.matchAll(/\b(\d{2,4})\s?ns\b/g)].map((m) => m[1])
+  );
+  for (const file of files) {
+    const rel = path.relative(root, file).replace(/\\/g, '/');
+    if (rel === 'scripts/check-claims.mjs') continue;
+    if (!rel.endsWith('.mdx')) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    text.split('\n').forEach((line, i) => {
+      if (!CROSS_PROCESS_CONTEXT.test(line)) return;
+      for (const m of line.matchAll(NS_RANGE)) {
+        const unpublished = [m[1], m[2]].filter((v) => !published.has(v));
+        if (unpublished.length) {
+          rangeProblems.push(
+            `${rel}:${i + 1} — "${m[0]}" quotes ${unpublished.join(' and ')} ns, ` +
+              `which performance.mdx does not publish`
+          );
+        }
+      }
+    });
+  }
+}
+if (rangeProblems.length) {
+  console.error(
+    `${rangeProblems.length} cross-process latency range(s) cite a figure that is not published:\n`
+  );
+  for (const r of rangeProblems) console.error(`  ${r}`);
+  console.error(
+    '\nEvery bound has to come off the topology table on ' +
+      'content/docs/performance/performance.mdx. If the benchmarks were re-run, ' +
+      'update that page first and these ranges with it.'
+  );
+  process.exit(1);
+}
+
 console.log(
   `OK — ${scanned} files carry no retracted performance claim, the ` +
     `${CANONICAL.length} headline figures agree with benchmarks.mdx, and the ` +

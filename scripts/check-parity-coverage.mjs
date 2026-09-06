@@ -297,12 +297,16 @@ const CLASSES = [
     what: 'a fact stated on more than one page is stated the same way',
     manual:
       'The largest single category — 30 findings — and only partly reachable. ' +
-      'check-claims pins the five headline latency figures to benchmarks.mdx, which ' +
-      'is single-sourcing done by hand for one fact family. The general form needs ' +
-      'facts to be transcluded from one place rather than retyped, which is a ' +
-      'content-model change, not a test. Until then a reader is the only oracle for ' +
-      'the rest: two pages disagreeing about what .watchdog() does are each ' +
-      'individually plausible.',
+      'check-claims pins the five headline latency figures to benchmarks.mdx and, ' +
+      'since a range needs only one real number to look sourced, also requires both ' +
+      'bounds of any cross-process latency range to appear on performance.mdx. That ' +
+      'second rule was added after "151-304ns p50 cross-process" shipped on two ' +
+      'pages: 151 is the SpscShm 1P1C median and 304 is the byte size of the Imu ' +
+      'message. Both are single-sourcing done by hand for one fact family. The ' +
+      'general form needs facts to be transcluded from one place rather than ' +
+      'retyped, which is a content-model change, not a test. Until then a reader is ' +
+      'the only oracle for the rest: two pages disagreeing about what .watchdog() ' +
+      'does are each individually plausible.',
   },
 
   // ── behaviour: what the system does ─────────────────────────────────────
